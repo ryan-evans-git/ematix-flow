@@ -79,6 +79,17 @@ import provenance  # noqa: E402
 REWRITES: dict[str, "callable[[str], str]"] = {}
 
 
+def apply_tpch_query_params(qid: str, sql: str, sf: int) -> str:
+    """Mirror of ematix_flow_core::tpch_params::apply_tpch_query_params —
+    Q11's HAVING fraction is 0.0001/SF per the TPC-H spec, so at SF>1 the
+    literal in q11.sql must be scaled or the query is degenerate AND the
+    ematix runner (which applies the same transform) would report a
+    different row count, tripping the aggregator's correctness flag."""
+    if qid == "Q11" and sf > 1:
+        return sql.replace("0.0001", f"(0.0001 / {sf})", 1)
+    return sql
+
+
 def load_query(queries_dir: Path, qid: str) -> str:
     """Load Qxx → SQL text, applying any per-query Trino adaptation."""
     # Files are lowercase q01.sql etc.
@@ -271,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     queries_out: dict[str, dict] = {}
     failures: dict[str, str] = {}
     for qid in qids:
-        sql = load_query(queries_dir, qid)
+        sql = apply_tpch_query_params(qid, load_query(queries_dir, qid), args.sf)
         try:
             queries_out[qid] = bench_one(conn, qid, sql, args.trials, args.warmups)
         except Exception as exc:  # noqa: BLE001 - we want to keep going

@@ -116,6 +116,17 @@ def adapt_sql_for_spark(sql: str) -> str:
     return sql.strip().rstrip(";").strip()
 
 
+def apply_tpch_query_params(n: int, sql: str, sf: int) -> str:
+    """Mirror of ematix_flow_core::tpch_params::apply_tpch_query_params —
+    Q11's HAVING fraction is 0.0001/SF per the TPC-H spec, so at SF>1 the
+    literal in q11.sql must be scaled or the query is degenerate AND the
+    ematix runner (which applies the same transform) would report a
+    different row count, tripping the aggregator's correctness flag."""
+    if n == 11 and sf > 1:
+        return sql.replace("0.0001", f"(0.0001 / {sf})", 1)
+    return sql
+
+
 # -----------------------------------------------------------------------------
 # SparkSession setup
 # -----------------------------------------------------------------------------
@@ -185,6 +196,7 @@ def benchmark_all(
     queries_dir: Path,
     trials: int,
     warmups: int,
+    sf: int,
 ) -> Dict[str, dict]:
     """Run all 22 TPC-H queries, returning the per-query result dict."""
     out: Dict[str, dict] = {}
@@ -195,7 +207,7 @@ def benchmark_all(
             print(f"!! missing {path}, skipping", flush=True)
             continue
 
-        sql = adapt_sql_for_spark(path.read_text())
+        sql = apply_tpch_query_params(n, adapt_sql_for_spark(path.read_text()), sf)
 
         print(f"== {qid} (warmups={warmups}, trials={trials})", flush=True)
         # Warmups — JVM optimization, Catalyst codegen cache priming.
@@ -318,7 +330,7 @@ def main(argv: List[str]) -> int:
         cluster_size = cluster_size_from_spark(spark)
 
         print("==> running queries", flush=True)
-        results = benchmark_all(spark, args.queries_dir, args.trials, args.warmups)
+        results = benchmark_all(spark, args.queries_dir, args.trials, args.warmups, args.sf)
     finally:
         spark.stop()
 
