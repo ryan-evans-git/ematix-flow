@@ -83,30 +83,33 @@ data "aws_subnet" "anchor" {
 # External traffic: nothing. Operator access is via SSM Session
 # Manager, which doesn't require any inbound rule.
 
+# NO inline ingress/egress blocks here: mixing inline rules with the
+# standalone intra_cluster_all rule resource makes terraform treat the
+# inline set as authoritative — the SECOND apply strips the standalone
+# rule and partitions the running cluster (workers can't announce).
+# All rules live as standalone resources below.
 resource "aws_security_group" "cluster" {
   name        = "${local.base_name}-cluster"
   description = "ematix-flow distributed cluster - intra-SG traffic only"
   vpc_id      = data.aws_vpc.default.id
+}
 
-  # SSH only if pubkey provided (emergency console)
-  dynamic "ingress" {
-    for_each = var.ssh_pubkey == "" ? [] : [1]
-    content {
-      description = "SSH from operator"
-      from_port   = 22
-      to_port     = 22
-      protocol    = "tcp"
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-  }
+# SSH only if pubkey provided (emergency console)
+resource "aws_vpc_security_group_ingress_rule" "ssh_operator" {
+  count             = var.ssh_pubkey == "" ? 0 : 1
+  security_group_id = aws_security_group.cluster.id
+  description       = "SSH from operator"
+  ip_protocol       = "tcp"
+  from_port         = 22
+  to_port           = 22
+  cidr_ipv4         = "0.0.0.0/0"
+}
 
-  egress {
-    description = "All outbound (S3, Glue, dnf, github)"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+resource "aws_vpc_security_group_egress_rule" "all_outbound" {
+  security_group_id = aws_security_group.cluster.id
+  description       = "All outbound (S3, Glue, dnf, github)"
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
 }
 
 # Self-referential rule (separate resource to avoid the chicken-and-egg
