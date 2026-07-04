@@ -84,6 +84,12 @@ dnf install -y \
 python3.12 -m ensurepip --upgrade >/dev/null 2>&1 || true
 python3.12 -m pip install --upgrade pip >/dev/null
 
+# bench.py deps (README's manual step, automated): system-wide, NOT --user —
+# cloud-init runs as root but the bench runs as ec2-user.
+if [ "$ROLE" = "master" ]; then
+    python3.12 -m pip install --quiet "pyspark==${SPARK_VERSION}" boto3
+fi
+
 # -----------------------------------------------------------------------------
 # Spark user
 # -----------------------------------------------------------------------------
