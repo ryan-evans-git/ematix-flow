@@ -41,8 +41,10 @@ use std::time::Duration;
 
 use crate::backend::BackendError;
 
+pub mod kafka_topic;
 pub mod table;
 
+pub use kafka_topic::KafkaTopicDlq;
 pub use table::TableDlq;
 
 /// Error strings persisted in `DlqMeta` are truncated to this many
