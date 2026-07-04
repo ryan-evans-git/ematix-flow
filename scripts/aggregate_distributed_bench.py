@@ -173,6 +173,39 @@ def render_table(results: dict, sf: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_provenance(results: dict) -> str:
+    """Render the per-run provenance table (campaign refresh 2026-07-04:
+    every runner stamps a `provenance` block — the campaign-side
+    equivalent of the strict local protocol's env.json). Runs without
+    the block (pre-refresh JSONs) render as em-dashes."""
+    lines = ["\n## Run provenance\n"]
+    lines.append(
+        "| engine | SF | version | instance | AZ | git SHA | dirty | cores |"
+    )
+    lines.append("|---|---:|---|---|---|---|---|---:|")
+    for (engine, sf), doc in sorted(results.items()):
+        prov = doc.get("provenance") or {}
+        sha = prov.get("git_sha") or ""
+        lines.append(
+            "| {e} | {sf} | {v} | {inst} | {az} | {sha} | {dirty} | {cores} |".format(
+                e=engine,
+                sf=sf,
+                v=doc.get("version", "—"),
+                inst=prov.get("instance_type") or "—",
+                az=prov.get("availability_zone") or "—",
+                sha=sha[:12] if sha else "—",
+                dirty="yes" if prov.get("git_dirty") else "no",
+                cores=prov.get("cores", "—"),
+            )
+        )
+    lines.append(
+        "\nLever state (`EMAT_*` / `TPCH_*` env) for each run is preserved "
+        "verbatim in the source JSON under `provenance.emat_env` — consult "
+        "it before comparing runs across stamps.\n"
+    )
+    return "\n".join(lines)
+
+
 def render_doc(results: dict, stamp: str | None) -> str:
     out = []
     out.append("# Distributed TPC-H bench — ematix-flow vs PySpark vs Trino\n")
@@ -186,6 +219,8 @@ def render_doc(results: dict, stamp: str | None) -> str:
     )
     if stamp:
         out.append(f"_Source: `s3://<bucket>/results/{stamp}/`_\n")
+
+    out.append(render_provenance(results))
 
     for sf in SCALES:
         out.append(render_table(results, sf))

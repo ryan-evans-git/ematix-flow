@@ -395,6 +395,20 @@ pub trait Backend: Send + Sync + 'static {
         None
     }
 
+    /// **Internal escape hatch — not a stable extension point.**
+    ///
+    /// DLQ Phase 1: returns the underlying [`crate::kafka_backend::KafkaBackend`]
+    /// when the implementing backend is Kafka. The single caller is
+    /// the streaming pipeline's dead-letter-store resolution, which
+    /// must (a) detect "explicit dead_letter_topic + Kafka source →
+    /// KafkaTopicDlq" and (b) reuse the source's producer/auth for
+    /// header-carrying DLQ produces. Same `pub(crate)`-in-spirit
+    /// caveat as [`Backend::as_postgres`].
+    #[doc(hidden)]
+    fn as_kafka(&self) -> Option<&crate::kafka_backend::KafkaBackend> {
+        None
+    }
+
     /// Execute a side-effecting statement. SQL for DB backends; backend-
     /// specific commands for others (e.g., `DELETE` against an object
     /// prefix). Returns the affected row count where meaningful, 0

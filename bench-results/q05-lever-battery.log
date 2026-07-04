@@ -1,0 +1,357 @@
+  [env] captured -> bench-results/q05-lever-2026-07-04/ab-sf10/env.json
+=== Σ.AI.2 strict interleaved A/B bench ===
+  sf:             10
+  invocations:    4 (first of each discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off (both sides)
+  cache policy:   warm
+  env A:          EMAT_STATVEC=0 EMAT_PROBE_RUN_MEMO=0
+  env B:          EMAT_NOOPMARK=defaults
+  output:         bench-results/q05-lever-2026-07-04/ab-sf10
+
+--- pair 1 / 4 ---
+  → mode A invocation 1 → bench-results/q05-lever-2026-07-04/ab-sf10/A/run-1.md
+  → mode B invocation 1 → bench-results/q05-lever-2026-07-04/ab-sf10/B/run-1.md
+--- pair 2 / 4 ---
+  → mode A invocation 2 → bench-results/q05-lever-2026-07-04/ab-sf10/A/run-2.md
+  → mode B invocation 2 → bench-results/q05-lever-2026-07-04/ab-sf10/B/run-2.md
+--- pair 3 / 4 ---
+  → mode A invocation 3 → bench-results/q05-lever-2026-07-04/ab-sf10/A/run-3.md
+  → mode B invocation 3 → bench-results/q05-lever-2026-07-04/ab-sf10/B/run-3.md
+--- pair 4 / 4 ---
+  → mode A invocation 4 → bench-results/q05-lever-2026-07-04/ab-sf10/A/run-4.md
+  → mode B invocation 4 → bench-results/q05-lever-2026-07-04/ab-sf10/B/run-4.md
+
+--- aggregating ---
+
+# Σ.AI.2 strict interleaved A/B diff
+
+- A summary: `A/strict-22q-summary.md`
+- B summary: `B/strict-22q-summary.md`
+
+Per-query Δ = B − A. Verdict uses 2× max(σ_A, σ_B) as the noise bar.
+
+| Query | A median | B median | Δ ms | Δ % | bar (2σ) | verdict |
+|------:|---------:|---------:|-----:|----:|---------:|:--------|
+| Q01 | 258.05 | 276.55 | +18.50 | +7.17% | 52.74 | noise |
+| Q02 | 19.78 | 20.11 | +0.33 | +1.67% | 2.20 | noise |
+| Q03 | 132.20 | 143.21 | +11.01 | +8.33% | 16.56 | noise |
+| Q04 | 60.00 | 63.49 | +3.49 | +5.82% | 9.84 | noise |
+| Q05 | 145.23 | 143.81 | -1.42 | -0.98% | 18.70 | noise |
+| Q06 | 26.44 | 27.63 | +1.19 | +4.50% | 3.38 | noise |
+| Q07 | 136.35 | 144.72 | +8.37 | +6.14% | 24.84 | noise |
+| Q08 | 165.59 | 178.94 | +13.35 | +8.06% | 27.42 | noise |
+| Q09 | 319.72 | 336.80 | +17.08 | +5.34% | 55.24 | noise |
+| Q10 | 223.95 | 213.15 | -10.80 | -4.82% | 26.42 | noise |
+| Q11 | 12.53 | 12.69 | +0.16 | +1.28% | 1.18 | noise |
+| Q12 | 99.65 | 98.41 | -1.24 | -1.24% | 17.56 | noise |
+| Q13 | 122.31 | 115.46 | -6.85 | -5.60% | 16.66 | noise |
+| Q14 | 92.41 | 90.27 | -2.14 | -2.32% | 9.08 | noise |
+| Q15 | 67.35 | 65.99 | -1.36 | -2.02% | 8.28 | noise |
+| Q16 | 48.44 | 47.27 | -1.17 | -2.42% | 4.86 | noise |
+| Q17 | 87.65 | 84.58 | -3.07 | -3.50% | 11.16 | noise |
+| Q18 | 210.00 | 199.50 | -10.50 | -5.00% | 27.52 | noise |
+| Q19 | 143.56 | 144.42 | +0.86 | +0.60% | 20.18 | noise |
+| Q20 | 102.12 | 75.11 | -27.01 | -26.45% | 6.70 | WIN |
+| Q21 | 210.49 | 204.26 | -6.23 | -2.96% | 33.08 | noise |
+| Q22 | 25.16 | 25.26 | +0.10 | +0.40% | 2.04 | noise |
+
+**Sum of A medians**: 2708.98 ms
+**Sum of B medians**: 2711.63 ms
+**Net Δ**: +2.65 ms (+0.10%)
+
+**Clear WIN (>2σ)**: 1  Q20 -27.0ms
+**Clear regression (>2σ)**: 0  
+  [env] captured -> bench-results/q05-lever-2026-07-04/ab-sf100/env.json
+=== Σ.AI.2 strict interleaved A/B bench ===
+  sf:             100
+  invocations:    4 (first of each discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off (both sides)
+  cache policy:   warm
+  env A:          EMAT_STATVEC=0 EMAT_PROBE_RUN_MEMO=0
+  env B:          EMAT_NOOPMARK=defaults
+  output:         bench-results/q05-lever-2026-07-04/ab-sf100
+
+--- pair 1 / 4 ---
+  → mode A invocation 1 → bench-results/q05-lever-2026-07-04/ab-sf100/A/run-1.md
+  → mode B invocation 1 → bench-results/q05-lever-2026-07-04/ab-sf100/B/run-1.md
+--- pair 2 / 4 ---
+  → mode A invocation 2 → bench-results/q05-lever-2026-07-04/ab-sf100/A/run-2.md
+  → mode B invocation 2 → bench-results/q05-lever-2026-07-04/ab-sf100/B/run-2.md
+--- pair 3 / 4 ---
+  → mode A invocation 3 → bench-results/q05-lever-2026-07-04/ab-sf100/A/run-3.md
+  → mode B invocation 3 → bench-results/q05-lever-2026-07-04/ab-sf100/B/run-3.md
+--- pair 4 / 4 ---
+  → mode A invocation 4 → bench-results/q05-lever-2026-07-04/ab-sf100/A/run-4.md
+  → mode B invocation 4 → bench-results/q05-lever-2026-07-04/ab-sf100/B/run-4.md
+
+--- aggregating ---
+
+# Σ.AI.2 strict interleaved A/B diff
+
+- A summary: `A/strict-22q-summary.md`
+- B summary: `B/strict-22q-summary.md`
+
+Per-query Δ = B − A. Verdict uses 2× max(σ_A, σ_B) as the noise bar.
+
+| Query | A median | B median | Δ ms | Δ % | bar (2σ) | verdict |
+|------:|---------:|---------:|-----:|----:|---------:|:--------|
+| Q01 | 3071.29 | 3103.57 | +32.28 | +1.05% | 570.16 | noise |
+| Q02 | 240.08 | 242.01 | +1.93 | +0.80% | 51.84 | noise |
+| Q03 | 1920.78 | 1930.74 | +9.96 | +0.52% | 428.76 | noise |
+| Q04 | 1079.79 | 1079.28 | -0.51 | -0.05% | 229.38 | noise |
+| Q05 | 1754.34 | 1758.12 | +3.78 | +0.22% | 345.26 | noise |
+| Q06 | 664.45 | 666.81 | +2.36 | +0.36% | 142.12 | noise |
+| Q07 | 1857.74 | 1854.23 | -3.51 | -0.19% | 392.58 | noise |
+| Q08 | 2032.26 | 2060.49 | +28.23 | +1.39% | 408.08 | noise |
+| Q09 | 4409.47 | 4421.44 | +11.97 | +0.27% | 940.00 | noise |
+| Q10 | 2111.50 | 2523.32 | +411.82 | +19.50% | 568.92 | noise |
+| Q11 | 201.43 | 236.77 | +35.34 | +17.54% | 52.32 | noise |
+| Q12 | 1101.26 | 1302.39 | +201.13 | +18.26% | 276.78 | noise |
+| Q13 | 2380.21 | 2530.19 | +149.98 | +6.30% | 561.06 | noise |
+| Q14 | 1022.63 | 1031.60 | +8.97 | +0.88% | 190.86 | noise |
+| Q15 | 987.07 | 994.39 | +7.32 | +0.74% | 181.58 | noise |
+| Q16 | 495.23 | 491.00 | -4.23 | -0.85% | 92.04 | noise |
+| Q17 | 1835.49 | 1868.47 | +32.98 | +1.80% | 386.22 | noise |
+| Q18 | 2673.62 | 2694.34 | +20.72 | +0.77% | 574.80 | noise |
+| Q19 | 1510.93 | 1515.70 | +4.77 | +0.32% | 287.86 | noise |
+| Q20 | 1400.04 | 1194.31 | -205.73 | -14.69% | 252.74 | noise |
+| Q21 | 4313.61 | 4344.89 | +31.28 | +0.73% | 923.02 | noise |
+| Q22 | 409.37 | 415.19 | +5.82 | +1.42% | 79.28 | noise |
+
+**Sum of A medians**: 37472.59 ms
+**Sum of B medians**: 38259.25 ms
+**Net Δ**: +786.66 ms (+2.10%)
+
+**Clear WIN (>2σ)**: 0  
+**Clear regression (>2σ)**: 0  
+  [env] captured -> bench-results/q05-lever-2026-07-04/ab-sf1/env.json
+=== Σ.AI.2 strict interleaved A/B bench ===
+  sf:             1
+  invocations:    4 (first of each discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off (both sides)
+  cache policy:   warm
+  env A:          EMAT_STATVEC=0 EMAT_PROBE_RUN_MEMO=0
+  env B:          EMAT_NOOPMARK=defaults
+  output:         bench-results/q05-lever-2026-07-04/ab-sf1
+
+--- pair 1 / 4 ---
+  → mode A invocation 1 → bench-results/q05-lever-2026-07-04/ab-sf1/A/run-1.md
+  → mode B invocation 1 → bench-results/q05-lever-2026-07-04/ab-sf1/B/run-1.md
+--- pair 2 / 4 ---
+  → mode A invocation 2 → bench-results/q05-lever-2026-07-04/ab-sf1/A/run-2.md
+  → mode B invocation 2 → bench-results/q05-lever-2026-07-04/ab-sf1/B/run-2.md
+--- pair 3 / 4 ---
+  → mode A invocation 3 → bench-results/q05-lever-2026-07-04/ab-sf1/A/run-3.md
+  → mode B invocation 3 → bench-results/q05-lever-2026-07-04/ab-sf1/B/run-3.md
+--- pair 4 / 4 ---
+  → mode A invocation 4 → bench-results/q05-lever-2026-07-04/ab-sf1/A/run-4.md
+  → mode B invocation 4 → bench-results/q05-lever-2026-07-04/ab-sf1/B/run-4.md
+
+--- aggregating ---
+
+# Σ.AI.2 strict interleaved A/B diff
+
+- A summary: `A/strict-22q-summary.md`
+- B summary: `B/strict-22q-summary.md`
+
+Per-query Δ = B − A. Verdict uses 2× max(σ_A, σ_B) as the noise bar.
+
+| Query | A median | B median | Δ ms | Δ % | bar (2σ) | verdict |
+|------:|---------:|---------:|-----:|----:|---------:|:--------|
+| Q01 | 20.55 | 20.66 | +0.11 | +0.54% | 0.86 | noise |
+| Q02 | 7.96 | 8.18 | +0.22 | +2.76% | 0.40 | noise |
+| Q03 | 14.07 | 14.36 | +0.29 | +2.06% | 0.48 | noise |
+| Q04 | 12.52 | 12.43 | -0.09 | -0.72% | 0.44 | noise |
+| Q05 | 12.66 | 12.63 | -0.03 | -0.24% | 0.18 | noise |
+| Q06 | 1.74 | 1.71 | -0.03 | -1.72% | 0.04 | noise |
+| Q07 | 26.93 | 27.35 | +0.42 | +1.56% | 0.50 | noise |
+| Q08 | 15.75 | 15.71 | -0.04 | -0.25% | 0.78 | noise |
+| Q09 | 19.13 | 19.38 | +0.25 | +1.31% | 0.58 | noise |
+| Q10 | 23.27 | 22.92 | -0.35 | -1.50% | 0.86 | noise |
+| Q11 | 5.92 | 5.77 | -0.15 | -2.53% | 0.24 | noise |
+| Q12 | 15.48 | 15.36 | -0.12 | -0.78% | 0.22 | noise |
+| Q13 | 9.87 | 9.66 | -0.21 | -2.13% | 0.96 | noise |
+| Q14 | 12.32 | 12.53 | +0.21 | +1.70% | 0.38 | noise |
+| Q15 | 11.52 | 11.57 | +0.05 | +0.43% | 0.50 | noise |
+| Q16 | 9.85 | 10.10 | +0.25 | +2.54% | 0.24 | regression |
+| Q17 | 15.38 | 15.63 | +0.25 | +1.63% | 0.46 | noise |
+| Q18 | 20.35 | 20.14 | -0.21 | -1.03% | 0.74 | noise |
+| Q19 | 18.64 | 18.47 | -0.17 | -0.91% | 0.84 | noise |
+| Q20 | 13.26 | 13.45 | +0.19 | +1.43% | 0.62 | noise |
+| Q21 | 37.10 | 37.16 | +0.06 | +0.16% | 0.74 | noise |
+| Q22 | 4.42 | 4.38 | -0.04 | -0.90% | 0.26 | noise |
+
+**Sum of A medians**: 328.69 ms
+**Sum of B medians**: 329.55 ms
+**Net Δ**: +0.86 ms (+0.26%)
+
+**Clear WIN (>2σ)**: 0  
+**Clear regression (>2σ)**: 1  Q16 +0.2ms
+=== Σ.AI.1 strict bench protocol ===
+  sf:             10
+  invocations:    4 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,
+  extra env:      <none>
+  output dir:     bench-results/q05-lever-2026-07-04/ematix-sf10-full
+
+  [env] captured -> bench-results/q05-lever-2026-07-04/ematix-sf10-full/env.json
+--- invocation 1 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-full/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-full/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-full/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-full/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/q05-lever-2026-07-04/ematix-sf10-full/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — ematix
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'AC Power'
+- Git: 31a826400769 on main (dirty: True)
+- Data: SF=10; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 3 of 4 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-2.md', 'run-3.md', 'run-4.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q01 | 307.06 | 306.45 | 1.17 | 0.38% | 307.1 / 305.1 / 307.2 |
+| Q02 | 20.81 | 20.89 | 0.24 | 1.14% | 21.2 / 20.8 / 20.7 |
+| Q03 | 150.45 | 151.41 | 1.83 | 1.22% | 150.3 / 153.5 / 150.4 |
+| Q04 | 70.13 | 70.58 | 1.16 | 1.65% | 69.7 / 71.9 / 70.1 |
+| Q05 | 152.30 | 151.42 | 1.64 | 1.08% | 149.5 / 152.3 / 152.4 |
+| Q06 | 29.14 | 29.32 | 0.92 | 3.15% | 30.3 / 28.5 / 29.1 |
+| Q07 | 157.43 | 158.04 | 2.70 | 1.72% | 161.0 / 157.4 / 155.7 |
+| Q08 | 195.20 | 195.60 | 1.57 | 0.80% | 197.3 / 194.3 / 195.2 |
+| Q09 | 363.16 | 365.95 | 6.15 | 1.69% | 363.2 / 373.0 / 361.7 |
+| Q10 | 251.08 | 250.95 | 1.46 | 0.58% | 252.3 / 251.1 / 249.4 |
+| Q11 | 13.85 | 13.79 | 0.21 | 1.53% | 13.8 / 13.6 / 14.0 |
+| Q12 | 114.92 | 114.19 | 2.00 | 1.74% | 111.9 / 114.9 / 115.7 |
+| Q13 | 133.55 | 133.52 | 0.78 | 0.58% | 134.3 / 132.7 / 133.6 |
+| Q14 | 100.98 | 100.91 | 0.94 | 0.93% | 101.8 / 101.0 / 99.9 |
+| Q15 | 74.96 | 75.55 | 2.09 | 2.79% | 77.9 / 75.0 / 73.8 |
+| Q16 | 52.88 | 53.26 | 1.31 | 2.48% | 52.2 / 54.7 / 52.9 |
+| Q17 | 97.80 | 95.99 | 3.60 | 3.68% | 91.8 / 98.3 / 97.8 |
+| Q18 | 231.22 | 231.55 | 3.29 | 1.42% | 231.2 / 228.4 / 235.0 |
+| Q19 | 165.80 | 164.13 | 3.33 | 2.01% | 160.3 / 166.3 / 165.8 |
+| Q20 | 84.82 | 84.87 | 0.26 | 0.31% | 84.6 / 84.8 / 85.2 |
+| Q21 | 242.36 | 241.04 | 9.60 | 3.96% | 230.8 / 242.4 / 249.9 |
+| Q22 | 27.21 | 27.11 | 0.27 | 0.99% | 26.8 / 27.3 / 27.2 |
+
+**Sum of medians**: 3037.11 ms  (primary, robust to single-run outliers)
+**Sum of means**: 3036.54 ms  (secondary)
+**Median CV**: 1.48%  (noise-floor across invocations)
+**Max CV**: 3.96%  (worst-case per-query noise — likely single-run outlier)
+=== Σ.AI.1 strict bench protocol ===
+  sf:             10
+  invocations:    4 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,
+  extra env:      <none>
+  output dir:     bench-results/q05-lever-2026-07-04/duckdb-sf10-full
+
+  [env] captured -> bench-results/q05-lever-2026-07-04/duckdb-sf10-full/env.json
+--- invocation 1 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-full/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-full/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-full/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-full/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/q05-lever-2026-07-04/duckdb-sf10-full/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — duckdb
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'AC Power'
+- Git: 31a826400769 on main (dirty: True)
+- Data: SF=10; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 3 of 4 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-2.md', 'run-3.md', 'run-4.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q01 | 294.95 | 294.00 | 3.42 | 1.16% | 294.9 / 296.9 / 290.2 |
+| Q02 | 41.43 | 41.66 | 0.46 | 1.11% | 42.2 / 41.4 / 41.4 |
+| Q03 | 158.92 | 158.59 | 0.86 | 0.54% | 157.6 / 158.9 / 159.2 |
+| Q04 | 100.77 | 100.86 | 0.44 | 0.44% | 100.5 / 100.8 / 101.3 |
+| Q05 | 159.75 | 159.04 | 2.13 | 1.33% | 159.8 / 160.7 / 156.7 |
+| Q06 | 90.59 | 90.41 | 0.63 | 0.69% | 89.7 / 90.6 / 90.9 |
+| Q07 | 163.47 | 162.77 | 1.84 | 1.12% | 164.2 / 163.5 / 160.7 |
+| Q08 | 191.06 | 190.53 | 1.39 | 0.73% | 191.6 / 191.1 / 188.9 |
+| Q09 | 347.28 | 348.68 | 5.68 | 1.63% | 354.9 / 347.3 / 343.8 |
+| Q10 | 252.41 | 252.95 | 0.95 | 0.38% | 252.4 / 252.4 / 254.0 |
+| Q11 | 28.34 | 28.01 | 0.62 | 2.19% | 28.3 / 27.3 / 28.4 |
+| Q12 | 126.49 | 126.99 | 2.02 | 1.59% | 129.2 / 125.3 / 126.5 |
+| Q13 | 292.65 | 292.57 | 1.53 | 0.52% | 294.1 / 292.6 / 291.0 |
+| Q14 | 140.48 | 140.91 | 1.44 | 1.02% | 142.5 / 140.5 / 139.7 |
+| Q15 | 95.30 | 95.70 | 1.37 | 1.44% | 97.2 / 95.3 / 94.6 |
+| Q16 | 64.22 | 64.53 | 0.85 | 1.32% | 65.5 / 64.2 / 63.9 |
+| Q17 | 179.40 | 179.56 | 2.39 | 1.33% | 182.0 / 179.4 / 177.2 |
+| Q18 | 250.30 | 251.12 | 1.56 | 0.62% | 252.9 / 250.3 / 250.2 |
+| Q19 | 213.83 | 213.38 | 2.49 | 1.17% | 213.8 / 215.6 / 210.7 |
+| Q20 | 152.68 | 152.81 | 0.24 | 0.16% | 153.1 / 152.7 / 152.7 |
+| Q21 | 458.65 | 459.87 | 2.75 | 0.60% | 463.0 / 458.6 / 457.9 |
+| Q22 | 59.89 | 59.59 | 0.57 | 0.95% | 59.9 / 58.9 / 59.9 |
+
+**Sum of medians**: 3862.86 ms  (primary, robust to single-run outliers)
+**Sum of means**: 3864.51 ms  (secondary)
+**Median CV**: 1.07%  (noise-floor across invocations)
+**Max CV**: 2.19%  (worst-case per-query noise — likely single-run outlier)
+Q05-BATTERY-DONE

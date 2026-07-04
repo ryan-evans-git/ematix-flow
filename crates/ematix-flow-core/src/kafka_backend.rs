@@ -139,6 +139,20 @@ pub enum KafkaPayloadFormat {
     Protobuf,
 }
 
+impl KafkaPayloadFormat {
+    /// Stable snake_case name (matches the serde rename) — used by
+    /// the DLQ layer as `DlqMeta::payload_format` so replay decodes
+    /// symmetrically.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KafkaPayloadFormat::Json => "json",
+            KafkaPayloadFormat::RawBytes => "raw_bytes",
+            KafkaPayloadFormat::Avro => "avro",
+            KafkaPayloadFormat::Protobuf => "protobuf",
+        }
+    }
+}
+
 /// Column name used by the RawBytes decoder for the single Binary
 /// column it emits.
 const RAW_BYTES_COLUMN: &str = "payload";
@@ -1234,6 +1248,58 @@ impl KafkaBackend {
         }
     }
 
+    /// Encode one batch into per-row wire payloads using this
+    /// backend's `payload_format`. Extracted from
+    /// `write_arrow_stream` so the DLQ layer (Phase 1) produces
+    /// byte-identical, format-preserved payloads: JSON sources stay
+    /// JSON on the DLQ, RawBytes stay raw, Avro/Protobuf re-encode
+    /// through the same registry paths.
+    ///
+    /// `topic` feeds the Avro/Protobuf schema-subject convention
+    /// ("<topic>-value") exactly as the produce path does.
+    pub(crate) async fn encode_batch_payloads(
+        &self,
+        topic: &str,
+        batch: &RecordBatch,
+    ) -> Result<Vec<Vec<u8>>, BackendError> {
+        Ok(match self.payload_format {
+            KafkaPayloadFormat::Json => encode_batch_as_jsonl_lines(batch)?,
+            KafkaPayloadFormat::RawBytes => encode_batch_as_raw_bytes(batch)?,
+            KafkaPayloadFormat::Avro => match &self.schema_registry_kind {
+                SchemaRegistryKind::Confluent => {
+                    encode_batch_as_avro(batch, topic, &self.sr_auth()?).await?
+                }
+                SchemaRegistryKind::Glue {
+                    region,
+                    registry_name,
+                    schema_lookup_by_name_callback,
+                    ..
+                } => {
+                    // Topic name doubles as the Glue schema name —
+                    // matches the Confluent convention of
+                    // "<topic>-value" subject. Users wanting a
+                    // different schema name today can manage it
+                    // outside this surface; a per-pipeline
+                    // override field is a future enhancement.
+                    encode_batch_as_glue_avro(
+                        batch,
+                        region,
+                        registry_name,
+                        topic,
+                        schema_lookup_by_name_callback,
+                        &self.glue_producer_schema_cache,
+                    )?
+                }
+            },
+            KafkaPayloadFormat::Protobuf => {
+                // schema_registry_url presence is validated by the
+                // caller (write_arrow_stream) or errors here with
+                // the sr_auth message.
+                encode_batch_as_protobuf(batch, topic, &self.sr_auth()?).await?
+            }
+        })
+    }
+
     /// Get (or lazily-create) the FutureProducer for this backend.
     /// In `ExactlyOnce` mode the producer must be reused across
     /// `write_arrow_stream` calls because (a) `init_transactions`
@@ -1241,7 +1307,7 @@ impl KafkaBackend {
     /// the same `transactional.id` are mutually fenced at the
     /// broker. `AtLeastOnce` mode also caches for cheaper repeated
     /// writes.
-    async fn acquire_producer(
+    pub(crate) async fn acquire_producer(
         &self,
     ) -> Result<Arc<FutureProducer<EmatixKafkaContext>>, BackendError> {
         // Fast path: producer exists and (for ExactlyOnce)
@@ -1386,7 +1452,7 @@ impl KafkaBackend {
     /// callback can bridge sync librdkafka into the async signer.
     /// For non-MSK auth modes the context is essentially inert
     /// (the OAUTHBEARER override never fires).
-    fn build_context(&self) -> EmatixKafkaContext {
+    pub(crate) fn build_context(&self) -> EmatixKafkaContext {
         let msk_region = match &self.auth {
             AuthMode::MskIam { region } => Some(region.clone()),
             _ => None,
@@ -1801,40 +1867,7 @@ impl Backend for KafkaBackend {
                 Some(col) => Some(extract_message_keys(&batch, col)?),
                 None => None,
             };
-            let payloads = match self.payload_format {
-                KafkaPayloadFormat::Json => encode_batch_as_jsonl_lines(&batch)?,
-                KafkaPayloadFormat::RawBytes => encode_batch_as_raw_bytes(&batch)?,
-                KafkaPayloadFormat::Avro => match &self.schema_registry_kind {
-                    SchemaRegistryKind::Confluent => {
-                        encode_batch_as_avro(&batch, topic, &self.sr_auth()?).await?
-                    }
-                    SchemaRegistryKind::Glue {
-                        region,
-                        registry_name,
-                        schema_lookup_by_name_callback,
-                        ..
-                    } => {
-                        // Topic name doubles as the Glue schema name —
-                        // matches the Confluent convention of
-                        // "<topic>-value" subject. Users wanting a
-                        // different schema name today can manage it
-                        // outside this surface; a per-pipeline
-                        // override field is a future enhancement.
-                        encode_batch_as_glue_avro(
-                            &batch,
-                            region,
-                            registry_name,
-                            topic,
-                            schema_lookup_by_name_callback,
-                            &self.glue_producer_schema_cache,
-                        )?
-                    }
-                },
-                KafkaPayloadFormat::Protobuf => {
-                    // schema_registry_url presence already validated above.
-                    encode_batch_as_protobuf(&batch, topic, &self.sr_auth()?).await?
-                }
-            };
+            let payloads = self.encode_batch_payloads(topic, &batch).await?;
             // ExactlyOnce: wrap the per-batch produce in a Kafka
             // transaction so a partial-failure mid-batch aborts and
             // no rows leak. The transaction is begun + committed
@@ -2036,6 +2069,14 @@ impl Backend for KafkaBackend {
 
     fn supports_seek_to(&self) -> bool {
         true
+    }
+
+    /// DLQ Phase 1: expose the concrete backend so the streaming
+    /// pipeline's DLQ resolution can route "dead_letter_topic +
+    /// Kafka source" through `KafkaTopicDlq` (reusing this
+    /// backend's producer + auth). See `Backend::as_kafka` docs.
+    fn as_kafka(&self) -> Option<&KafkaBackend> {
+        Some(self)
     }
 
     /// Phase 39.5a: stash a per-partition seek map decoded from
@@ -2295,7 +2336,7 @@ fn decode_payloads_as_raw_bytes(payloads: Vec<Vec<u8>>) -> Result<Vec<RecordBatc
 /// not significant). Each row's value is one outgoing payload —
 /// nulls become empty payloads (matching Kafka tombstone semantics
 /// on the produce side).
-fn encode_batch_as_raw_bytes(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, BackendError> {
+pub(crate) fn encode_batch_as_raw_bytes(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, BackendError> {
     use arrow_array::Array;
     use arrow_array::BinaryArray;
     use arrow_schema::DataType;

@@ -59,6 +59,21 @@ strict run now writes `env.json` and embeds it in the summary header.
 6. **Idle machine.** Nothing else heavy may run during a strict sweep —
    no builds, no other benches. If in doubt, rerun.
 
+## Settled-machine rule for engine-vs-engine verdicts (2026-07-03)
+
+Solo-pass verdicts (ematix vs DuckDB) are only quotable from a SETTLED
+machine: after hours of continuous benching, sustained thermal/memory
+soak slows BOTH engines 20-25% and ematix's bandwidth-heavy queries
+(Q01/Q08/Q09-class) disproportionately — a soaked end-of-day pass
+produced 3 spurious "duckdb faster" verdicts that a settled re-run
+reversed. Rule of thumb: ≥45 min idle before any verdict pass, and
+distrust a verdict whose absolute medians sit ≥15% above the same
+query's recent settled baseline. Interleaved A/Bs (`strict_ab.sh`) are
+immune — thermal drift cancels across arms — so lever decisions may
+run any time; only the engine-vs-engine scoreboard needs the settled
+gate. `pmset -g therm` "nominal" does NOT capture soak on Apple
+Silicon; use the idle-time rule.
+
 ## Canonical campaign runbook
 
 ```bash

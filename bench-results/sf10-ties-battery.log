@@ -1,0 +1,252 @@
+  [env] captured -> bench-results/sf10-ties-2026-07-03/ab-newlevers-sf10/env.json
+=== Σ.AI.2 strict interleaved A/B bench ===
+  sf:             10
+  invocations:    4 (first of each discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off (both sides)
+  cache policy:   warm
+  env A:          EMAT_BALANCED_RG_ASSIGN=0 EMAT_LOWCARD_GROUPBY_BOOST=0
+  env B:          EMAT_NOOPMARK=defaults
+  output:         bench-results/sf10-ties-2026-07-03/ab-newlevers-sf10
+
+--- pair 1 / 4 ---
+  → mode A invocation 1 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf10/A/run-1.md
+  → mode B invocation 1 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf10/B/run-1.md
+--- pair 2 / 4 ---
+  → mode A invocation 2 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf10/A/run-2.md
+  → mode B invocation 2 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf10/B/run-2.md
+--- pair 3 / 4 ---
+  → mode A invocation 3 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf10/A/run-3.md
+  → mode B invocation 3 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf10/B/run-3.md
+--- pair 4 / 4 ---
+  → mode A invocation 4 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf10/A/run-4.md
+  → mode B invocation 4 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf10/B/run-4.md
+
+--- aggregating ---
+
+# Σ.AI.2 strict interleaved A/B diff
+
+- A summary: `A/strict-22q-summary.md`
+- B summary: `B/strict-22q-summary.md`
+
+Per-query Δ = B − A. Verdict uses 2× max(σ_A, σ_B) as the noise bar.
+
+| Query | A median | B median | Δ ms | Δ % | bar (2σ) | verdict |
+|------:|---------:|---------:|-----:|----:|---------:|:--------|
+| Q01 | 261.41 | 254.31 | -7.10 | -2.72% | 35.92 | noise |
+| Q02 | 19.29 | 19.36 | +0.07 | +0.36% | 2.52 | noise |
+| Q03 | 130.83 | 135.47 | +4.64 | +3.55% | 9.60 | noise |
+| Q04 | 58.35 | 59.83 | +1.48 | +2.54% | 7.24 | noise |
+| Q05 | 142.29 | 142.83 | +0.54 | +0.38% | 8.60 | noise |
+| Q06 | 26.34 | 25.97 | -0.37 | -1.40% | 1.50 | noise |
+| Q07 | 123.94 | 130.90 | +6.96 | +5.62% | 19.96 | noise |
+| Q08 | 158.72 | 163.74 | +5.02 | +3.16% | 18.00 | noise |
+| Q09 | 297.79 | 314.31 | +16.52 | +5.55% | 51.96 | noise |
+| Q10 | 210.21 | 213.87 | +3.66 | +1.74% | 21.26 | noise |
+| Q11 | 12.22 | 12.37 | +0.15 | +1.23% | 0.86 | noise |
+| Q12 | 95.00 | 97.72 | +2.72 | +2.86% | 13.84 | noise |
+| Q13 | 111.75 | 116.67 | +4.92 | +4.40% | 17.08 | noise |
+| Q14 | 87.10 | 90.29 | +3.19 | +3.66% | 7.74 | noise |
+| Q15 | 66.72 | 66.58 | -0.14 | -0.21% | 3.74 | noise |
+| Q16 | 47.72 | 48.00 | +0.28 | +0.59% | 2.22 | noise |
+| Q17 | 81.11 | 80.44 | -0.67 | -0.83% | 15.76 | noise |
+| Q18 | 193.50 | 205.58 | +12.08 | +6.24% | 29.36 | noise |
+| Q19 | 134.52 | 140.23 | +5.71 | +4.24% | 18.44 | noise |
+| Q20 | 95.29 | 98.85 | +3.56 | +3.74% | 11.16 | noise |
+| Q21 | 200.77 | 200.85 | +0.08 | +0.04% | 23.62 | noise |
+| Q22 | 24.06 | 24.51 | +0.45 | +1.87% | 1.40 | noise |
+
+**Sum of A medians**: 2578.93 ms
+**Sum of B medians**: 2642.68 ms
+**Net Δ**: +63.75 ms (+2.47%)
+
+**Clear WIN (>2σ)**: 0  
+**Clear regression (>2σ)**: 0  
+  [env] captured -> bench-results/sf10-ties-2026-07-03/ab-newlevers-sf1/env.json
+=== Σ.AI.2 strict interleaved A/B bench ===
+  sf:             1
+  invocations:    4 (first of each discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off (both sides)
+  cache policy:   warm
+  env A:          EMAT_BALANCED_RG_ASSIGN=0 EMAT_LOWCARD_GROUPBY_BOOST=0
+  env B:          EMAT_NOOPMARK=defaults
+  output:         bench-results/sf10-ties-2026-07-03/ab-newlevers-sf1
+
+--- pair 1 / 4 ---
+  → mode A invocation 1 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf1/A/run-1.md
+  → mode B invocation 1 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf1/B/run-1.md
+--- pair 2 / 4 ---
+  → mode A invocation 2 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf1/A/run-2.md
+  → mode B invocation 2 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf1/B/run-2.md
+--- pair 3 / 4 ---
+  → mode A invocation 3 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf1/A/run-3.md
+  → mode B invocation 3 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf1/B/run-3.md
+--- pair 4 / 4 ---
+  → mode A invocation 4 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf1/A/run-4.md
+  → mode B invocation 4 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf1/B/run-4.md
+
+--- aggregating ---
+
+# Σ.AI.2 strict interleaved A/B diff
+
+- A summary: `A/strict-22q-summary.md`
+- B summary: `B/strict-22q-summary.md`
+
+Per-query Δ = B − A. Verdict uses 2× max(σ_A, σ_B) as the noise bar.
+
+| Query | A median | B median | Δ ms | Δ % | bar (2σ) | verdict |
+|------:|---------:|---------:|-----:|----:|---------:|:--------|
+| Q01 | 18.40 | 18.72 | +0.32 | +1.74% | 0.48 | noise |
+| Q02 | 7.56 | 7.59 | +0.03 | +0.40% | 0.54 | noise |
+| Q03 | 13.09 | 13.57 | +0.48 | +3.67% | 0.62 | noise |
+| Q04 | 11.44 | 11.57 | +0.13 | +1.14% | 0.36 | noise |
+| Q05 | 12.22 | 12.15 | -0.07 | -0.57% | 0.24 | noise |
+| Q06 | 1.72 | 1.73 | +0.01 | +0.58% | 0.04 | noise |
+| Q07 | 25.79 | 25.78 | -0.01 | -0.04% | 0.52 | noise |
+| Q08 | 14.75 | 14.65 | -0.10 | -0.68% | 0.20 | noise |
+| Q09 | 18.09 | 18.09 | +0.00 | +0.00% | 0.46 | noise |
+| Q10 | 21.10 | 21.10 | +0.00 | +0.00% | 0.62 | noise |
+| Q11 | 5.53 | 5.58 | +0.05 | +0.90% | 0.32 | noise |
+| Q12 | 14.66 | 14.77 | +0.11 | +0.75% | 0.36 | noise |
+| Q13 | 9.26 | 9.03 | -0.23 | -2.48% | 0.52 | noise |
+| Q14 | 11.53 | 11.50 | -0.03 | -0.26% | 0.28 | noise |
+| Q15 | 11.13 | 11.13 | +0.00 | +0.00% | 0.28 | noise |
+| Q16 | 9.59 | 9.47 | -0.12 | -1.25% | 0.12 | noise |
+| Q17 | 14.72 | 14.82 | +0.10 | +0.68% | 0.54 | noise |
+| Q18 | 18.74 | 18.76 | +0.02 | +0.11% | 0.54 | noise |
+| Q19 | 17.42 | 17.35 | -0.07 | -0.40% | 0.42 | noise |
+| Q20 | 12.27 | 12.50 | +0.23 | +1.87% | 0.60 | noise |
+| Q21 | 34.46 | 34.61 | +0.15 | +0.44% | 1.36 | noise |
+| Q22 | 4.03 | 4.10 | +0.07 | +1.74% | 0.40 | noise |
+
+**Sum of A medians**: 307.50 ms
+**Sum of B medians**: 308.57 ms
+**Net Δ**: +1.07 ms (+0.35%)
+
+**Clear WIN (>2σ)**: 0  
+**Clear regression (>2σ)**: 0  
+  [env] captured -> bench-results/sf10-ties-2026-07-03/ab-newlevers-sf100/env.json
+=== Σ.AI.2 strict interleaved A/B bench ===
+  sf:             100
+  invocations:    4 (first of each discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off (both sides)
+  cache policy:   warm
+  env A:          EMAT_BALANCED_RG_ASSIGN=0 EMAT_LOWCARD_GROUPBY_BOOST=0
+  env B:          EMAT_NOOPMARK=defaults
+  output:         bench-results/sf10-ties-2026-07-03/ab-newlevers-sf100
+
+--- pair 1 / 4 ---
+  → mode A invocation 1 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf100/A/run-1.md
+  → mode B invocation 1 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf100/B/run-1.md
+--- pair 2 / 4 ---
+  → mode A invocation 2 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf100/A/run-2.md
+  → mode B invocation 2 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf100/B/run-2.md
+--- pair 3 / 4 ---
+  → mode A invocation 3 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf100/A/run-3.md
+  → mode B invocation 3 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf100/B/run-3.md
+--- pair 4 / 4 ---
+  → mode A invocation 4 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf100/A/run-4.md
+  → mode B invocation 4 → bench-results/sf10-ties-2026-07-03/ab-newlevers-sf100/B/run-4.md
+
+--- aggregating ---
+
+# Σ.AI.2 strict interleaved A/B diff
+
+- A summary: `A/strict-22q-summary.md`
+- B summary: `B/strict-22q-summary.md`
+
+Per-query Δ = B − A. Verdict uses 2× max(σ_A, σ_B) as the noise bar.
+
+| Query | A median | B median | Δ ms | Δ % | bar (2σ) | verdict |
+|------:|---------:|---------:|-----:|----:|---------:|:--------|
+| Q01 | 2501.05 | 2491.83 | -9.22 | -0.37% | 372.54 | noise |
+| Q02 | 193.01 | 197.79 | +4.78 | +2.48% | 32.66 | noise |
+| Q03 | 1508.97 | 1506.32 | -2.65 | -0.18% | 254.80 | noise |
+| Q04 | 847.26 | 848.30 | +1.04 | +0.12% | 144.56 | noise |
+| Q05 | 1421.83 | 1424.73 | +2.90 | +0.20% | 187.70 | noise |
+| Q06 | 517.19 | 518.56 | +1.37 | +0.26% | 82.84 | noise |
+| Q07 | 1460.05 | 1465.15 | +5.10 | +0.35% | 227.88 | noise |
+| Q08 | 1635.32 | 1634.00 | -1.32 | -0.08% | 236.48 | noise |
+| Q09 | 3496.83 | 3548.17 | +51.34 | +1.47% | 525.00 | noise |
+| Q10 | 1940.83 | 1950.16 | +9.33 | +0.48% | 333.78 | noise |
+| Q11 | 184.42 | 185.85 | +1.43 | +0.78% | 33.88 | noise |
+| Q12 | 1015.59 | 1026.59 | +11.00 | +1.08% | 181.98 | noise |
+| Q13 | 1936.57 | 1957.77 | +21.20 | +1.09% | 350.88 | noise |
+| Q14 | 810.77 | 815.38 | +4.61 | +0.57% | 131.48 | noise |
+| Q15 | 809.37 | 818.13 | +8.76 | +1.08% | 104.48 | noise |
+| Q16 | 401.42 | 401.17 | -0.25 | -0.06% | 55.02 | noise |
+| Q17 | 1466.24 | 1464.36 | -1.88 | -0.13% | 242.96 | noise |
+| Q18 | 2115.43 | 2112.61 | -2.82 | -0.13% | 363.52 | noise |
+| Q19 | 1213.17 | 1213.63 | +0.46 | +0.04% | 189.36 | noise |
+| Q20 | 1129.97 | 1129.45 | -0.52 | -0.05% | 140.64 | noise |
+| Q21 | 3400.75 | 3385.56 | -15.19 | -0.45% | 594.52 | noise |
+| Q22 | 345.31 | 344.48 | -0.83 | -0.24% | 36.00 | noise |
+
+**Sum of A medians**: 30351.35 ms
+**Sum of B medians**: 30439.99 ms
+**Net Δ**: +88.64 ms (+0.29%)
+
+**Clear WIN (>2σ)**: 0  
+**Clear regression (>2σ)**: 0  
+  [env] captured -> bench-results/sf10-ties-2026-07-03/tput-sf10-s10-check/env.json
+=== Σ.AI.3 strict throughput bench ===
+  sf: 10 | streams: 10 | engines: ematix | batches: 4 (first discarded) | partitions: auto
+  out: bench-results/sf10-ties-2026-07-03/tput-sf10-s10-check
+
+--- stream count 10 ---
+  ematix s10 batch 1: makespan 28557 ms, failures 0
+  ematix s10 batch 2: makespan 27397 ms, failures 0
+  ematix s10 batch 3: makespan 27371 ms, failures 0
+  ematix s10 batch 4: makespan 27513 ms, failures 0
+wrote bench-results/sf10-ties-2026-07-03/tput-sf10-s10-check/throughput-summary.md
+# Σ.AI.3 strict throughput summary
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1
+- Git: 068564e1fc1b (dirty: True)
+- Run config: {'batches': '4', 'engines': 'ematix', 'mode': 'throughput', 'partitions': 'auto', 'plan_cache': 'off', 'sf': '10', 'streams': '10'}
+
+## ematix — 10 concurrent stream(s)
+
+- Batches: 3 kept, 1 discarded as cold-start (`batch-1`)
+- Makespan (median across batches): 27397 ms
+- Throughput: **28908.3 QPH** (10 streams x 22 queries)
+
+| Query | p50 ms | p95 ms | p99 ms | samples |
+|------:|-------:|-------:|-------:|--------:|
+| Q01 | 2557.89 | 2838.58 | 2912.34 | 30 |
+| Q02 | 122.26 | 176.69 | 194.03 | 30 |
+| Q03 | 1304.83 | 1465.35 | 1608.33 | 30 |
+| Q04 | 735.36 | 1064.68 | 1173.78 | 30 |
+| Q05 | 1730.79 | 2027.74 | 2046.76 | 30 |
+| Q06 | 157.95 | 302.00 | 307.34 | 30 |
+| Q07 | 1387.03 | 1681.21 | 1701.72 | 30 |
+| Q08 | 1908.03 | 2214.36 | 2262.52 | 30 |
+| Q09 | 2751.20 | 3470.33 | 3499.77 | 30 |
+| Q10 | 1943.68 | 2157.68 | 2166.27 | 30 |
+| Q11 | 128.04 | 203.06 | 216.23 | 30 |
+| Q12 | 1148.44 | 1311.34 | 1318.51 | 30 |
+| Q13 | 1168.73 | 1334.69 | 1372.75 | 30 |
+| Q14 | 469.99 | 674.31 | 727.46 | 30 |
+| Q15 | 690.96 | 822.10 | 840.82 | 30 |
+| Q16 | 328.02 | 511.37 | 512.31 | 30 |
+| Q17 | 687.51 | 951.61 | 1057.86 | 30 |
+| Q18 | 2767.13 | 3113.66 | 3244.94 | 30 |
+| Q19 | 905.91 | 1054.69 | 1115.34 | 30 |
+| Q20 | 1382.21 | 1552.36 | 1581.75 | 30 |
+| Q21 | 2024.43 | 2562.71 | 2734.62 | 30 |
+| Q22 | 234.97 | 305.98 | 309.40 | 30 |
+BATTERY-DONE

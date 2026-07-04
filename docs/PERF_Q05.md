@@ -200,3 +200,66 @@ noise (−0.6 ms) on top of the production shape at SF=10; stays
 conservative-AUTO. Remaining Q05 work: none as a loss-closure target;
 SF=10 tie could be revisited via the L9 cascade at higher selectivity
 shapes if it ever regresses.
+
+---
+
+## 2026-07-03 — FRESH production-shape profile (post dim-semi splice); Q05.MEMO + Q05.STATVEC lever
+
+**The per-stage waste map above (2026-05-26) is OBSOLETE.** It profiled a
+hand-built pre-splice chain. `stage_profiler` now builds its session via
+`preset::with_optimizer_rules_overridden` (default `HarnessOverrides`,
+`auto_target_partitions=false` mirroring the bench) — parity pinned by
+`profiler_preset_parity_tests`. Everything below is the PRODUCTION plan.
+
+### Fresh per-stage profile (SF=10, M4 Max, P=14, 5 trials / 2 warmups, pre-lever)
+
+Wall median **132.78 ms** (profiler harness; strict bench same-session ~127-129).
+
+| Rank | Operator | Median Σ ms | Out rows | vs stale map |
+|-----:|:---------|----------:|---------:|:-------------|
+| 1 | EmatixFastParquetExec **lineitem** (bloom-filtered) | **959.59** | 514,454 | was 170.87 Σ / 60.0M rows — the L9 l_orderkey bloom (456K keys, ~0.86% pass) moved the cost INTO the scan's filtered-decode path |
+| 2 | EmatixFastParquetExec **orders** (date bridge-filter + c_custkey bloom) | 322.57 | 479,532 | was 4.80 Σ / 2.28M rows (cost was credited to the downstream join) |
+| 3 | HashJoinExec (cust+orders) ⋈ lineitem | 32.33 | 366,425 | was **613.70 Σ / 9.10M rows** — the dominant stage of the stale map is GONE (probe side pre-pruned 60M → 514K) |
+| 4 | EmatixFastParquetExec customer | 19.13 | 1,500,000 | ~same |
+| 5 | HashJoinExec cust ⋈ orders | 14.04 | 456,771 | was 63.99 Σ / 2.28M (splice cut probe 2.28M → 480K) |
+| 6 | HashJoinExec customer ⋉ (nation ⋈ region) RightSemi (splice) | 11.94 | 300,270 | NEW (transitive dim-semi) |
+| 7 | HashJoinExec supplier 2-key | 5.25 | 72,985 | was 140.50 Σ / 364K — probe now 366K not 9.1M |
+| 8 | EmatixFastParquetExec supplier (nationkey-pruned) | 1.54 | 20,037 | NEW pruning (chain sideband) |
+
+Σ compute 1369 ms; effective parallelism **10.31× / 14 = 74%** (stale map:
+5.32× / 38%). The CollectLeft serialization signature is gone; the plan now
+runs as two pipeline phases serialized by the bloom dependency:
+orders-phase (~25 ms wall, ~77% util) → l_orderkey bloom publish (~5 ms
+handoff gap) → lineitem-phase (~80 ms wall, ~85% util + straggler tail).
+
+### Top over-floor stages (fresh floor model)
+
+| Stage | Floor | Observed | Over-floor |
+|-------|------:|---------:|-----------:|
+| lineitem filtered decode (1.9 GB snappy + probe) | ~480-550 Σ (decompress-bound; samply: snappy = 54% of on-CPU) | 959.6 Σ | ~2× — the filtered-path detour: 60M-row bloom probe (~285 Σ incl. un-inlined eval closures) + masked machinery |
+| orders scan (15M rows × 3 cols + i32 date range + custkey bloom) | ~150 Σ | 322.6 Σ | ~2× — `eval_i32` scalar per-row fallback (~90 Σ) ON the critical path gating the lineitem bloom |
+| phase serialization | 97.8 ms wall at perfect parallelism | 127-133 ms wall | ~5 ms handoff gap + ~15 ms partial-utilization/tails |
+
+Ruled out this round: rayon fan-out width (RAYON_NUM_THREADS ∈ {1,2,7,default}
+— default best), per-thread imbalance (all 14 workers uniformly ~85% busy
+mid-phase).
+
+### The lever (landed): Q05.STATVEC + Q05.MEMO (commit 4dbf867)
+
+Scan-side BridgeFilter first-pass eval fast paths — see
+`docs/EMAT_FLAGS.md` (`EMAT_STATVEC` default-ON opt-out;
+`EMAT_PROBE_RUN_MEMO` tri-state AUTO). Orders scan 322.6 → 233.4 ms Σ;
+lineitem probe memoized (~20 ms Σ). Note: recompiling the eval path also
+re-inlined `eval_i32` into the closure loop (part of the measured win is
+recovered inlining that the STATVEC monomorphized path now guarantees
+structurally instead of leaving to inliner mood).
+
+**Interleaved bin-A/B (main 44f0b28 vs branch, Q05 SF=10, 6 pairs × 3
+trials, ematix-only, plan cache off): main 134.84 ms mean → branch
+127.13 ms mean = −7.7 ms (−5.7%), branch wins 6/6 pairs, per-pair σ 2.0.**
+Q05 SF=100 single each arm: 1419.6 → 1404.5 (no regression).
+Suspicion sweep (22q singles) flagged Q09/Q10/Q12/Q15; interleaved 3-pair
+re-check: all washes. Value gates: tpch_validate SF=1 22/22 with lever
+default / both-off / memo-forced.
+
+Strict verdict-grade A/B remains the user's call per protocol.

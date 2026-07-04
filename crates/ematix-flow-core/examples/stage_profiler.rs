@@ -1,9 +1,15 @@
-//! Per-stage profiler for a single TPC-H query.
+//! Per-stage profiler for a single TPC-H query — PRODUCTION plan shape.
 //!
 //! Walks the executed physical plan and prints one line per
 //! ExecutionPlan node: operator name, output partition, output rows,
 //! elapsed_compute (ms), and a stable "tree path" indent so the reader
 //! can see parent/child relationships.
+//!
+//! The session is built through `preset::with_optimizer_rules_overridden`
+//! with default `HarnessOverrides` (2026-07-03; see `build_ctx`), so the
+//! profiled plan is exactly what production users and the strict bench
+//! get — including `FlowQueryPlanner` passes (transitive dim-semi
+//! splice etc.) the old hand-built chain in this file predated.
 //!
 //! Run:
 //!     TPCH_QUERY=1 TPCH_DATA_DIR=examples/tpch/data/sf10 \
@@ -25,15 +31,8 @@ use std::time::Instant;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
-use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
-use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
-use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
-use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
-use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
-use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
-use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
+use ematix_flow_core::preset::{self, HarnessOverrides};
 use futures_util::TryStreamExt;
 
 #[global_allocator]
@@ -315,43 +314,50 @@ fn median_usize(v: &[usize]) -> usize {
     }
 }
 
+/// Build the profiled session through the PRODUCTION preset
+/// constructor (2026-07-03 migration, same hardening as the strict
+/// bench's 2026-07-02 unification): `HarnessOverrides::default()` is
+/// the production chain — dedupe + inject trio + swap-semi +
+/// force-collect-left + RANGE.AGG + push-semi + rh-sum + L9 milestone
+/// sideband + `FlowQueryPlanner` (agg_semi → dim_push → q20_semi →
+/// transitive dim-semi → shape-gated reorder). The old hand-built
+/// chain here predated the dim-semi splice, so this profiler measured
+/// a STALE, non-production plan (no `customer ⋉ (nation ⋈ region)`
+/// splice, no pass-1 L9 lineitem wrap on Q05).
+///
+/// The single delta vs `HarnessOverrides::default()` mirrors the
+/// strict bench exactly: `auto_target_partitions: false`, because the
+/// harness resolves partitions itself (explicit `PARTITIONS=N` env
+/// keeps absolute precedence; otherwise the library's
+/// `EMAT_TARGET_PARTITIONS` tri-state / cross-process AUTO — a solo
+/// process resolves to full cores) and the preset must not
+/// second-guess the override at a different instant.
+fn session_state_builder(partitions: usize) -> SessionStateBuilder {
+    let (builder, _handles) = preset::with_optimizer_rules_overridden(
+        SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(partitions))
+            .with_default_features(),
+        &HarnessOverrides {
+            auto_target_partitions: false,
+            ..HarnessOverrides::default()
+        },
+    );
+    builder
+}
+
 async fn build_ctx(
     data_dir: &std::path::Path,
 ) -> Result<SessionContext, Box<dyn std::error::Error>> {
     let partitions: usize = std::env::var("PARTITIONS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(14)
-        });
-    // Mirror milestone-default rule set in tpch_triangulation_bench's
-    // "all" path, minus the bloom-pushdown rule (which only fires when
-    // EMAT_BLOOM_PUSHDOWN=1, off here for fewer moving parts).
-    let mut builder = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(partitions))
-        .with_default_features();
-    builder = builder
-        .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
-        .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-        .with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule))
-        .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()))
-        .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
-            min_probe_to_build_ratio: 1024,
-            allow_inner_join: true,
-            require_filtered_build: true,
-            max_expected_keys_per_partition: 0,
-            min_probe_proj_cols: 0,
-            // Σ.AH.2: env-resolved NDV ceiling (EMAT_L9_NDV_MAX_ROWS /
-            // EMAT_L9_PARTITIONED) + any future fields track the default.
-            ..EnableRuntimeBloomSidebandRule::default()
-        }))
-        .with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
-    let state = builder.build();
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(ematix_flow_core::partition_registry::resolve_target_partitions);
+    let state = session_state_builder(partitions).build();
     let ctx = SessionContext::new_with_state(state);
+    // Production registration shape (bench default `EMAT_ALL_TABLES_EMAT=1`):
+    // every table via EmatixFastParquetTableProvider so the L9 sideband
+    // can target dim scans too.
     for t in TPCH_TABLES {
         let path = data_dir
             .join(format!("{t}.parquet"))
@@ -361,4 +367,37 @@ async fn build_ctx(
         ctx.register_table(*t, Arc::new(prov))?;
     }
     Ok(ctx)
+}
+
+/// Parity pin (mirrors `bench_preset_parity_tests`): the profiled
+/// session's ematix rule chain must EQUAL the production preset's —
+/// this profiler exists to explain production plans, so any drift is
+/// a bug. Run: `cargo test -p ematix-flow-core --example stage_profiler`.
+#[cfg(test)]
+mod profiler_preset_parity_tests {
+    use super::*;
+
+    #[test]
+    fn profiler_rule_chain_equals_production_preset() {
+        let state = session_state_builder(4).build();
+        let (physical, logical) = preset::ematix_rule_names(&state);
+        assert_eq!(
+            physical,
+            preset::PRODUCTION_PHYSICAL_RULE_NAMES,
+            "stage_profiler PHYSICAL rule chain diverged from the production preset"
+        );
+        assert_eq!(
+            logical,
+            preset::PRODUCTION_LOGICAL_RULE_NAMES,
+            "stage_profiler LOGICAL rule chain diverged from the production preset"
+        );
+        // Query-planner parity: the profiler must ship the production
+        // FlowQueryPlanner (the Q05 transitive-dim-semi carrier the old
+        // hand-built chain was missing).
+        assert_eq!(
+            format!("{:?}", state.query_planner()),
+            "FlowQueryPlanner",
+            "stage_profiler must install FlowQueryPlanner"
+        );
+    }
 }

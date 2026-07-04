@@ -346,11 +346,13 @@ impl BridgeFilter {
         if self.predicates.len() == 1 {
             match &self.predicates[0] {
                 ColumnPredicate::I64InBloom { bloom, .. } => {
-                    probe_chunks_into_bitmap(values, &mut bitmap, |v| bloom.might_contain_i64(v));
+                    probe_membership_into_bitmap(values, &mut bitmap, |v| {
+                        bloom.might_contain_i64(v)
+                    });
                     return Some((first_col, bitmap));
                 }
                 ColumnPredicate::I64InSet { set, .. } => {
-                    probe_chunks_into_bitmap(values, &mut bitmap, |v| set.contains(v));
+                    probe_membership_into_bitmap(values, &mut bitmap, |v| set.contains(v));
                     return Some((first_col, bitmap));
                 }
                 ColumnPredicate::I64Range { lo, hi, .. } => {
@@ -599,6 +601,10 @@ impl BridgeFilter {
         };
 
         let mut first = true;
+        // Q05.STATVEC — default-ON opt-out (`EMAT_STATVEC=0`) so the
+        // strict harness can A/B the vectorised static first pass in
+        // isolation. One env read per row-group filter eval.
+        let statvec = crate::flags::enabled("EMAT_STATVEC");
         let apply = |b: &Bound<'_, 'a>, bitmap: &mut Vec<u8>, first: &mut bool| {
             if *first {
                 // Full pass, chunk-of-8 byte packing (avoids the
@@ -610,10 +616,10 @@ impl BridgeFilter {
                             probe_chunks_into_bitmap(v, bitmap, |x| x >= lo && x <= hi);
                         }
                         ColumnPredicate::I64InSet { set, .. } => {
-                            probe_chunks_into_bitmap(v, bitmap, |x| set.contains(x));
+                            probe_membership_into_bitmap(v, bitmap, |x| set.contains(x));
                         }
                         ColumnPredicate::I64InBloom { bloom, .. } => {
-                            probe_chunks_into_bitmap(v, bitmap, |x| bloom.might_contain_i64(x));
+                            probe_membership_into_bitmap(v, bitmap, |x| bloom.might_contain_i64(x));
                         }
                         _ => unreachable!("Bound::I64 holds only i64 predicate shapes"),
                     },
@@ -628,15 +634,39 @@ impl BridgeFilter {
                             });
                         }
                         ColumnPredicate::I64InSet { set, .. } => {
-                            probe_chunks_into_bitmap(v, bitmap, |x| set.contains(x as i64));
+                            probe_membership_into_bitmap(v, bitmap, |x| set.contains(x as i64));
                         }
                         ColumnPredicate::I64InBloom { bloom, .. } => {
-                            probe_chunks_into_bitmap(v, bitmap, |x| {
+                            probe_membership_into_bitmap(v, bitmap, |x| {
                                 bloom.might_contain_i64(x as i64)
                             });
                         }
                         _ => unreachable!("Bound::I64onI32 holds only i64 predicate shapes"),
                     },
+                    // Q05.STATVEC (2026-07-03) — the scalar fallback
+                    // below serialised the o_orderdate-class first-pass
+                    // statics through the bitmap read-modify-write
+                    // (Q05 SF=10 profile: `eval_i32` over the 15M-row
+                    // orders scan ≈ 90 ms Σ, ON the critical path that
+                    // gates the L9 l_orderkey bloom → lineitem phase).
+                    // Route i32/f64 single-column statics through the
+                    // same chunk-of-8 byte-packing loop the i64 shapes
+                    // already use — value-identical evaluation, packed
+                    // writes.
+                    Bound::I32(p, v) if statvec => {
+                        // Fold the dominant shape (pure comparison
+                        // clauses, e.g. the TPC-H date-range bridge
+                        // filters) into one [lo, hi] window so the
+                        // per-row clause loop disappears entirely.
+                        if let Some((lo, hi)) = p.i32_range_window() {
+                            probe_chunks_into_bitmap(v, bitmap, |x| x >= lo && x <= hi);
+                        } else {
+                            probe_chunks_into_bitmap(v, bitmap, |x| p.eval_i32(x));
+                        }
+                    }
+                    Bound::F64(p, v) if statvec => {
+                        probe_chunks_into_bitmap(v, bitmap, |x| p.eval_f64(x));
+                    }
                     _ => {
                         for row in 0..total {
                             if eval_row(b, row) {
@@ -763,6 +793,105 @@ fn probe_chunks_into_bitmap<T: Copy>(values: &[T], bitmap: &mut [u8], probe: imp
         if probe(v) {
             bitmap[row >> 3] |= 1 << (row & 7);
         }
+    }
+}
+
+/// Q05.MEMO (2026-07-03) — run-memoized variant of
+/// [`probe_chunks_into_bitmap`] for EXPENSIVE membership probes
+/// (bloom / hash-set). Fact tables clustered on the probed key repeat
+/// the previous key on most consecutive rows (TPC-H
+/// `lineitem.l_orderkey`: ~4 rows per order → 75% consecutive
+/// duplicates), so re-using the previous verdict replaces a ~4 ns
+/// hash+load probe with a compare. Q05 SF=10 stage profile: the L9
+/// l_orderkey bloom probe over 60M rows was ~285 ms Σ compute inside
+/// the dominant lineitem scan; memoization probes ~15M distinct runs
+/// instead.
+///
+/// Correctness: bit-identical to the plain helper — the probe is a
+/// pure function of the value, so equal adjacent values always share
+/// one verdict.
+#[inline(always)]
+fn probe_chunks_into_bitmap_memo<T: Copy + PartialEq>(
+    values: &[T],
+    bitmap: &mut [u8],
+    probe: impl Fn(T) -> bool,
+) {
+    let Some(&first) = values.first() else {
+        return;
+    };
+    let mut last_v = first;
+    let mut last_r = probe(first);
+    let chunks = values.chunks_exact(8);
+    let rem = chunks.remainder();
+    let n_chunks = values.len() / 8;
+    for (chunk_idx, chunk) in chunks.enumerate() {
+        let mut byte = 0u8;
+        for (lane, &v) in chunk.iter().enumerate() {
+            if v != last_v {
+                last_v = v;
+                last_r = probe(v);
+            }
+            byte |= (last_r as u8) << lane;
+        }
+        bitmap[chunk_idx] = byte;
+    }
+    for (i, &v) in rem.iter().enumerate() {
+        if v != last_v {
+            last_v = v;
+            last_r = probe(v);
+        }
+        if last_r {
+            let row = n_chunks * 8 + i;
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+}
+
+/// Q05.MEMO — should the run-memo probe path be used for this column
+/// buffer? Pure core (the `tri_state_of` convention): `force` is the
+/// parsed `EMAT_PROBE_RUN_MEMO` tri-state — `Some(true)` always memo,
+/// `Some(false)` never, `None` = AUTO: sample the first
+/// [`RUN_MEMO_SAMPLE`] values and require ≥25% consecutive duplicates
+/// (memo wins from ~15% on the ~4 ns bloom probe; 25% keeps margin).
+/// Unique-key columns (dup fraction 0) and short buffers stay on the
+/// 8-lane vectorised path, so non-clustered shapes (Q20 l_partkey,
+/// dim-PK scans) never pay the loop-carried memo dependency.
+const RUN_MEMO_SAMPLE: usize = 1024;
+fn run_memo_pays<T: Copy + PartialEq>(values: &[T], force: Option<bool>) -> bool {
+    if let Some(f) = force {
+        return f;
+    }
+    let n = values.len().min(RUN_MEMO_SAMPLE);
+    if n < 64 {
+        return false;
+    }
+    let dups = values[..n].windows(2).filter(|w| w[0] == w[1]).count();
+    // dups/(n-1) ≥ 1/4
+    dups * 4 >= n - 1
+}
+
+/// Q05.MEMO — env resolver for the `EMAT_PROBE_RUN_MEMO` tri-state
+/// (unset = AUTO; see `docs/EMAT_FLAGS.md`). Read per row-group column
+/// — one `env::var` against a multi-ms decode, not a hot-path read.
+fn probe_run_memo_flag() -> Option<bool> {
+    crate::flags::tri_state("EMAT_PROBE_RUN_MEMO")
+}
+
+/// Q05.MEMO — dispatch an expensive membership probe (bloom /
+/// hash-set) over a full column buffer to the run-memoized or plain
+/// chunk-of-8 loop. Cheap static predicates (ranges) keep calling
+/// [`probe_chunks_into_bitmap`] directly — a compare-based memo can't
+/// beat a compare-based predicate.
+#[inline(always)]
+fn probe_membership_into_bitmap<T: Copy + PartialEq>(
+    values: &[T],
+    bitmap: &mut [u8],
+    probe: impl Fn(T) -> bool,
+) {
+    if run_memo_pays(values, probe_run_memo_flag()) {
+        probe_chunks_into_bitmap_memo(values, bitmap, probe);
+    } else {
+        probe_chunks_into_bitmap(values, bitmap, probe);
     }
 }
 
@@ -1402,6 +1531,39 @@ impl ColumnPredicate {
         }
     }
 
+    /// Q05.STATVEC — fold an `I32Range` whose clauses are all plain
+    /// comparisons (`=`, `<`, `<=`, `>`, `>=`) into one inclusive
+    /// `[lo, hi]` window, so the first-pass scan filter tests two
+    /// compares per value instead of looping the clause list per row.
+    /// Returns `None` for any other predicate shape or any `!=` clause
+    /// (callers fall back to [`Self::eval_i32`], value-identical).
+    /// An unsatisfiable clause set folds to an empty window
+    /// (`lo > hi`) — the window test is then false for every value,
+    /// exactly like the clause loop.
+    pub(crate) fn i32_range_window(&self) -> Option<(i32, i32)> {
+        let ColumnPredicate::I32Range { clauses, .. } = self else {
+            return None;
+        };
+        let (mut lo, mut hi) = (i32::MIN, i32::MAX);
+        for c in clauses {
+            let l = c.literal_i32;
+            match c.op {
+                Operator::Eq => {
+                    lo = lo.max(l);
+                    hi = hi.min(l);
+                }
+                Operator::Lt => hi = hi.min(l.checked_sub(1)?),
+                Operator::LtEq => hi = hi.min(l),
+                Operator::Gt => lo = lo.max(l.checked_add(1)?),
+                Operator::GtEq => lo = lo.max(l),
+                // `!=` (or anything else) punches a hole in the
+                // window — not representable, keep the clause loop.
+                _ => return None,
+            }
+        }
+        Some((lo, hi))
+    }
+
     /// Evaluate AND of all clauses against one i32 value (I32Range / I32In only).
     #[inline]
     pub fn eval_i32(&self, v: i32) -> bool {
@@ -1859,6 +2021,14 @@ pub struct EmatixFastParquetTableProvider {
     /// can size its partitions and pick the right reader variant
     /// without re-decoding the thrift footer.
     rg_num_rows: Arc<Vec<usize>>,
+    /// LPT.RG — per-(row-group, leaf-column) `total_compressed_size`
+    /// bytes `[rg][col]`, cached at `try_new` time from the footer's
+    /// column-chunk metadata (never re-read per scan). `scan()` sums a
+    /// row group's PROJECTED columns to predict its decode cost, then
+    /// LPT bin-packs row groups across partitions so the slowest
+    /// partition no longer sets the scan's tail latency (round-robin
+    /// left ~54% effective parallelism on Q01 SF=10 — docs/PERF_Q01.md).
+    rg_col_compressed_bytes: Arc<Vec<Vec<u64>>>,
     /// Per-column typed min/max + null_count aggregated across row
     /// groups at `try_new` time. Mirrors what `FastParquetTableProvider`
     /// computes; the planner uses these for join-build-side selection
@@ -1985,6 +2155,9 @@ struct CachedProviderMeta {
     column_stats: Arc<Vec<datafusion::common::stats::ColumnStatistics>>,
     column_is_dict_encoded: Arc<Vec<bool>>,
     column_has_no_nulls: Arc<Vec<bool>>,
+    /// LPT.RG — per-(rg, col) compressed sizes for the scan's
+    /// cost-balanced assignment (see the provider field of the same name).
+    rg_col_compressed_bytes: Arc<Vec<Vec<u64>>>,
 }
 
 type ProviderMetaCacheKey = (PathBuf, u64, u128);
@@ -2120,6 +2293,7 @@ impl EmatixFastParquetTableProvider {
         let num_rows = em.num_rows;
         let num_row_groups = em.num_row_groups;
         let rg_num_rows: Arc<Vec<usize>> = Arc::new(em.rg_num_rows);
+        let rg_col_compressed_bytes: Arc<Vec<Vec<u64>>> = Arc::new(em.rg_column_compressed_sizes);
         let column_is_dict_encoded: Arc<Vec<bool>> = Arc::new(em.column_is_dict_encoded);
         let column_has_no_nulls: Arc<Vec<bool>> = Arc::new(em.column_has_no_nulls);
         // Σ.E5 (2026-05-18): promote Utf8 → Utf8View at `try_new` time.
@@ -2335,6 +2509,7 @@ impl EmatixFastParquetTableProvider {
                     column_stats: column_stats.clone(),
                     column_is_dict_encoded: column_is_dict_encoded.clone(),
                     column_has_no_nulls: column_has_no_nulls.clone(),
+                    rg_col_compressed_bytes: rg_col_compressed_bytes.clone(),
                 };
                 provider_meta_cache().lock().unwrap().insert(key, meta);
             }
@@ -2346,6 +2521,7 @@ impl EmatixFastParquetTableProvider {
             num_row_groups,
             num_rows,
             rg_num_rows,
+            rg_col_compressed_bytes,
             column_stats,
             column_is_dict_encoded,
             column_has_no_nulls,
@@ -2380,6 +2556,7 @@ impl EmatixFastParquetTableProvider {
             num_row_groups: meta.num_row_groups,
             num_rows: meta.num_rows,
             rg_num_rows: meta.rg_num_rows,
+            rg_col_compressed_bytes: meta.rg_col_compressed_bytes,
             column_stats: meta.column_stats,
             column_is_dict_encoded: meta.column_is_dict_encoded,
             column_has_no_nulls: meta.column_has_no_nulls,
@@ -2610,6 +2787,133 @@ impl EmatixFastParquetTableProvider {
     }
 }
 
+/// LPT.RG — the legacy round-robin row-group → partition assignment
+/// (`rg % num_partitions`). Kept verbatim as the `EMAT_BALANCED_RG_ASSIGN=0`
+/// A/B escape hatch: with the lever off, `scan()` must reproduce this
+/// exactly.
+pub fn round_robin_rg_assignments(num_rgs: usize, num_partitions: usize) -> Vec<Vec<usize>> {
+    let num_partitions = num_partitions.max(1);
+    let mut assignments: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
+    for rg in 0..num_rgs {
+        assignments[rg % num_partitions].push(rg);
+    }
+    assignments
+}
+
+/// LPT.RG — count-balanced fallback: contiguous ascending runs whose
+/// lengths differ by at most 1 (the first `num_rgs % num_partitions`
+/// partitions take the extra row group). Used when per-RG cost metadata
+/// is unavailable or carries no signal (all costs equal — LPT would
+/// degenerate to this anyway). Never panics: `num_rgs == 0` yields
+/// `num_partitions` empty lists, matching round-robin's shape.
+pub fn count_balanced_rg_assignments(num_rgs: usize, num_partitions: usize) -> Vec<Vec<usize>> {
+    let num_partitions = num_partitions.max(1);
+    let base = num_rgs / num_partitions;
+    let extra = num_rgs % num_partitions;
+    let mut assignments: Vec<Vec<usize>> = Vec::with_capacity(num_partitions);
+    let mut next = 0usize;
+    for p in 0..num_partitions {
+        let len = base + usize::from(p < extra);
+        assignments.push((next..next + len).collect());
+        next += len;
+    }
+    assignments
+}
+
+/// LPT.RG — deterministic longest-processing-time (LPT) bin-packing of
+/// row groups across partitions by predicted decode cost.
+///
+/// - Row groups are taken in descending `costs[rg]` order (stable
+///   tie-break: lower index first) and each is assigned to the currently
+///   least-loaded partition (tie-break: lowest partition index) — so the
+///   same input always produces the same assignment.
+/// - Within each partition the assigned list is sorted ascending, which
+///   preserves forward-sequential reads inside each producer.
+/// - If every cost is identical (including all-zero — no signal), falls
+///   back to [`count_balanced_rg_assignments`].
+///
+/// Classic LPT guarantee: final `max_load − min_load ≤ max(costs)` —
+/// the imbalance is bounded by one row group, vs round-robin's unbounded
+/// cost skew (SF=10 lineitem: 58 RGs / 14 partitions put +25% tail work
+/// on two partitions before per-RG cost skew even enters).
+pub fn lpt_rg_assignments(costs: &[u64], num_partitions: usize) -> Vec<Vec<usize>> {
+    let num_partitions = num_partitions.max(1);
+    let num_rgs = costs.len();
+    if num_rgs == 0 || costs.iter().all(|&c| c == costs[0]) {
+        return count_balanced_rg_assignments(num_rgs, num_partitions);
+    }
+    let mut order: Vec<usize> = (0..num_rgs).collect();
+    // Descending cost; ties broken by ascending RG index (determinism).
+    order.sort_by(|&a, &b| costs[b].cmp(&costs[a]).then_with(|| a.cmp(&b)));
+    let mut loads: Vec<u128> = vec![0; num_partitions];
+    let mut assignments: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
+    for rg in order {
+        // `min_by_key` returns the FIRST minimum → lowest partition index
+        // wins ties.
+        let p = (0..num_partitions)
+            .min_by_key(|&p| loads[p])
+            .expect("num_partitions >= 1");
+        assignments[p].push(rg);
+        loads[p] += costs[rg] as u128;
+    }
+    for part in &mut assignments {
+        part.sort_unstable();
+    }
+    assignments
+}
+
+/// LPT.RG — per-RG predicted decode cost: the sum over the PROJECTED
+/// columns of that row group's column-chunk `total_compressed_size`.
+/// Compressed bytes track both imbalance sources round-robin ignores:
+/// compression-ratio skew and projected-column width skew. Returns
+/// `None` when the cached footer metadata doesn't cover every row group
+/// (caller falls back to a count-balanced split).
+pub fn rg_projected_costs(
+    rg_col_compressed_bytes: &[Vec<u64>],
+    num_rgs: usize,
+    projection: &[usize],
+) -> Option<Vec<u64>> {
+    if rg_col_compressed_bytes.len() != num_rgs {
+        return None;
+    }
+    Some(
+        rg_col_compressed_bytes
+            .iter()
+            .map(|cols| {
+                projection
+                    .iter()
+                    .map(|&c| cols.get(c).copied().unwrap_or(0))
+                    .sum()
+            })
+            .collect(),
+    )
+}
+
+/// LPT.RG — the assignment `scan()` uses. Gated by
+/// `EMAT_BALANCED_RG_ASSIGN` (default **ON**, house `flags::enabled`
+/// pattern): `=0` restores the legacy round-robin exactly (A/B escape).
+/// With the lever on: LPT over per-RG projected compressed bytes;
+/// count-balanced split when metadata is unavailable; never panics.
+///
+/// Scope: ONLY the plain `scan()` path calls this. The RANGE.AGG
+/// key-disjoint chunk contracts (`EmatixFastParquetExec::with_assignments`
+/// / `with_assignments_claiming_hash`) inject their own assignments and
+/// are deliberately untouched.
+fn compute_scan_rg_assignments(
+    num_rgs: usize,
+    num_partitions: usize,
+    projection: &[usize],
+    rg_col_compressed_bytes: &[Vec<u64>],
+) -> Vec<Vec<usize>> {
+    if !crate::flags::enabled("EMAT_BALANCED_RG_ASSIGN") {
+        return round_robin_rg_assignments(num_rgs, num_partitions);
+    }
+    match rg_projected_costs(rg_col_compressed_bytes, num_rgs, projection) {
+        Some(costs) => lpt_rg_assignments(&costs, num_partitions),
+        None => count_balanced_rg_assignments(num_rgs, num_partitions),
+    }
+}
+
 #[async_trait::async_trait]
 impl TableProvider for EmatixFastParquetTableProvider {
     fn as_any(&self) -> &dyn Any {
@@ -2756,10 +3060,19 @@ impl TableProvider for EmatixFastParquetTableProvider {
         let target_partitions = state.config_options().execution.target_partitions;
         let num_rgs = self.num_row_groups;
         let num_partitions = num_rgs.min(target_partitions).max(1);
-        let mut assignments: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
-        for rg in 0..num_rgs {
-            assignments[rg % num_partitions].push(rg);
-        }
+        // LPT.RG — cost-balanced (LPT) row-group → partition assignment,
+        // replacing round-robin (`rg % num_partitions`). Each partition's
+        // producer decodes its list sequentially, so the most expensive
+        // partition sets the scan's tail latency; round-robin ignored
+        // both uneven counts (58 RGs / 14 partitions → +25% tail work)
+        // and per-RG decode-cost skew. `EMAT_BALANCED_RG_ASSIGN=0`
+        // restores round-robin exactly.
+        let assignments = compute_scan_rg_assignments(
+            num_rgs,
+            num_partitions,
+            &projection,
+            &self.rg_col_compressed_bytes,
+        );
 
         // Phase 3: extract pushable filters from DataFusion's filter
         // list. If all filters fit the shape, plumb them to the Exec
@@ -4545,6 +4858,230 @@ mod tests {
     /// bit is set (the masked-probe contract: probe cost scales with
     /// survivors, not total rows). A counting closure proves the skip:
     /// 4 of 16 rows set → exactly 4 evals, on exactly those rows.
+    /// Q05.MEMO — the run-memoized probe loop must be bit-identical to
+    /// the plain chunk-of-8 loop for every buffer shape: clustered
+    /// runs, unique keys, all-duplicate, non-multiple-of-8 tails,
+    /// short, and empty inputs.
+    #[test]
+    fn run_memo_probe_bitmap_identical_to_plain() {
+        let probe = |v: i64| v % 3 == 0;
+        let shapes: Vec<Vec<i64>> = vec![
+            // clustered: ~4 consecutive rows per key (the l_orderkey shape)
+            (0..1000).map(|i| (i / 4) as i64).collect(),
+            // unique keys
+            (0..1000).map(|i| i as i64).collect(),
+            // all one key
+            vec![42i64; 333],
+            // tail not a multiple of 8
+            (0..77).map(|i| (i / 3) as i64).collect(),
+            // short
+            vec![1, 1, 2],
+            // empty
+            vec![],
+        ];
+        for values in shapes {
+            let mut plain = vec![0u8; values.len().div_ceil(8)];
+            let mut memo = vec![0u8; values.len().div_ceil(8)];
+            probe_chunks_into_bitmap(&values, &mut plain, probe);
+            probe_chunks_into_bitmap_memo(&values, &mut memo, probe);
+            assert_eq!(plain, memo, "diverged on len={}", values.len());
+        }
+    }
+
+    /// Q05.MEMO — the memo path must call the probe once per RUN, not
+    /// once per row (that's the whole lever).
+    #[test]
+    fn run_memo_probe_probes_once_per_run() {
+        use std::cell::RefCell;
+        let values: Vec<i64> = (0..64).map(|i| (i / 4) as i64).collect(); // 16 runs
+        let calls: RefCell<usize> = RefCell::new(0);
+        let mut bitmap = vec![0u8; 8];
+        probe_chunks_into_bitmap_memo(&values, &mut bitmap, |v| {
+            *calls.borrow_mut() += 1;
+            v % 2 == 0
+        });
+        // first-value seed probe + one per run-change (values[0] probed
+        // by the seed; the loop re-probes only on key changes).
+        assert_eq!(*calls.borrow(), 16, "expected one probe per run");
+    }
+
+    /// Q05.MEMO — pure gate table: force overrides win, AUTO requires
+    /// ≥64 sampled values and ≥25% consecutive duplicates.
+    #[test]
+    fn run_memo_pays_gate_table() {
+        let clustered: Vec<i64> = (0..2048).map(|i| (i / 4) as i64).collect(); // 75% dups
+        let unique: Vec<i64> = (0..2048).map(|i| i as i64).collect(); // 0% dups
+        let sparse_dups: Vec<i64> = (0..2048).map(|i| (i / 10 * 10 + i % 10) as i64).collect();
+        let short: Vec<i64> = vec![7; 32];
+        // AUTO (None): data decides.
+        assert!(run_memo_pays(&clustered, None));
+        assert!(!run_memo_pays(&unique, None));
+        assert!(
+            !run_memo_pays(&sparse_dups, None),
+            "0% dups after arithmetic"
+        );
+        assert!(
+            !run_memo_pays(&short, None),
+            "buffers under the 64-value floor stay on the vector path"
+        );
+        // Force ON/OFF override data entirely.
+        assert!(run_memo_pays(&unique, Some(true)));
+        assert!(!run_memo_pays(&clustered, Some(false)));
+        assert!(run_memo_pays(&short, Some(true)));
+        // Boundary: exactly 1 consecutive dup per 4 values passes the
+        // 25% gate (dups*4 >= n-1). Group g emits [3g, 3g, 3g+1, 3g+2].
+        let quarter: Vec<i64> = (0..1024)
+            .map(|i| {
+                let g = (i / 4) as i64 * 3;
+                match i % 4 {
+                    0 | 1 => g,
+                    r => g + r as i64 - 1,
+                }
+            })
+            .collect();
+        let n = quarter.len().min(RUN_MEMO_SAMPLE);
+        let dups = quarter[..n].windows(2).filter(|w| w[0] == w[1]).count();
+        assert!(
+            dups * 4 >= n - 1,
+            "constructed pattern must sit at the boundary"
+        );
+        assert!(run_memo_pays(&quarter, None));
+    }
+
+    /// Q05.MEMO — end-to-end via `probe_i64_values_from_decoded`: both
+    /// loop implementations must agree against a real bloom, and the
+    /// production entry point's bitmap must be exactly the bloom hits.
+    #[test]
+    fn run_memo_bridge_filter_bitmap_parity() {
+        use crate::bloom::BloomFilter;
+        let mut bloom = BloomFilter::for_keys(64);
+        for k in [3i64, 7, 11, 200] {
+            bloom.insert_i64(k);
+        }
+        let values: Vec<i64> = (0..600).map(|i| (i / 4) as i64).collect();
+        let filt = BridgeFilter::new(vec![ColumnPredicate::I64InBloom {
+            col_idx: 0,
+            bloom: std::sync::Arc::new(bloom),
+        }]);
+        // Env-independent check: compare the two loop implementations
+        // directly on the same predicate closure the filter would run.
+        let ColumnPredicate::I64InBloom { bloom, .. } = &filt.predicates[0] else {
+            unreachable!()
+        };
+        let mut plain = vec![0u8; values.len().div_ceil(8)];
+        let mut memo = vec![0u8; values.len().div_ceil(8)];
+        probe_chunks_into_bitmap(&values, &mut plain, |v| bloom.might_contain_i64(v));
+        probe_chunks_into_bitmap_memo(&values, &mut memo, |v| bloom.might_contain_i64(v));
+        assert_eq!(plain, memo);
+        // And the production entry point still produces a bitmap whose
+        // set rows are exactly the bloom hits.
+        let (col, bitmap) = filt.probe_i64_values_from_decoded(&values).unwrap();
+        assert_eq!(col, 0);
+        for (row, &v) in values.iter().enumerate() {
+            let bit = bitmap[row >> 3] & (1 << (row & 7)) != 0;
+            assert_eq!(bit, bloom.might_contain_i64(v), "row {row} key {v}");
+        }
+    }
+
+    /// Q05.STATVEC — the [lo, hi] window fold must agree with the
+    /// clause-loop `eval_i32` for every foldable clause combination,
+    /// and decline unfoldable shapes.
+    #[test]
+    fn statvec_i32_range_window_fold_table() {
+        let mk = |clauses: Vec<(Operator, i32)>| ColumnPredicate::I32Range {
+            col_idx: 0,
+            clauses: clauses
+                .into_iter()
+                .map(|(op, literal_i32)| RangeClause { op, literal_i32 })
+                .collect(),
+        };
+        // The Q05 orders shape: >= 8766 AND < 9131 (dates as i32 days).
+        let p = mk(vec![(Operator::GtEq, 8766), (Operator::Lt, 9131)]);
+        assert_eq!(p.i32_range_window(), Some((8766, 9130)));
+        // Every op folds.
+        assert_eq!(mk(vec![(Operator::Eq, 5)]).i32_range_window(), Some((5, 5)));
+        assert_eq!(
+            mk(vec![(Operator::Gt, 5), (Operator::LtEq, 9)]).i32_range_window(),
+            Some((6, 9))
+        );
+        // Unsatisfiable folds to an empty window, not None.
+        let empty = mk(vec![(Operator::Gt, 9), (Operator::Lt, 5)]).i32_range_window();
+        let (lo, hi) = empty.unwrap();
+        assert!(lo > hi, "contradictory clauses fold to an empty window");
+        // != declines.
+        assert_eq!(mk(vec![(Operator::NotEq, 5)]).i32_range_window(), None);
+        // Overflow edges decline (correct via the clause loop instead).
+        assert_eq!(mk(vec![(Operator::Lt, i32::MIN)]).i32_range_window(), None);
+        assert_eq!(mk(vec![(Operator::Gt, i32::MAX)]).i32_range_window(), None);
+        // Non-range shapes decline.
+        assert_eq!(
+            ColumnPredicate::I32In {
+                col_idx: 0,
+                values: vec![1, 2]
+            }
+            .i32_range_window(),
+            None
+        );
+        // Window agrees with eval_i32 across the whole boundary zone.
+        let p = mk(vec![(Operator::GtEq, 100), (Operator::Lt, 200)]);
+        let (lo, hi) = p.i32_range_window().unwrap();
+        for v in 95..205 {
+            assert_eq!(v >= lo && v <= hi, p.eval_i32(v), "value {v}");
+        }
+    }
+
+    /// Q05.STATVEC — first-pass i32/f64 statics through
+    /// `eval_on_decoded_views` (now chunk-packed) must produce the
+    /// same bitmap as a manual row-by-row eval, including tails.
+    #[test]
+    fn statvec_first_pass_i32_f64_bitmap_parity() {
+        let dates: Vec<i32> = (0..83).map(|i| 8760 + (i % 20)).collect();
+        let prices: Vec<f64> = (0..83).map(|i| i as f64).collect();
+        let date_pred = ColumnPredicate::I32Range {
+            col_idx: 0,
+            clauses: vec![
+                RangeClause {
+                    op: Operator::GtEq,
+                    literal_i32: 8766,
+                },
+                RangeClause {
+                    op: Operator::Lt,
+                    literal_i32: 8775,
+                },
+            ],
+        };
+        let price_pred = ColumnPredicate::F64Range {
+            col_idx: 1,
+            clauses: vec![F64RangeClause {
+                op: Operator::Lt,
+                literal_f64: 50.0,
+            }],
+        };
+        for filt in [
+            BridgeFilter::new(vec![date_pred.clone()]),
+            BridgeFilter::new(vec![price_pred.clone()]),
+            BridgeFilter::new(vec![date_pred.clone(), price_pred.clone()]),
+        ] {
+            let (bitmap, total) = filt
+                .eval_on_decoded_views(|idx| match idx {
+                    0 => Some(DecodedView::I32(&dates)),
+                    1 => Some(DecodedView::F64(&prices)),
+                    _ => None,
+                })
+                .expect("statics on decoded views must evaluate");
+            assert_eq!(total, 83);
+            for row in 0..total {
+                let expect = filt.predicates.iter().all(|p| match p {
+                    ColumnPredicate::I32Range { .. } => p.eval_i32(dates[row]),
+                    ColumnPredicate::F64Range { .. } => p.eval_f64(prices[row]),
+                    _ => unreachable!(),
+                });
+                let got = bitmap[row >> 3] & (1 << (row & 7)) != 0;
+                assert_eq!(got, expect, "row {row}");
+            }
+        }
+    }
+
     #[test]
     fn probeorder_and_eval_masked_skips_cleared_rows() {
         use std::cell::RefCell;
@@ -6673,5 +7210,308 @@ mod tests {
             "dict-encoded string col should report distinct_count=Inexact(5), got {:?}",
             cs.distinct_count
         );
+    }
+
+    // ------------- LPT.RG — cost-balanced scan assignment tests -------------
+
+    /// LPT.RG — per-call unique fixture dir (process id + atomic counter,
+    /// the 01e6a50 pattern) so parallel tests never collide on a re-write.
+    fn lpt_fixture_dir(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lpt_rg_assign_{}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            name
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// LPT.RG — classic LPT balance guarantee on constructed skewed
+    /// inputs: every RG assigned exactly once, and the final
+    /// `max_load − min_load` never exceeds the largest single RG cost.
+    #[test]
+    fn lpt_balance_bounded_by_max_single_cost() {
+        let cases: Vec<(Vec<u64>, usize)> = vec![
+            (vec![100, 1, 1, 1, 90, 5, 60, 2, 80, 3, 40, 7], 3),
+            (vec![1000, 999, 998, 1, 1, 1, 1, 1, 1, 1], 4),
+            (vec![7, 7, 7, 7, 7, 100], 2),
+            // SF=10 lineitem shape: 58 RGs / 14 partitions with cost skew.
+            (
+                (0..58u64)
+                    .map(|i| 1_000_000 + (i * 37_919) % 500_000)
+                    .collect(),
+                14,
+            ),
+        ];
+        for (costs, parts) in cases {
+            let a = lpt_rg_assignments(&costs, parts);
+            assert_eq!(a.len(), parts);
+            let mut seen = vec![false; costs.len()];
+            for part in &a {
+                for &rg in part {
+                    assert!(!seen[rg], "rg {rg} assigned twice");
+                    seen[rg] = true;
+                }
+            }
+            assert!(seen.iter().all(|&s| s), "every rg assigned exactly once");
+            let loads: Vec<u64> = a
+                .iter()
+                .map(|p| p.iter().map(|&rg| costs[rg]).sum())
+                .collect();
+            let spread = loads.iter().max().unwrap() - loads.iter().min().unwrap();
+            let max_cost = *costs.iter().max().unwrap();
+            assert!(
+                spread <= max_cost,
+                "LPT balance property violated: spread {spread} > max cost {max_cost} \
+                 (loads {loads:?} for costs {costs:?} / {parts} partitions)"
+            );
+        }
+    }
+
+    /// LPT.RG — determinism (same input → same assignment; cost ties
+    /// break by RG index, load ties by partition index) and ascending
+    /// RG order within every partition (forward-sequential reads).
+    #[test]
+    fn lpt_deterministic_and_ascending_within_partitions() {
+        let costs: Vec<u64> = (0..37u64).map(|i| (i * 7_919) % 1_000 + 1).collect();
+        let a1 = lpt_rg_assignments(&costs, 5);
+        let a2 = lpt_rg_assignments(&costs, 5);
+        assert_eq!(a1, a2, "same input must produce the same assignment");
+        for part in &a1 {
+            assert!(
+                part.windows(2).all(|w| w[0] < w[1]),
+                "partition list must be strictly ascending: {part:?}"
+            );
+        }
+        // Heavy cost ties: still deterministic across calls.
+        let tied = vec![5u64, 5, 5, 9, 5, 5, 9, 5];
+        assert_eq!(lpt_rg_assignments(&tied, 3), lpt_rg_assignments(&tied, 3));
+    }
+
+    /// LPT.RG — no-signal costs (all zero / all equal) fall back to the
+    /// count-balanced split; unavailable metadata yields `None` costs;
+    /// projected costs sum ONLY the projected columns and never panic on
+    /// an out-of-range column index.
+    #[test]
+    fn lpt_fallbacks_count_balanced_and_projected_costs() {
+        for costs in [vec![0u64; 10], vec![42u64; 10]] {
+            let a = lpt_rg_assignments(&costs, 4);
+            assert_eq!(a, count_balanced_rg_assignments(10, 4));
+            let sizes: Vec<usize> = a.iter().map(Vec::len).collect();
+            assert_eq!(sizes.iter().sum::<usize>(), 10);
+            assert!(
+                sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1,
+                "as even as possible: {sizes:?}"
+            );
+        }
+        // Count-balanced shape: contiguous ascending runs, sizes differ ≤ 1.
+        assert_eq!(
+            count_balanced_rg_assignments(5, 3),
+            vec![vec![0, 1], vec![2, 3], vec![4]]
+        );
+        // Degenerate shapes never panic and mirror round-robin's layout.
+        let empty: Vec<Vec<usize>> = vec![vec![], vec![], vec![]];
+        assert_eq!(count_balanced_rg_assignments(0, 3), empty);
+        assert_eq!(round_robin_rg_assignments(0, 3), empty);
+
+        // Metadata unavailable (rg count mismatch) → None → caller falls back.
+        assert!(rg_projected_costs(&[vec![1, 2]], 3, &[0]).is_none());
+        // Cost = sum of PROJECTED columns only.
+        let meta = vec![vec![10u64, 100, 1], vec![20, 200, 2]];
+        assert_eq!(rg_projected_costs(&meta, 2, &[0, 2]), Some(vec![11, 22]));
+        // Out-of-range projected column contributes 0 (never panics).
+        assert_eq!(rg_projected_costs(&meta, 2, &[0, 9]), Some(vec![10, 20]));
+    }
+
+    /// LPT.RG — `EMAT_BALANCED_RG_ASSIGN=0` must reproduce the legacy
+    /// round-robin bit-for-bit; unset (default ON) takes the LPT path.
+    /// Mutates a production `EMAT_*` var → takes `EMAT_ENV_TEST_LOCK`
+    /// (blocking_lock — sync test) and restores the prior value.
+    #[test]
+    fn balanced_rg_assign_off_reproduces_round_robin() {
+        let _guard = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
+        let key = "EMAT_BALANCED_RG_ASSIGN";
+        let prev = std::env::var(key).ok();
+
+        // Strongly skewed per-RG costs (powers of two).
+        let meta: Vec<Vec<u64>> = (0..9).map(|i| vec![1u64 << i]).collect();
+        let proj = vec![0usize];
+
+        unsafe { std::env::set_var(key, "0") };
+        let off = compute_scan_rg_assignments(9, 4, &proj, &meta);
+        assert_eq!(
+            off,
+            round_robin_rg_assignments(9, 4),
+            "=0 must restore round-robin exactly"
+        );
+
+        unsafe { std::env::remove_var(key) };
+        let on = compute_scan_rg_assignments(9, 4, &proj, &meta);
+        let costs: Vec<u64> = (0..9).map(|i| 1u64 << i).collect();
+        assert_eq!(on, lpt_rg_assignments(&costs, 4), "default (unset) → LPT");
+        assert_ne!(
+            on, off,
+            "skewed costs must produce a non-round-robin packing"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// LPT.RG scope pin — RANGE.AGG-style injected assignments must pass
+    /// through `with_assignments` / `with_assignments_claiming_hash`
+    /// UNTOUCHED (the key-disjoint chunk contract): no re-balancing, no
+    /// reordering, partition count taken verbatim.
+    #[tokio::test]
+    async fn injected_assignments_pass_through_unbalanced() {
+        use ematix_parquet_codec::write::ColumnData;
+        use ematix_parquet_codec::write::write_table_to_path_with_row_group_size;
+        use ematix_parquet_format::types::CompressionCodec;
+
+        let dir = lpt_fixture_dir("passthrough");
+        let path = dir.join("t.parquet");
+        let k: Vec<i64> = (0..600).collect();
+        write_table_to_path_with_row_group_size(
+            &path,
+            &[("k", ColumnData::I64(&k))],
+            CompressionCodec::Uncompressed,
+            100, // → 6 row groups
+        )
+        .unwrap();
+
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_target_partitions(2),
+        );
+        let state = ctx.state();
+        let exec = provider.scan(&state, None, &[], None).await.unwrap();
+        let exec = exec
+            .as_any()
+            .downcast_ref::<EmatixFastParquetExec>()
+            .expect("plain scan produces EmatixFastParquetExec");
+
+        // Deliberately UNBALANCED key-disjoint chunks — a re-balancer
+        // would rewrite these; the contract forbids it.
+        let injected = vec![vec![0usize, 1, 2, 3, 4], vec![5]];
+        let with = exec.with_assignments(injected.clone());
+        assert_eq!(
+            with.assignments(),
+            injected.as_slice(),
+            "with_assignments must pass injected chunks through verbatim"
+        );
+        assert_eq!(
+            with.properties().output_partitioning().partition_count(),
+            2,
+            "partition count follows the injected assignment"
+        );
+
+        let hash_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            datafusion::physical_expr::expressions::col("k", &exec.schema()).unwrap();
+        let claiming = exec.with_assignments_claiming_hash(injected.clone(), vec![hash_expr]);
+        assert_eq!(
+            claiming.assignments(),
+            injected.as_slice(),
+            "with_assignments_claiming_hash must pass injected chunks through verbatim"
+        );
+        assert!(
+            matches!(
+                claiming.properties().output_partitioning(),
+                Partitioning::Hash(_, 2)
+            ),
+            "claiming variant advertises Hash partitioning over the injected chunks"
+        );
+    }
+
+    /// LPT.RG e2e — a file whose HEAVY row groups sit at indices 0 and 2
+    /// (round-robin with 2 partitions stacks both on partition 0): the
+    /// default-ON balanced scan must split them across partitions, keep
+    /// every partition ascending, and cover all RGs exactly once; `=0`
+    /// restores round-robin exactly. Mutates env → `EMAT_ENV_TEST_LOCK`
+    /// (held across awaits — tokio Mutex).
+    #[tokio::test]
+    async fn scan_balances_heavy_row_groups_and_flag_off_round_robins() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let _guard = crate::flags::EMAT_ENV_TEST_LOCK.lock().await;
+        let key = "EMAT_BALANCED_RG_ASSIGN";
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::remove_var(key) }; // default ON
+
+        let dir = lpt_fixture_dir("scan_e2e");
+        let path = dir.join("t.parquet");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "k",
+            DataType::Int64,
+            false,
+        )]));
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
+        // RG row counts [4000, 10, 4000, 10, 10, 10] — each flush() ends
+        // a row group, so compressed sizes are heavily skewed.
+        for rows in [4000i64, 10, 4000, 10, 10, 10] {
+            let vals: Vec<i64> = (0..rows).map(|i| i * 31 + rows).collect();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))])
+                    .unwrap();
+            w.write(&batch).unwrap();
+            w.flush().unwrap();
+        }
+        w.close().unwrap();
+
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(provider.num_row_groups(), 6, "fixture must have 6 RGs");
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_target_partitions(2),
+        );
+        let state = ctx.state();
+
+        let exec = provider.scan(&state, None, &[], None).await.unwrap();
+        let exec = exec
+            .as_any()
+            .downcast_ref::<EmatixFastParquetExec>()
+            .expect("plain scan produces EmatixFastParquetExec");
+        let a = exec.assignments();
+        assert_eq!(a.len(), 2);
+        let mut all: Vec<usize> = a.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3, 4, 5], "all RGs exactly once");
+        for part in a {
+            assert!(
+                part.windows(2).all(|w| w[0] < w[1]),
+                "ascending within partition: {part:?}"
+            );
+        }
+        let part_of = |rg: usize| a.iter().position(|p| p.contains(&rg)).unwrap();
+        assert_ne!(
+            part_of(0),
+            part_of(2),
+            "LPT must split the two heavy RGs apart (round-robin stacks both on \
+             partition 0); assignments: {a:?}"
+        );
+
+        unsafe { std::env::set_var(key, "0") };
+        let exec = provider.scan(&state, None, &[], None).await.unwrap();
+        let exec = exec
+            .as_any()
+            .downcast_ref::<EmatixFastParquetExec>()
+            .unwrap();
+        assert_eq!(
+            exec.assignments(),
+            round_robin_rg_assignments(6, 2).as_slice(),
+            "=0 must reproduce the legacy round-robin exactly"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 }

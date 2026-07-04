@@ -418,6 +418,11 @@ pub mod parquet_decode_cache;
 // using memchr::memmem. Used by emat's BridgeFilter for byte_array
 // substring predicates (and available as a standalone utility).
 pub mod glue_schema_registry;
+// DLQ Phase 1 (2026-07-04): the `DeadLetterStore` abstraction —
+// uniform dead-letter surface (table-backed universal default +
+// Kafka-topic store with metadata headers). See
+// `docs/plans/DLQ_REPLAY.md`.
+pub mod dlq;
 pub mod kafka_backend;
 pub mod kinesis_backend;
 pub mod like_matcher;

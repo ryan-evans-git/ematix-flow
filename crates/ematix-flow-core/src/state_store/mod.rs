@@ -32,8 +32,10 @@
 //!   per-emit single transaction. Lands in a follow-up slice.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::backend::BackendError;
+use crate::dlq::DeadLetterStore;
 
 pub mod in_memory;
 pub mod migrations;
@@ -103,4 +105,17 @@ pub trait StateStore: Send + Sync + std::fmt::Debug {
     /// Apply `snapshot` atomically. On error nothing is visible to a
     /// subsequent `load`.
     async fn commit(&self, pipeline: &str, snapshot: CommitSnapshot) -> Result<(), BackendError>;
+
+    /// DLQ Phase 1: hand back a [`DeadLetterStore`] riding this
+    /// state store's connection family, if it has one. The streaming
+    /// pipeline resolves its dead-letter store through this hook so
+    /// a Postgres-checkpointed pipeline gets a Postgres table DLQ
+    /// with zero extra configuration.
+    ///
+    /// Default `Ok(None)` — stores without a durable SQL surface
+    /// (e.g. [`InMemoryStateStore`]) opt out, and the pipeline falls
+    /// back to an in-process SQLite `TableDlq` with a loud warning.
+    async fn dead_letter_store(&self) -> Result<Option<Arc<dyn DeadLetterStore>>, BackendError> {
+        Ok(None)
+    }
 }

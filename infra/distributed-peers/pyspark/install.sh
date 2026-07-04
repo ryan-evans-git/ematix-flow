@@ -11,8 +11,8 @@
 #   sudo bash install.sh --role worker --master-host 10.0.1.10
 #
 # Effect:
-#   - Installs OpenJDK 21 (Corretto), Python 3.12, Spark 3.5.4 to /opt/spark
-#   - Drops s3a:// JARs (hadoop-aws 3.3.4 + aws-java-sdk-bundle) into /opt/spark/jars
+#   - Installs OpenJDK 21 (Corretto), Python 3.12, Spark 4.1.2 to /opt/spark
+#   - Drops s3a:// JARs (hadoop-aws 3.4.2 + AWS SDK v2 bundle) into /opt/spark/jars
 #   - Writes /opt/spark/conf/spark-env.sh + spark-defaults.conf
 #   - Installs systemd units (spark-master on master, spark-worker on workers)
 #   - Enables + starts the appropriate service(s)
@@ -49,11 +49,21 @@ fi
 
 # -----------------------------------------------------------------------------
 # Versions — pinned. Changing these requires re-validating the JAR matrix.
+#
+# 2026-07-04 refresh (owner decision: competitors at latest stable):
+#   Spark 3.5.4 → 4.1.2 (latest stable 4.x line; released 2026-05-16,
+#   verified at https://archive.apache.org/dist/spark/spark-4.1.2/).
+#   Spark 4.1.x bundles Hadoop 3.4.2, so the s3a companion JARs move to
+#   hadoop-aws 3.4.2 + the AWS SDK **v2** bundle it was built against
+#   (software.amazon.awssdk:bundle:2.29.52, per hadoop-project-3.4.2.pom)
+#   — the v1 aws-java-sdk-bundle no longer applies.
+#   Java: Spark 4.1 runs on Java 17/21 → Corretto 21 stays. Python 3.10+
+#   → python3.12 stays.
 # -----------------------------------------------------------------------------
-SPARK_VERSION="3.5.4"
+SPARK_VERSION="4.1.2"
 HADOOP_LINE="hadoop3"            # Spark's "-bin-hadoop3" build
-HADOOP_AWS_VERSION="3.3.4"       # matches Spark 3.5.4's bundled Hadoop
-AWS_SDK_VERSION="1.12.262"       # the version hadoop-aws 3.3.4 was built against
+HADOOP_AWS_VERSION="3.4.2"       # matches Spark 4.1.2's bundled Hadoop
+AWS_SDK_V2_VERSION="2.29.52"     # the awssdk bundle hadoop-aws 3.4.2 was built against
 SPARK_TGZ="spark-${SPARK_VERSION}-bin-${HADOOP_LINE}.tgz"
 SPARK_URL="https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/${SPARK_TGZ}"
 SPARK_HOME="/opt/spark"
@@ -98,11 +108,21 @@ mkdir -p "$SPARK_HOME/logs" "$SPARK_HOME/work"
 chown -R "$SPARK_USER:$SPARK_USER" "$SPARK_HOME"
 
 # -----------------------------------------------------------------------------
-# Hadoop AWS JARs for s3a://
+# Hadoop AWS JARs for s3a:// (Hadoop 3.4.x line = AWS SDK v2 bundle)
 # -----------------------------------------------------------------------------
+# Guard: the pinned hadoop-aws MUST match the hadoop-client the Spark
+# tarball actually bundles, or s3a fails at runtime with linkage errors.
+BUNDLED_HADOOP="$(ls "$SPARK_HOME"/jars/hadoop-client-api-*.jar 2>/dev/null \
+    | sed -E 's/.*hadoop-client-api-([0-9.]+)\.jar/\1/' | head -1 || true)"
+if [[ -n "$BUNDLED_HADOOP" && "$BUNDLED_HADOOP" != "$HADOOP_AWS_VERSION" ]]; then
+    echo "!! bundled hadoop-client is $BUNDLED_HADOOP but HADOOP_AWS_VERSION=$HADOOP_AWS_VERSION" >&2
+    echo "!! re-pin HADOOP_AWS_VERSION (and the matching awssdk bundle) before proceeding" >&2
+    exit 1
+fi
+
 MAVEN_BASE="https://repo1.maven.org/maven2"
 HADOOP_AWS_JAR="hadoop-aws-${HADOOP_AWS_VERSION}.jar"
-AWS_SDK_JAR="aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar"
+AWS_SDK_JAR="bundle-${AWS_SDK_V2_VERSION}.jar"
 
 if [[ ! -f "$SPARK_HOME/jars/$HADOOP_AWS_JAR" ]]; then
     echo "==> fetching $HADOOP_AWS_JAR"
@@ -110,9 +130,9 @@ if [[ ! -f "$SPARK_HOME/jars/$HADOOP_AWS_JAR" ]]; then
         "$MAVEN_BASE/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/${HADOOP_AWS_JAR}"
 fi
 if [[ ! -f "$SPARK_HOME/jars/$AWS_SDK_JAR" ]]; then
-    echo "==> fetching $AWS_SDK_JAR"
+    echo "==> fetching $AWS_SDK_JAR (AWS SDK v2 bundle)"
     curl -fsSL -o "$SPARK_HOME/jars/$AWS_SDK_JAR" \
-        "$MAVEN_BASE/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/${AWS_SDK_JAR}"
+        "$MAVEN_BASE/software/amazon/awssdk/bundle/${AWS_SDK_V2_VERSION}/${AWS_SDK_JAR}"
 fi
 chown -R "$SPARK_USER:$SPARK_USER" "$SPARK_HOME/jars"
 
@@ -124,6 +144,11 @@ IMDS_TOKEN="$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
     http://169.254.169.254/latest/api/token 2>/dev/null || true)"
 INSTANCE_TYPE="$(curl -fsS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
     http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown)"
+
+# Region for s3a — same IMDSv2 token; falls back to us-east-2 (the
+# campaign default region) if IMDS is unavailable.
+AWS_REGION="$(curl -fsS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
+    http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || echo us-east-2)"
 
 case "$INSTANCE_TYPE" in
     c7i.2xlarge) WORKER_MEMORY="12g" ;;
@@ -175,9 +200,14 @@ spark.sql.adaptive.coalescePartitions.enabled  true
 spark.sql.shuffle.partitions                   ${WORKER_CORES}
 
 # s3a access via the EC2 instance profile (no static creds on disk).
+# hadoop-aws 3.4.x runs on AWS SDK **v2**: the provider below is the
+# v2-native IAM/instance-profile provider (the old v1
+# com.amazonaws.auth.InstanceProfileCredentialsProvider class no longer
+# exists on the classpath). Region comes from IMDS, not a hardcode —
+# the May kit pinned us-east-1 while the campaign runs in us-east-2.
 spark.hadoop.fs.s3a.impl                       org.apache.hadoop.fs.s3a.S3AFileSystem
-spark.hadoop.fs.s3a.aws.credentials.provider   com.amazonaws.auth.InstanceProfileCredentialsProvider
-spark.hadoop.fs.s3a.endpoint.region            us-east-1
+spark.hadoop.fs.s3a.aws.credentials.provider   org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider
+spark.hadoop.fs.s3a.endpoint.region            ${AWS_REGION}
 spark.hadoop.fs.s3a.connection.maximum         200
 spark.hadoop.fs.s3a.threads.max                64
 spark.hadoop.fs.s3a.fast.upload                true

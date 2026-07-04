@@ -7,6 +7,7 @@
 # Variables provided by templatefile():
 #   ${aws_region}   — region for awscli default
 #   ${bench_bucket} — exported for downstream scripts
+#   ${git_ref}      — ematix-flow ref to clone (must be PUSHED to GitHub)
 
 set -uo pipefail
 exec > >(tee /var/log/base-userdata.log) 2>&1
@@ -39,8 +40,9 @@ fi
 mkdir -p /opt/ematix
 cd /opt/ematix
 if [ ! -d ematix-flow ]; then
-  git clone --depth 1 https://github.com/ryan-evans-git/ematix-flow.git
+  git clone --depth 1 --branch "${git_ref}" https://github.com/ryan-evans-git/ematix-flow.git
 fi
+echo "ematix-flow @ $(git -C ematix-flow rev-parse HEAD) (ref ${git_ref})"
 
 # Make repo world-readable; engine scripts run as ec2-user.
 chown -R ec2-user:ec2-user /opt/ematix
