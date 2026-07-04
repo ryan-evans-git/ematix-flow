@@ -27,10 +27,15 @@
 #     flow-worker process is solo on its instance, so the partition
 #     registry senses live=1 and resolves full cores.
 
+set -euo pipefail
 set -uo pipefail
 exec > >(tee /var/log/ematix-userdata.log) 2>&1
 
 echo "=== ematix bootstrap: role=${role}: $(date -u +%FT%TZ) ==="
+
+# Build prerequisites: the workspace needs a C toolchain (ring/librdkafka/
+# mimalloc build scripts) — rustup alone is NOT enough on a stock AL2023 AMI.
+dnf install -y -q gcc gcc-c++ cmake make perl
 
 # Rust toolchain — install for ec2-user (not root) so cargo cache lives
 # under /home/ec2-user.
@@ -63,7 +68,8 @@ sudo -u ec2-user bash <<'BUILD'
 set -uo pipefail
 source $HOME/.cargo/env
 cd /opt/ematix/ematix-flow
-cargo build --release -p ematix-flow-distributed --bin flow-worker 2>&1 | tail -20
+cargo build --release -p ematix-flow-distributed --bin flow-worker > /tmp/build-worker.log 2>&1 || { echo 'FLOW-WORKER BUILD FAILED'; tail -40 /tmp/build-worker.log; exit 1; }
+tail -3 /tmp/build-worker.log
 rc=$${PIPESTATUS[0]}
 echo "flow-worker build exit: $rc"
 exit $rc
@@ -75,7 +81,8 @@ if [ "${role}" = "coordinator" ]; then
 set -uo pipefail
 source $HOME/.cargo/env
 cd /opt/ematix/ematix-flow
-cargo build --release -p ematix-flow-distributed --example tpch_distributed_campaign 2>&1 | tail -20
+cargo build --release -p ematix-flow-distributed --example tpch_distributed_campaign > /tmp/build-campaign.log 2>&1 || { echo 'CAMPAIGN BUILD FAILED'; tail -40 /tmp/build-campaign.log; exit 1; }
+tail -3 /tmp/build-campaign.log
 rc=$${PIPESTATUS[0]}
 echo "campaign example build exit: $rc"
 exit $rc
