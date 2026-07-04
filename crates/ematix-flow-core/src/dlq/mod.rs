@@ -42,9 +42,11 @@ use std::time::Duration;
 use crate::backend::BackendError;
 
 pub mod kafka_topic;
+pub mod replay;
 pub mod table;
 
 pub use kafka_topic::KafkaTopicDlq;
+pub use replay::{DEFAULT_MAX_ATTEMPTS, DlqReplaySource, ReplayOptions, ReplayReport};
 pub use table::TableDlq;
 
 /// Error strings persisted in `DlqMeta` are truncated to this many
@@ -298,6 +300,20 @@ pub trait DeadLetterStore: Send + Sync + std::fmt::Debug {
 
     /// Delete matching records of any status; returns the count.
     async fn purge(&self, pipeline: &str, selection: DlqSelection) -> Result<u64, DlqError>;
+
+    /// DLQ Phase 2: must overlapping replay runs over this store
+    /// (same pipeline, same process) be serialized?
+    ///
+    /// Table stores answer `false` — their leases are safe under
+    /// concurrency (`FOR UPDATE SKIP LOCKED` on Postgres, a
+    /// connection-serialized transaction on SQLite). The Kafka
+    /// topic store answers `true`: its lease is process-local and
+    /// group-offset based, so concurrent takes could double-lease
+    /// (see `dlq/kafka_topic.rs` module docs). The replay engine
+    /// takes an in-process per-pipeline mutex when this is `true`.
+    fn replay_requires_serialization(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

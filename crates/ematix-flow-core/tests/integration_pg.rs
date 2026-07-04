@@ -9174,3 +9174,298 @@ async fn kafka_dlq_unsupported_ops_are_typed() {
     // The record is still there — Unsupported ops must not consume.
     assert_eq!(store.depth("p").await.unwrap().pending, 1);
 }
+
+// ----- DLQ Phase 2: replay engine over the Kafka topic store -------------
+//
+// TDD note: committed red against the `run_dlq_replay` stub before
+// the engine existed (same discipline as the Phase 1 contract
+// suite).
+
+use ematix_flow_core::dlq::{ReplayOptions, TableDlq};
+use ematix_flow_core::streaming::TransformErrorPolicy;
+
+/// A transform that always fails — drives replay-side re-dead-
+/// lettering and the poison-park path against a real broker.
+#[derive(Debug)]
+struct AlwaysFailTransform;
+
+#[async_trait::async_trait]
+impl ematix_flow_core::transform::BatchTransform for AlwaysFailTransform {
+    fn input_schema(&self) -> arrow_schema::SchemaRef {
+        std::sync::Arc::new(arrow_schema::Schema::empty())
+    }
+    fn output_schema(&self) -> arrow_schema::SchemaRef {
+        self.input_schema()
+    }
+    async fn transform(
+        &self,
+        _input: arrow_array::RecordBatch,
+        _ctx: &ematix_flow_core::transform::BatchContext,
+    ) -> Result<Vec<arrow_array::RecordBatch>, ematix_flow_core::backend::BackendError> {
+        Err(ematix_flow_core::backend::BackendError::Other(
+            "replay poison: scripted transform failure".into(),
+        ))
+    }
+}
+
+/// PRD round trip on the Kafka store family: pipeline fails at the
+/// sink (missing table) → records dead-letter to the topic with
+/// metadata → fix the sink → replay All through the pipeline's own
+/// targets → rows present, DLQ drained (replay-group cursor
+/// advanced in per-partition offset order), report counts exact.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_dlq_replay_round_trip_after_sink_fix() {
+    let (_container, bootstrap) = start_kafka().await;
+    let primary_topic = "dlq-replay-primary";
+    let dlq_topic = "dlq-replay-dead";
+
+    produce_json_messages(
+        &bootstrap,
+        primary_topic,
+        &[
+            r#"{"id": 1, "name": "alice"}"#,
+            r#"{"id": 2, "name": "bob"}"#,
+            r#"{"id": 3, "name": "carol"}"#,
+        ],
+    )
+    .await;
+
+    let source: Arc<dyn Backend> = Arc::new(
+        ematix_flow_core::KafkaBackend::open(&bootstrap, Some("dlq-replay-grp"))
+            .unwrap()
+            .with_batch_config(KafkaBatchConfig {
+                batch_size: 100,
+                idle_timeout_ms: 1_500,
+                batch_window_ms: 5_000,
+                ..Default::default()
+            }),
+    );
+
+    // Sink: the `events` table does not exist yet — every write fails.
+    let target_backend: Arc<dyn Backend> =
+        Arc::new(ematix_flow_core::SQLiteBackend::open(":memory:").unwrap());
+
+    let cfg = StreamingPipelineConfig::new(
+        primary_topic,
+        TargetTable {
+            schema: "main".into(),
+            name: "events".into(),
+        },
+        "dlq-replay",
+    )
+    .with_dead_letter_topic(dlq_topic);
+    let pipeline = Arc::new(StreamingPipeline::new_single(
+        Arc::clone(&source),
+        Arc::clone(&target_backend),
+        cfg,
+    ));
+
+    let (sig, trigger) = ShutdownSignal::new();
+    let p = Arc::clone(&pipeline);
+    let handle = tokio::spawn(async move { p.run(sig).await });
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    trigger.trigger();
+    handle.await.unwrap().unwrap();
+
+    // All 3 rows dead-lettered, visible under the pipeline's
+    // deterministic replay group.
+    let probe_backend: Arc<dyn Backend> = Arc::new(
+        ematix_flow_core::KafkaBackend::open(&bootstrap, Some("dlq-replay-probe")).unwrap(),
+    );
+    let probe =
+        ematix_flow_core::dlq::KafkaTopicDlq::new(probe_backend, dlq_topic, "dlq-replay").unwrap();
+    assert_eq!(probe.depth("dlq-replay").await.unwrap().pending, 3);
+
+    // Fix the sink.
+    target_backend
+        .execute("CREATE TABLE events (id INTEGER, name TEXT)")
+        .await
+        .unwrap();
+
+    // Replay all through the pipeline's own transform + targets.
+    let report = pipeline
+        .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(report.taken, 3, "all 3 dead letters leased");
+    assert_eq!(report.succeeded, 3, "all 3 reprocessed into the target");
+    assert_eq!(report.redeadlettered, 0);
+    assert_eq!(report.parked, 0);
+
+    // Rows present at the target.
+    let stream = target_backend
+        .read_arrow_stream("SELECT count(*) FROM events")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 3, "replayed rows landed in the fixed sink");
+
+    // DLQ drained: the replay group's committed cursor covers every
+    // record (ack in per-partition offset order).
+    assert_eq!(probe.depth("dlq-replay").await.unwrap().pending, 0);
+    assert!(
+        probe
+            .take_for_replay(
+                "dlq-replay",
+                DlqSelection::All,
+                std::time::Duration::from_secs(60),
+                1
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing left to take after the replay acked everything"
+    );
+}
+
+/// Poison-park on the Kafka store family: a topic cannot express
+/// `park`, so at max_attempts the record must park into the
+/// caller-provided table fallback store, while the topic cursor
+/// still advances (the original + redrives are all acked).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_dlq_replay_poison_parks_into_fallback_table() {
+    let (_container, bootstrap) = start_kafka().await;
+    let primary_topic = "dlq-poison-primary";
+    let dlq_topic = "dlq-poison-dead";
+
+    produce_json_messages(
+        &bootstrap,
+        primary_topic,
+        &[r#"{"id": 1, "name": "poison"}"#],
+    )
+    .await;
+
+    let source: Arc<dyn Backend> = Arc::new(
+        ematix_flow_core::KafkaBackend::open(&bootstrap, Some("dlq-poison-grp"))
+            .unwrap()
+            .with_batch_config(KafkaBatchConfig {
+                batch_size: 100,
+                idle_timeout_ms: 1_500,
+                batch_window_ms: 5_000,
+                ..Default::default()
+            }),
+    );
+    let target_backend: Arc<dyn Backend> =
+        Arc::new(ematix_flow_core::SQLiteBackend::open(":memory:").unwrap());
+    target_backend
+        .execute("CREATE TABLE events (id INTEGER, name TEXT)")
+        .await
+        .unwrap();
+
+    let cfg = StreamingPipelineConfig::new(
+        primary_topic,
+        TargetTable {
+            schema: "main".into(),
+            name: "events".into(),
+        },
+        "dlq-poison",
+    )
+    .with_dead_letter_topic(dlq_topic)
+    .with_transform(Arc::new(AlwaysFailTransform))
+    .with_transform_on_error(TransformErrorPolicy::Dlq);
+    let pipeline = Arc::new(StreamingPipeline::new_single(
+        Arc::clone(&source),
+        Arc::clone(&target_backend),
+        cfg,
+    ));
+
+    let (sig, trigger) = ShutdownSignal::new();
+    let p = Arc::clone(&pipeline);
+    let handle = tokio::spawn(async move { p.run(sig).await });
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    trigger.trigger();
+    handle.await.unwrap().unwrap();
+
+    let fallback: Arc<dyn DlqStore> = Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+    let opts = ReplayOptions {
+        max_attempts: 2,
+        park_store: Some(Arc::clone(&fallback)),
+        ..Default::default()
+    };
+
+    // Replay #1: transform still fails → re-published to the DLQ
+    // topic with attempt 2 (headers round-trip the bump).
+    let r1 = pipeline
+        .run_dlq_replay(DlqSelection::All, opts.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        (r1.taken, r1.succeeded, r1.redeadlettered, r1.parked),
+        (1, 0, 1, 0)
+    );
+
+    // Replay #2: attempt 2 fails; budget (max_attempts = 2)
+    // exhausted → parked into the fallback table store.
+    let r2 = pipeline
+        .run_dlq_replay(DlqSelection::All, opts.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        (r2.taken, r2.succeeded, r2.redeadlettered, r2.parked),
+        (1, 0, 0, 1)
+    );
+
+    let depth = fallback.depth("dlq-poison").await.unwrap();
+    assert_eq!(
+        depth.parked, 1,
+        "poison record parked in the fallback store"
+    );
+    assert_eq!(depth.pending, 0);
+    let parked = fallback
+        .browse(
+            "dlq-poison",
+            0,
+            10,
+            Some(ematix_flow_core::dlq::DlqRecordStatus::Parked),
+        )
+        .await
+        .unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].meta.attempt, 2, "parked at max_attempts");
+    let payload = String::from_utf8(parked[0].payload.clone()).unwrap();
+    assert!(
+        payload.contains("\"id\""),
+        "original wire payload preserved: {payload}"
+    );
+
+    // Topic drained — the cursor advanced past the original AND the
+    // redrive.
+    let probe_backend: Arc<dyn Backend> = Arc::new(
+        ematix_flow_core::KafkaBackend::open(&bootstrap, Some("dlq-poison-probe")).unwrap(),
+    );
+    let probe =
+        ematix_flow_core::dlq::KafkaTopicDlq::new(probe_backend, dlq_topic, "dlq-poison").unwrap();
+    assert_eq!(probe.depth("dlq-poison").await.unwrap().pending, 0);
+
+    // Replay #3 finds nothing.
+    let r3 = pipeline
+        .run_dlq_replay(DlqSelection::All, opts)
+        .await
+        .unwrap();
+    assert_eq!(
+        (r3.taken, r3.succeeded, r3.redeadlettered, r3.parked),
+        (0, 0, 0, 0)
+    );
+
+    // Nothing ever reached the sink.
+    let stream = target_backend
+        .read_arrow_stream("SELECT count(*) FROM events")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 0);
+}
