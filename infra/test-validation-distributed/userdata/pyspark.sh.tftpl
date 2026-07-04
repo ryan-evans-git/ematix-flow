@@ -30,6 +30,14 @@ if [ "$ROLE" = "coordinator" ]; then
   ROLE=master
 fi
 
-"$INSTALL" --role "$ROLE" --master-host ${coordinator_ip}
+# Terraform passes coordinator_ip="" on the master itself (its IP isn't
+# known while its own userdata is being templated) — resolve via IMDS.
+MASTER="${coordinator_ip}"
+if [ -z "$MASTER" ]; then
+  TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+  MASTER=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+fi
+
+"$INSTALL" --role "$ROLE" --master-host "$MASTER"
 
 echo "=== pyspark bootstrap: done ==="

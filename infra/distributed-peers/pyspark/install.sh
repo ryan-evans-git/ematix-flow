@@ -73,10 +73,12 @@ SPARK_USER="spark"
 # Packages: JDK 21, Python 3.12, basic tools
 # -----------------------------------------------------------------------------
 echo "==> installing JDK 21 + Python 3.12"
+# No `curl` here: AL2023 ships curl-minimal, which provides the curl
+# binary and CONFLICTS with the full curl package (dnf hard-fails).
 dnf install -y \
     java-21-amazon-corretto-headless \
     python3.12 python3.12-pip \
-    tar gzip curl which procps-ng
+    tar gzip which procps-ng
 
 # Provide a stable `python3.12` -> ensurepip / venv path
 python3.12 -m ensurepip --upgrade >/dev/null 2>&1 || true

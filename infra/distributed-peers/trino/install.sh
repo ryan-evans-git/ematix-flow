@@ -85,7 +85,9 @@ NODE_ID_FILE="$TRINO_DATA/node.id"
 
 # --- packages ---------------------------------------------------------------
 echo "==> installing Corretto 25 + tools"
-sudo dnf install -y java-25-amazon-corretto-headless tar gzip curl python3 python3-pip uuid
+# No `curl` here: AL2023 ships curl-minimal, which provides the curl
+# binary and CONFLICTS with the full curl package (dnf hard-fails).
+sudo dnf install -y java-25-amazon-corretto-headless tar gzip python3 python3-pip uuid
 
 # Create dedicated user. -r = system user, -m = home dir for cli history.
 if ! id -u "$TRINO_USER" >/dev/null 2>&1; then

@@ -26,6 +26,14 @@ export BENCH_BUCKET=${bench_bucket}
 export GLUE_DATABASE=${glue_database_name}
 export TRINO_SCALE_FACTOR=${scale_factor}
 
-"$INSTALL" --role ${role} --coordinator-host ${coordinator_ip}
+# Terraform passes coordinator_ip="" on the coordinator itself (its IP
+# isn't known while its own userdata is being templated) — resolve via IMDS.
+COORD="${coordinator_ip}"
+if [ -z "$COORD" ]; then
+  TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+  COORD=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+fi
+
+"$INSTALL" --role ${role} --coordinator-host "$COORD"
 
 echo "=== trino bootstrap: done ==="

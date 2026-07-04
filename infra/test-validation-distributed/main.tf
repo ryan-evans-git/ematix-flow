@@ -288,7 +288,10 @@ resource "aws_instance" "coordinator" {
 
   associate_public_ip_address = true
 
-  user_data_base64 = data.cloudinit_config.coordinator[0].rendered
+  # One-time spot instances can't be stopped for an in-place user_data
+  # update — force replacement instead.
+  user_data_base64            = data.cloudinit_config.coordinator[0].rendered
+  user_data_replace_on_change = true
 
   root_block_device {
     volume_size = local.ebs_size_gb
@@ -356,7 +359,10 @@ resource "aws_instance" "worker" {
 
   associate_public_ip_address = true
 
-  user_data_base64 = data.cloudinit_config.worker[count.index].rendered
+  # One-time spot instances can't be stopped for an in-place user_data
+  # update — force replacement instead.
+  user_data_base64            = data.cloudinit_config.worker[count.index].rendered
+  user_data_replace_on_change = true
 
   root_block_device {
     volume_size = local.ebs_size_gb
