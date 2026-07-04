@@ -100,7 +100,9 @@ sudo chown -R "$TRINO_USER:$TRINO_USER" "$TRINO_DATA"
 if [[ ! -x "$TRINO_HOME/bin/launcher" ]]; then
     echo "==> downloading Trino $TRINO_VERSION"
     cd /tmp
-    curl -fsSLO "https://repo1.maven.org/maven2/io/trino/trino-server/${TRINO_VERSION}/trino-server-${TRINO_VERSION}.tar.gz"
+    # Trino stopped publishing server tarballs to Maven Central after 476;
+    # 477+ ship as GitHub release assets (verified live 2026-07-04).
+    curl -fsSLO "https://github.com/trinodb/trino/releases/download/${TRINO_VERSION}/trino-server-${TRINO_VERSION}.tar.gz"
     tar -xzf "trino-server-${TRINO_VERSION}.tar.gz"
     sudo cp -a "trino-server-${TRINO_VERSION}/." "$TRINO_HOME/"
     sudo chown -R "$TRINO_USER:$TRINO_USER" "$TRINO_HOME"
@@ -112,8 +114,10 @@ fi
 # --- Trino CLI (only on coordinator; useful for register-tables + bench) ----
 if [[ "$ROLE" == "coordinator" && ! -x /usr/local/bin/trino ]]; then
     echo "==> installing Trino CLI"
+    # CLI also moved to GitHub releases; the asset is the extensionless
+    # executable jar named trino-cli-<version> (per current CLI docs).
     curl -fsSL -o /tmp/trino-cli.jar \
-        "https://repo1.maven.org/maven2/io/trino/trino-cli/${TRINO_VERSION}/trino-cli-${TRINO_VERSION}-executable.jar"
+        "https://github.com/trinodb/trino/releases/download/${TRINO_VERSION}/trino-cli-${TRINO_VERSION}"
     sudo install -m 0755 /tmp/trino-cli.jar /usr/local/bin/trino
     rm -f /tmp/trino-cli.jar
 fi
