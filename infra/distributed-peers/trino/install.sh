@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
-# Trino 440 installer for the AWS-campaign 4-node cluster (1 coordinator + 3
+# Trino 482 installer for the AWS-campaign 4-node cluster (1 coordinator + 3
 # workers). Runs from cloud-init on every node. Idempotent: re-running on a
 # host that already has Trino installed will reconcile config + restart.
+#
+# 2026-07-04 refresh (owner decision: competitors at latest stable):
+#   Trino 440 -> 482 (released 2026-06-25, trino.io/docs/current/release.html).
+#   Trino 482 requires Java 25 (min 25.0.1; Java 21/24 refused at startup)
+#   -> Corretto 25 (available in the AL2023 repos as
+#   java-25-amazon-corretto-headless).
+#   jvm.config rebased on the current documented recommendation (adds
+#   --add-modules=jdk.incubator.vector; drops the Java-17-era --add-opens
+#   list, no longer in the reference config).
+#   hive.properties: the legacy hive.s3-file-system-type property was
+#   REMOVED upstream; the native S3 filesystem is enabled per-catalog with
+#   fs.s3.enabled=true (Trino 482 docs; the fs.native-s3.enabled spelling
+#   from the 458-era docs was renamed). Glue metastore properties
+#   (hive.metastore=glue, hive.metastore.glue.region,
+#   hive.metastore.glue.default-warehouse-dir) verified still current.
 #
 # Usage (cloud-init):
 #   install.sh --role coordinator --coordinator-host <ip>
@@ -12,8 +27,8 @@
 #   AWS_REGION     AWS region for Glue + S3 (defaults to ec2 IMDS placement)
 #
 # What it installs:
-#   - Amazon Corretto JDK 21
-#   - Trino server 440 → /opt/trino
+#   - Amazon Corretto JDK 25
+#   - Trino server 482 → /opt/trino
 #   - /opt/trino/etc/{node,jvm,config}.properties
 #   - /opt/trino/etc/catalog/hive.properties (Glue metastore)
 #   - systemd unit trino.service
@@ -62,15 +77,15 @@ if [[ -z "${AWS_REGION:-}" ]]; then
 fi
 echo "==> role=$ROLE coordinator-host=$COORDINATOR_HOST region=$AWS_REGION bucket=$BENCH_BUCKET"
 
-TRINO_VERSION=440
+TRINO_VERSION=482
 TRINO_HOME=/opt/trino
 TRINO_DATA=/var/lib/trino
 TRINO_USER=trino
 NODE_ID_FILE="$TRINO_DATA/node.id"
 
 # --- packages ---------------------------------------------------------------
-echo "==> installing OpenJDK 21 + tools"
-sudo dnf install -y java-21-amazon-corretto-headless tar gzip curl python3-pip uuid
+echo "==> installing Corretto 25 + tools"
+sudo dnf install -y java-25-amazon-corretto-headless tar gzip curl python3 python3-pip uuid
 
 # Create dedicated user. -r = system user, -m = home dir for cli history.
 if ! id -u "$TRINO_USER" >/dev/null 2>&1; then
@@ -118,12 +133,27 @@ node.data-dir=${TRINO_DATA}
 EOF
 
 # --- jvm.config -------------------------------------------------------------
-# Heap sized for c7i.2xlarge (16 GB) leaving ~3 GB for OS + Glue clients.
-# On c7i.4xlarge (32 GB) the same -Xmx is safe; if you bump it, also bump
-# query.max-memory-per-node in config.properties below.
-sudo tee "$TRINO_HOME/etc/jvm.config" >/dev/null <<'EOF'
+# Heap sized per instance: docs recommend 70-85% of RAM for -Xmx.
+#   c7i.2xlarge (16 GB) -> 12G   c7i.4xlarge (32 GB) -> 24G
+# If you bump heap, revisit query.max-memory-per-node below.
+IMDS_TOKEN="$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' || true)"
+INSTANCE_TYPE="$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+    http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown)"
+case "$INSTANCE_TYPE" in
+    c7i.2xlarge) TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB"  ;;
+    c7i.4xlarge) TRINO_XMX="24G"; MAX_MEM_PER_NODE="18GB" ;;
+    *)           TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB"  ;;
+esac
+echo "==> instance=$INSTANCE_TYPE  Xmx=$TRINO_XMX  max-memory-per-node=$MAX_MEM_PER_NODE"
+
+# Flag set = the Trino 482 documented recommendation (deployment docs),
+# verbatim except -Xmx sizing. jdk.incubator.vector is REQUIRED for the
+# SIMD paths; the Java-17-era --add-opens list is gone from the
+# reference config and stays out here.
+sudo tee "$TRINO_HOME/etc/jvm.config" >/dev/null <<EOF
 -server
--Xmx13G
+-Xmx${TRINO_XMX}
 -XX:InitialRAMPercentage=80
 -XX:MaxRAMPercentage=80
 -XX:G1HeapRegionSize=32M
@@ -137,13 +167,7 @@ sudo tee "$TRINO_HOME/etc/jvm.config" >/dev/null <<'EOF'
 -Djdk.attach.allowAttachSelf=true
 -Djdk.nio.maxCachedBufferSize=2000000
 -Dfile.encoding=UTF-8
-# Allow Trino's reflective access to internal JDK APIs (required since Java 17+).
---add-opens=java.base/java.nio=ALL-UNNAMED
---add-opens=java.base/sun.nio.ch=ALL-UNNAMED
---add-opens=java.base/java.lang=ALL-UNNAMED
---add-opens=java.base/java.lang.invoke=ALL-UNNAMED
---add-opens=java.base/java.util=ALL-UNNAMED
---enable-native-access=ALL-UNNAMED
+--add-modules=jdk.incubator.vector
 EOF
 
 # --- config.properties ------------------------------------------------------
@@ -156,7 +180,7 @@ node-scheduler.include-coordinator=false
 http-server.http.port=8080
 discovery.uri=http://${COORDINATOR_HOST}:8080
 query.max-memory=40GB
-query.max-memory-per-node=10GB
+query.max-memory-per-node=${MAX_MEM_PER_NODE}
 EOF
 else
     sudo tee "$TRINO_HOME/etc/config.properties" >/dev/null <<EOF
@@ -164,20 +188,23 @@ coordinator=false
 http-server.http.port=8080
 discovery.uri=http://${COORDINATOR_HOST}:8080
 query.max-memory=40GB
-query.max-memory-per-node=10GB
+query.max-memory-per-node=${MAX_MEM_PER_NODE}
 EOF
 fi
 
 # --- catalog/hive.properties (Glue metastore + S3) --------------------------
 # hive.metastore=glue → no HMS to operate. The IAM role on each node grants
 # glue:Get* on the ematix_tpch database + s3:GetObject on the bucket.
+# Trino 482: the legacy S3 filesystem (hive.s3-file-system-type) is gone;
+# the native filesystem is enabled per-catalog with fs.s3.enabled=true
+# and authenticates via the default AWS SDK credential chain (instance
+# profile — no static creds on disk).
 sudo tee "$TRINO_HOME/etc/catalog/hive.properties" >/dev/null <<EOF
 connector.name=hive
 hive.metastore=glue
 hive.metastore.glue.region=${AWS_REGION}
 hive.metastore.glue.default-warehouse-dir=s3://${BENCH_BUCKET}/glue-warehouse/
-hive.s3-file-system-type=TRINO
-fs.native-s3.enabled=true
+fs.s3.enabled=true
 s3.region=${AWS_REGION}
 # Don't try to write Hive views as Trino views or vice versa — read-only.
 hive.security=allow-all
@@ -188,6 +215,10 @@ EOF
 sudo chown -R "$TRINO_USER:$TRINO_USER" "$TRINO_HOME" "$TRINO_DATA"
 
 # --- systemd unit -----------------------------------------------------------
+# Resolve JAVA_HOME from the installed Corretto (path differs per arch/
+# package layout on AL2023 — never hardcode it).
+JAVA_HOME_DIR="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
+
 sudo tee /etc/systemd/system/trino.service >/dev/null <<EOF
 [Unit]
 Description=Trino ${TRINO_VERSION} (${ROLE})
@@ -198,7 +229,7 @@ Wants=network-online.target
 Type=forking
 User=${TRINO_USER}
 Group=${TRINO_USER}
-Environment=JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto
+Environment=JAVA_HOME=${JAVA_HOME_DIR}
 ExecStart=${TRINO_HOME}/bin/launcher start
 ExecStop=${TRINO_HOME}/bin/launcher stop
 PIDFile=${TRINO_DATA}/var/run/launcher.pid

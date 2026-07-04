@@ -1,7 +1,7 @@
-# Trino 440 peer deployment for the AWS-campaign
+# Trino 482 peer deployment for the AWS-campaign
 
-This directory deploys **Trino 440** (Apache 2.0, current LTS as of
-2026-05) on the same 4-node EC2 cluster (1× coordinator + 3× workers)
+This directory deploys **Trino 482** (Apache 2.0, latest stable as of
+2026-07, released 2026-06-25) on the same 4-node EC2 cluster (1× coordinator + 3× workers)
 that runs ematix-flow distributed and PySpark, as one of the three peers
 in the distributed TPC-H comparison described in
 `docs/AWS_CAMPAIGN_2026_05_PLAN.md`.
@@ -80,7 +80,7 @@ scale factor.
 ## TPC-H dialect notes (Trino vs DataFusion)
 
 The repo's canonical `examples/tpch/queries/q*.sql` are written for
-DataFusion's parser. Trino 440 accepts all 22 verbatim — we audited
+DataFusion's parser. Trino accepts all 22 verbatim (audited on 440, re-checked for 482) — we audited
 each one before writing this. Specific points we checked:
 
 | query | DataFusion form                                          | Trino                  |
@@ -105,7 +105,7 @@ adaptation is documented in-place in `bench.py`.
 ```json
 {
   "engine": "trino",
-  "version": "440",
+  "version": "482",
   "scale_factor": 10,
   "cluster_size": 4,
   "queries": {
@@ -180,7 +180,7 @@ Likely causes:
 Symptom: `bench.py` reports `io.trino.spi.TrinoException: line N:M ...`.
 
 The canonical TPC-H queries in `examples/tpch/queries/` are
-DataFusion-dialect. All 22 are verified to work on Trino 440 as-is (see
+DataFusion-dialect. All 22 are verified to work on Trino as-is (440-audited, 482 re-checked; see
 the table above). If you hit a parse error on a query that's listed as
 "works as-is", the most likely cause is a stale checkout — `git pull`
 and confirm the file content matches.

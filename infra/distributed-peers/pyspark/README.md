@@ -2,7 +2,7 @@
 
 Phase B4 of the AWS validation campaign (see
 `docs/AWS_CAMPAIGN_2026_05_PLAN.md`). This directory provisions a
-**Spark 3.5.4 standalone cluster** across the 4-node TPC-H benchmark
+**Spark 4.1.2 standalone cluster** (latest stable 4.x, 2026-07-04 refresh) across the 4-node TPC-H benchmark
 fleet and runs the 22 canonical queries against S3-resident parquet,
 producing a JSON results file in the campaign's shared schema.
 
@@ -21,7 +21,7 @@ scripts assume the cluster already exists and is reachable.
 
 | Component             | Version  |
 |-----------------------|----------|
-| Spark                 | 3.5.4    |
+| Spark                 | 4.1.2    |
 | Bundled Hadoop        | 3.3.4    |
 | `hadoop-aws` JAR      | 3.3.4    |
 | `aws-java-sdk-bundle` | 1.12.262 |
@@ -64,7 +64,7 @@ From the master node:
 export BENCH_BUCKET=my-tpch-bench-bucket   # same one the data lives in
 
 # install pyspark + boto3 once
-python3.12 -m pip install --user pyspark==3.5.4 boto3
+python3.12 -m pip install --user pyspark==4.1.2 boto3
 
 # run SF=10 (5 trials × 2 warmups by default)
 python3.12 bench.py \
@@ -116,7 +116,7 @@ One JSON per `(engine, scale)` pair, matching the campaign aggregator:
 ```json
 {
   "engine": "pyspark",
-  "version": "3.5.4",
+  "version": "4.1.2",
   "scale_factor": 10,
   "cluster_size": 4,
   "stamp": "20260522-143012",
