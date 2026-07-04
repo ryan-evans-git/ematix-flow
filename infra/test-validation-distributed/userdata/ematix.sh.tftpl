@@ -6,9 +6,26 @@
 # Scale: ${scale_factor}
 # Bench bucket: ${bench_bucket}
 #
-# Builds flow-worker from /opt/ematix/ematix-flow (cloned by base.sh)
-# and starts it as a systemd service. Coordinator runs the bench
-# orchestrator; workers expose Arrow Flight on port 50051.
+# Builds flow-worker from /opt/ematix/ematix-flow (cloned by base.sh),
+# pulls the TPC-H parquet for this scale factor from S3 to local disk
+# (the campaign binary and every worker read the SAME local path —
+# /opt/ematix/data/sf${scale_factor}/<table>.parquet), and starts
+# flow-worker as a systemd service. The coordinator additionally builds
+# the campaign orchestrator example.
+#
+# 2026-07-04 refresh:
+#   - fixed flow-worker invocation: the binary takes `--bind ADDR --port
+#     PORT` as SEPARATE flags; the May kit passed `--bind 0.0.0.0:50051`,
+#     which produced an unparseable "0.0.0.0:50051:50051" socket addr and
+#     would have crash-looped the service. Never executed; caught in kit
+#     review.
+#   - added the S3 → local data pull (the May kit never staged data, so
+#     the campaign binary's pre-flight would have failed on every node).
+#   - coordinator now builds the tpch_distributed_campaign example during
+#     bootstrap (the old runbook assumed it existed).
+#   - EMAT_* levers intentionally NOT set: production auto-gating. The
+#     flow-worker process is solo on its instance, so the partition
+#     registry senses live=1 and resolves full cores.
 
 set -uo pipefail
 exec > >(tee /var/log/ematix-userdata.log) 2>&1
@@ -25,17 +42,49 @@ source $HOME/.cargo/env
 rustc --version
 INSTALL_RUST
 
-# Build flow-worker (only the binary we actually need). Reusing the
-# cached target dir if present.
+# TPC-H parquet: pull from the campaign bucket to the local path shared
+# by coordinator + workers. S3 layout is a directory per table (Trino
+# hive-connector requirement); local layout is flat files (what the
+# campaign binary registers).
+mkdir -p /opt/ematix/data/sf${scale_factor}
+for t in region nation supplier customer part partsupp orders lineitem; do
+  if [ ! -s "/opt/ematix/data/sf${scale_factor}/$t.parquet" ]; then
+    /usr/local/bin/aws s3 cp \
+      "s3://${bench_bucket}/tpch-data/sf${scale_factor}/$t/$t.parquet" \
+      "/opt/ematix/data/sf${scale_factor}/$t.parquet" --only-show-errors
+  fi
+done
+chown -R ec2-user:ec2-user /opt/ematix/data
+ls -lh /opt/ematix/data/sf${scale_factor}/
+
+# Build flow-worker (every node). Reuses the cached target dir if present.
+# Real cargo exit captured from PIPESTATUS (tail would otherwise mask it).
 sudo -u ec2-user bash <<'BUILD'
+set -uo pipefail
 source $HOME/.cargo/env
 cd /opt/ematix/ematix-flow
-cargo build --release -p ematix-flow-distributed --bin flow-worker 2>&1 | tail -50
+cargo build --release -p ematix-flow-distributed --bin flow-worker 2>&1 | tail -20
+rc=$${PIPESTATUS[0]}
+echo "flow-worker build exit: $rc"
+exit $rc
 BUILD
+
+# Coordinator additionally builds the campaign orchestrator example.
+if [ "${role}" = "coordinator" ]; then
+  sudo -u ec2-user bash <<'BUILD_CAMPAIGN'
+set -uo pipefail
+source $HOME/.cargo/env
+cd /opt/ematix/ematix-flow
+cargo build --release -p ematix-flow-distributed --example tpch_distributed_campaign 2>&1 | tail -20
+rc=$${PIPESTATUS[0]}
+echo "campaign example build exit: $rc"
+exit $rc
+BUILD_CAMPAIGN
+fi
 
 # systemd unit. Coordinator vs worker share the same flow-worker
 # binary; the orchestrator just connects to the workers' Flight
-# endpoints by IP.
+# endpoints by IP. NOTE: --bind and --port are separate flags.
 cat > /etc/systemd/system/flow-worker.service <<EOF
 [Unit]
 Description=ematix-flow flow-worker (Arrow Flight peer)
@@ -52,7 +101,7 @@ Environment=EMATIX_ROLE=${role}
 Environment=EMATIX_COORDINATOR_IP=${coordinator_ip}
 Environment=EMATIX_SCALE_FACTOR=${scale_factor}
 Environment=RUST_LOG=info
-ExecStart=/opt/ematix/ematix-flow/target/release/flow-worker --bind 0.0.0.0:50051
+ExecStart=/opt/ematix/ematix-flow/target/release/flow-worker --bind 0.0.0.0 --port 50051
 Restart=on-failure
 RestartSec=5
 

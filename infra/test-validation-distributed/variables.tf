@@ -87,6 +87,12 @@ variable "bench_bucket" {
   type        = string
 }
 
+variable "git_ref" {
+  description = "Git branch or tag of ematix-flow to clone on every node (shallow clone; a raw SHA won't work). The nodes clone from GitHub — make sure the ref you benchmark is PUSHED (local-only commits are invisible to the cluster)."
+  type        = string
+  default     = "main"
+}
+
 variable "glue_database_name" {
   description = "Glue Data Catalog database for Trino's hive catalog. Auto-created if missing. Only used when engine=trino."
   type        = string
