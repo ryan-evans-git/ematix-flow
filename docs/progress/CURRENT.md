@@ -43,3 +43,10 @@ The Σ.AH survey (Phases A-D) completed 2026-05-26 and archived to [`docs/plans/
 ## Deferred plans
 
 - [`sidecar-deferred.md`](../plans/sidecar-deferred.md) — V5 Tier 5 sidecar read + adaptive work.
+
+## 2026-07-04 — DLQ + replay feature (in flight)
+
+PRD: [docs/prds/2026-07-04-dlq-replay.md](../prds/2026-07-04-dlq-replay.md)
+— DLQ management + stream replayability (redrive = reprocess-through-
+pipeline; rewind = state-reset-with-confirm; all backends via
+DeadLetterStore trait). Phased plan next: docs/plans/DLQ_REPLAY.md.
