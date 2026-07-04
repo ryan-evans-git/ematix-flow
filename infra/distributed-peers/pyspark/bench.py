@@ -156,7 +156,10 @@ def register_tables(spark, bucket: str, sf: int) -> None:
     Hive metastore / Glue dependency."""
     prefix = f"s3a://{bucket}/tpch-data/sf{sf}"
     for tbl in TPCH_TABLES:
-        path = f"{prefix}/{tbl}.parquet"
+        # Directory layout (<table>/<table>.parquet): the canonical S3 shape
+        # since the Trino leg's register-tables.sh reorganisation — Hive
+        # treats external_location as a directory. Spark reads the dir fine.
+        path = f"{prefix}/{tbl}/"
         spark.read.parquet(path).createOrReplaceTempView(tbl)
         print(f"  registered {tbl} <- {path}", flush=True)
 

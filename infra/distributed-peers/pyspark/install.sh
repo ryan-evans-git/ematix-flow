@@ -88,6 +88,10 @@ python3.12 -m pip install --upgrade pip >/dev/null
 # cloud-init runs as root but the bench runs as ec2-user.
 if [ "$ROLE" = "master" ]; then
     python3.12 -m pip install --quiet "pyspark==${SPARK_VERSION}" boto3
+    # Without SPARK_HOME the pip pyspark runs self-contained: no s3a jars,
+    # no spark-defaults.conf (master URL!) — the bench would silently run
+    # local-mode. Point it at the real install for every login shell.
+    echo "export SPARK_HOME=${SPARK_HOME}" >> /etc/profile.d/ematix-env.sh
 fi
 
 # -----------------------------------------------------------------------------
