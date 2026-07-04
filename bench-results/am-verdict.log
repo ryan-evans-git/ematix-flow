@@ -1,0 +1,306 @@
+IDLE-DETECTED loadavg15=1.12 at Fri Jul  3 23:58:21 EDT 2026
+=== Σ.AI.1 strict bench protocol ===
+  sf:             10
+  invocations:    4 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,
+  extra env:      <none>
+  output dir:     bench-results/q05-lever-2026-07-04/ematix-sf10-am1
+
+  [env] captured -> bench-results/q05-lever-2026-07-04/ematix-sf10-am1/env.json
+--- invocation 1 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-am1/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-am1/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-am1/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-am1/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/q05-lever-2026-07-04/ematix-sf10-am1/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — ematix
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'AC Power'
+- Git: 82d9c244c9e3 on main (dirty: True)
+- Data: SF=10; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 3 of 4 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-2.md', 'run-3.md', 'run-4.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q01 | 207.64 | 208.32 | 2.68 | 1.29% | 206.0 / 207.6 / 211.3 |
+| Q02 | 18.10 | 18.12 | 0.21 | 1.14% | 17.9 / 18.3 / 18.1 |
+| Q03 | 117.35 | 117.34 | 0.47 | 0.40% | 117.8 / 117.3 / 116.9 |
+| Q04 | 52.52 | 52.60 | 0.20 | 0.39% | 52.8 / 52.5 / 52.5 |
+| Q05 | 121.14 | 120.79 | 2.42 | 2.00% | 123.0 / 118.2 / 121.1 |
+| Q06 | 23.99 | 23.93 | 0.31 | 1.29% | 24.2 / 23.6 / 24.0 |
+| Q07 | 111.75 | 111.09 | 1.42 | 1.27% | 112.0 / 111.8 / 109.5 |
+| Q08 | 140.68 | 140.69 | 3.52 | 2.50% | 144.2 / 137.2 / 140.7 |
+| Q09 | 255.53 | 257.30 | 4.62 | 1.81% | 255.5 / 253.8 / 262.6 |
+| Q10 | 187.27 | 187.32 | 1.18 | 0.63% | 186.2 / 187.3 / 188.5 |
+| Q11 | 11.35 | 11.50 | 0.26 | 2.29% | 11.3 / 11.3 / 11.8 |
+| Q12 | 82.31 | 82.65 | 1.25 | 1.51% | 81.6 / 82.3 / 84.0 |
+| Q13 | 96.57 | 97.85 | 2.61 | 2.70% | 96.1 / 96.6 / 100.8 |
+| Q14 | 79.68 | 80.45 | 1.87 | 2.34% | 82.6 / 79.1 / 79.7 |
+| Q15 | 59.07 | 58.89 | 0.83 | 1.41% | 58.0 / 59.6 / 59.1 |
+| Q16 | 42.98 | 43.45 | 1.01 | 2.34% | 43.0 / 42.8 / 44.6 |
+| Q17 | 73.58 | 72.93 | 2.41 | 3.27% | 70.3 / 73.6 / 74.9 |
+| Q18 | 172.39 | 172.38 | 0.04 | 0.02% | 172.4 / 172.3 / 172.4 |
+| Q19 | 118.19 | 117.78 | 2.55 | 2.15% | 118.2 / 115.0 / 120.1 |
+| Q20 | 70.02 | 69.98 | 0.85 | 1.21% | 69.1 / 70.0 / 70.8 |
+| Q21 | 175.01 | 177.26 | 7.40 | 4.23% | 185.5 / 171.2 / 175.0 |
+| Q22 | 23.89 | 23.91 | 0.51 | 2.12% | 23.4 / 24.4 / 23.9 |
+
+**Sum of medians**: 2241.01 ms  (primary, robust to single-run outliers)
+**Sum of means**: 2246.52 ms  (secondary)
+**Median CV**: 1.66%  (noise-floor across invocations)
+**Max CV**: 4.23%  (worst-case per-query noise — likely single-run outlier)
+=== Σ.AI.1 strict bench protocol ===
+  sf:             10
+  invocations:    4 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,
+  extra env:      <none>
+  output dir:     bench-results/q05-lever-2026-07-04/duckdb-sf10-am1
+
+  [env] captured -> bench-results/q05-lever-2026-07-04/duckdb-sf10-am1/env.json
+--- invocation 1 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-am1/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-am1/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-am1/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-am1/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/q05-lever-2026-07-04/duckdb-sf10-am1/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — duckdb
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'AC Power'
+- Git: 82d9c244c9e3 on main (dirty: True)
+- Data: SF=10; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 3 of 4 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-2.md', 'run-3.md', 'run-4.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q01 | 243.38 | 243.10 | 1.06 | 0.44% | 244.0 / 243.4 / 241.9 |
+| Q02 | 39.46 | 39.26 | 0.42 | 1.07% | 38.8 / 39.5 / 39.5 |
+| Q03 | 133.70 | 133.85 | 1.31 | 0.98% | 132.6 / 133.7 / 135.2 |
+| Q04 | 83.31 | 84.97 | 3.07 | 3.68% | 83.1 / 88.5 / 83.3 |
+| Q05 | 128.11 | 128.02 | 1.25 | 0.97% | 129.2 / 128.1 / 126.7 |
+| Q06 | 72.93 | 72.58 | 1.74 | 2.38% | 70.7 / 72.9 / 74.1 |
+| Q07 | 132.82 | 132.49 | 1.26 | 0.95% | 132.8 / 133.6 / 131.1 |
+| Q08 | 154.34 | 153.70 | 1.81 | 1.17% | 155.1 / 151.7 / 154.3 |
+| Q09 | 271.04 | 271.24 | 0.51 | 0.19% | 271.8 / 271.0 / 270.9 |
+| Q10 | 221.20 | 220.90 | 1.06 | 0.48% | 219.7 / 221.8 / 221.2 |
+| Q11 | 25.41 | 25.54 | 0.41 | 1.59% | 25.2 / 25.4 / 26.0 |
+| Q12 | 110.93 | 111.31 | 0.88 | 0.80% | 110.7 / 110.9 / 112.3 |
+| Q13 | 231.63 | 231.20 | 1.07 | 0.46% | 232.0 / 231.6 / 230.0 |
+| Q14 | 124.32 | 123.74 | 1.02 | 0.82% | 122.6 / 124.3 / 124.3 |
+| Q15 | 79.64 | 80.35 | 1.37 | 1.73% | 81.9 / 79.6 / 79.5 |
+| Q16 | 57.12 | 57.28 | 0.34 | 0.60% | 57.0 / 57.7 / 57.1 |
+| Q17 | 145.43 | 145.10 | 1.16 | 0.80% | 145.4 / 143.8 / 146.1 |
+| Q18 | 195.36 | 194.87 | 1.11 | 0.57% | 195.4 / 195.7 / 193.6 |
+| Q19 | 185.76 | 185.73 | 1.10 | 0.59% | 185.8 / 186.8 / 184.6 |
+| Q20 | 133.65 | 134.18 | 1.27 | 0.95% | 133.7 / 135.6 / 133.2 |
+| Q21 | 367.07 | 366.68 | 1.52 | 0.41% | 365.0 / 367.1 / 368.0 |
+| Q22 | 51.28 | 51.09 | 0.45 | 0.88% | 50.6 / 51.4 / 51.3 |
+
+**Sum of medians**: 3187.89 ms  (primary, robust to single-run outliers)
+**Sum of means**: 3187.15 ms  (secondary)
+**Median CV**: 0.85%  (noise-floor across invocations)
+**Max CV**: 3.68%  (worst-case per-query noise — likely single-run outlier)
+=== Σ.AI.1 strict bench protocol ===
+  sf:             10
+  invocations:    4 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,
+  extra env:      <none>
+  output dir:     bench-results/q05-lever-2026-07-04/duckdb-sf10-am2
+
+  [env] captured -> bench-results/q05-lever-2026-07-04/duckdb-sf10-am2/env.json
+--- invocation 1 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-am2/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-am2/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-am2/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 4 → bench-results/q05-lever-2026-07-04/duckdb-sf10-am2/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/q05-lever-2026-07-04/duckdb-sf10-am2/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — duckdb
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'AC Power'
+- Git: 82d9c244c9e3 on main (dirty: True)
+- Data: SF=10; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 3 of 4 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-2.md', 'run-3.md', 'run-4.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q01 | 240.46 | 240.42 | 0.40 | 0.17% | 240.5 / 240.0 / 240.8 |
+| Q02 | 38.77 | 39.04 | 0.54 | 1.40% | 38.8 / 38.7 / 39.7 |
+| Q03 | 135.26 | 135.23 | 0.16 | 0.12% | 135.3 / 135.1 / 135.4 |
+| Q04 | 83.80 | 84.16 | 0.77 | 0.91% | 83.6 / 83.8 / 85.0 |
+| Q05 | 128.97 | 128.71 | 1.83 | 1.42% | 130.4 / 129.0 / 126.8 |
+| Q06 | 71.29 | 72.08 | 1.40 | 1.96% | 73.7 / 71.3 / 71.3 |
+| Q07 | 132.55 | 132.52 | 1.55 | 1.17% | 131.0 / 134.1 / 132.6 |
+| Q08 | 154.50 | 154.23 | 1.04 | 0.67% | 153.1 / 154.5 / 155.1 |
+| Q09 | 272.47 | 272.23 | 0.65 | 0.24% | 272.7 / 272.5 / 271.5 |
+| Q10 | 217.45 | 217.90 | 1.87 | 0.86% | 217.4 / 216.3 / 219.9 |
+| Q11 | 25.38 | 25.40 | 0.19 | 0.75% | 25.6 / 25.4 / 25.2 |
+| Q12 | 107.52 | 108.66 | 2.27 | 2.11% | 107.2 / 111.3 / 107.5 |
+| Q13 | 230.15 | 230.34 | 1.06 | 0.46% | 230.2 / 229.4 / 231.5 |
+| Q14 | 123.31 | 123.60 | 1.37 | 1.11% | 125.1 / 123.3 / 122.4 |
+| Q15 | 79.11 | 79.51 | 0.75 | 0.95% | 79.1 / 79.0 / 80.4 |
+| Q16 | 57.16 | 57.15 | 0.13 | 0.23% | 57.0 / 57.3 / 57.2 |
+| Q17 | 145.42 | 145.39 | 0.58 | 0.40% | 146.0 / 145.4 / 144.8 |
+| Q18 | 194.27 | 194.47 | 1.32 | 0.68% | 194.3 / 195.9 / 193.3 |
+| Q19 | 185.08 | 185.18 | 1.80 | 0.97% | 185.1 / 187.0 / 183.4 |
+| Q20 | 134.57 | 134.64 | 0.13 | 0.10% | 134.6 / 134.6 / 134.8 |
+| Q21 | 365.04 | 366.16 | 2.11 | 0.58% | 368.6 / 365.0 / 364.9 |
+| Q22 | 50.64 | 50.78 | 1.03 | 2.03% | 49.8 / 50.6 / 51.9 |
+
+**Sum of medians**: 3173.17 ms  (primary, robust to single-run outliers)
+**Sum of means**: 3177.82 ms  (secondary)
+**Median CV**: 0.80%  (noise-floor across invocations)
+**Max CV**: 2.11%  (worst-case per-query noise — likely single-run outlier)
+=== Σ.AI.1 strict bench protocol ===
+  sf:             10
+  invocations:    4 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,
+  extra env:      <none>
+  output dir:     bench-results/q05-lever-2026-07-04/ematix-sf10-am2
+
+  [env] captured -> bench-results/q05-lever-2026-07-04/ematix-sf10-am2/env.json
+--- invocation 1 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-am2/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-am2/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-am2/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 4 → bench-results/q05-lever-2026-07-04/ematix-sf10-am2/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 22 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/q05-lever-2026-07-04/ematix-sf10-am2/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — ematix
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'AC Power'
+- Git: 82d9c244c9e3 on main (dirty: True)
+- Data: SF=10; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 3 of 4 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-2.md', 'run-3.md', 'run-4.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q01 | 231.60 | 232.60 | 4.45 | 1.92% | 228.7 / 231.6 / 237.5 |
+| Q02 | 18.52 | 18.50 | 0.59 | 3.19% | 17.9 / 18.5 / 19.1 |
+| Q03 | 123.37 | 122.85 | 1.68 | 1.36% | 123.4 / 124.2 / 121.0 |
+| Q04 | 54.81 | 55.03 | 0.61 | 1.12% | 55.7 / 54.8 / 54.5 |
+| Q05 | 124.45 | 125.21 | 1.49 | 1.20% | 126.9 / 124.3 / 124.5 |
+| Q06 | 25.21 | 25.34 | 0.87 | 3.46% | 24.5 / 25.2 / 26.3 |
+| Q07 | 118.47 | 118.69 | 0.96 | 0.81% | 117.8 / 118.5 / 119.7 |
+| Q08 | 153.52 | 153.73 | 0.51 | 0.33% | 154.3 / 153.4 / 153.5 |
+| Q09 | 283.94 | 283.83 | 1.46 | 0.52% | 283.9 / 282.3 / 285.2 |
+| Q10 | 196.14 | 196.00 | 0.77 | 0.39% | 196.1 / 195.2 / 196.7 |
+| Q11 | 11.44 | 11.42 | 0.15 | 1.28% | 11.3 / 11.6 / 11.4 |
+| Q12 | 88.67 | 89.29 | 1.22 | 1.37% | 88.5 / 90.7 / 88.7 |
+| Q13 | 103.03 | 103.17 | 1.43 | 1.38% | 103.0 / 101.8 / 104.7 |
+| Q14 | 82.71 | 82.86 | 0.34 | 0.41% | 83.2 / 82.7 / 82.6 |
+| Q15 | 60.53 | 60.69 | 0.62 | 1.03% | 60.2 / 61.4 / 60.5 |
+| Q16 | 44.70 | 44.59 | 0.49 | 1.10% | 44.0 / 45.0 / 44.7 |
+| Q17 | 74.61 | 74.95 | 0.77 | 1.03% | 74.4 / 75.8 / 74.6 |
+| Q18 | 178.17 | 178.86 | 1.25 | 0.70% | 178.2 / 178.1 / 180.3 |
+| Q19 | 129.06 | 129.64 | 1.26 | 0.98% | 128.8 / 129.1 / 131.1 |
+| Q20 | 70.06 | 70.87 | 2.10 | 3.00% | 69.3 / 70.1 / 73.2 |
+| Q21 | 188.53 | 188.91 | 3.44 | 1.82% | 192.5 / 188.5 / 185.7 |
+| Q22 | 23.65 | 23.80 | 0.36 | 1.53% | 23.6 / 23.5 / 24.2 |
+
+**Sum of medians**: 2385.19 ms  (primary, robust to single-run outliers)
+**Sum of means**: 2390.82 ms  (secondary)
+**Median CV**: 1.16%  (noise-floor across invocations)
+**Max CV**: 3.46%  (worst-case per-query noise — likely single-run outlier)
+AM-VERDICT-DONE

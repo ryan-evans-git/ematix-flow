@@ -58,3 +58,25 @@ STATVEC/MEMO battery shows zero regressions at all scales + Q20
 −27 ms clear win. Engine-vs-engine verdicts require a SETTLED machine;
 a 1h-cooldown re-run supersedes the soaked pass
 (`q05-lever-2026-07-04/verdict-sf10-settled.md`).
+
+## 2026-07-04 FINAL — idle-machine verdict (both engine orders)
+
+Idle-triggered at 23:58 (loadavg 1.12), sequence E→D→D→E so the two
+verdicts cross-check order effects
+(`q05-lever-2026-07-04/verdict-sf10-am-order{1,2}.md`):
+
+- **19/22 clear ematix wins in BOTH orders** — including **Q05 (+7.0 /
+  +4.5 ms, clear in both): FLIPPED**, and Q03 (a release-day tie)
+  firmed to a win in both orders.
+- **Q01: FLIPPED on the weight of evidence** — clear in order 1
+  (+35.7 ms) and in the settled morning verdict (+33.1 ms, bar 3.7),
+  noise in order 2 (ran last, drift resuming); the lever itself is
+  2σ-proven (−13.8 ms interleaved). Never behind on a settled machine.
+- Q08/Q09: unchanged order-/state-sensitive tie class (were ties at
+  v0.12.0 too); Q09's one-order −11.5 mirrors its other-order +15.5 —
+  an order artifact, not a loss.
+
+SF=10 standing: **19 always-clear + Q01 (2-of-3 clear) + Q08/Q09
+ties, 0 losses** — up from v0.12.0's 17 clear + 5 ties. Both targeted
+ties closed; nothing lost at any scale or stream count (no-loss gates
+above).
