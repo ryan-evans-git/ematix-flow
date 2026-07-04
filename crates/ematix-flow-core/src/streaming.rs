@@ -39,6 +39,10 @@ use prometheus::{GaugeVec, IntCounter, Registry};
 use tokio::sync::watch;
 
 use crate::backend::{ArrowBatchStream, Backend, BackendError, TargetTable, WriteMode};
+use crate::dlq::{
+    DeadLetterStore, DlqMeta, DlqRecord, DlqRecordId, DlqStage, KafkaTopicDlq, TableDlq,
+    truncate_error,
+};
 use crate::kafka_backend::KafkaBackend;
 use crate::state_store::{RecoveredState, StateStore};
 use crate::transform::{BatchContext, BatchTransform};
@@ -283,7 +287,8 @@ impl StreamingPipelineMetricsCounters {
             ),
             dlq_writes: mk(
                 "ematix_streaming_dlq_writes_total",
-                "Total rows produced to the dead-letter topic after a target write failure.",
+                "Total rows appended to the dead-letter store (topic or table) \
+                 after a transform/write failure or late-data eviction.",
             ),
             idle_iterations: mk(
                 "ematix_streaming_idle_iterations_total",
@@ -346,16 +351,23 @@ pub struct StreamingPipelineConfig {
     pub idle_pause_ms: u64,
     /// Pipeline name — used for logs / metrics labels.
     pub pipeline_name: String,
-    /// When `Some`, failed-batch rows get routed here as raw bytes
-    /// instead of bubbling the error up. The DLQ is itself a Kafka
-    /// topic — the source backend must be Kafka (its FutureProducer
-    /// is reused) for DLQ routing to work; for non-Kafka sources
-    /// this is silently ignored and the error bubbles up.
+    /// When `Some`, failed-batch rows get routed to this Kafka
+    /// topic (via [`crate::dlq::KafkaTopicDlq`] — payload format
+    /// preserved, failure metadata in `emat-dlq-*` headers) instead
+    /// of bubbling the error up. Requires a Kafka source; with a
+    /// non-Kafka source the DLQ resolution (DLQ Phase 1) falls back
+    /// to the table store instead of silently dropping.
     ///
     /// At-least-once: source offsets are committed *after* the DLQ
-    /// produce ack lands, so a crash mid-DLQ-write means the
+    /// append ack lands, so a crash mid-DLQ-write means the
     /// original messages are re-delivered, not lost.
     pub dead_letter_topic: Option<String>,
+    /// DLQ Phase 1: explicit dead-letter store override. When set it
+    /// wins over every other resolution rule (topic / state-store
+    /// family / in-memory fallback) — see
+    /// [`StreamingPipeline::resolve_dlq_store`]. Zero happy-path
+    /// cost: the store is only touched on error paths.
+    pub dead_letter_store: Option<Arc<dyn DeadLetterStore>>,
     /// Π.4b-1: optional per-batch SQL transform applied between
     /// `source.read_arrow_stream` and `target.write_arrow_stream`.
     /// `None` is the historical fast path — the pipeline forwards
@@ -473,6 +485,7 @@ impl StreamingPipelineConfig {
             idle_pause_ms: 500,
             pipeline_name: pipeline_name.into(),
             dead_letter_topic: None,
+            dead_letter_store: None,
             transform: None,
             watermark: None,
             state_store: None,
@@ -530,6 +543,14 @@ impl StreamingPipelineConfig {
     /// Builder-style: opt into DLQ routing on target write failure.
     pub fn with_dead_letter_topic(mut self, topic: impl Into<String>) -> Self {
         self.dead_letter_topic = Some(topic.into());
+        self
+    }
+
+    /// Builder-style (DLQ Phase 1): install an explicit
+    /// [`DeadLetterStore`]. Overrides the automatic resolution
+    /// (Kafka topic / state-store family / in-memory fallback).
+    pub fn with_dead_letter_store(mut self, store: Arc<dyn DeadLetterStore>) -> Self {
+        self.dead_letter_store = Some(store);
         self
     }
 
@@ -643,6 +664,11 @@ pub struct StreamingPipeline {
     /// so non-CDC pipelines never pay the reflection round-trip.
     /// Empty when `config.cdc.is_none()`.
     cdc_target_specs: tokio::sync::OnceCell<Vec<crate::types::TableSpec>>,
+    /// DLQ Phase 1: lazily-resolved dead-letter store. Populated on
+    /// the FIRST dead-letter emission (never on the happy path — a
+    /// pipeline where nothing fails performs zero DLQ work) via
+    /// [`Self::resolve_dlq_store`].
+    dlq_store: tokio::sync::OnceCell<Arc<dyn DeadLetterStore>>,
 }
 
 impl StreamingPipeline {
@@ -661,6 +687,7 @@ impl StreamingPipeline {
             metrics,
             watermark_state,
             cdc_target_specs: tokio::sync::OnceCell::new(),
+            dlq_store: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -717,6 +744,7 @@ impl StreamingPipeline {
             metrics,
             watermark_state,
             cdc_target_specs: tokio::sync::OnceCell::new(),
+            dlq_store: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -1111,24 +1139,20 @@ impl StreamingPipeline {
                                                 error = %e,
                                                 "transform error — batch routed to DLQ (on_error = dlq)"
                                             );
-                                            if let Some(topic) =
-                                                self.config.dead_letter_topic.clone()
-                                            {
-                                                let count = self
-                                                    .route_batches_to_dlq(
-                                                        topic.as_str(),
-                                                        vec![b_clone],
-                                                    )
-                                                    .await?;
-                                                self.metrics.dlq_writes.inc_by(count);
-                                            } else {
-                                                tracing::warn!(
-                                                    pipeline = %self.config.pipeline_name,
-                                                    "on_error = \"dlq\" but no \
-                                                     dead_letter_topic configured — \
-                                                     batch silently discarded"
-                                                );
-                                            }
+                                            // DLQ Phase 1: on_error = "dlq" IS
+                                            // the opt-in; resolution picks the
+                                            // topic / table / in-memory store.
+                                            // Pre-Phase-1 this silently
+                                            // discarded when no topic was set.
+                                            let count = self
+                                                .route_batches_to_dlq(
+                                                    DlqStage::Transform,
+                                                    &e.to_string(),
+                                                    source_query,
+                                                    vec![b_clone],
+                                                )
+                                                .await?;
+                                            self.metrics.dlq_writes.inc_by(count);
                                         }
                                     }
                                 }
@@ -1250,17 +1274,30 @@ impl StreamingPipeline {
                 }
                 Some(e) => {
                     self.metrics.errors.inc();
-                    // DLQ routing: if a topic is configured, produce
-                    // each row's source-encoded payload to the DLQ
-                    // and continue. With multi-target the DLQ runs
-                    // when *any* target failed; targets that already
-                    // succeeded keep their writes (data is in those
-                    // sinks plus the DLQ — partial-success is the
-                    // accepted trade for at-least-once across N
-                    // sinks). No DLQ ⇒ surface the first failure
-                    // and skip the offset commit.
-                    if let Some(topic) = &self.config.dead_letter_topic {
-                        let dlq_count = self.route_batches_to_dlq(topic.as_str(), batches).await?;
+                    // DLQ routing: if a topic or explicit store is
+                    // configured, append each row's source-encoded
+                    // payload (plus failure metadata) to the
+                    // dead-letter store and continue. With
+                    // multi-target the DLQ runs when *any* target
+                    // failed; targets that already succeeded keep
+                    // their writes (data is in those sinks plus the
+                    // DLQ — partial-success is the accepted trade
+                    // for at-least-once across N sinks). No DLQ
+                    // opt-in ⇒ surface the first failure and skip
+                    // the offset commit — byte-identical to the
+                    // pre-Phase-1 behavior.
+                    if self.config.dead_letter_topic.is_some()
+                        || self.config.dead_letter_store.is_some()
+                    {
+                        let source_id = self.sources.first().map(|(_, q)| q.as_str()).unwrap_or("");
+                        let dlq_count = self
+                            .route_batches_to_dlq(
+                                DlqStage::Write,
+                                &e.to_string(),
+                                source_id,
+                                batches,
+                            )
+                            .await?;
                         self.metrics.dlq_writes.inc_by(dlq_count);
                     } else {
                         return Err(e);
@@ -1381,10 +1418,11 @@ impl StreamingPipeline {
             return Ok(());
         }
         let n_rows: u64 = dlq_rows.iter().map(|b| b.num_rows() as u64).sum();
-        let Some(topic) = self.config.dead_letter_topic.clone() else {
-            // Policy is Dlq but no topic configured. Bump the
+        if self.config.dead_letter_topic.is_none() && self.config.dead_letter_store.is_none() {
+            // Policy is Dlq but no DLQ opt-in configured. Bump the
             // dropped counter so this is visible in metrics rather
-            // than silent.
+            // than silent. (Unchanged from pre-Phase-1; the full
+            // late_data DLQ write path is PRD-reserved.)
             self.metrics.dlq_writes.inc_by(0);
             tracing::warn!(
                 pipeline = %self.config.pipeline_name,
@@ -1393,48 +1431,170 @@ impl StreamingPipeline {
                  late rows discarded"
             );
             return Ok(());
-        };
-        let count = self.route_batches_to_dlq(topic.as_str(), dlq_rows).await?;
+        }
+        let source_id = self.sources.first().map(|(_, q)| q.as_str()).unwrap_or("");
+        let count = self
+            .route_batches_to_dlq(
+                DlqStage::LateData,
+                "late data evicted past its lateness deadline (late_data = \"dlq\")",
+                source_id,
+                dlq_rows,
+            )
+            .await?;
         self.metrics.dlq_writes.inc_by(count);
         Ok(())
     }
 
-    /// Route a failed batch's rows to the configured DLQ topic. The
-    /// DLQ is a Kafka topic produced via the source backend's own
-    /// `write_arrow_stream` (which uses the source's ClientConfig +
-    /// auth). This means DLQ produce only works when the source IS
-    /// Kafka — for non-Kafka sources `write_arrow_stream` will likely
-    /// error with a clearer "wrong target" message, which surfaces
-    /// to the supervisor.
+    /// DLQ Phase 1: resolve the pipeline's [`DeadLetterStore`] —
+    /// once, lazily, and ONLY from an error path (zero happy-path
+    /// cost; a pipeline where nothing fails never calls this).
     ///
-    /// Each row is sent in the source backend's payload format —
-    /// JSON-formatted sources keep their JSON wire format on the
-    /// DLQ, RawBytes-formatted sources keep the raw blob. That
-    /// symmetry means a downstream DLQ consumer can re-consume +
-    /// replay exactly the same way it would the primary topic.
+    /// Resolution order:
+    /// 1. Explicit [`StreamingPipelineConfig::dead_letter_store`].
+    /// 2. `dead_letter_topic` + Kafka source →
+    ///    [`KafkaTopicDlq`] (the historical behavior, upgraded with
+    ///    `emat-dlq-*` metadata headers; payload format preserved).
+    /// 3. The configured state store's family via
+    ///    [`StateStore::dead_letter_store`] (Postgres state store →
+    ///    Postgres `ematix_dlq_records` table).
+    /// 4. Fallback: in-process SQLite [`TableDlq`] (`:memory:`) with
+    ///    a LOUD once-per-pipeline warning — dead-lettered records
+    ///    are lost on process exit, mirroring the
+    ///    `InMemoryStateStore` convention.
+    pub(crate) async fn resolve_dlq_store(
+        &self,
+    ) -> Result<&Arc<dyn DeadLetterStore>, BackendError> {
+        self.dlq_store
+            .get_or_try_init(|| async {
+                // 1. Explicit store wins.
+                if let Some(store) = &self.config.dead_letter_store {
+                    return Ok(Arc::clone(store));
+                }
+                // 2. Historical: explicit topic + Kafka source. Uses
+                //    the primary (first) source — multi-source DLQ
+                //    routing would need per-source policy and isn't
+                //    built (same limitation as before Phase 1).
+                if let Some(topic) = &self.config.dead_letter_topic
+                    && let Some((backend, _query)) = self.sources.first()
+                    && backend.as_kafka().is_some()
+                {
+                    let store = KafkaTopicDlq::new(
+                        Arc::clone(backend),
+                        topic.clone(),
+                        self.config.pipeline_name.clone(),
+                    )?;
+                    return Ok(Arc::new(store) as Arc<dyn DeadLetterStore>);
+                }
+                // 3. The state store family (portable table DLQ).
+                if let Some(state_store) = &self.config.state_store
+                    && let Some(store) = state_store.dead_letter_store().await?
+                {
+                    if self.config.dead_letter_topic.is_some() {
+                        tracing::warn!(
+                            pipeline = %self.config.pipeline_name,
+                            "dead_letter_topic is set but the source is not Kafka —                              routing dead letters to the state store's table DLQ                              instead"
+                        );
+                    }
+                    return Ok(store);
+                }
+                // 4. LOUD fallback. Matches the InMemoryStateStore
+                //    convention: works, but loses data on exit.
+                tracing::warn!(
+                    pipeline = %self.config.pipeline_name,
+                    "DLQ requested but no dead_letter_topic (with a Kafka source),                      no state store with a SQL family, and no explicit                      dead_letter_store are configured — falling back to an                      IN-MEMORY SQLite dead-letter store. Dead-lettered records                      WILL BE LOST when this process exits. Configure a                      dead_letter_topic or a Postgres state store for durability."
+                );
+                let store = TableDlq::open_sqlite(":memory:").await?;
+                Ok(Arc::new(store) as Arc<dyn DeadLetterStore>)
+            })
+            .await
+    }
+
+    /// Route failed batches to the resolved [`DeadLetterStore`] with
+    /// full [`DlqMeta`]. Returns the number of dead-lettered records
+    /// (one per row — feeds the `dlq_writes` counter).
+    ///
+    /// Format preservation: with a Kafka primary source, rows are
+    /// encoded through the source's own `payload_format` machinery
+    /// (`encode_batch_payloads`) — byte-identical to the pre-Phase-1
+    /// `write_arrow_stream`-based DLQ path. Non-Kafka sources encode
+    /// JSONL (`payload_format = "json"`).
+    ///
+    /// At-least-once: callers invoke this BEFORE
+    /// [`Self::finalize_iteration`], so the store's append ack lands
+    /// before source offsets commit.
     async fn route_batches_to_dlq(
         &self,
-        topic: &str,
+        stage: DlqStage,
+        error: &str,
+        source_id: &str,
         batches: Vec<RecordBatch>,
     ) -> Result<u64, BackendError> {
-        let dlq_target = TargetTable {
-            schema: String::new(),
-            name: topic.to_string(),
-        };
-        let stream: ArrowBatchStream =
-            Box::pin(futures_util::stream::iter(batches.into_iter().map(Ok)));
-        // Use the primary (first) source for DLQ produces.
-        // Multi-source DLQ routing would need per-source policy +
-        // a way to know which source originated each row — out of
-        // scope for the v0.1 multi-source path.
+        let store = self.resolve_dlq_store().await?;
+
+        // Failure metadata gathered at the emission boundary (the
+        // stores themselves never read clocks — house convention).
+        let failed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let event_ts: Option<i64> = batches.iter().filter_map(batch_max_event_ts).max();
+
         let primary = self
             .sources
             .first()
             .ok_or_else(|| BackendError::Other("DLQ requested but no sources configured".into()))?;
-        let n = primary
-            .0
-            .write_arrow_stream(&dlq_target, stream, WriteMode::Append)
-            .await?;
+        // Offset snapshot is advisory metadata — a snapshot error
+        // must not turn a recoverable dead-letter into a pipeline
+        // failure.
+        let offset_bytes: Option<Vec<u8>> = primary.0.offset_snapshot().await.unwrap_or(None);
+
+        // Encode rows in the source's wire format.
+        let (payloads, payload_format) = match primary.0.as_kafka() {
+            Some(kafka) => {
+                // Avro/Protobuf schema-subject convention keys off
+                // the DLQ topic when one is configured (identical to
+                // the historical produce path); otherwise the source
+                // id stands in.
+                let subject_topic = self
+                    .config
+                    .dead_letter_topic
+                    .clone()
+                    .unwrap_or_else(|| source_id.to_string());
+                let mut payloads: Vec<Vec<u8>> = Vec::new();
+                for batch in &batches {
+                    payloads.extend(kafka.encode_batch_payloads(&subject_topic, batch).await?);
+                }
+                (payloads, kafka.payload_format().as_str().to_string())
+            }
+            None => {
+                let mut payloads: Vec<Vec<u8>> = Vec::new();
+                for batch in &batches {
+                    payloads.extend(crate::kafka_backend::encode_batch_as_jsonl_lines(batch)?);
+                }
+                (payloads, "json".to_string())
+            }
+        };
+
+        let records: Vec<DlqRecord> = payloads
+            .into_iter()
+            .map(|payload| DlqRecord {
+                id: DlqRecordId(uuid::Uuid::new_v4().to_string()),
+                meta: DlqMeta {
+                    pipeline: self.config.pipeline_name.clone(),
+                    stage,
+                    error: truncate_error(error),
+                    source_id: source_id.to_string(),
+                    offset_bytes: offset_bytes.clone(),
+                    event_ts,
+                    failed_at,
+                    attempt: 1,
+                    payload_format: payload_format.clone(),
+                },
+                payload,
+            })
+            .collect();
+        let n = records.len() as u64;
+        store.append(records).await?;
         Ok(n)
     }
 }
@@ -3155,6 +3315,322 @@ mod tests {
                 target.cdc_calls().is_empty(),
                 "no CDC apply attempted when PK declaration is invalid"
             );
+        }
+
+        // --- DLQ Phase 1: emission rewire through DeadLetterStore ---------
+
+        use crate::dlq::{DeadLetterStore, DlqSelection, DlqStage, TableDlq};
+
+        /// Transform that always errors — drives the
+        /// `transform_on_error = Dlq` emission site.
+        #[derive(Debug)]
+        struct FailingTransform;
+
+        #[async_trait]
+        impl crate::transform::BatchTransform for FailingTransform {
+            fn input_schema(&self) -> arrow_schema::SchemaRef {
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]))
+            }
+            fn output_schema(&self) -> arrow_schema::SchemaRef {
+                self.input_schema()
+            }
+            async fn transform(
+                &self,
+                _input: RecordBatch,
+                _ctx: &crate::transform::BatchContext,
+            ) -> Result<Vec<RecordBatch>, BackendError> {
+                Err(BackendError::Other("scripted transform failure".into()))
+            }
+        }
+
+        /// Write failure with an explicit dead-letter store: the
+        /// batch lands in the store with full `DlqMeta`, offsets
+        /// still commit (after the append), and the pipeline
+        /// continues instead of erroring.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn write_failure_routes_to_explicit_store_with_meta() {
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![one_row_batch(7), one_row_batch(8)]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            target.fail_next();
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+
+            let dlq: Arc<dyn DeadLetterStore> =
+                Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+            let cfg = StreamingPipelineConfig::new("orders-topic", table.clone(), "dlq-p")
+                .with_dead_letter_store(Arc::clone(&dlq));
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            pipeline.run(sig).await.expect("DLQ absorbs the failure");
+
+            assert_eq!(
+                dlq.depth("dlq-p").await.unwrap().pending,
+                2,
+                "both failed rows dead-lettered (one record per row)"
+            );
+            let records = dlq.browse("dlq-p", 0, 10, None).await.unwrap();
+            assert_eq!(records.len(), 2);
+            for r in &records {
+                assert_eq!(r.meta.pipeline, "dlq-p");
+                assert_eq!(r.meta.stage, DlqStage::Write);
+                assert!(
+                    r.meta.error.contains("scripted write failure"),
+                    "error carries the target failure: {}",
+                    r.meta.error
+                );
+                assert_eq!(r.meta.source_id, "orders-topic");
+                assert_eq!(r.meta.attempt, 1);
+                assert_eq!(r.meta.payload_format, "json");
+                assert!(r.meta.failed_at > 0, "failed_at populated");
+            }
+            // Format preservation (non-Kafka source ⇒ JSONL): the
+            // original row round-trips as its JSON wire form.
+            let payloads: Vec<String> = records
+                .iter()
+                .map(|r| String::from_utf8(r.payload.clone()).unwrap())
+                .collect();
+            assert!(payloads.contains(&"{\"v\":7}".to_string()), "{payloads:?}");
+            assert!(payloads.contains(&"{\"v\":8}".to_string()), "{payloads:?}");
+
+            assert_eq!(
+                source.commit_count(),
+                1,
+                "offsets commit AFTER the DLQ append ack (at-least-once preserved)"
+            );
+            assert_eq!(pipeline.metrics.dlq_writes.get(), 2, "dlq_writes counted");
+        }
+
+        /// Transform error under `on_error = "dlq"` routes the
+        /// ORIGINAL (pre-transform) batch with stage = Transform.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn transform_error_dlq_policy_routes_original_batch() {
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![one_row_batch(42)]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+
+            let dlq: Arc<dyn DeadLetterStore> =
+                Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+            let cfg = StreamingPipelineConfig::new("orders-topic", table.clone(), "tf-p")
+                .with_transform(Arc::new(FailingTransform))
+                .with_transform_on_error(TransformErrorPolicy::Dlq)
+                .with_dead_letter_store(Arc::clone(&dlq));
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            pipeline.run(sig).await.expect("DLQ absorbs the failure");
+
+            let records = dlq.browse("tf-p", 0, 10, None).await.unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].meta.stage, DlqStage::Transform);
+            assert!(
+                records[0].meta.error.contains("scripted transform failure"),
+                "{}",
+                records[0].meta.error
+            );
+            assert_eq!(
+                String::from_utf8(records[0].payload.clone()).unwrap(),
+                "{\"v\":42}",
+                "the PRE-transform input batch is what dead-letters"
+            );
+            assert!(
+                target.writes().is_empty(),
+                "nothing reached the target for the failed batch"
+            );
+        }
+
+        /// The records a store hands back are takeable — the Phase 2
+        /// replay engine sees exactly what the pipeline emitted.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn emitted_records_are_takeable_for_replay() {
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![one_row_batch(1)]);
+            let target = Arc::new(TestBackend::new("t"));
+            target.fail_next();
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let dlq: Arc<dyn DeadLetterStore> =
+                Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+            let cfg = StreamingPipelineConfig::new("q", table.clone(), "rp")
+                .with_dead_letter_store(Arc::clone(&dlq));
+            let pipeline = StreamingPipeline::new(
+                source as Arc<dyn Backend>,
+                vec![(target as Arc<dyn Backend>, table)],
+                cfg,
+            );
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            pipeline.run(sig).await.unwrap();
+
+            let taken = dlq
+                .take_for_replay("rp", DlqSelection::All, Duration::from_secs(60), 1)
+                .await
+                .unwrap();
+            assert_eq!(taken.len(), 1);
+        }
+
+        /// Behavior pin: with NO DLQ configured (no topic, no store)
+        /// a write failure still propagates and offsets do not
+        /// commit — byte-identical to pre-Phase-1 (see also
+        /// `target_failure_skips_offset_commit_when_no_dlq` above,
+        /// which this complements for the single-target shape).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn no_dlq_config_write_failure_still_propagates() {
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![one_row_batch(1)]);
+            let target = Arc::new(TestBackend::new("t"));
+            target.fail_next();
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("q", table.clone(), "plain");
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![(target as Arc<dyn Backend>, table)],
+                cfg,
+            );
+            let (sig, _trigger) = ShutdownSignal::new();
+            let err = pipeline.run(sig).await.expect_err("must propagate");
+            assert!(err.to_string().contains("scripted write failure"));
+            assert_eq!(source.commit_count(), 0);
+        }
+
+        /// Resolution rule 2: explicit topic + Kafka source →
+        /// KafkaTopicDlq (constructing a KafkaBackend does not
+        /// contact the broker, so this is a pure unit test).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn resolution_prefers_kafka_topic_store() {
+            let kafka: Arc<dyn Backend> =
+                Arc::new(KafkaBackend::open("localhost:9092", Some("g")).unwrap());
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "kp")
+                .with_dead_letter_topic("dlq-topic");
+            let pipeline =
+                StreamingPipeline::new(kafka, vec![(target as Arc<dyn Backend>, table)], cfg);
+            let store = pipeline.resolve_dlq_store().await.unwrap();
+            let debug = format!("{store:?}");
+            assert!(debug.contains("KafkaTopicDlq"), "resolved: {debug}");
+            assert!(debug.contains("dlq-topic"), "resolved: {debug}");
+        }
+
+        /// Resolution rule 3: a state store that provides a DLQ on
+        /// its family wins over the in-memory fallback.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn resolution_uses_state_store_family() {
+            #[derive(Debug)]
+            struct DlqProvidingStateStore(Arc<dyn DeadLetterStore>);
+            #[async_trait]
+            impl crate::state_store::StateStore for DlqProvidingStateStore {
+                async fn load(
+                    &self,
+                    _pipeline: &str,
+                ) -> Result<crate::state_store::RecoveredState, BackendError> {
+                    Ok(Default::default())
+                }
+                async fn commit(
+                    &self,
+                    _pipeline: &str,
+                    _snapshot: crate::state_store::CommitSnapshot,
+                ) -> Result<(), BackendError> {
+                    Ok(())
+                }
+                async fn dead_letter_store(
+                    &self,
+                ) -> Result<Option<Arc<dyn DeadLetterStore>>, BackendError> {
+                    Ok(Some(Arc::clone(&self.0)))
+                }
+            }
+
+            let family_dlq: Arc<dyn DeadLetterStore> =
+                Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+            let source = Arc::new(TestBackend::new("src"));
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("q", table.clone(), "fam")
+                .with_state_store(Arc::new(DlqProvidingStateStore(Arc::clone(&family_dlq))));
+            let pipeline = StreamingPipeline::new(
+                source as Arc<dyn Backend>,
+                vec![(target as Arc<dyn Backend>, table)],
+                cfg,
+            );
+            let resolved = pipeline.resolve_dlq_store().await.unwrap();
+            assert!(
+                Arc::ptr_eq(resolved, &family_dlq),
+                "the state store's family DLQ must be used verbatim"
+            );
+        }
+
+        /// Resolution rule 4: nothing configured → LOUD in-memory
+        /// SQLite fallback (the `on_error = dlq` batch is preserved
+        /// in-process instead of silently discarded as pre-Phase-1).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn resolution_falls_back_to_in_memory_table() {
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![one_row_batch(5)]);
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("q", table.clone(), "fb")
+                .with_transform(Arc::new(FailingTransform))
+                .with_transform_on_error(TransformErrorPolicy::Dlq);
+            let pipeline = StreamingPipeline::new(
+                source as Arc<dyn Backend>,
+                vec![(target as Arc<dyn Backend>, table)],
+                cfg,
+            );
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            pipeline.run(sig).await.expect("fallback DLQ absorbs");
+            assert_eq!(
+                pipeline.metrics.dlq_writes.get(),
+                1,
+                "the failed batch dead-lettered into the in-memory fallback"
+            );
+            let store = pipeline.resolve_dlq_store().await.unwrap();
+            assert_eq!(store.depth("fb").await.unwrap().pending, 1);
         }
     }
 }

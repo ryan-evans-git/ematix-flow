@@ -1,7 +1,7 @@
 # Plan — DLQ management + stream replayability
 
 **PRD:** [docs/prds/2026-07-04-dlq-replay.md](../prds/2026-07-04-dlq-replay.md)
-**Status:** Phase 1 in flight (2026-07-04)
+**Status:** Phase 1 landed on `feat/dlq-store-phase1` (2026-07-04); Phase 2 next
 **Discipline:** TDD per phase (contract tests written first, shared across
 store impls); every phase independently green + shippable; strict CI gates
 unchanged. Rust core in `ematix-flow-core`, orchestration/API in
@@ -31,6 +31,18 @@ unchanged. Rust core in `ematix-flow-core`, orchestration/API in
   existing streaming bench/smoke).
 - Exit: contract suite green on all impls; integration: fail →
   record-with-meta visible via store API on Kafka + SQLite + Postgres.
+- **Landed 2026-07-04** (`feat/dlq-store-phase1`): contract suite
+  18/18 on TableDlq(SQLite) + 18/18 on TableDlq(Postgres,
+  testcontainers); KafkaTopicDlq applicable subset + typed
+  `Unsupported` pins green on a real broker; legacy
+  `streaming_pipeline_routes_failed_batch_to_dlq` upgraded with
+  `emat-dlq-*` header assertions. Phase 1 deviations/notes for
+  Phase 2: (a) `take_for_replay` carries an explicit `now_ms`
+  parameter (timestamps-passed-in house rule); (b) the lease column
+  is named `leased_until` (plan said `taken_until`); (c)
+  KafkaTopicDlq lease semantics are group-offset based and
+  process-local — concurrent cross-process replays must serialize
+  in the replay engine (see `dlq/kafka_topic.rs` module docs).
 
 ## Phase 2 — Replay engine (redrive = reprocess through pipeline)
 

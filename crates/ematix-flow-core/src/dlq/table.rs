@@ -1,0 +1,858 @@
+//! `TableDlq` — the universal, table-backed `DeadLetterStore`.
+//!
+//! One `ematix_dlq_records` table on the state-store SQL family:
+//!
+//! - **SQLite** (local dev + the zero-config fallback): payload BLOB
+//!   plus metadata columns in `main`, following `SQLiteBackend`'s
+//!   threading model (`rusqlite::Connection` is `Send` but not `Sync`,
+//!   so: `Arc<Mutex<..>>` + `tokio::task::spawn_blocking`). Append
+//!   order is the implicit `rowid`.
+//! - **Postgres** (prod): same shape under a configurable schema,
+//!   riding the identical `deadpool_postgres` plumbing as
+//!   [`crate::state_store::PostgresStateStore`] (and shareable with
+//!   its pool via [`TableDlq::from_postgres_pool`]). Append order is
+//!   an identity `seq` column; `take_for_replay` uses
+//!   `FOR UPDATE SKIP LOCKED` so concurrent replays never
+//!   double-lease.
+//!
+//! Schema management mirrors `ematix_streaming_state`: idempotent
+//! `CREATE TABLE IF NOT EXISTS` at store construction, indexed on
+//! `(pipeline_name, status)`.
+//!
+//! ## Lease model
+//!
+//! `status` ∈ {`pending`, `leased`, `parked`} plus a nullable
+//! `leased_until` (milliseconds since the Unix epoch). A record is
+//! *eligible* for [`DeadLetterStore::take_for_replay`] when
+//! `status = 'pending'` OR (`status = 'leased'` AND
+//! `leased_until <= now_ms`) — the caller supplies `now_ms`, the
+//! store never reads a clock (house testability convention).
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use rusqlite::Connection as SqliteConn;
+use tokio_postgres::{Config as PgConfig, NoTls};
+
+use crate::backend::BackendError;
+use crate::pg::PgError;
+
+use super::{
+    DeadLetterStore, DlqDepth, DlqError, DlqMeta, DlqRecord, DlqRecordId, DlqRecordStatus,
+    DlqSelection, DlqStage, truncate_error,
+};
+
+/// Table name shared by both SQL flavors (schema-qualified on
+/// Postgres, `main` on SQLite).
+const TABLE: &str = "ematix_dlq_records";
+
+#[derive(Debug)]
+enum Inner {
+    Sqlite(Arc<Mutex<SqliteConn>>),
+    Postgres { pool: Pool, schema: String },
+}
+
+/// Table-backed [`DeadLetterStore`] over SQLite or Postgres.
+#[derive(Debug)]
+pub struct TableDlq {
+    inner: Inner,
+}
+
+impl TableDlq {
+    /// Open (or create) a SQLite-backed store at `path`
+    /// (`":memory:"` for an in-process ephemeral store). Ensures the
+    /// `ematix_dlq_records` schema idempotently.
+    pub async fn open_sqlite(path: &str) -> Result<Self, BackendError> {
+        let path = path.to_string();
+        let conn = tokio::task::spawn_blocking(move || -> Result<SqliteConn, BackendError> {
+            let conn = SqliteConn::open(&path)
+                .map_err(|e| BackendError::Connection(format!("sqlite dlq open {path}: {e}")))?;
+            conn.execute_batch(&sqlite_schema_sql())
+                .map_err(|e| BackendError::Query(format!("sqlite dlq schema: {e}")))?;
+            Ok(conn)
+        })
+        .await
+        .map_err(|e| BackendError::Other(format!("sqlite dlq open join: {e}")))??;
+        Ok(Self {
+            inner: Inner::Sqlite(Arc::new(Mutex::new(conn))),
+        })
+    }
+
+    /// Open a Postgres-backed store against `url`, mirroring
+    /// [`crate::state_store::PostgresStateStore::connect`] (eager
+    /// connectivity validation, same pool shape). Ensures the schema
+    /// idempotently.
+    pub async fn connect_postgres(url: &str, schema: &str) -> Result<Self, BackendError> {
+        let pg_cfg: PgConfig = url.parse().map_err(|e: tokio_postgres::Error| {
+            BackendError::Connection(format!("invalid postgres url: {e}"))
+        })?;
+        let mgr_cfg = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+        let mgr = Manager::from_config(pg_cfg, NoTls, mgr_cfg);
+        let pool = Pool::builder(mgr)
+            .max_size(8)
+            .build()
+            .map_err(|e| BackendError::Connection(format!("pool: {e}")))?;
+        Self::from_postgres_pool(pool, schema).await
+    }
+
+    /// Build the store over an existing pool — used by
+    /// `PostgresStateStore::dead_letter_store()` so the DLQ rides
+    /// the state store's connection family with no extra infra.
+    pub async fn from_postgres_pool(pool: Pool, schema: &str) -> Result<Self, BackendError> {
+        let store = Self {
+            inner: Inner::Postgres {
+                pool,
+                schema: schema.to_string(),
+            },
+        };
+        store.ensure_pg_schema().await?;
+        Ok(store)
+    }
+
+    async fn ensure_pg_schema(&self) -> Result<(), BackendError> {
+        let Inner::Postgres { pool, schema } = &self.inner else {
+            return Ok(());
+        };
+        let schema_q = quote_ident(schema);
+        let sql = format!(
+            "CREATE SCHEMA IF NOT EXISTS {schema_q};
+             CREATE TABLE IF NOT EXISTS {schema_q}.{TABLE} (
+                 id             TEXT    PRIMARY KEY,
+                 seq            BIGINT  GENERATED BY DEFAULT AS IDENTITY,
+                 pipeline_name  TEXT    NOT NULL,
+                 stage          TEXT    NOT NULL,
+                 error          TEXT    NOT NULL,
+                 source_id      TEXT    NOT NULL,
+                 offset_bytes   BYTEA,
+                 event_ts       BIGINT,
+                 failed_at      BIGINT  NOT NULL,
+                 attempt        INTEGER NOT NULL,
+                 payload_format TEXT    NOT NULL,
+                 payload        BYTEA   NOT NULL,
+                 status         TEXT    NOT NULL DEFAULT 'pending',
+                 leased_until   BIGINT
+             );
+             CREATE INDEX IF NOT EXISTS {TABLE}_pipeline_status_idx
+                 ON {schema_q}.{TABLE} (pipeline_name, status);
+             CREATE INDEX IF NOT EXISTS {TABLE}_pipeline_seq_idx
+                 ON {schema_q}.{TABLE} (pipeline_name, seq);"
+        );
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| BackendError::Connection(format!("pool: {e}")))?;
+        client.batch_execute(&sql).await.map_err(pg_err)?;
+        Ok(())
+    }
+
+    /// Run `f` on the SQLite connection inside `spawn_blocking`.
+    async fn sqlite<T, F>(&self, f: F) -> Result<T, DlqError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut SqliteConn) -> Result<T, rusqlite::Error> + Send + 'static,
+    {
+        let Inner::Sqlite(conn) = &self.inner else {
+            unreachable!("sqlite() called on a non-sqlite TableDlq");
+        };
+        let conn = Arc::clone(conn);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn.lock().expect("TableDlq sqlite mutex poisoned");
+            f(&mut guard).map_err(|e| BackendError::Query(format!("sqlite dlq: {e}")))
+        })
+        .await
+        .map_err(|e| DlqError::Backend(BackendError::Other(format!("sqlite dlq join: {e}"))))?
+        .map_err(DlqError::Backend)
+    }
+
+    async fn pg_client(&self) -> Result<deadpool_postgres::Object, DlqError> {
+        let Inner::Postgres { pool, .. } = &self.inner else {
+            unreachable!("pg_client() called on a non-postgres TableDlq");
+        };
+        pool.get()
+            .await
+            .map_err(|e| DlqError::Backend(BackendError::Connection(format!("pool: {e}"))))
+    }
+}
+
+/// SQLite DDL. `rowid` (implicit) is the append-order key; SQLite
+/// has no schemas, so we live in `main` with the `ematix_` prefix
+/// like `SQLiteBackend`'s meta tables.
+fn sqlite_schema_sql() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {TABLE} (\
+             id             TEXT    PRIMARY KEY, \
+             pipeline_name  TEXT    NOT NULL, \
+             stage          TEXT    NOT NULL, \
+             error          TEXT    NOT NULL, \
+             source_id      TEXT    NOT NULL, \
+             offset_bytes   BLOB, \
+             event_ts       INTEGER, \
+             failed_at      INTEGER NOT NULL, \
+             attempt        INTEGER NOT NULL, \
+             payload_format TEXT    NOT NULL, \
+             payload        BLOB    NOT NULL, \
+             status         TEXT    NOT NULL DEFAULT 'pending', \
+             leased_until   INTEGER\
+         ); \
+         CREATE INDEX IF NOT EXISTS {TABLE}_pipeline_status_idx \
+             ON {TABLE} (pipeline_name, status);"
+    )
+}
+
+/// Column list shared by every row-returning query, in the order
+/// `row_to_record` reads them.
+const RECORD_COLS: &str = "id, pipeline_name, stage, error, source_id, offset_bytes, event_ts, failed_at, \
+     attempt, payload_format, payload";
+
+fn sqlite_row_to_record(row: &rusqlite::Row<'_>) -> Result<DlqRecord, rusqlite::Error> {
+    let stage_s: String = row.get(2)?;
+    let attempt: i64 = row.get(8)?;
+    Ok(DlqRecord {
+        id: DlqRecordId(row.get(0)?),
+        meta: DlqMeta {
+            pipeline: row.get(1)?,
+            stage: DlqStage::parse(&stage_s).unwrap_or(DlqStage::Write),
+            error: row.get(3)?,
+            source_id: row.get(4)?,
+            offset_bytes: row.get(5)?,
+            event_ts: row.get(6)?,
+            failed_at: row.get(7)?,
+            attempt: attempt as u32,
+            payload_format: row.get(9)?,
+        },
+        payload: row.get(10)?,
+    })
+}
+
+fn pg_row_to_record(row: &tokio_postgres::Row) -> DlqRecord {
+    let stage_s: String = row.get(2);
+    let attempt: i32 = row.get(8);
+    DlqRecord {
+        id: DlqRecordId(row.get(0)),
+        meta: DlqMeta {
+            pipeline: row.get(1),
+            stage: DlqStage::parse(&stage_s).unwrap_or(DlqStage::Write),
+            error: row.get(3),
+            source_id: row.get(4),
+            offset_bytes: row.get(5),
+            event_ts: row.get(6),
+            failed_at: row.get(7),
+            attempt: attempt as u32,
+            payload_format: row.get(9),
+        },
+        payload: row.get(10),
+    }
+}
+
+/// `(?, ?, …)` placeholder list for SQLite dynamic `IN` clauses.
+fn sqlite_placeholders(n: usize) -> String {
+    let mut s = String::with_capacity(n * 2);
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('?');
+    }
+    s
+}
+
+fn lease_deadline(now_ms: i64, lease: Duration) -> i64 {
+    now_ms.saturating_add(i64::try_from(lease.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn pg_err(e: tokio_postgres::Error) -> BackendError {
+    BackendError::from(PgError::Postgres(e))
+}
+
+/// Render a Postgres identifier safely (same contract as
+/// `state_store::postgres::quote_ident`).
+fn quote_ident(ident: &str) -> String {
+    let escaped = ident.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+/// Eligibility predicate for `take_for_replay` — `$now` is spliced
+/// as a bound parameter by each caller.
+const ELIGIBLE_PRED_SQLITE: &str =
+    "(status = 'pending' OR (status = 'leased' AND leased_until <= ?2))";
+
+#[async_trait::async_trait]
+impl DeadLetterStore for TableDlq {
+    async fn append(&self, records: Vec<DlqRecord>) -> Result<(), DlqError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        match &self.inner {
+            Inner::Sqlite(_) => {
+                self.sqlite(move |conn| {
+                    let tx = conn.transaction()?;
+                    {
+                        let mut stmt = tx.prepare(&format!(
+                            "INSERT INTO {TABLE} ({RECORD_COLS}, status, leased_until) \
+                             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'pending',NULL)"
+                        ))?;
+                        for r in &records {
+                            stmt.execute(rusqlite::params![
+                                r.id.0,
+                                r.meta.pipeline,
+                                r.meta.stage.as_str(),
+                                truncate_error(&r.meta.error),
+                                r.meta.source_id,
+                                r.meta.offset_bytes,
+                                r.meta.event_ts,
+                                r.meta.failed_at,
+                                i64::from(r.meta.attempt),
+                                r.meta.payload_format,
+                                r.payload,
+                            ])?;
+                        }
+                    }
+                    tx.commit()
+                })
+                .await
+            }
+            Inner::Postgres { schema, .. } => {
+                let schema_q = quote_ident(schema);
+                let mut client = self.pg_client().await?;
+                let tx = client.transaction().await.map_err(pg_err)?;
+                let stmt = tx
+                    .prepare(&format!(
+                        "INSERT INTO {schema_q}.{TABLE} ({RECORD_COLS}, status, leased_until) \
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',NULL)"
+                    ))
+                    .await
+                    .map_err(pg_err)?;
+                for r in &records {
+                    let error = truncate_error(&r.meta.error);
+                    tx.execute(
+                        &stmt,
+                        &[
+                            &r.id.0,
+                            &r.meta.pipeline,
+                            &r.meta.stage.as_str(),
+                            &error,
+                            &r.meta.source_id,
+                            &r.meta.offset_bytes,
+                            &r.meta.event_ts,
+                            &r.meta.failed_at,
+                            &(r.meta.attempt as i32),
+                            &r.meta.payload_format,
+                            &r.payload,
+                        ],
+                    )
+                    .await
+                    .map_err(pg_err)?;
+                }
+                tx.commit().await.map_err(pg_err)?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn depth(&self, pipeline: &str) -> Result<DlqDepth, DlqError> {
+        match &self.inner {
+            Inner::Sqlite(_) => {
+                let pipeline = pipeline.to_string();
+                self.sqlite(move |conn| {
+                    conn.query_row(
+                        &format!(
+                            "SELECT \
+                                 COALESCE(SUM(CASE WHEN status != 'parked' THEN 1 ELSE 0 END), 0), \
+                                 COALESCE(SUM(CASE WHEN status  = 'parked' THEN 1 ELSE 0 END), 0) \
+                             FROM {TABLE} WHERE pipeline_name = ?1"
+                        ),
+                        rusqlite::params![pipeline],
+                        |row| {
+                            let pending: i64 = row.get(0)?;
+                            let parked: i64 = row.get(1)?;
+                            Ok(DlqDepth {
+                                pending: pending as u64,
+                                parked: parked as u64,
+                            })
+                        },
+                    )
+                })
+                .await
+            }
+            Inner::Postgres { schema, .. } => {
+                let schema_q = quote_ident(schema);
+                let client = self.pg_client().await?;
+                let row = client
+                    .query_one(
+                        &format!(
+                            "SELECT \
+                                 COALESCE(SUM(CASE WHEN status != 'parked' THEN 1 ELSE 0 END), 0)::BIGINT, \
+                                 COALESCE(SUM(CASE WHEN status  = 'parked' THEN 1 ELSE 0 END), 0)::BIGINT \
+                             FROM {schema_q}.{TABLE} WHERE pipeline_name = $1"
+                        ),
+                        &[&pipeline],
+                    )
+                    .await
+                    .map_err(pg_err)?;
+                let pending: i64 = row.get(0);
+                let parked: i64 = row.get(1);
+                Ok(DlqDepth {
+                    pending: pending as u64,
+                    parked: parked as u64,
+                })
+            }
+        }
+    }
+
+    async fn browse(
+        &self,
+        pipeline: &str,
+        page: u64,
+        page_size: u64,
+        status_filter: Option<DlqRecordStatus>,
+    ) -> Result<Vec<DlqRecord>, DlqError> {
+        let limit = i64::try_from(page_size).unwrap_or(i64::MAX);
+        let offset = i64::try_from(page.saturating_mul(page_size)).unwrap_or(i64::MAX);
+        match &self.inner {
+            Inner::Sqlite(_) => {
+                let pipeline = pipeline.to_string();
+                self.sqlite(move |conn| {
+                    let (filter_sql, status_s) = match status_filter {
+                        Some(s) => (" AND status = ?4", s.as_str()),
+                        None => ("", ""),
+                    };
+                    let sql = format!(
+                        "SELECT {RECORD_COLS} FROM {TABLE} \
+                         WHERE pipeline_name = ?1{filter_sql} \
+                         ORDER BY rowid LIMIT ?2 OFFSET ?3"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = if status_filter.is_some() {
+                        stmt.query_map(
+                            rusqlite::params![pipeline, limit, offset, status_s],
+                            sqlite_row_to_record,
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        stmt.query_map(
+                            rusqlite::params![pipeline, limit, offset],
+                            sqlite_row_to_record,
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?
+                    };
+                    Ok(rows)
+                })
+                .await
+            }
+            Inner::Postgres { schema, .. } => {
+                let schema_q = quote_ident(schema);
+                let client = self.pg_client().await?;
+                let rows = match status_filter {
+                    Some(s) => {
+                        client
+                            .query(
+                                &format!(
+                                    "SELECT {RECORD_COLS} FROM {schema_q}.{TABLE} \
+                                     WHERE pipeline_name = $1 AND status = $4 \
+                                     ORDER BY seq LIMIT $2 OFFSET $3"
+                                ),
+                                &[&pipeline, &limit, &offset, &s.as_str()],
+                            )
+                            .await
+                    }
+                    None => {
+                        client
+                            .query(
+                                &format!(
+                                    "SELECT {RECORD_COLS} FROM {schema_q}.{TABLE} \
+                                     WHERE pipeline_name = $1 \
+                                     ORDER BY seq LIMIT $2 OFFSET $3"
+                                ),
+                                &[&pipeline, &limit, &offset],
+                            )
+                            .await
+                    }
+                }
+                .map_err(pg_err)?;
+                Ok(rows.iter().map(pg_row_to_record).collect())
+            }
+        }
+    }
+
+    async fn take_for_replay(
+        &self,
+        pipeline: &str,
+        selection: DlqSelection,
+        lease: Duration,
+        now_ms: i64,
+    ) -> Result<Vec<DlqRecord>, DlqError> {
+        let until = lease_deadline(now_ms, lease);
+        match &self.inner {
+            Inner::Sqlite(_) => {
+                let pipeline = pipeline.to_string();
+                self.sqlite(move |conn| {
+                    // The connection mutex already serializes access,
+                    // but the transaction keeps the select+update+
+                    // select atomic vs. other handles on a shared
+                    // file database.
+                    let tx = conn.transaction()?;
+                    // 1. Pick eligible ids in append order.
+                    let picked: Vec<String> = {
+                        let (sql, extra): (String, Vec<Box<dyn rusqlite::ToSql>>) = match &selection
+                        {
+                            DlqSelection::All => (
+                                format!(
+                                    "SELECT id FROM {TABLE} WHERE pipeline_name = ?1 \
+                                     AND {ELIGIBLE_PRED_SQLITE} ORDER BY rowid"
+                                ),
+                                Vec::new(),
+                            ),
+                            DlqSelection::FirstN(n) => (
+                                format!(
+                                    "SELECT id FROM {TABLE} WHERE pipeline_name = ?1 \
+                                     AND {ELIGIBLE_PRED_SQLITE} ORDER BY rowid LIMIT ?3"
+                                ),
+                                vec![Box::new(i64::try_from(*n).unwrap_or(i64::MAX))],
+                            ),
+                            DlqSelection::Ids(ids) => {
+                                let ph = sqlite_placeholders(ids.len());
+                                let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                                    Vec::with_capacity(ids.len());
+                                for id in ids {
+                                    params.push(Box::new(id.0.clone()));
+                                }
+                                (
+                                    format!(
+                                        "SELECT id FROM {TABLE} WHERE pipeline_name = ?1 \
+                                         AND {ELIGIBLE_PRED_SQLITE} AND id IN ({ph2}) \
+                                         ORDER BY rowid",
+                                        ph2 = ph
+                                            .split(',')
+                                            .enumerate()
+                                            .map(|(i, _)| format!("?{}", i + 3))
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    ),
+                                    params,
+                                )
+                            }
+                        };
+                        let mut stmt = tx.prepare(&sql)?;
+                        let mut all: Vec<Box<dyn rusqlite::ToSql>> =
+                            vec![Box::new(pipeline.clone()), Box::new(now_ms)];
+                        all.extend(extra);
+                        let refs: Vec<&dyn rusqlite::ToSql> =
+                            all.iter().map(|b| b.as_ref()).collect();
+                        stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(0))?
+                            .collect::<Result<Vec<_>, _>>()?
+                    };
+                    if picked.is_empty() {
+                        tx.commit()?;
+                        return Ok(Vec::new());
+                    }
+                    // 2. Lease them.
+                    {
+                        let ph = sqlite_placeholders(picked.len());
+                        let sql = format!(
+                            "UPDATE {TABLE} SET status = 'leased', leased_until = ?1 \
+                             WHERE id IN ({ph2})",
+                            ph2 = ph
+                                .split(',')
+                                .enumerate()
+                                .map(|(i, _)| format!("?{}", i + 2))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        );
+                        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(until)];
+                        for id in &picked {
+                            params.push(Box::new(id.clone()));
+                        }
+                        let refs: Vec<&dyn rusqlite::ToSql> =
+                            params.iter().map(|b| b.as_ref()).collect();
+                        tx.execute(&sql, refs.as_slice())?;
+                    }
+                    // 3. Return the full leased records, oldest-first.
+                    let out = {
+                        let ph = sqlite_placeholders(picked.len());
+                        let sql = format!(
+                            "SELECT {RECORD_COLS} FROM {TABLE} WHERE id IN ({ph}) \
+                             ORDER BY rowid"
+                        );
+                        let params: Vec<Box<dyn rusqlite::ToSql>> = picked
+                            .iter()
+                            .map(|id| Box::new(id.clone()) as Box<dyn rusqlite::ToSql>)
+                            .collect();
+                        let refs: Vec<&dyn rusqlite::ToSql> =
+                            params.iter().map(|b| b.as_ref()).collect();
+                        let mut stmt = tx.prepare(&sql)?;
+                        stmt.query_map(refs.as_slice(), sqlite_row_to_record)?
+                            .collect::<Result<Vec<_>, _>>()?
+                    };
+                    tx.commit()?;
+                    Ok(out)
+                })
+                .await
+            }
+            Inner::Postgres { schema, .. } => {
+                let schema_q = quote_ident(schema);
+                let mut client = self.pg_client().await?;
+                let tx = client.transaction().await.map_err(pg_err)?;
+                let eligible = "(status = 'pending' OR (status = 'leased' AND leased_until <= $2))";
+                let rows = match &selection {
+                    DlqSelection::All => {
+                        tx.query(
+                            &format!(
+                                "WITH eligible AS (\
+                                     SELECT id FROM {schema_q}.{TABLE} \
+                                     WHERE pipeline_name = $1 AND {eligible} \
+                                     ORDER BY seq FOR UPDATE SKIP LOCKED) \
+                                 UPDATE {schema_q}.{TABLE} t \
+                                 SET status = 'leased', leased_until = $3 \
+                                 FROM eligible WHERE t.id = eligible.id \
+                                 RETURNING {cols}, t.seq",
+                                cols = record_cols_prefixed("t")
+                            ),
+                            &[&pipeline, &now_ms, &until],
+                        )
+                        .await
+                    }
+                    DlqSelection::FirstN(n) => {
+                        let limit = i64::try_from(*n).unwrap_or(i64::MAX);
+                        tx.query(
+                            &format!(
+                                "WITH eligible AS (\
+                                     SELECT id FROM {schema_q}.{TABLE} \
+                                     WHERE pipeline_name = $1 AND {eligible} \
+                                     ORDER BY seq LIMIT $4 FOR UPDATE SKIP LOCKED) \
+                                 UPDATE {schema_q}.{TABLE} t \
+                                 SET status = 'leased', leased_until = $3 \
+                                 FROM eligible WHERE t.id = eligible.id \
+                                 RETURNING {cols}, t.seq",
+                                cols = record_cols_prefixed("t")
+                            ),
+                            &[&pipeline, &now_ms, &until, &limit],
+                        )
+                        .await
+                    }
+                    DlqSelection::Ids(ids) => {
+                        let id_vec: Vec<String> = ids.iter().map(|i| i.0.clone()).collect();
+                        tx.query(
+                            &format!(
+                                "WITH eligible AS (\
+                                     SELECT id FROM {schema_q}.{TABLE} \
+                                     WHERE pipeline_name = $1 AND {eligible} \
+                                       AND id = ANY($4) \
+                                     ORDER BY seq FOR UPDATE SKIP LOCKED) \
+                                 UPDATE {schema_q}.{TABLE} t \
+                                 SET status = 'leased', leased_until = $3 \
+                                 FROM eligible WHERE t.id = eligible.id \
+                                 RETURNING {cols}, t.seq",
+                                cols = record_cols_prefixed("t")
+                            ),
+                            &[&pipeline, &now_ms, &until, &id_vec],
+                        )
+                        .await
+                    }
+                }
+                .map_err(pg_err)?;
+                tx.commit().await.map_err(pg_err)?;
+                // RETURNING order is unspecified — restore append
+                // order via the trailing seq column.
+                let mut with_seq: Vec<(i64, DlqRecord)> = rows
+                    .iter()
+                    .map(|row| {
+                        let seq: i64 = row.get(11);
+                        (seq, pg_row_to_record(row))
+                    })
+                    .collect();
+                with_seq.sort_by_key(|(seq, _)| *seq);
+                Ok(with_seq.into_iter().map(|(_, r)| r).collect())
+            }
+        }
+    }
+
+    async fn ack_replayed(&self, pipeline: &str, ids: &[DlqRecordId]) -> Result<(), DlqError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        match &self.inner {
+            Inner::Sqlite(_) => {
+                let pipeline = pipeline.to_string();
+                let id_vec: Vec<String> = ids.iter().map(|i| i.0.clone()).collect();
+                self.sqlite(move |conn| {
+                    let ph = (0..id_vec.len())
+                        .map(|i| format!("?{}", i + 2))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let sql =
+                        format!("DELETE FROM {TABLE} WHERE pipeline_name = ?1 AND id IN ({ph})");
+                    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(pipeline)];
+                    for id in id_vec {
+                        params.push(Box::new(id));
+                    }
+                    let refs: Vec<&dyn rusqlite::ToSql> =
+                        params.iter().map(|b| b.as_ref()).collect();
+                    conn.execute(&sql, refs.as_slice())?;
+                    Ok(())
+                })
+                .await
+            }
+            Inner::Postgres { schema, .. } => {
+                let schema_q = quote_ident(schema);
+                let client = self.pg_client().await?;
+                let id_vec: Vec<String> = ids.iter().map(|i| i.0.clone()).collect();
+                client
+                    .execute(
+                        &format!(
+                            "DELETE FROM {schema_q}.{TABLE} \
+                             WHERE pipeline_name = $1 AND id = ANY($2)"
+                        ),
+                        &[&pipeline, &id_vec],
+                    )
+                    .await
+                    .map_err(pg_err)?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn park(&self, pipeline: &str, ids: &[DlqRecordId]) -> Result<(), DlqError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        match &self.inner {
+            Inner::Sqlite(_) => {
+                let pipeline = pipeline.to_string();
+                let id_vec: Vec<String> = ids.iter().map(|i| i.0.clone()).collect();
+                self.sqlite(move |conn| {
+                    let ph = (0..id_vec.len())
+                        .map(|i| format!("?{}", i + 2))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let sql = format!(
+                        "UPDATE {TABLE} SET status = 'parked', leased_until = NULL \
+                         WHERE pipeline_name = ?1 AND id IN ({ph})"
+                    );
+                    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(pipeline)];
+                    for id in id_vec {
+                        params.push(Box::new(id));
+                    }
+                    let refs: Vec<&dyn rusqlite::ToSql> =
+                        params.iter().map(|b| b.as_ref()).collect();
+                    conn.execute(&sql, refs.as_slice())?;
+                    Ok(())
+                })
+                .await
+            }
+            Inner::Postgres { schema, .. } => {
+                let schema_q = quote_ident(schema);
+                let client = self.pg_client().await?;
+                let id_vec: Vec<String> = ids.iter().map(|i| i.0.clone()).collect();
+                client
+                    .execute(
+                        &format!(
+                            "UPDATE {schema_q}.{TABLE} \
+                             SET status = 'parked', leased_until = NULL \
+                             WHERE pipeline_name = $1 AND id = ANY($2)"
+                        ),
+                        &[&pipeline, &id_vec],
+                    )
+                    .await
+                    .map_err(pg_err)?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn purge(&self, pipeline: &str, selection: DlqSelection) -> Result<u64, DlqError> {
+        match &self.inner {
+            Inner::Sqlite(_) => {
+                let pipeline = pipeline.to_string();
+                self.sqlite(move |conn| {
+                    let n = match &selection {
+                        DlqSelection::All => conn.execute(
+                            &format!("DELETE FROM {TABLE} WHERE pipeline_name = ?1"),
+                            rusqlite::params![pipeline],
+                        )?,
+                        DlqSelection::FirstN(n) => conn.execute(
+                            &format!(
+                                "DELETE FROM {TABLE} WHERE id IN (\
+                                     SELECT id FROM {TABLE} WHERE pipeline_name = ?1 \
+                                     ORDER BY rowid LIMIT ?2)"
+                            ),
+                            rusqlite::params![pipeline, i64::try_from(*n).unwrap_or(i64::MAX)],
+                        )?,
+                        DlqSelection::Ids(ids) => {
+                            let ph = (0..ids.len())
+                                .map(|i| format!("?{}", i + 2))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let sql = format!(
+                                "DELETE FROM {TABLE} WHERE pipeline_name = ?1 AND id IN ({ph})"
+                            );
+                            let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                                vec![Box::new(pipeline.clone())];
+                            for id in ids {
+                                params.push(Box::new(id.0.clone()));
+                            }
+                            let refs: Vec<&dyn rusqlite::ToSql> =
+                                params.iter().map(|b| b.as_ref()).collect();
+                            conn.execute(&sql, refs.as_slice())?
+                        }
+                    };
+                    Ok(n as u64)
+                })
+                .await
+            }
+            Inner::Postgres { schema, .. } => {
+                let schema_q = quote_ident(schema);
+                let client = self.pg_client().await?;
+                let n = match &selection {
+                    DlqSelection::All => {
+                        client
+                            .execute(
+                                &format!("DELETE FROM {schema_q}.{TABLE} WHERE pipeline_name = $1"),
+                                &[&pipeline],
+                            )
+                            .await
+                    }
+                    DlqSelection::FirstN(n) => {
+                        let limit = i64::try_from(*n).unwrap_or(i64::MAX);
+                        client
+                            .execute(
+                                &format!(
+                                    "DELETE FROM {schema_q}.{TABLE} WHERE id IN (\
+                                         SELECT id FROM {schema_q}.{TABLE} \
+                                         WHERE pipeline_name = $1 ORDER BY seq LIMIT $2)"
+                                ),
+                                &[&pipeline, &limit],
+                            )
+                            .await
+                    }
+                    DlqSelection::Ids(ids) => {
+                        let id_vec: Vec<String> = ids.iter().map(|i| i.0.clone()).collect();
+                        client
+                            .execute(
+                                &format!(
+                                    "DELETE FROM {schema_q}.{TABLE} \
+                                     WHERE pipeline_name = $1 AND id = ANY($2)"
+                                ),
+                                &[&pipeline, &id_vec],
+                            )
+                            .await
+                    }
+                }
+                .map_err(pg_err)?;
+                Ok(n)
+            }
+        }
+    }
+}
+
+/// `RECORD_COLS` with a table alias prefix (for `UPDATE … RETURNING`
+/// where the target is aliased).
+fn record_cols_prefixed(alias: &str) -> String {
+    RECORD_COLS
+        .split(", ")
+        .map(|c| format!("{alias}.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}

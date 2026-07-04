@@ -22,7 +22,10 @@ use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres::{Config as PgConfig, NoTls};
 
+use std::sync::Arc;
+
 use crate::backend::BackendError;
+use crate::dlq::{DeadLetterStore, TableDlq};
 use crate::pg::PgError;
 
 use super::{CommitSnapshot, RecoveredState, StateStore};
@@ -256,6 +259,16 @@ impl StateStore for PostgresStateStore {
 
         tx.commit().await.map_err(pg_err)?;
         Ok(())
+    }
+
+    /// DLQ Phase 1: a [`TableDlq`] on this store's pool + schema —
+    /// the "state store family" resolution path. Ensures the
+    /// `ematix_dlq_records` schema idempotently (same
+    /// `CREATE TABLE IF NOT EXISTS` discipline as
+    /// [`Self::ensure_schema`]).
+    async fn dead_letter_store(&self) -> Result<Option<Arc<dyn DeadLetterStore>>, BackendError> {
+        let dlq = TableDlq::from_postgres_pool(self.pool.clone(), &self.schema).await?;
+        Ok(Some(Arc::new(dlq)))
     }
 }
 
