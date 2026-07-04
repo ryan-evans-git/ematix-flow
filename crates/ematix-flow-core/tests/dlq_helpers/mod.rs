@@ -56,7 +56,11 @@ pub fn ids(records: &[DlqRecord]) -> Vec<DlqRecordId> {
     records.iter().map(|r| r.id.clone()).collect()
 }
 
-async fn append_n<S: DeadLetterStore + ?Sized>(store: &S, pipeline: &str, n: u32) -> Vec<DlqRecord> {
+async fn append_n<S: DeadLetterStore + ?Sized>(
+    store: &S,
+    pipeline: &str,
+    n: u32,
+) -> Vec<DlqRecord> {
     let records: Vec<DlqRecord> = (1..=n).map(|i| mk_record(pipeline, i)).collect();
     store.append(records.clone()).await.unwrap();
     records
@@ -73,7 +77,11 @@ pub async fn run_empty_store_edges<S: DeadLetterStore + ?Sized>(store: &S, pipel
         "empty store must report zero depth, not an error"
     );
     assert!(
-        store.browse(pipeline, 0, 10, None).await.unwrap().is_empty(),
+        store
+            .browse(pipeline, 0, 10, None)
+            .await
+            .unwrap()
+            .is_empty(),
         "browse on an empty store returns an empty page"
     );
     assert!(
@@ -149,7 +157,10 @@ pub async fn run_meta_round_trips<S: DeadLetterStore + ?Sized>(store: &S, pipeli
     assert_eq!(got[0], record, "record must round-trip byte-identically");
 }
 
-pub async fn run_meta_none_fields_round_trip<S: DeadLetterStore + ?Sized>(store: &S, pipeline: &str) {
+pub async fn run_meta_none_fields_round_trip<S: DeadLetterStore + ?Sized>(
+    store: &S,
+    pipeline: &str,
+) {
     let mut record = mk_record(pipeline, 1);
     record.meta.offset_bytes = None;
     record.meta.event_ts = None;
@@ -286,7 +297,13 @@ pub async fn run_ack_replayed_removes<S: DeadLetterStore + ?Sized>(store: &S, pi
         DlqDepth::default(),
         "acked records leave the store entirely"
     );
-    assert!(store.browse(pipeline, 0, 10, None).await.unwrap().is_empty());
+    assert!(
+        store
+            .browse(pipeline, 0, 10, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         store
             .take_for_replay(pipeline, DlqSelection::All, LEASE, T0_MS + 999_999)
@@ -400,7 +417,10 @@ pub async fn run_purge_ids<S: DeadLetterStore + ?Sized>(store: &S, pipeline: &st
 
 pub async fn run_purge_first_n<S: DeadLetterStore + ?Sized>(store: &S, pipeline: &str) {
     let records = append_n(store, pipeline, 3).await;
-    let n = store.purge(pipeline, DlqSelection::FirstN(2)).await.unwrap();
+    let n = store
+        .purge(pipeline, DlqSelection::FirstN(2))
+        .await
+        .unwrap();
     assert_eq!(n, 2);
     let left = store.browse(pipeline, 0, 10, None).await.unwrap();
     assert_eq!(
@@ -427,7 +447,11 @@ pub async fn run_purge_all_includes_parked<S: DeadLetterStore + ?Sized>(store: &
 // to a single pipeline's topic by construction)
 // ---------------------------------------------------------------
 
-pub async fn run_pipelines_isolated<S: DeadLetterStore + ?Sized>(store: &S, pipeline_a: &str, pipeline_b: &str) {
+pub async fn run_pipelines_isolated<S: DeadLetterStore + ?Sized>(
+    store: &S,
+    pipeline_a: &str,
+    pipeline_b: &str,
+) {
     store.append(vec![mk_record(pipeline_a, 1)]).await.unwrap();
     store
         .append(vec![mk_record(pipeline_b, 1), mk_record(pipeline_b, 2)])

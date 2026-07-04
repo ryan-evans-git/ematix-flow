@@ -41,6 +41,10 @@ use std::time::Duration;
 
 use crate::backend::BackendError;
 
+pub mod table;
+
+pub use table::TableDlq;
+
 /// Error strings persisted in `DlqMeta` are truncated to this many
 /// bytes. Guards against Kafka header size limits (and unbounded
 /// TEXT columns) when a transform error carries a giant plan dump.
