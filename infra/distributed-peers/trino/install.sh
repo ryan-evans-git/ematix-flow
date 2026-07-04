@@ -122,6 +122,11 @@ if [[ "$ROLE" == "coordinator" && ! -x /usr/local/bin/trino ]]; then
     rm -f /tmp/trino-cli.jar
 fi
 
+# bench.py deps (coordinator-only): trino client + boto3 for result upload.
+if [[ "$ROLE" == "coordinator" ]]; then
+    python3 -m pip install --user --quiet trino boto3
+fi
+
 # --- node.properties --------------------------------------------------------
 # Stable UUID per host so coordinator/workers can be restarted without
 # losing identity. Persist on disk; regenerate only if missing.
