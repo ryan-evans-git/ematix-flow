@@ -123,8 +123,10 @@ if [[ "$ROLE" == "coordinator" && ! -x /usr/local/bin/trino ]]; then
 fi
 
 # bench.py deps (coordinator-only): trino client + boto3 for result upload.
+# System-wide, NOT --user: cloud-init runs this as root, but the bench runs
+# as ec2-user — a --user install lands in /root/.local and is invisible to it.
 if [[ "$ROLE" == "coordinator" ]]; then
-    python3 -m pip install --user --quiet trino boto3
+    sudo python3 -m pip install --quiet trino boto3
 fi
 
 # --- node.properties --------------------------------------------------------
