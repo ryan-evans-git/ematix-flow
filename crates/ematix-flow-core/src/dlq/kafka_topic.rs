@@ -95,6 +95,40 @@ const OP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_TIMEOUT: Duration = Duration::from_millis(250);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Group-coordinator ops (`committed_offsets` / `commit`) fail with
+/// transient errors while a broker (re-)elects the coordinator —
+/// e.g. `NotCoordinator` / `CoordinatorLoadInProgress` on a freshly
+/// started single-broker cluster. Retry with a bounded backoff
+/// before surfacing; only called from `spawn_blocking` contexts so
+/// the thread sleep is fine.
+fn retry_group_op<T>(
+    what: &str,
+    mut op: impl FnMut() -> Result<T, rdkafka::error::KafkaError>,
+) -> Result<T, BackendError> {
+    const ATTEMPTS: u32 = 20;
+    const BACKOFF: Duration = Duration::from_millis(500);
+    let mut last_err: Option<rdkafka::error::KafkaError> = None;
+    for attempt in 0..ATTEMPTS {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                tracing::debug!(
+                    what,
+                    attempt,
+                    error = %e,
+                    "kafka dlq group op failed; retrying"
+                );
+                last_err = Some(e);
+                std::thread::sleep(BACKOFF);
+            }
+        }
+    }
+    Err(BackendError::Query(format!(
+        "kafka dlq {what}: {e} (after {ATTEMPTS} attempts)",
+        e = last_err.expect("at least one attempt ran"),
+    )))
+}
+
 /// In-process lease bookkeeping (see module docs — process-local by
 /// construction, offset-committed across processes).
 #[derive(Debug, Default)]
@@ -192,13 +226,13 @@ impl KafkaTopicDlq {
             return Ok(Vec::new());
         }
 
-        let mut tpl = TopicPartitionList::new();
-        for p in &partitions {
-            tpl.add_partition(topic, *p);
-        }
-        let committed = consumer
-            .committed_offsets(tpl, OP_TIMEOUT)
-            .map_err(|e| BackendError::Query(format!("kafka dlq committed {topic}: {e}")))?;
+        let committed = retry_group_op(&format!("committed {topic}"), || {
+            let mut tpl = TopicPartitionList::new();
+            for p in &partitions {
+                tpl.add_partition(topic, *p);
+            }
+            consumer.committed_offsets(tpl, OP_TIMEOUT)
+        })?;
 
         let mut out = Vec::with_capacity(partitions.len());
         for p in partitions {
@@ -605,9 +639,9 @@ impl DeadLetterStore for KafkaTopicDlq {
                 tpl.add_partition_offset(&this.topic, *p, rdkafka::Offset::Offset(*next))
                     .map_err(|e| BackendError::Other(format!("kafka dlq ack tpl: {e}")))?;
             }
-            consumer
-                .commit(&tpl, rdkafka::consumer::CommitMode::Sync)
-                .map_err(|e| BackendError::Query(format!("kafka dlq ack commit: {e}")))?;
+            retry_group_op("ack commit", || {
+                consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync)
+            })?;
             Ok(())
         })
         .await
@@ -659,9 +693,9 @@ impl DeadLetterStore for KafkaTopicDlq {
                                 BackendError::Other(format!("kafka dlq purge tpl: {e}"))
                             })?;
                     }
-                    consumer
-                        .commit(&tpl, rdkafka::consumer::CommitMode::Sync)
-                        .map_err(|e| BackendError::Query(format!("kafka dlq purge commit: {e}")))?;
+                    retry_group_op("purge commit", || {
+                        consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync)
+                    })?;
                     Ok(pending)
                 })
                 .await
@@ -702,9 +736,9 @@ impl DeadLetterStore for KafkaTopicDlq {
                                 BackendError::Other(format!("kafka dlq purge tpl: {e}"))
                             })?;
                     }
-                    consumer
-                        .commit(&tpl, rdkafka::consumer::CommitMode::Sync)
-                        .map_err(|e| BackendError::Query(format!("kafka dlq purge commit: {e}")))?;
+                    retry_group_op("purge commit", || {
+                        consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync)
+                    })?;
                     Ok(collected.len() as u64)
                 })
                 .await

@@ -5,6 +5,8 @@
 //! Marked `#[ignore]` so `cargo test` stays fast by default. Run with
 //! `cargo test -p ematix-flow-core -- --ignored` (Docker required).
 
+mod dlq_helpers;
+
 use std::sync::Arc;
 
 use ematix_flow_core::DuckDBBackend;
@@ -5227,6 +5229,43 @@ async fn streaming_pipeline_routes_failed_batch_to_dlq() {
         dlq_rows, 3,
         "all 3 failed rows should have been routed to the DLQ"
     );
+
+    // DLQ Phase 1: the same messages now carry `emat-dlq-*` failure
+    // metadata in Kafka HEADERS (payload untouched — the row count +
+    // JSON payload assertions above prove format preservation).
+    // Browse them back through the KafkaTopicDlq store surface.
+    use ematix_flow_core::dlq::{DeadLetterStore, DlqStage, KafkaTopicDlq};
+    let browse_backend: Arc<dyn Backend> =
+        Arc::new(ematix_flow_core::KafkaBackend::open(&bootstrap, Some("dlq-browse-grp")).unwrap());
+    let store = KafkaTopicDlq::new(browse_backend, dlq_topic, "dlq-test").unwrap();
+    assert_eq!(
+        store.depth("dlq-test").await.unwrap().pending,
+        3,
+        "replay group has consumed nothing yet — full pending depth"
+    );
+    let records = store.browse("dlq-test", 0, 10, None).await.unwrap();
+    assert_eq!(records.len(), 3, "browse peeks all three dead letters");
+    for r in &records {
+        assert_eq!(r.meta.pipeline, "dlq-test", "pipeline header");
+        assert_eq!(r.meta.stage, DlqStage::Write, "stage header");
+        assert!(
+            !r.meta.error.is_empty(),
+            "error header carries the sink failure"
+        );
+        assert_eq!(r.meta.source_id, "dlq-primary", "source_id header");
+        assert_eq!(r.meta.attempt, 1, "attempt header");
+        assert_eq!(r.meta.payload_format, "json", "payload_format header");
+        assert!(r.meta.failed_at > 0, "failed_at header");
+        assert!(
+            r.meta.offset_bytes.is_some(),
+            "offset snapshot header captured at failure time"
+        );
+        let payload = String::from_utf8(r.payload.clone()).unwrap();
+        assert!(
+            payload.contains("\"id\""),
+            "payload is the original JSON wire form: {payload}"
+        );
+    }
 }
 
 // ----- Phase 36j: Exactly-once produce ----------------------------------
@@ -9003,4 +9042,135 @@ async fn pg_jsonb_accepts_list_of_struct_from_aggregate() {
         bid_4500_centicents, 125,
         "minute 1 strike-4500 bid round-trips as 1.25"
     );
+}
+
+// ----- DLQ Phase 1: KafkaTopicDlq contract subset ------------------------
+//
+// The applicable `DeadLetterStore` contract bodies from
+// `tests/dlq_helpers/mod.rs` run against a real broker. Topic
+// semantics can't express park / by-id addressing — those return
+// typed `Unsupported` errors, asserted in
+// `kafka_dlq_unsupported_ops_are_typed`. Container-per-test is the
+// harness convention; contract bodies are grouped to keep the
+// container count sane.
+
+use ematix_flow_core::dlq::{DeadLetterStore as DlqStore, DlqError, DlqRecordId, DlqSelection};
+
+async fn fresh_kafka_dlq(
+    topic: &str,
+) -> (
+    testcontainers::ContainerAsync<Kafka>,
+    ematix_flow_core::dlq::KafkaTopicDlq,
+) {
+    let (container, bootstrap) = start_kafka().await;
+    let backend: Arc<dyn Backend> =
+        Arc::new(ematix_flow_core::KafkaBackend::open(&bootstrap, Some("dlq-store-grp")).unwrap());
+    let store = ematix_flow_core::dlq::KafkaTopicDlq::new(backend, topic, "p").unwrap();
+    (container, store)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_dlq_append_depth_browse_meta() {
+    let (_c, store) = fresh_kafka_dlq("kdlq-meta").await;
+    // Empty-store edges expressible on a topic (the full
+    // run_empty_store_edges body asserts park() is a no-op, which
+    // is Unsupported here — asserted in the typed-errors test).
+    assert_eq!(store.depth("p").await.unwrap().pending, 0);
+    assert!(store.browse("p", 0, 10, None).await.unwrap().is_empty());
+    assert!(
+        store
+            .take_for_replay(
+                "p",
+                DlqSelection::All,
+                std::time::Duration::from_secs(60),
+                0
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.purge("p", DlqSelection::All).await.unwrap(), 0);
+
+    dlq_helpers::run_meta_round_trips(&store, "p").await;
+    // meta_round_trips appended 1 record; purge it so the following
+    // bodies see a clean pending window.
+    assert_eq!(store.purge("p", DlqSelection::All).await.unwrap(), 1);
+    dlq_helpers::run_meta_none_fields_round_trip(&store, "p").await;
+    store.purge("p", DlqSelection::All).await.unwrap();
+    dlq_helpers::run_append_then_depth(&store, "p").await;
+    store.purge("p", DlqSelection::All).await.unwrap();
+    dlq_helpers::run_browse_pages_oldest_first(&store, "p").await;
+    store.purge("p", DlqSelection::All).await.unwrap();
+    dlq_helpers::run_error_truncated_to_8kb(&store, "p").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_dlq_take_lease_ack() {
+    let (_c, store) = fresh_kafka_dlq("kdlq-take").await;
+    dlq_helpers::run_take_leases_exclusively(&store, "p").await;
+    store.purge("p", DlqSelection::All).await.unwrap();
+    dlq_helpers::run_lease_expiry_releases(&store, "p").await;
+    store.purge("p", DlqSelection::All).await.unwrap();
+    dlq_helpers::run_ack_replayed_removes(&store, "p").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_dlq_purge_first_n() {
+    let (_c, store) = fresh_kafka_dlq("kdlq-purge").await;
+    dlq_helpers::run_purge_first_n(&store, "p").await;
+}
+
+/// Topic semantics can't express these — the store must say so with
+/// typed `DlqError::Unsupported`, never fake success.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_dlq_unsupported_ops_are_typed() {
+    let (_c, store) = fresh_kafka_dlq("kdlq-unsupported").await;
+    store
+        .append(vec![dlq_helpers::mk_record("p", 1)])
+        .await
+        .unwrap();
+
+    let park = store.park("p", &[DlqRecordId("x".into())]).await;
+    assert!(matches!(park, Err(DlqError::Unsupported(_))), "{park:?}");
+
+    let take_ids = store
+        .take_for_replay(
+            "p",
+            DlqSelection::Ids(vec![DlqRecordId("x".into())]),
+            std::time::Duration::from_secs(60),
+            0,
+        )
+        .await;
+    assert!(
+        matches!(take_ids, Err(DlqError::Unsupported(_))),
+        "{take_ids:?}"
+    );
+
+    let purge_ids = store
+        .purge("p", DlqSelection::Ids(vec![DlqRecordId("x".into())]))
+        .await;
+    assert!(
+        matches!(purge_ids, Err(DlqError::Unsupported(_))),
+        "{purge_ids:?}"
+    );
+
+    let browse_parked = store
+        .browse(
+            "p",
+            0,
+            10,
+            Some(ematix_flow_core::dlq::DlqRecordStatus::Parked),
+        )
+        .await;
+    assert!(
+        matches!(browse_parked, Err(DlqError::Unsupported(_))),
+        "{browse_parked:?}"
+    );
+
+    // The record is still there — Unsupported ops must not consume.
+    assert_eq!(store.depth("p").await.unwrap().pending, 1);
 }
