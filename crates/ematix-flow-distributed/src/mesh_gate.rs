@@ -116,10 +116,11 @@ fn min_bytes_of(val: Option<&str>) -> u64 {
 /// (`Precision::Exact` or `Inexact`), `None` when unknown (`Absent`).
 /// Returns `true` when the plan should distribute.
 ///
-/// - Any known bytes → distribute iff the (saturating) known sum is
-///   >= `min_bytes`. Unknown leaves contribute nothing — the known
-///   sum alone decides, so a large known fact scan still distributes
-///   even when a stat-less dimension source sits next to it.
+/// - Any known bytes → distribute iff the (saturating) known sum
+///   reaches `min_bytes`. Unknown leaves contribute nothing — the
+///   known sum alone decides, so a large known fact scan still
+///   distributes even when a stat-less dimension source sits next
+///   to it.
 /// - NO known bytes at all → distribute: with zero information the
 ///   gate preserves the pre-gate always-distribute behavior rather
 ///   than silently disabling the mesh.
@@ -316,7 +317,10 @@ mod tests {
 
     #[test]
     fn auto_saturates_instead_of_overflowing() {
-        assert!(auto_should_distribute(&[Some(u64::MAX), Some(u64::MAX)], u64::MAX));
+        assert!(auto_should_distribute(
+            &[Some(u64::MAX), Some(u64::MAX)],
+            u64::MAX
+        ));
     }
 
     // ---------------- plan-level tests (real parquet fixture) ----------------

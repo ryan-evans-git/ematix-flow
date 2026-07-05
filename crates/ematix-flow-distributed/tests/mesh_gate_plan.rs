@@ -183,6 +183,33 @@ async fn forced_on_plan_contains_distributed_stage_wrapper() {
         "forced-on plan must carry the datafusion-distributed stage wrapper; got:\n{rendered}"
     );
 
+    // And the mesh plan must actually EXECUTE correctly through the
+    // live workers: 16 groups, SUM(v) over all groups totalling
+    // 0 + 1 + ... + 1999 = 1_999_000. (This is real distributed
+    // execution — unlike the tiny MemTable plans in cross_pod.rs,
+    // whose single-task stages the splitter leaves local.)
+    let batches = ctx
+        .sql(SQL)
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("distributed execute");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 16, "16 distinct k groups");
+    let total: f64 = batches
+        .iter()
+        .flat_map(|b| {
+            let arr = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("f64 sums");
+            (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+        })
+        .sum();
+    assert_eq!(total, 1_999_000.0, "SUM(v) across all groups");
+
     workers.abort_all();
 }
 

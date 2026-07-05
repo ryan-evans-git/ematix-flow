@@ -78,9 +78,7 @@ use async_trait::async_trait;
 use datafusion::common::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
-use datafusion_distributed::{
-    CompressionType, DistributedExt, DistributedPhysicalOptimizerRule, WorkerResolver,
-};
+use datafusion_distributed::{CompressionType, DistributedExt, WorkerResolver};
 use ematix_flow_core::backend::{
     ArrowBatchStream, Backend, BackendConfig, BackendError, DeleteHandling, Dialect,
     DistributedConfig, DistributedTlsConfig, StrategyRunResult, TargetTable, WriteMode,
@@ -207,8 +205,15 @@ impl DistributedBackend {
         let mut builder = ematix_flow_core::preset::with_optimizer_rules(
             SessionStateBuilder::new().with_default_features(),
         );
+        // 2026-07 adaptive mesh gate: the stage splitter is installed
+        // behind the EMAT_MESH tri-state gate (see [`mesh_gate`]).
+        // `from_env()` snapshots EMAT_MESH / EMAT_MESH_MIN_BYTES once
+        // HERE at session build; the distribute-or-not decision then
+        // runs PER QUERY at plan-optimization time (the rule executes
+        // on every physical plan), so one session can mesh its big
+        // scans while keeping small queries free of Flight overhead.
         builder = builder
-            .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
+            .with_physical_optimizer_rule(Arc::new(mesh_gate::AdaptiveMeshGateRule::from_env()))
             .with_distributed_worker_resolver(resolver);
         // Σ.B follow-up: install the TLS-aware channel resolver
         // when a TLS config is present. `TlsChannelResolver::new`
