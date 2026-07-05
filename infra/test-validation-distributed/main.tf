@@ -272,6 +272,7 @@ data "cloudinit_config" "coordinator" {
         bench_bucket       = var.bench_bucket
         glue_database_name = var.glue_database_name
         scale_factor       = var.scale_factor
+        data_prefix        = var.data_prefix
       })
     }
   }
@@ -346,6 +347,7 @@ data "cloudinit_config" "worker" {
         bench_bucket       = var.bench_bucket
         glue_database_name = var.glue_database_name
         scale_factor       = var.scale_factor
+        data_prefix        = var.data_prefix
       })
     }
   }

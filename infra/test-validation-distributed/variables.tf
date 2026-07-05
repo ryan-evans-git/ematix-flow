@@ -87,6 +87,12 @@ variable "bench_bucket" {
   type        = string
 }
 
+variable "data_prefix" {
+  description = "S3 key prefix under the bucket holding the TPC-H parquet, e.g. s3://<bucket>/<data_prefix>/sf{N}/<table>/. Use 'tpch-data' for the legacy single-file-per-table layout, or 'tpch-data-parted' for the multi-file (K parts per table) layout that lets the distributed planner fan scans out across peers. All engines read the same prefix."
+  type        = string
+  default     = "tpch-data"
+}
+
 variable "git_ref" {
   description = "Git branch or tag of ematix-flow to clone on every node (shallow clone; a raw SHA won't work). The nodes clone from GitHub — make sure the ref you benchmark is PUSHED (local-only commits are invisible to the cluster)."
   type        = string

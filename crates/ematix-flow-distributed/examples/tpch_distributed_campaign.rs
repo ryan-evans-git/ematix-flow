@@ -331,6 +331,28 @@ fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState
     }
 }
 
+/// Resolve a table's on-disk parquet source, preferring the multi-file
+/// parts layout that lets the distributed planner fan a scan out:
+/// - `<data_dir>/<table>/` — a directory of `<table>-NNNN.parquet` parts,
+///   registered as a multi-file listing so each part is its own scan
+///   split (returned when the dir exists and is non-empty); else
+/// - `<data_dir>/<table>.parquet` — the legacy single flat file; else
+/// - `None` (pre-flight turns this into a hard error).
+fn table_source(data_dir: &std::path::Path, table: &str) -> Option<PathBuf> {
+    let dir = data_dir.join(table);
+    let dir_has_files = std::fs::read_dir(&dir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if dir.is_dir() && dir_has_files {
+        return Some(dir);
+    }
+    let flat = data_dir.join(format!("{table}.parquet"));
+    if flat.exists() {
+        return Some(flat);
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Provenance capture
 // ---------------------------------------------------------------------------
@@ -474,12 +496,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  workspace:    {}", workspace_root.display());
     eprintln!();
 
-    // Pre-flight: confirm every table file exists on the coordinator.
-    // (Workers need them too, but that's userdata's responsibility.)
+    // Pre-flight: confirm every table's data is present on the
+    // coordinator. Two layouts are accepted (see `table_source`):
+    // the multi-file parts dir `<data_dir>/<table>/` OR the legacy flat
+    // `<data_dir>/<table>.parquet`. (Workers need them too, but that's
+    // userdata's responsibility.)
     for table in TPCH_TABLES {
-        let p = data_dir.join(format!("{table}.parquet"));
-        if !p.exists() {
-            return Err(format!("missing parquet: {}", p.display()).into());
+        if table_source(&data_dir, table).is_none() {
+            let dir = data_dir.join(table);
+            let flat = data_dir.join(format!("{table}.parquet"));
+            return Err(format!(
+                "missing parquet for {table}: neither dir {} nor file {} exists",
+                dir.display(),
+                flat.display()
+            )
+            .into());
         }
     }
 
@@ -503,7 +534,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let ctx = Arc::new(SessionContext::from(state));
     for table in TPCH_TABLES {
-        let p = data_dir.join(format!("{table}.parquet"));
+        // `table_source` resolves the multi-file parts dir `<table>/` (each
+        // holding `<table>-NNNN.parquet`) when present, else the legacy flat
+        // `<table>.parquet`. Registering a DIRECTORY makes DataFusion list
+        // every part file as a separate scan split — the file count the
+        // distributed planner divides by `files_per_task` (pinned to 1) to
+        // fan the scan out across peers. A single flat file yields one split
+        // (single-node), which is why the parts layout matters for the mesh.
+        let p = table_source(&data_dir, table)
+            .unwrap_or_else(|| panic!("pre-flight passed but {table} source vanished"));
         ctx.register_parquet(*table, p.to_str().unwrap(), Default::default())
             .await?;
     }
