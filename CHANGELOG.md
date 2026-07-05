@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Adaptive mesh gate (`EMAT_MESH` / `EMAT_MESH_MIN_BYTES`).** A
+  tri-state, per-query gate in front of the datafusion-distributed stage
+  splitter. `EMAT_MESH=1` always distributes, `=0` never does (plans stay
+  byte-identical to single-node with peers configured but unused), and
+  unset = AUTO: sum `total_byte_size` across the plan's scan leaves and
+  distribute only when the known sum reaches `EMAT_MESH_MIN_BYTES`
+  (default 4 GiB, uncalibrated placeholder). The resolved gate is logged
+  at session build; the campaign harness records the per-query outcome as
+  `QueryStats::plan_mode`. See `docs/EMAT_FLAGS.md`.
+
+### Changed
+
+- **Behavior change — peer-configured distributed sessions now default to
+  AUTO, not always-distribute.** Before this release, once
+  `DistributedBackend` had peers configured, *every* query was split
+  across the Arrow Flight mesh. With the adaptive mesh gate the default
+  (env unset) is AUTO with a 4 GiB threshold, so small/medium queries now
+  execute single-node to skip mesh coordination overhead (measured:
+  distributed Q22 ~120 ms vs ~24 ms single-node at SF=10). **To restore
+  the previous always-distribute behavior, set `EMAT_MESH=1`** — benchmark
+  runs comparing against pre-gate results MUST pin it until the AUTO
+  threshold is calibrated.
+
 ## [0.12.0] — 2026-07-03
 
 Competitive-milestone release: under the strict, provenance-stamped
