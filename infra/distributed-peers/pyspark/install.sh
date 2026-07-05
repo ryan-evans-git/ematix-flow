@@ -164,23 +164,26 @@ INSTANCE_TYPE="$(curl -fsS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
 AWS_REGION="$(curl -fsS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
     http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || echo us-east-2)"
 
-# WORKER_MEMORY = the pool each worker advertises. EXECUTOR_MEMORY = the
-# heap ONE executor actually takes — CRITICAL: Spark's default is 1g, so
+# EXECUTOR_MEMORY = the heap ONE executor takes. Spark's default is 1g, so
 # without this every executor OOMs on any SF100 join ("Lost task …
-# executor N"). One executor per worker; executor + ~10% overhead must
-# fit under WORKER_MEMORY (e.g. 24g + 2.4g < 28g). DRIVER_MEMORY covers
-# the coordinator-side collectToPython of (small) result sets.
+# executor N"). BUT oversizing is just as fatal the other way: 10g on a
+# 16g box (62%) drove the workers into GC thrash → heartbeat timeouts →
+# the master deregistered them → re-registration storm → app stuck at 0
+# cores (and the boxes so starved sshd stopped answering). So size the
+# executor heap to leave GENEROUS absolute headroom for the worker
+# daemon (~1g), OS + parquet page cache (~3-4g), and the ~10% executor
+# memory overhead — roughly 55-60% of box RAM, not 75%+. WORKER_MEMORY
+# (advertised pool) only needs to cover one executor.
 case "$INSTANCE_TYPE" in
-    c7i.2xlarge) WORKER_MEMORY="12g"; EXECUTOR_MEMORY="10g"; DRIVER_MEMORY="4g"  ;;
-    c7i.4xlarge) WORKER_MEMORY="28g"; EXECUTOR_MEMORY="24g"; DRIVER_MEMORY="8g"  ;;
-    c7i.8xlarge) WORKER_MEMORY="56g"; EXECUTOR_MEMORY="48g"; DRIVER_MEMORY="12g" ;;
+    c7i.2xlarge) WORKER_MEMORY="10g"; EXECUTOR_MEMORY="8g";  DRIVER_MEMORY="3g" ;;  # 16g box
+    c7i.4xlarge) WORKER_MEMORY="22g"; EXECUTOR_MEMORY="20g"; DRIVER_MEMORY="6g" ;;  # 32g box
+    c7i.8xlarge) WORKER_MEMORY="44g"; EXECUTOR_MEMORY="40g"; DRIVER_MEMORY="8g" ;;  # 64g box
     *)
-        # Fallback: 75% of detected RAM for the worker pool; executor takes
-        # ~85% of that, driver a fixed 4g.
+        # Fallback: executor ≈ 55% of detected RAM, worker pool a touch above.
         TOTAL_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-        WORKER_GB=$(( TOTAL_KB * 75 / 100 / 1024 / 1024 ))
-        WORKER_MEMORY="${WORKER_GB}g"
-        EXECUTOR_MEMORY="$(( WORKER_GB * 85 / 100 ))g"
+        TOTAL_GB=$(( TOTAL_KB / 1024 / 1024 ))
+        EXECUTOR_MEMORY="$(( TOTAL_GB * 55 / 100 ))g"
+        WORKER_MEMORY="$(( TOTAL_GB * 60 / 100 ))g"
         DRIVER_MEMORY="4g"
         ;;
 esac
