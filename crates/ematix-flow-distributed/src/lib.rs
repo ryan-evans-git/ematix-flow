@@ -257,6 +257,23 @@ impl DistributedBackend {
         builder = builder
             .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
             .expect("LZ4_FRAME is a valid compression type");
+        // Cross-cluster fan-out derivation. datafusion-distributed sizes a
+        // stage's task count as `ceil(scan_file_splits / files_per_task)`,
+        // capped at `max_tasks_per_stage` (which auto-defaults to the worker
+        // count). Its default `files_per_task` is the LOCAL core count — the
+        // wrong basis for spreading work across peers: on a single-file-per-
+        // table dataset it collapses `ceil(<=cores / cores)` to 1 task, so NO
+        // network boundary is inserted and the mesh silently never engages
+        // (this is exactly what made an earlier "distributed" TPC-H run
+        // execute single-node). Pinning it to 1 makes the per-stage task count
+        // auto-derive as `min(scan_file_splits, worker_count)` — the two
+        // quantities are already known automatically (DataFusion range-splits
+        // large scans; the worker count is the cap), so fan-out adapts to the
+        // data and the cluster with zero per-run tuning. The cap keeps a many-
+        // file dataset from exploding into more tasks than workers.
+        builder = builder
+            .with_distributed_files_per_task(1)
+            .expect("files_per_task = 1 is valid");
         Arc::new(SessionContext::from(builder.build()))
     }
 }
@@ -852,6 +869,33 @@ mod tests {
         let backend = DistributedBackend::open(DistributedConfig::default()).unwrap();
         let dsn = backend.dsn().unwrap();
         assert!(dsn.contains("local"));
+    }
+
+    /// Regression guard for the silent-single-node bug: the mesh only
+    /// fans out when a stage's task count exceeds 1, and datafusion-
+    /// distributed derives that as `ceil(files / files_per_task)`. Its
+    /// default `files_per_task` (local core count) collapses single-file
+    /// scans to one task, so a peers-configured session silently ran
+    /// single-node. `build_context` pins `files_per_task = 1` so fan-out
+    /// auto-derives from scan splits × worker count. Assert it reaches the
+    /// live session's resolved config.
+    #[test]
+    fn build_context_pins_files_per_task_to_one_for_fanout() {
+        use datafusion_distributed::DistributedConfig as DfDistributedConfig;
+        let backend = DistributedBackend::open(DistributedConfig {
+            peers: vec!["http://a:50051".into(), "http://b:50051".into()],
+            tls: None,
+        })
+        .expect("open");
+        let ctx = backend.build_context();
+        let state = ctx.state();
+        let d_cfg = DfDistributedConfig::from_config_options(state.config().options())
+            .expect("distributed config extension present in a peers-configured session");
+        assert_eq!(
+            d_cfg.files_per_task, 1,
+            "cross-cluster fan-out requires files_per_task=1; got {}",
+            d_cfg.files_per_task
+        );
     }
 
     /// `Arc<dyn Backend>` is the shape Σ.B's executors use over Arrow

@@ -318,6 +318,13 @@ fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState
         builder
             .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
             .expect("LZ4_FRAME is a valid compression type")
+            // Match production (`DistributedBackend::build_context`): pin
+            // files_per_task=1 so the per-stage task count auto-derives as
+            // min(scan file-splits, worker count) instead of the library's
+            // core-count default, which collapses single-file scans to a
+            // single task and silently prevents the mesh from engaging.
+            .with_distributed_files_per_task(1)
+            .expect("files_per_task = 1 is valid")
             .build()
     } else {
         builder.build()
