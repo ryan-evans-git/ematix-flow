@@ -115,6 +115,13 @@ struct QueryStats {
     /// [`plan_mode_of`]; the flag state itself is in
     /// `provenance.emat_env` (EMAT_MESH / EMAT_MESH_MIN_BYTES).
     plan_mode: String,
+    /// Summed `total_byte_size` (uncompressed, projection-narrowed) of
+    /// this query's scan leaves — the exact quantity the AUTO mesh gate
+    /// compares against `EMAT_MESH_MIN_BYTES`. `None` when no leaf
+    /// reports a byte size. Recorded so a single+mesh run pair yields
+    /// the empirical (scan_bytes → single-vs-mesh) crossover used to
+    /// calibrate the AUTO threshold. See [`sum_scan_leaf_bytes`].
+    scan_bytes: Option<u64>,
 }
 
 /// Walk the optimized physical plan for the datafusion-distributed
@@ -141,6 +148,39 @@ fn plan_is_mesh(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// `plan_mode` label for [`QueryStats`] (see [`plan_is_mesh`]).
 fn plan_mode_of(plan: &Arc<dyn ExecutionPlan>) -> &'static str {
     if plan_is_mesh(plan) { "mesh" } else { "single" }
+}
+
+/// Sum `total_byte_size` across the plan's scan leaves — the exact
+/// quantity the AUTO mesh gate thresholds against `EMAT_MESH_MIN_BYTES`
+/// (mirrors `mesh_gate::collect_scan_leaf_bytes`). `Exact`/`Inexact`
+/// count; `Absent` contributes nothing. Returns `None` when NO leaf
+/// reports a size (the gate's "all-unknown → distribute" path). Recorded
+/// per query so a single+mesh run pair gives the empirical
+/// scan_bytes→(single-vs-mesh) crossover for threshold calibration.
+fn sum_scan_leaf_bytes(plan: &Arc<dyn ExecutionPlan>) -> Option<u64> {
+    fn walk(plan: &Arc<dyn ExecutionPlan>, sum: &mut u64, any: &mut bool) {
+        let children = plan.children();
+        if children.is_empty() {
+            if let Ok(s) = plan.partition_statistics(None) {
+                match s.total_byte_size {
+                    datafusion::common::stats::Precision::Exact(n)
+                    | datafusion::common::stats::Precision::Inexact(n) => {
+                        *any = true;
+                        *sum = sum.saturating_add(n as u64);
+                    }
+                    datafusion::common::stats::Precision::Absent => {}
+                }
+            }
+            return;
+        }
+        for c in children {
+            walk(&c, sum, any);
+        }
+    }
+    let mut sum = 0u64;
+    let mut any = false;
+    walk(plan, &mut sum, &mut any);
+    any.then_some(sum)
 }
 
 /// Run provenance — the campaign-side equivalent of the strict local
@@ -609,20 +649,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // re-plans anyway via ctx.sql); "unknown" means planning
         // itself failed — the warmups/trials below will surface the
         // same error.
-        let plan_mode: String = match ctx.sql(&sql).await {
+        let (plan_mode, scan_bytes): (String, Option<u64>) = match ctx.sql(&sql).await {
             Ok(df) => match df.create_physical_plan().await {
-                Ok(plan) => plan_mode_of(&plan).to_string(),
+                Ok(plan) => (plan_mode_of(&plan).to_string(), sum_scan_leaf_bytes(&plan)),
                 Err(e) => {
                     eprintln!("  plan_mode probe failed (physical): {e}");
-                    "unknown".to_string()
+                    ("unknown".to_string(), None)
                 }
             },
             Err(e) => {
                 eprintln!("  plan_mode probe failed (logical): {e}");
-                "unknown".to_string()
+                ("unknown".to_string(), None)
             }
         };
-        eprintln!("  plan_mode={plan_mode}");
+        eprintln!(
+            "  plan_mode={plan_mode} scan_bytes={}",
+            scan_bytes.map_or("none".to_string(), |b| b.to_string())
+        );
 
         // Warmups (untimed, but verify it runs cleanly).
         for w in 0..warmups {
@@ -671,6 +714,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 median_trials_3_5_ms: med35,
                 rows_returned,
                 plan_mode,
+                scan_bytes,
             },
         );
     }
