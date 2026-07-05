@@ -212,8 +212,24 @@ impl DistributedBackend {
         // runs PER QUERY at plan-optimization time (the rule executes
         // on every physical plan), so one session can mesh its big
         // scans while keeping small queries free of Flight overhead.
+        let gate = mesh_gate::AdaptiveMeshGateRule::from_env();
+        // Log the resolved gate ONCE at session build. Without this an
+        // operator debugging "why isn't my mesh being used" has zero
+        // signal — and a "distributed" run that silently executed
+        // single-node is exactly what gets a benchmark table challenged.
+        let cfg = gate.config();
+        tracing::info!(
+            mode = match cfg.mode {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "auto",
+            },
+            min_bytes = cfg.min_bytes,
+            peers = self.peers.len(),
+            "distributed session: adaptive mesh gate resolved"
+        );
         builder = builder
-            .with_physical_optimizer_rule(Arc::new(mesh_gate::AdaptiveMeshGateRule::from_env()))
+            .with_physical_optimizer_rule(Arc::new(gate))
             .with_distributed_worker_resolver(resolver);
         // Σ.B follow-up: install the TLS-aware channel resolver
         // when a TLS config is present. `TlsChannelResolver::new`

@@ -38,13 +38,22 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_distributed::DistributedPhysicalOptimizerRule;
+use datafusion_distributed::{DistributedExec, DistributedPhysicalOptimizerRule};
 
-/// Default AUTO threshold for `EMAT_MESH_MIN_BYTES`: 4 GiB of total
-/// scan bytes. **Initial value pending campaign calibration** — chosen
-/// so SF=1-class scans (~1 GB) stay single-node while SF=10-class
-/// fact-table scans (~7 GB lineitem) distribute; the 2026-07 campaign
-/// will refine it from measured crossover points.
+/// Default AUTO threshold for `EMAT_MESH_MIN_BYTES`: 4 GiB.
+///
+/// **Uncalibrated placeholder — do NOT cite in benchmark claims until
+/// the SF1/10/100 validation campaign refines it.** The gate compares
+/// against `Statistics::total_byte_size`, which for parquet is derived
+/// from the row groups' *uncompressed* byte sizes — typically 2–4× the
+/// on-disk file size, and further perturbed by projection / filter
+/// pushdown narrowing the scanned columns. So this threshold is NOT
+/// "≈ file size on disk": an SF=1 lineitem scan can plausibly report
+/// over 4 GiB uncompressed and distribute, while a projected few-column
+/// scan of a larger table can stay under it. The 2026-07 campaign
+/// measures the real single-node↔mesh crossover per query (recording
+/// `plan_mode` + the summed bytes) and this constant will be reset from
+/// that data.
 pub const DEFAULT_MESH_MIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Config for the adaptive mesh gate. Carried as a field of
@@ -68,9 +77,23 @@ impl MeshGateConfig {
     /// `EMAT_MESH_MIN_BYTES`). Called once at session build; the
     /// per-query decision then replays this snapshot at plan time.
     pub fn from_env() -> Self {
+        let raw = std::env::var("EMAT_MESH_MIN_BYTES").ok();
+        let (min_bytes, unparseable) = min_bytes_of(raw.as_deref());
+        if unparseable {
+            // An operator who typo'd the threshold (e.g. `4GiB`, `1e9`)
+            // would otherwise silently measure the 4 GiB default — loud
+            // in a benchmark-credibility context. Warn, don't fail.
+            tracing::warn!(
+                value = raw.as_deref().unwrap_or(""),
+                default_bytes = min_bytes,
+                "EMAT_MESH_MIN_BYTES is not a plain u64 byte count; \
+                 falling back to the default (only bare integers are \
+                 accepted, e.g. 4294967296)"
+            );
+        }
         Self {
             mode: ematix_flow_core::flags::tri_state("EMAT_MESH"),
-            min_bytes: min_bytes_of(std::env::var("EMAT_MESH_MIN_BYTES").ok().as_deref()),
+            min_bytes,
         }
     }
 
@@ -104,11 +127,22 @@ impl MeshGateConfig {
 
 /// Pure core of the `EMAT_MESH_MIN_BYTES` parse so tests can pin the
 /// parse table without racing on process-global env vars (the
-/// `tri_state_of` convention). Unparseable / unset → the default
-/// (same forgiving shape as `flags::u64_or`).
-fn min_bytes_of(val: Option<&str>) -> u64 {
-    val.and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MESH_MIN_BYTES)
+/// `tri_state_of` convention).
+///
+/// Returns `(bytes, unparseable)`: unset → `(default, false)`; a bare
+/// `u64` → `(n, false)`; anything else → `(default, true)` so the
+/// caller can WARN rather than silently swallow a typo'd threshold.
+/// We keep this local (rather than delegating to `flags::u64_or`)
+/// precisely because `u64_or` cannot distinguish "unset" from
+/// "garbage" — and that distinction is the whole point of the warning.
+fn min_bytes_of(val: Option<&str>) -> (u64, bool) {
+    match val {
+        None => (DEFAULT_MESH_MIN_BYTES, false),
+        Some(s) => match s.parse::<u64>() {
+            Ok(n) => (n, false),
+            Err(_) => (DEFAULT_MESH_MIN_BYTES, true),
+        },
+    }
 }
 
 /// Pure AUTO decision: `leaf_bytes` carries one entry per scan leaf —
@@ -187,17 +221,49 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // Idempotency guard: if the plan is already stage-split (root is
+        // a DistributedExec), never wrap it again — re-running the inner
+        // rule on a distributed root is unspecified, and AUTO would sum
+        // leaves INSIDE the existing stages. Unreachable via the single
+        // append the parity test pins, but cheap insurance against a
+        // future double-install or plan re-optimization.
+        if plan.as_any().is::<DistributedExec>() {
+            tracing::debug!("mesh gate: plan already distributed, passing through");
+            return Ok(plan);
+        }
         match self.config.mode {
             // Force OFF: hand back the SAME Arc — byte-identical
             // single-node plan, zero mesh coordination.
-            Some(false) => Ok(plan),
+            Some(false) => {
+                tracing::debug!("mesh gate: mode=off → single-node");
+                Ok(plan)
+            }
             // Force ON: the pre-gate behavior.
-            Some(true) => self.inner.optimize(plan, config),
+            Some(true) => {
+                tracing::debug!("mesh gate: mode=on → distribute");
+                self.inner.optimize(plan, config)
+            }
             // AUTO: decide from the scan leaves' byte statistics.
             None => {
                 let mut leaf_bytes = Vec::new();
                 collect_scan_leaf_bytes(&plan, &mut leaf_bytes);
-                if auto_should_distribute(&leaf_bytes, self.config.min_bytes) {
+                let known_sum: u64 = leaf_bytes
+                    .iter()
+                    .flatten()
+                    .fold(0u64, |acc, b| acc.saturating_add(*b));
+                let distribute = auto_should_distribute(&leaf_bytes, self.config.min_bytes);
+                tracing::debug!(
+                    known_scan_bytes = known_sum,
+                    min_bytes = self.config.min_bytes,
+                    leaves = leaf_bytes.len(),
+                    decision = if distribute {
+                        "distribute"
+                    } else {
+                        "single-node"
+                    },
+                    "mesh gate: mode=auto"
+                );
+                if distribute {
                     self.inner.optimize(plan, config)
                 } else {
                     Ok(plan)
@@ -259,16 +325,20 @@ mod tests {
 
     #[test]
     fn min_bytes_of_parse_table() {
-        // Unset → default.
-        assert_eq!(min_bytes_of(None), DEFAULT_MESH_MIN_BYTES);
-        // Plain u64 parses.
-        assert_eq!(min_bytes_of(Some("1")), 1);
-        assert_eq!(min_bytes_of(Some("123456789")), 123_456_789);
-        // Garbage / empty / negative → default (same forgiving shape
-        // as flags::u64_or).
-        assert_eq!(min_bytes_of(Some("")), DEFAULT_MESH_MIN_BYTES);
-        assert_eq!(min_bytes_of(Some("4GiB")), DEFAULT_MESH_MIN_BYTES);
-        assert_eq!(min_bytes_of(Some("-5")), DEFAULT_MESH_MIN_BYTES);
+        // Unset → default, NOT flagged unparseable.
+        assert_eq!(min_bytes_of(None), (DEFAULT_MESH_MIN_BYTES, false));
+        // Plain u64 parses, not flagged.
+        assert_eq!(min_bytes_of(Some("1")), (1, false));
+        assert_eq!(min_bytes_of(Some("123456789")), (123_456_789, false));
+        // Garbage / empty / negative / suffixed → default VALUE but
+        // FLAGGED, so from_env can warn instead of silently ignoring an
+        // operator's typo'd threshold. Note "4GiB"/"1e9" are exactly the
+        // human-friendly forms someone would reach for — and they all
+        // fail; only a bare integer works.
+        assert_eq!(min_bytes_of(Some("")), (DEFAULT_MESH_MIN_BYTES, true));
+        assert_eq!(min_bytes_of(Some("4GiB")), (DEFAULT_MESH_MIN_BYTES, true));
+        assert_eq!(min_bytes_of(Some("1e9")), (DEFAULT_MESH_MIN_BYTES, true));
+        assert_eq!(min_bytes_of(Some("-5")), (DEFAULT_MESH_MIN_BYTES, true));
     }
 
     #[test]
@@ -464,6 +534,31 @@ mod tests {
         assert!(
             Arc::ptr_eq(&plan, &out),
             "AUTO below threshold must keep the single-node plan Arc"
+        );
+    }
+
+    /// Idempotency: a plan whose root is already `DistributedExec` is
+    /// passed straight through (same Arc), even forced-ON — the gate
+    /// never double-wraps an already-distributed plan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn already_distributed_root_passes_through() {
+        let (_tmp, path) = write_fixture();
+        let ctx = fixture_ctx(&path).await;
+        let plan = physical_plan(&ctx, FIXTURE_SQL).await;
+
+        // Wrap the plan so its root IS a DistributedExec, mimicking a
+        // plan that already went through the stage splitter.
+        let distributed: Arc<dyn ExecutionPlan> = Arc::new(DistributedExec::new(plan));
+
+        // Forced ON is the arm that would otherwise call the inner rule
+        // on the distributed root; the guard must short-circuit it.
+        let rule = AdaptiveMeshGateRule::new(MeshGateConfig::forced());
+        let out = rule
+            .optimize(distributed.clone(), &ConfigOptions::default())
+            .expect("optimize");
+        assert!(
+            Arc::ptr_eq(&distributed, &out),
+            "an already-distributed root must pass through unchanged"
         );
     }
 }
