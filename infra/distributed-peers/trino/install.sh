@@ -155,8 +155,11 @@ IMDS_TOKEN="$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' \
 INSTANCE_TYPE="$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
     http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown)"
 case "$INSTANCE_TYPE" in
+    # Constraint: max-mem-per-node + heap headroom (default 0.3*Xmx) <= Xmx,
+    # i.e. per-node query memory can be at most 0.7*Xmx. 18GB on a 24G heap
+    # violated this (18 + 7.2 > 24) and Trino refused to start.
     c7i.2xlarge) TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB"  ;;
-    c7i.4xlarge) TRINO_XMX="24G"; MAX_MEM_PER_NODE="18GB" ;;
+    c7i.4xlarge) TRINO_XMX="24G"; MAX_MEM_PER_NODE="16GB" ;;
     *)           TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB"  ;;
 esac
 echo "==> instance=$INSTANCE_TYPE  Xmx=$TRINO_XMX  max-memory-per-node=$MAX_MEM_PER_NODE"
