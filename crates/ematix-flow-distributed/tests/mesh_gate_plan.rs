@@ -71,30 +71,42 @@ async fn spawn_workers(n: usize) -> (Vec<Url>, JoinSet<()>) {
     (urls, join_set)
 }
 
-/// Small parquet fixture: 2000 rows (k Int64, v Float64).
+/// Small parquet fixture: a DIRECTORY of 4 files × 500 rows
+/// (k Int64, v Float64). Multiple files matter: the stage splitter's
+/// `FileScanConfigTaskEstimator` assigns tasks per file
+/// (`files_per_task`), and it elides network boundaries entirely when
+/// both sides of a would-be boundary run in a single task — a
+/// one-file scan therefore never distributes no matter what the gate
+/// decides. Pairing 4 files with `with_distributed_files_per_task(1)`
+/// gives the splitter real multi-task stages to split.
 fn write_fixture() -> (tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let path = tmp.path().join("t.parquet");
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
         Field::new("v", DataType::Float64, false),
     ]));
-    let n = 2000i64;
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int64Array::from((0..n).map(|i| i % 16).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(
-                (0..n).map(|i| i as f64).collect::<Vec<_>>(),
-            )),
-        ],
-    )
-    .expect("batch");
-    let file = std::fs::File::create(&path).expect("create parquet");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
-    writer.write(&batch).expect("write");
-    writer.close().expect("close");
-    (tmp, path.to_string_lossy().into_owned())
+    for f in 0..4i64 {
+        let path = tmp.path().join(format!("t{f}.parquet"));
+        let n = 500i64;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    (0..n).map(|i| (f * n + i) % 16).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    (0..n).map(|i| (f * n + i) as f64).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(&path).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+    let dir = tmp.path().to_string_lossy().into_owned();
+    (tmp, dir)
 }
 
 /// Session with the gate installed LAST + the worker resolver + the
@@ -113,7 +125,12 @@ async fn gated_ctx(config: MeshGateConfig, urls: Vec<Url>, parquet_path: &str) -
         .with_distributed_worker_resolver(StaticPeers { urls });
     let builder = builder
         .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
-        .expect("LZ4_FRAME is a valid compression type");
+        .expect("LZ4_FRAME is a valid compression type")
+        // One task per fixture file (see `write_fixture`): the leaf
+        // stage spans multiple tasks, so the splitter has boundaries
+        // to install when the gate lets it run.
+        .with_distributed_files_per_task(1)
+        .expect("files_per_task is configurable");
     let ctx = SessionContext::new_with_state(builder.build());
     ctx.register_parquet("t", parquet_path, Default::default())
         .await

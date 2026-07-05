@@ -68,44 +68,72 @@ impl MeshGateConfig {
     /// `EMAT_MESH_MIN_BYTES`). Called once at session build; the
     /// per-query decision then replays this snapshot at plan time.
     pub fn from_env() -> Self {
-        todo!("mesh gate: from_env")
+        Self {
+            mode: ematix_flow_core::flags::tri_state("EMAT_MESH"),
+            min_bytes: min_bytes_of(std::env::var("EMAT_MESH_MIN_BYTES").ok().as_deref()),
+        }
     }
 
     /// Force single-node: never distribute (what `EMAT_MESH=0`
     /// resolves to).
     pub fn off() -> Self {
-        todo!("mesh gate: off")
+        Self {
+            mode: Some(false),
+            min_bytes: DEFAULT_MESH_MIN_BYTES,
+        }
     }
 
     /// Force distribute: always run the stage splitter (what
     /// `EMAT_MESH=1` resolves to — the pre-gate behavior).
     pub fn forced() -> Self {
-        todo!("mesh gate: forced")
+        Self {
+            mode: Some(true),
+            min_bytes: DEFAULT_MESH_MIN_BYTES,
+        }
     }
 
     /// AUTO with an explicit byte threshold — the constructor tests
     /// and harnesses use to pin the decision without env mutation.
     pub fn auto_with_min_bytes(min_bytes: u64) -> Self {
-        let _ = min_bytes;
-        todo!("mesh gate: auto_with_min_bytes")
+        Self {
+            mode: None,
+            min_bytes,
+        }
     }
 }
 
 /// Pure core of the `EMAT_MESH_MIN_BYTES` parse so tests can pin the
 /// parse table without racing on process-global env vars (the
-/// `tri_state_of` convention).
+/// `tri_state_of` convention). Unparseable / unset → the default
+/// (same forgiving shape as `flags::u64_or`).
 fn min_bytes_of(val: Option<&str>) -> u64 {
-    let _ = val;
-    todo!("mesh gate: min_bytes_of")
+    val.and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MESH_MIN_BYTES)
 }
 
 /// Pure AUTO decision: `leaf_bytes` carries one entry per scan leaf —
 /// `Some(bytes)` when the leaf reports a usable `total_byte_size`
 /// (`Precision::Exact` or `Inexact`), `None` when unknown (`Absent`).
 /// Returns `true` when the plan should distribute.
+///
+/// - Any known bytes → distribute iff the (saturating) known sum is
+///   >= `min_bytes`. Unknown leaves contribute nothing — the known
+///   sum alone decides, so a large known fact scan still distributes
+///   even when a stat-less dimension source sits next to it.
+/// - NO known bytes at all → distribute: with zero information the
+///   gate preserves the pre-gate always-distribute behavior rather
+///   than silently disabling the mesh.
 fn auto_should_distribute(leaf_bytes: &[Option<u64>], min_bytes: u64) -> bool {
-    let _ = (leaf_bytes, min_bytes);
-    todo!("mesh gate: auto_should_distribute")
+    let mut any_known = false;
+    let mut sum: u64 = 0;
+    for bytes in leaf_bytes.iter().flatten() {
+        any_known = true;
+        sum = sum.saturating_add(*bytes);
+    }
+    if !any_known {
+        return true;
+    }
+    sum >= min_bytes
 }
 
 /// `PhysicalOptimizerRule` wrapping
@@ -158,8 +186,23 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let _ = (plan, config);
-        todo!("mesh gate: optimize")
+        match self.config.mode {
+            // Force OFF: hand back the SAME Arc — byte-identical
+            // single-node plan, zero mesh coordination.
+            Some(false) => Ok(plan),
+            // Force ON: the pre-gate behavior.
+            Some(true) => self.inner.optimize(plan, config),
+            // AUTO: decide from the scan leaves' byte statistics.
+            None => {
+                let mut leaf_bytes = Vec::new();
+                collect_scan_leaf_bytes(&plan, &mut leaf_bytes);
+                if auto_should_distribute(&leaf_bytes, self.config.min_bytes) {
+                    self.inner.optimize(plan, config)
+                } else {
+                    Ok(plan)
+                }
+            }
+        }
     }
 
     fn name(&self) -> &str {
