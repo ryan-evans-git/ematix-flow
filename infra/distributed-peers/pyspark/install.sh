@@ -87,7 +87,9 @@ python3.12 -m pip install --upgrade pip >/dev/null
 # bench.py deps (README's manual step, automated): system-wide, NOT --user —
 # cloud-init runs as root but the bench runs as ec2-user.
 if [ "$ROLE" = "master" ]; then
-    python3.12 -m pip install --quiet "pyspark==${SPARK_VERSION}" boto3
+    # As ec2-user with --user (the bench's runtime user): a system-wide pip
+    # tries to upgrade RPM-owned deps (requests) and hard-fails.
+    sudo -u ec2-user python3.12 -m pip install --user --quiet "pyspark==${SPARK_VERSION}" boto3
     # Without SPARK_HOME the pip pyspark runs self-contained: no s3a jars,
     # no spark-defaults.conf (master URL!) — the bench would silently run
     # local-mode. Point it at the real install for every login shell.
