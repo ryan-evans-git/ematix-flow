@@ -158,9 +158,12 @@ case "$INSTANCE_TYPE" in
     # Constraint: max-mem-per-node + heap headroom (default 0.3*Xmx) <= Xmx,
     # i.e. per-node query memory can be at most 0.7*Xmx. 18GB on a 24G heap
     # violated this (18 + 7.2 > 24) and Trino refused to start.
-    c7i.2xlarge) TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB"  ;;
-    c7i.4xlarge) TRINO_XMX="24G"; MAX_MEM_PER_NODE="16GB" ;;
-    *)           TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB"  ;;
+    # MAX_MEM_TOTAL (query.max-memory, the distributed cap) = 3 workers x
+    # per-node: 40GB undersold the SF100 cluster and killed Q09/Q21 with
+    # EXCEEDED_GLOBAL_MEMORY_LIMIT.
+    c7i.2xlarge) TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB";  MAX_MEM_TOTAL="24GB" ;;
+    c7i.4xlarge) TRINO_XMX="24G"; MAX_MEM_PER_NODE="16GB"; MAX_MEM_TOTAL="48GB" ;;
+    *)           TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB";  MAX_MEM_TOTAL="24GB" ;;
 esac
 echo "==> instance=$INSTANCE_TYPE  Xmx=$TRINO_XMX  max-memory-per-node=$MAX_MEM_PER_NODE"
 
@@ -196,7 +199,7 @@ coordinator=true
 node-scheduler.include-coordinator=false
 http-server.http.port=8080
 discovery.uri=http://${COORDINATOR_HOST}:8080
-query.max-memory=40GB
+query.max-memory=${MAX_MEM_TOTAL}
 query.max-memory-per-node=${MAX_MEM_PER_NODE}
 EOF
 else
@@ -204,7 +207,7 @@ else
 coordinator=false
 http-server.http.port=8080
 discovery.uri=http://${COORDINATOR_HOST}:8080
-query.max-memory=40GB
+query.max-memory=${MAX_MEM_TOTAL}
 query.max-memory-per-node=${MAX_MEM_PER_NODE}
 EOF
 fi
