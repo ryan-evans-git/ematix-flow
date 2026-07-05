@@ -164,14 +164,24 @@ INSTANCE_TYPE="$(curl -fsS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
 AWS_REGION="$(curl -fsS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
     http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || echo us-east-2)"
 
+# WORKER_MEMORY = the pool each worker advertises. EXECUTOR_MEMORY = the
+# heap ONE executor actually takes — CRITICAL: Spark's default is 1g, so
+# without this every executor OOMs on any SF100 join ("Lost task …
+# executor N"). One executor per worker; executor + ~10% overhead must
+# fit under WORKER_MEMORY (e.g. 24g + 2.4g < 28g). DRIVER_MEMORY covers
+# the coordinator-side collectToPython of (small) result sets.
 case "$INSTANCE_TYPE" in
-    c7i.2xlarge) WORKER_MEMORY="12g" ;;
-    c7i.4xlarge) WORKER_MEMORY="28g" ;;
-    c7i.8xlarge) WORKER_MEMORY="56g" ;;
+    c7i.2xlarge) WORKER_MEMORY="12g"; EXECUTOR_MEMORY="10g"; DRIVER_MEMORY="4g"  ;;
+    c7i.4xlarge) WORKER_MEMORY="28g"; EXECUTOR_MEMORY="24g"; DRIVER_MEMORY="8g"  ;;
+    c7i.8xlarge) WORKER_MEMORY="56g"; EXECUTOR_MEMORY="48g"; DRIVER_MEMORY="12g" ;;
     *)
-        # Fallback: 75% of detected RAM, in whole GiB.
+        # Fallback: 75% of detected RAM for the worker pool; executor takes
+        # ~85% of that, driver a fixed 4g.
         TOTAL_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-        WORKER_MEMORY="$(( TOTAL_KB * 75 / 100 / 1024 / 1024 ))g"
+        WORKER_GB=$(( TOTAL_KB * 75 / 100 / 1024 / 1024 ))
+        WORKER_MEMORY="${WORKER_GB}g"
+        EXECUTOR_MEMORY="$(( WORKER_GB * 85 / 100 ))g"
+        DRIVER_MEMORY="4g"
         ;;
 esac
 
@@ -209,9 +219,16 @@ cat >"$SPARK_HOME/conf/spark-defaults.conf" <<EOF
 spark.master                                   spark://${MASTER_HOST}:7077
 spark.serializer                               org.apache.spark.serializer.KryoSerializer
 spark.sql.parquet.enableVectorizedReader       true
+spark.executor.memory                          ${EXECUTOR_MEMORY}
+spark.executor.cores                           ${WORKER_CORES}
+spark.driver.memory                            ${DRIVER_MEMORY}
 spark.sql.adaptive.enabled                     true
 spark.sql.adaptive.coalescePartitions.enabled  true
-spark.sql.shuffle.partitions                   ${WORKER_CORES}
+# 400 initial shuffle partitions (was WORKER_CORES≈16 — far too coarse
+# for SF100: each partition held ~1/16 of a shuffled fact relation and
+# OOM'd the executor). AQE coalescePartitions merges these back down for
+# small stages, so 400 is safe across SF10/SF100.
+spark.sql.shuffle.partitions                   400
 
 # s3a access via the EC2 instance profile (no static creds on disk).
 # hadoop-aws 3.4.x runs on AWS SDK **v2**: the provider below is the
