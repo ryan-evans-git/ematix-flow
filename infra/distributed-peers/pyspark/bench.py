@@ -151,14 +151,16 @@ def build_spark(app_name: str):
 
 
 def register_tables(spark, bucket: str, sf: int) -> None:
-    """Register each TPC-H table as a temp view from its single parquet
-    file in S3. We register a view (not a managed table) so there is no
-    Hive metastore / Glue dependency."""
-    prefix = f"s3a://{bucket}/tpch-data/sf{sf}"
+    """Register each TPC-H table as a temp view from its parquet files in
+    S3. We register a view (not a managed table) so there is no Hive
+    metastore / Glue dependency. `DATA_PREFIX` (env, default `tpch-data`)
+    selects the single-file layout vs the multi-file `tpch-data-parted`
+    layout; Spark reads the per-table directory either way."""
+    data_prefix = os.environ.get("DATA_PREFIX", "tpch-data")
+    prefix = f"s3a://{bucket}/{data_prefix}/sf{sf}"
     for tbl in TPCH_TABLES:
-        # Directory layout (<table>/<table>.parquet): the canonical S3 shape
-        # since the Trino leg's register-tables.sh reorganisation — Hive
-        # treats external_location as a directory. Spark reads the dir fine.
+        # Per-table directory layout — Spark reads every parquet file in the
+        # dir (1 file for single-file data, K parts for the parted layout).
         path = f"{prefix}/{tbl}/"
         spark.read.parquet(path).createOrReplaceTempView(tbl)
         print(f"  registered {tbl} <- {path}", flush=True)
