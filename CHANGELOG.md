@@ -15,22 +15,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte-identical to single-node with peers configured but unused), and
   unset = AUTO: sum `total_byte_size` across the plan's scan leaves and
   distribute only when the known sum reaches `EMAT_MESH_MIN_BYTES`
-  (default 4 GiB, uncalibrated placeholder). The resolved gate is logged
+  (default 8 MiB, calibrated 2026-07). The resolved gate is logged
   at session build; the campaign harness records the per-query outcome as
-  `QueryStats::plan_mode`. See `docs/EMAT_FLAGS.md`.
+  `QueryStats::plan_mode` and `scan_bytes`. See `docs/EMAT_FLAGS.md`.
 
 ### Changed
 
-- **Behavior change — peer-configured distributed sessions now default to
-  AUTO, not always-distribute.** Before this release, once
-  `DistributedBackend` had peers configured, *every* query was split
-  across the Arrow Flight mesh. With the adaptive mesh gate the default
-  (env unset) is AUTO with a 4 GiB threshold, so small/medium queries now
-  execute single-node to skip mesh coordination overhead (measured:
-  distributed Q22 ~120 ms vs ~24 ms single-node at SF=10). **To restore
-  the previous always-distribute behavior, set `EMAT_MESH=1`** — benchmark
-  runs comparing against pre-gate results MUST pin it until the AUTO
-  threshold is calibrated.
+- **Behavior change — peer-configured distributed sessions now gate on
+  the adaptive mesh gate (AUTO by default), and the distributed planner
+  fans scans out by file count.** Two coupled fixes: (1) `files_per_task`
+  is pinned to 1 so a partitioned scan's task count auto-derives as
+  `min(file-splits, worker-count)` — previously the library default
+  (local core count) collapsed single-file scans to one task, silently
+  running "distributed" sessions single-node; (2) the AUTO gate distributes
+  when summed scan bytes reach `EMAT_MESH_MIN_BYTES` (calibrated 8 MiB).
+  The 2026-07 SF1/SF10 crossover campaign found that on partitioned data
+  the mesh **wins or ties on every query from 1 MiB to 3.8 GiB of scanned
+  bytes** (e.g. Q13 2.1×, Q15 2.3× at SF10), so AUTO distributes broadly;
+  single-node is the fallback when a scan is trivial or unpartitioned.
+  `EMAT_MESH=1` forces always-distribute, `=0` forces single-node.
 
 ## [0.12.0] — 2026-07-03
 

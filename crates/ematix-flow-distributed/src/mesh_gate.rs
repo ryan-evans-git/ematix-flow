@@ -20,9 +20,9 @@
 //!   single-node plan. Peers stay configured but unused.
 //! - unset / unrecognized → AUTO: sum `total_byte_size` across the
 //!   plan's scan leaves. If the known sum is >= `EMAT_MESH_MIN_BYTES`
-//!   (default [`DEFAULT_MESH_MIN_BYTES`] = 4 GiB — an initial value
-//!   pending campaign calibration) → distribute; below → keep the
-//!   single-node plan. If NO leaf reports a byte size at all
+//!   (default [`DEFAULT_MESH_MIN_BYTES`] = 8 MiB — calibrated 2026-07,
+//!   the mesh wins/ties across the whole measured range) → distribute;
+//!   below → keep the single-node plan. If NO leaf reports a byte size at all
 //!   (all `Precision::Absent`) → distribute, preserving the pre-gate
 //!   behavior for stat-less sources (MemTable streams, custom scans
 //!   without stats, `collect_statistics(false)` sessions).
@@ -40,21 +40,26 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_distributed::{DistributedExec, DistributedPhysicalOptimizerRule};
 
-/// Default AUTO threshold for `EMAT_MESH_MIN_BYTES`: 4 GiB.
+/// Default AUTO threshold for `EMAT_MESH_MIN_BYTES`: 8 MiB.
 ///
-/// **Uncalibrated placeholder — do NOT cite in benchmark claims until
-/// the SF1/10/100 validation campaign refines it.** The gate compares
-/// against `Statistics::total_byte_size`, which for parquet is derived
-/// from the row groups' *uncompressed* byte sizes — typically 2–4× the
-/// on-disk file size, and further perturbed by projection / filter
-/// pushdown narrowing the scanned columns. So this threshold is NOT
-/// "≈ file size on disk": an SF=1 lineitem scan can plausibly report
-/// over 4 GiB uncompressed and distribute, while a projected few-column
-/// scan of a larger table can stay under it. The 2026-07 campaign
-/// measures the real single-node↔mesh crossover per query (recording
-/// `plan_mode` + the summed bytes) and this constant will be reset from
-/// that data.
-pub const DEFAULT_MESH_MIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// **Calibrated 2026-07 from the SF1/SF10 crossover campaign** (per-query
+/// `scan_bytes` + single-vs-mesh medians on 8-way-partitioned TPC-H, 4
+/// nodes). The finding: once data is partitioned so scans actually fan
+/// out (`files_per_task=1`), the mesh **wins or ties on every query
+/// across 1 MiB – 3.8 GiB of scanned bytes — no measured loss.** So the
+/// true crossover is near zero; the earlier 4 GiB placeholder (which
+/// suppressed all but the very largest scans) was ~1000× too high and
+/// left almost the entire mesh speedup on the table. 8 MiB sits just
+/// below the smallest robustly-measured win (Q13 at ~11 MiB, a 2×
+/// speedup — small scan, heavy compute) while still declining to spin up
+/// the mesh for genuinely trivial scans where the benefit is noise-level.
+///
+/// The gate compares against `Statistics::total_byte_size` — parquet
+/// row-groups' *uncompressed* size, narrowed by projection/filter
+/// pushdown to the scanned columns — so it is NOT "≈ file size on disk".
+/// A stat-less scan (all `Precision::Absent`) still distributes, matching
+/// the pre-gate behavior.
+pub const DEFAULT_MESH_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Config for the adaptive mesh gate. Carried as a field of
 /// [`AdaptiveMeshGateRule`] so tests construct it explicitly via the
@@ -319,8 +324,12 @@ mod tests {
     // ---------------- pure config / parse tests ----------------
 
     #[test]
-    fn default_mesh_min_bytes_is_4gib() {
-        assert_eq!(DEFAULT_MESH_MIN_BYTES, 4_294_967_296);
+    fn default_mesh_min_bytes_is_8mib_calibrated() {
+        // Calibrated 2026-07 from the SF1/SF10 crossover campaign (was a
+        // 4 GiB placeholder). 8 MiB — mesh wins/ties across the whole
+        // measured 1 MiB–3.8 GiB range, so distribute broadly.
+        assert_eq!(DEFAULT_MESH_MIN_BYTES, 8 * 1024 * 1024);
+        assert_eq!(DEFAULT_MESH_MIN_BYTES, 8_388_608);
     }
 
     #[test]
