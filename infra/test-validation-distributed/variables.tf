@@ -37,12 +37,12 @@ variable "max_lifetime_hours" {
 # ============================================================
 
 variable "scale_factor" {
-  description = "TPC-H scale factor. 10 → c7i.2xlarge / 100 GB EBS. 100 → c7i.4xlarge / 250 GB EBS for Q18/Q21 RAM headroom."
+  description = "TPC-H scale factor. 1/10 → c7i.2xlarge / 100 GB EBS. 100 → c7i.4xlarge / 250 GB EBS for Q18/Q21 RAM headroom."
   type        = number
   default     = 10
   validation {
-    condition     = contains([10, 100], var.scale_factor)
-    error_message = "scale_factor must be 10 or 100."
+    condition     = contains([1, 10, 100], var.scale_factor)
+    error_message = "scale_factor must be 1, 10, or 100."
   }
 }
 
