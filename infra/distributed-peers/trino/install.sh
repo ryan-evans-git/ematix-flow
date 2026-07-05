@@ -193,6 +193,12 @@ EOF
 # --- config.properties ------------------------------------------------------
 # Discovery: workers + coordinator both point at coordinator:8080. The
 # coordinator additionally hosts the discovery service.
+# Spill-to-disk: SF100 Q21 provably exceeds even the 48GB distributed cap
+# on this cluster; spill (docs: spill-enabled + spiller-spill-path) lets
+# genuinely-over-memory queries complete at the cost of latency.
+sudo mkdir -p "$TRINO_DATA/spill"
+sudo chown "$TRINO_USER:$TRINO_USER" "$TRINO_DATA/spill"
+
 if [[ "$ROLE" == "coordinator" ]]; then
     sudo tee "$TRINO_HOME/etc/config.properties" >/dev/null <<EOF
 coordinator=true
@@ -201,6 +207,8 @@ http-server.http.port=8080
 discovery.uri=http://${COORDINATOR_HOST}:8080
 query.max-memory=${MAX_MEM_TOTAL}
 query.max-memory-per-node=${MAX_MEM_PER_NODE}
+spill-enabled=true
+spiller-spill-path=${TRINO_DATA}/spill
 EOF
 else
     sudo tee "$TRINO_HOME/etc/config.properties" >/dev/null <<EOF
@@ -209,6 +217,8 @@ http-server.http.port=8080
 discovery.uri=http://${COORDINATOR_HOST}:8080
 query.max-memory=${MAX_MEM_TOTAL}
 query.max-memory-per-node=${MAX_MEM_PER_NODE}
+spill-enabled=true
+spiller-spill-path=${TRINO_DATA}/spill
 EOF
 fi
 
