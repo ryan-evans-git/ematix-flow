@@ -32,6 +32,9 @@ REGION="${AWS_REGION:-us-east-2}"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 LOCAL_DIR="${LOCAL_DIR:-/var/tmp/tpch-parted}"
 DEST_PREFIX="tpch-data-parted"
+# aws-cli lives at /usr/local/bin/aws on the EC2 AL2023 boxes but wherever
+# PATH resolves it on a dev laptop — pick whichever exists.
+AWS_BIN="${AWS_BIN:-$(command -v aws || echo /usr/local/bin/aws)}"
 
 TABLES=(region nation supplier customer part partsupp orders lineitem)
 
@@ -52,11 +55,11 @@ for t in "${TABLES[@]}"; do
   fi
   nfiles=$(ls -1 "$src"/*.parquet 2>/dev/null | wc -l | tr -d ' ')
   echo "  $t: $nfiles file(s) -> s3://$BUCKET/$DEST_PREFIX/sf$SF/$t/"
-  /usr/local/bin/aws s3 cp --recursive "$src/" \
+  "$AWS_BIN" s3 cp --recursive "$src/" \
     "s3://$BUCKET/$DEST_PREFIX/sf$SF/$t/" --region "$REGION" --no-progress
 done
 
 echo "=== verify ==="
-/usr/local/bin/aws s3 ls "s3://$BUCKET/$DEST_PREFIX/sf$SF/" \
+"$AWS_BIN" s3 ls "s3://$BUCKET/$DEST_PREFIX/sf$SF/" \
   --region "$REGION" --recursive --human-readable --summarize | tail -25
 echo "=== sf$SF parted upload complete ==="
