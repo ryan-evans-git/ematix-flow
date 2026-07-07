@@ -232,9 +232,14 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 fn parse_peers() -> Vec<String> {
-    std::env::var("EMATIX_PEERS")
-        .expect("EMATIX_PEERS env var required (comma-separated worker URLs)")
-        .split(',')
+    // A single-node diagnostic run (NO_DISTRIBUTE) has no mesh, so peers are
+    // optional there; only the distributed path truly requires them.
+    let raw = match std::env::var("EMATIX_PEERS") {
+        Ok(v) => v,
+        Err(_) if std::env::var_os("NO_DISTRIBUTE").is_some() => return Vec::new(),
+        Err(_) => panic!("EMATIX_PEERS env var required (comma-separated worker URLs)"),
+    };
+    raw.split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()

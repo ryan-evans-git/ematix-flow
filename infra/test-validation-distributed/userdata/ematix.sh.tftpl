@@ -75,6 +75,10 @@ ls -lhR /opt/ematix/data/sf${scale_factor}/ | head -60
 SHA=$(sudo -u ec2-user git -C /opt/ematix/ematix-flow rev-parse HEAD 2>/dev/null || echo unknown)
 BINDIR=/opt/ematix/ematix-flow/target/release
 mkdir -p "$BINDIR/examples"
+# This script runs as root, so mkdir creates target/ root-owned. The compile
+# fallback runs as ec2-user and would fail to write target/release/.cargo-build-lock
+# (Permission denied). Hand target/ to ec2-user so the fresh-compile path works.
+chown -R ec2-user:ec2-user /opt/ematix/ematix-flow/target
 echo "resolving binaries for SHA=$SHA"
 
 if /usr/local/bin/aws s3 cp "s3://${bench_bucket}/bin/$SHA/flow-worker" "$BINDIR/flow-worker" --only-show-errors 2>/dev/null; then
