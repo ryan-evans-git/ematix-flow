@@ -11,6 +11,32 @@ harnesses under `infra/distributed-peers/`.
 
 ---
 
+> ### ⚠️ Correction in progress (2026-07-07)
+>
+> The originally published ematix distributed figures (SF=10 **11.8 s**,
+> SF=100 **70.0 s**) were **not actually distributed** — with a single
+> parquet file per table the distributed planner sized every scan to one
+> task (`ceil(1 file / files_per_task)` = 1) and the mesh silently never
+> engaged. Those numbers were single-node ematix on the coordinator with
+> the 3 workers idle.
+>
+> **Fixed:** `files_per_task=1` (commit `2d430af`) + an 8-parts-per-table
+> data layout (`tpch-data-parted/`) now make the mesh genuinely fan out
+> (18/22 queries distribute; verified via per-query `plan_mode`). The
+> **real meshed** ematix numbers are **SF=10 ≈ 9.9 s** and
+> **SF=100 ≈ 61.9 s** — *faster* than the mislabeled single-node figures,
+> so ematix's lead over the JVM engines only widens.
+>
+> **Open caveat before republishing the multiples below:** the corrected
+> ematix runs read the **parted** layout, while the Trino/PySpark numbers
+> were measured on the **single-file** layout and have **not** been
+> re-run. The order-of-magnitude gaps are unaffected, but the exact
+> multiples should be re-measured with a matched data layout across all
+> engines before this doc is considered final. The tables below have been
+> updated with the real ematix numbers and flag this pending re-run.
+
+---
+
 ## TL;DR
 
 Same 4-node cluster, same S3 parquet data, same 22 TPC-H queries,
@@ -18,10 +44,14 @@ Same 4-node cluster, same S3 parquet data, same 22 TPC-H queries,
 gap widens with data volume — because ematix needs no memory tuning
 while the JVM engines need progressively more.**
 
-| Scale | ematix | Trino 482 | PySpark 4.1.2 |
+ematix numbers are the **real meshed** figures (18/22 queries fan out;
+`EMAT_MESH=auto`). Trino/PySpark columns are the prior single-file runs,
+pending a matched-layout re-run (see correction banner above).
+
+| Scale | ematix (meshed) | Trino 482 | PySpark 4.1.2 |
 |---|---:|---:|---:|
-| **SF=10** (Σ median, 22/22) | **11.8 s** | 53.6 s (4.5×) | 63.5 s (5.4×) |
-| **SF=100** (Σ median, 22/22) | **70.0 s** | 524.5 s (7.5×) | **DNF** (7/22 completed) |
+| **SF=10** (Σ median, 22/22) | **9.9 s** | 53.6 s (~5.4×) | 63.5 s (~6.4×) |
+| **SF=100** (Σ median, 22/22) | **61.9 s** | 524.5 s (~8.5×) | **DNF** (7/22 completed) |
 
 ematix ran **22/22 at both scales with zero memory configuration and
 zero disk spill.** Trino required three rounds of memory engineering
@@ -36,18 +66,24 @@ this hardware at all — its executors OOM on the join-heavy queries.
   - SF=10: `c7i.2xlarge` (8 vCPU / 16 GB) spot.
   - SF=100: `c7i.4xlarge` (16 vCPU / 32 GB) on-demand.
   - **Every engine ran on the identical instance type at each scale.**
-- **Data:** one canonical TPC-H parquet copy in S3
-  (`s3://<bucket>/tpch-data/sf{N}/<table>/<table>.parquet`), read by all
-  three engines. No per-engine data massaging beyond the directory
-  layout Hive/Glue requires (Spark and ematix read the same files).
+- **Data:** TPC-H parquet in S3. The corrected ematix meshed runs read
+  the **parted** layout `tpch-data-parted/sf{N}/<table>/<table>-NNNN.parquet`
+  (8 parts/table) — required for the distributed planner to split a scan
+  into ≥ worker-count tasks and fan out. The Trino/PySpark numbers here
+  were measured on the single-file layout `tpch-data/sf{N}/<table>/<table>.parquet`
+  and have not yet been re-run on the parted layout (see correction
+  banner). Matching the layout across all engines is the outstanding item
+  before the exact multiples are final.
 - **Protocol:** 5 measured trials + 2 warmups per query, per-query
   medians, Σ = sum of the 22 medians. Each result carries a provenance
   block (git sha, `git_dirty=false`, instance type, peer list) asserted
   before the result is accepted; a leg that fails to complete 22/22 is
   **not** banked (driver-enforced).
 - **Engines / versions:**
-  - ematix-flow `v0.12.0` (sha `f66e293`), distributed backend with 3
-    Arrow Flight peers.
+  - ematix-flow distributed backend with 3 Arrow Flight peers. Original
+    (mislabeled) figures: `v0.12.0` sha `f66e293`. Corrected meshed
+    figures: branch `integration/mesh-gate-campaign` sha `e9bd188`
+    (includes the `files_per_task=1` fan-out fix `2d430af`).
   - Trino **482** (latest stable), Java 25 (Corretto), Glue metastore,
     native S3.
   - PySpark **4.1.2** (latest stable), standalone cluster, hadoop-aws
@@ -61,27 +97,39 @@ this hardware at all — its executors OOM on the join-heavy queries.
 
 | Engine | Σ of 22 medians | vs ematix |
 |---|---:|---:|
-| **ematix-flow** | **11.8 s** | — |
-| Trino 482 | 53.6 s | 4.5× slower |
-| PySpark 4.1.2 | 63.5 s | 5.4× slower |
+| **ematix-flow** (meshed) | **9.9 s** | — |
+| Trino 482 | 53.6 s | ~5.4× slower |
+| PySpark 4.1.2 | 63.5 s | ~6.4× slower |
+
+ematix gate-mode breakdown on the same cluster (`plan_mode` recorded per
+query): `single` (forced, all on coordinator) **12.1 s** → `mesh`
+(forced, 18/22 fan out) **9.9 s** → `auto` **10.1 s**. `auto` reaches the
+mesh result on its own by distributing the 18 heavy queries and keeping
+the 4 tiny ones single-node.
 
 ### SF=100 (c7i.4xlarge ×4)
 
 | Engine | Σ of 22 medians | vs ematix | Notes |
 |---|---:|---:|---|
-| **ematix-flow** | **70.0 s** | — | 22/22, zero tuning, zero spill |
-| Trino 482 | 524.5 s | 7.5× slower | 22/22, **only after** 3 memory rounds + disk spill |
+| **ematix-flow** (meshed) | **61.9 s** | — | 22/22, zero tuning, zero spill |
+| Trino 482 | 524.5 s | ~8.5× slower | 22/22, **only after** 3 memory rounds + disk spill |
 | PySpark 4.1.2 | **DNF** | — | 7/22 completed; executors OOM on joins |
+
+ematix gate-mode breakdown: `single` **72.8 s** → `mesh` **61.8 s** →
+`auto` **61.9 s** (18/22 fan out). Notably, Q09 — the six-table join —
+runs **6.2 s** meshed vs **20.9 s** on a single node reading a *single
+22 GB* lineitem file: the parted layout that enables fan-out also gives
+the big join the scan parallelism it was starved of.
 
 **SF=100, the queries that separate the engines** (ematix vs Trino
 median, both 22/22):
 
-| Query | ematix | Trino 482 | Trino / ematix |
+| Query | ematix (meshed) | Trino 482 | Trino / ematix |
 |---|---:|---:|---:|
-| Q21 (large self-join) | 12.5 s | 243.4 s | **19.5×** |
-| Q10 | 3.8 s | 58.5 s | 15.6× |
-| Q09 | 6.5 s | 59.8 s | 9.2× |
-| Q18 | 6.1 s | 18.3 s | 3.0× |
+| Q21 (large self-join) | 12.1 s | 243.4 s | **20.1×** |
+| Q10 | 3.0 s | 58.5 s | 19.6× |
+| Q09 | 6.2 s | 59.8 s | 9.6× |
+| Q18 | 4.1 s | 18.3 s | 4.4× |
 
 Trino's tail is dominated by the queries whose intermediate state
 exceeds cluster memory and spill to disk. ematix streams the same
