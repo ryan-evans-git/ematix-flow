@@ -573,6 +573,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provenance.instance_type,
     );
     let ctx = Arc::new(SessionContext::from(state));
+    // Match the SHIPPED engine: read parquet via the hand-rolled ematix-parquet
+    // reader (EmatixFastParquetTableProvider — late-materialization + fused
+    // NEON/AVX2 predicate kernels), which is what run_shard/work_unit use in
+    // production. The generic arrow-rs `register_parquet` is used ONLY when we
+    // fan out (distributed): the DistributedPhysicalOptimizerRule splits an
+    // arrow-rs ListingTable across peers, and each peer's shard then reads via
+    // ematix-parquet itself. So single-node (NO_DISTRIBUTE) uses ematix-parquet
+    // directly — no code path benchmarks the arrow-rs reader as "ematix".
+    let use_fast = !distributed;
     for table in TPCH_TABLES {
         // `table_source` resolves the multi-file parts dir `<table>/` (each
         // holding `<table>-NNNN.parquet`) when present, else the legacy flat
@@ -583,8 +592,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (single-node), which is why the parts layout matters for the mesh.
         let p = table_source(&data_dir, table)
             .unwrap_or_else(|| panic!("pre-flight passed but {table} source vanished"));
-        ctx.register_parquet(*table, p.to_str().unwrap(), Default::default())
-            .await?;
+        if use_fast {
+            let prov = ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider::try_new(
+                p.to_string_lossy().to_string(),
+            )?;
+            ctx.register_table(*table, Arc::new(prov))?;
+        } else {
+            ctx.register_parquet(*table, p.to_str().unwrap(), Default::default())
+                .await?;
+        }
     }
 
     // CUSTOM_SQL=<sql> — run one ad-hoc query through the distributed ctx
