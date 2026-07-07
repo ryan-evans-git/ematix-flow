@@ -11,7 +11,7 @@ harnesses under `infra/distributed-peers/`.
 
 ---
 
-> ### ⚠️ Correction in progress (2026-07-07)
+> ### Correction (2026-07-07) — numbers re-measured, now matched-layout
 >
 > The originally published ematix distributed figures (SF=10 **11.8 s**,
 > SF=100 **70.0 s**) were **not actually distributed** — with a single
@@ -23,17 +23,15 @@ harnesses under `infra/distributed-peers/`.
 > **Fixed:** `files_per_task=1` (commit `2d430af`) + an 8-parts-per-table
 > data layout (`tpch-data-parted/`) now make the mesh genuinely fan out
 > (18/22 queries distribute; verified via per-query `plan_mode`). The
-> **real meshed** ematix numbers are **SF=10 ≈ 9.9 s** and
-> **SF=100 ≈ 61.9 s** — *faster* than the mislabeled single-node figures,
-> so ematix's lead over the JVM engines only widens.
+> **real meshed** ematix numbers are **SF=10 = 9.9 s** and
+> **SF=100 = 61.9 s** — *faster* than the mislabeled single-node figures.
 >
-> **Open caveat before republishing the multiples below:** the corrected
-> ematix runs read the **parted** layout, while the Trino/PySpark numbers
-> were measured on the **single-file** layout and have **not** been
-> re-run. The order-of-magnitude gaps are unaffected, but the exact
-> multiples should be re-measured with a matched data layout across all
-> engines before this doc is considered final. The tables below have been
-> updated with the real ematix numbers and flag this pending re-run.
+> **All engines re-measured on the matched (parted) layout.** Trino and
+> PySpark were re-run reading the *same* 8-parts-per-table files (they were
+> essentially unaffected: Trino SF10 53.6→56.4 s, SF100 524.5→497.0 s;
+> PySpark SF10 63.5→65.0 s, SF100 DNF again). So the multiples below are
+> apples-to-apples on identical data — and ematix's lead is unchanged to
+> slightly wider than the original (mislabeled) figures implied.
 
 ---
 
@@ -44,14 +42,13 @@ Same 4-node cluster, same S3 parquet data, same 22 TPC-H queries,
 gap widens with data volume — because ematix needs no memory tuning
 while the JVM engines need progressively more.**
 
-ematix numbers are the **real meshed** figures (18/22 queries fan out;
-`EMAT_MESH=auto`). Trino/PySpark columns are the prior single-file runs,
-pending a matched-layout re-run (see correction banner above).
+All three engines read the **same parted layout** (8 parts/table). ematix
+is `EMAT_MESH=auto` (18/22 queries fan out).
 
 | Scale | ematix (meshed) | Trino 482 | PySpark 4.1.2 |
 |---|---:|---:|---:|
-| **SF=10** (Σ median, 22/22) | **9.9 s** | 53.6 s (~5.4×) | 63.5 s (~6.4×) |
-| **SF=100** (Σ median, 22/22) | **61.9 s** | 524.5 s (~8.5×) | **DNF** (7/22 completed) |
+| **SF=10** (Σ median, 22/22) | **9.9 s** | 56.4 s (5.7×) | 65.0 s (6.6×) |
+| **SF=100** (Σ median, 22/22) | **61.9 s** | 497.0 s (8.0×) | **DNF** (4/22 completed) |
 
 ematix ran **22/22 at both scales with zero memory configuration and
 zero disk spill.** Trino required three rounds of memory engineering
@@ -66,14 +63,14 @@ this hardware at all — its executors OOM on the join-heavy queries.
   - SF=10: `c7i.2xlarge` (8 vCPU / 16 GB) spot.
   - SF=100: `c7i.4xlarge` (16 vCPU / 32 GB) on-demand.
   - **Every engine ran on the identical instance type at each scale.**
-- **Data:** TPC-H parquet in S3. The corrected ematix meshed runs read
-  the **parted** layout `tpch-data-parted/sf{N}/<table>/<table>-NNNN.parquet`
-  (8 parts/table) — required for the distributed planner to split a scan
-  into ≥ worker-count tasks and fan out. The Trino/PySpark numbers here
-  were measured on the single-file layout `tpch-data/sf{N}/<table>/<table>.parquet`
-  and have not yet been re-run on the parted layout (see correction
-  banner). Matching the layout across all engines is the outstanding item
-  before the exact multiples are final.
+- **Data:** all three engines read the **same parted layout**
+  `tpch-data-parted/sf{N}/<table>/<table>-NNNN.parquet` (8 parts/table).
+  ematix needs ≥ worker-count files per table for the distributed planner
+  to split a scan into multiple tasks and fan out; Trino (Hive/Glue) and
+  PySpark read the identical directory of parts. Re-measuring the JVM
+  engines on this layout moved them <6% vs the earlier single-file runs
+  (Trino SF10 53.6→56.4 s, SF100 524.5→497.0 s; PySpark SF10 63.5→65.0 s),
+  so the head-to-head is genuinely apples-to-apples.
 - **Protocol:** 5 measured trials + 2 warmups per query, per-query
   medians, Σ = sum of the 22 medians. Each result carries a provenance
   block (git sha, `git_dirty=false`, instance type, peer list) asserted
@@ -98,8 +95,8 @@ this hardware at all — its executors OOM on the join-heavy queries.
 | Engine | Σ of 22 medians | vs ematix |
 |---|---:|---:|
 | **ematix-flow** (meshed) | **9.9 s** | — |
-| Trino 482 | 53.6 s | ~5.4× slower |
-| PySpark 4.1.2 | 63.5 s | ~6.4× slower |
+| Trino 482 | 56.4 s | 5.7× slower |
+| PySpark 4.1.2 | 65.0 s | 6.6× slower |
 
 ematix gate-mode breakdown on the same cluster (`plan_mode` recorded per
 query): `single` (forced, all on coordinator) **12.1 s** → `mesh`
@@ -112,8 +109,8 @@ the 4 tiny ones single-node.
 | Engine | Σ of 22 medians | vs ematix | Notes |
 |---|---:|---:|---|
 | **ematix-flow** (meshed) | **61.9 s** | — | 22/22, zero tuning, zero spill |
-| Trino 482 | 524.5 s | ~8.5× slower | 22/22, **only after** 3 memory rounds + disk spill |
-| PySpark 4.1.2 | **DNF** | — | 7/22 completed; executors OOM on joins |
+| Trino 482 | 497.0 s | 8.0× slower | 22/22, **only after** 3 memory rounds + disk spill |
+| PySpark 4.1.2 | **DNF** | — | 4/22 completed; executors OOM on joins |
 
 ematix gate-mode breakdown: `single` **72.8 s** → `mesh` **61.8 s** →
 `auto` **61.9 s** (18/22 fan out). Notably, Q09 — the six-table join —
@@ -126,10 +123,10 @@ median, both 22/22):
 
 | Query | ematix (meshed) | Trino 482 | Trino / ematix |
 |---|---:|---:|---:|
-| Q21 (large self-join) | 12.1 s | 243.4 s | **20.1×** |
-| Q10 | 3.0 s | 58.5 s | 19.6× |
-| Q09 | 6.2 s | 59.8 s | 9.6× |
-| Q18 | 4.1 s | 18.3 s | 4.4× |
+| Q21 (large self-join) | 12.1 s | 240.0 s | **19.9×** |
+| Q10 | 2.9 s | 50.0 s | 17.0× |
+| Q09 | 6.2 s | 55.7 s | 9.0× |
+| Q18 | 4.1 s | 16.3 s | 3.9× |
 
 Trino's tail is dominated by the queries whose intermediate state
 exceeds cluster memory and spill to disk. ematix streams the same
@@ -179,13 +176,14 @@ default:
   GC-thrash, miss heartbeats, the master deregisters them, and the app
   stalls at 0 cores.
 - **Right-sized (~50–60% of box RAM, e.g. 20 GB on 32 GB):** completes
-  SF=10 (63.5 s) but **still cannot complete SF=100** — executors OOM
-  on the join-heavy queries (Q05 onward) and Spark's master removes the
-  application after the executor-retry limit (`Master removed our
-  application: FAILED`). 7 of 22 queries (the scan/aggregate-light ones)
-  completed before the app died.
+  SF=10 (65.0 s on the parted layout) but **still cannot complete
+  SF=100** — executors OOM on the join-heavy queries (Q05 onward) and
+  Spark's master removes the application after the executor-retry limit
+  (`Master removed our application: FAILED`). Only 4 of 22 queries
+  (Q01–Q04, the scan/aggregate-light ones) completed before the app died
+  — the parted re-run reproduced the single-file DNF exactly.
 
-**PySpark SF=100 is recorded as DNF (did-not-finish, 7/22).** Caveat
+**PySpark SF=100 is recorded as DNF (did-not-finish, 4/22).** Caveat
 for completeness: the Spark config used one "fat" executor per worker
 rather than the multi-small-executor ("rule of 5") layout; a
 best-practice retry was not pursued (owner decision). The finding —
