@@ -45,7 +45,11 @@ locals {
   # joins fit in 16 GB; SF=100 lineitem is ~75 GB and the Q18/Q21
   # build sides won't fit on 16 GB workers.
   instance_type = var.scale_factor == 100 ? "c7i.4xlarge" : "c7i.2xlarge"
-  ebs_size_gb   = var.scale_factor == 100 ? 250 : 100
+  # SF100: 1 TB. Spark spills shuffle to local disk aggressively and DNF'd Q5
+  # at SF100 on 250 GB with "No space left on device"; 1 TB gives the full
+  # 22-query suite (154 warmup+trial iters) headroom. Trino survived on 250 GB
+  # but shares this sizing harmlessly.
+  ebs_size_gb   = var.scale_factor == 100 ? 1000 : 100
 
   # Bench bucket name (input) — referenced in IAM policies + userdata.
   # Validate caller provided it.
