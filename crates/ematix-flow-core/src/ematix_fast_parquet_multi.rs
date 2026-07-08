@@ -177,7 +177,9 @@ impl TableProvider for EmatixFastParquetMultiTableProvider {
         if children.len() == 1 {
             return Ok(children.pop().expect("len checked"));
         }
-        Ok(Arc::new(UnionExec::new(children)))
+        // `try_new` returns the already-boxed plan (and collapses a
+        // single-child union itself, though we short-circuit above anyway).
+        Ok(UnionExec::try_new(children)?)
     }
 }
 
@@ -189,12 +191,15 @@ mod tests {
     use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
     use ematix_parquet_format::types::CompressionCodec;
 
-    /// Write a `(key: i64, val: i64)` parquet at `path`.
+    /// Write an `(id: i64, val: i64)` parquet at `path`.
+    /// (`id`, not `key` — names ending in `key` hit the scale-gated
+    /// EMAT_DOWNCAST_KEYS Int64→Int32 narrowing, whose env gate other tests
+    /// toggle concurrently; a `key` fixture makes the schema race-flaky.)
     fn write_part(path: &Path, keys: &[i64], vals: &[i64]) {
         write_table_to_path(
             path,
             &[
-                ("key", ColumnData::I64(keys)),
+                ("id", ColumnData::I64(keys)),
                 ("val", ColumnData::I64(vals)),
             ],
             CompressionCodec::Uncompressed,
@@ -251,8 +256,8 @@ mod tests {
 
         // Filter (pushdown-eligible) + projection + aggregate spanning parts.
         for tmpl in [
-            "SELECT count(*) c, sum(val) s FROM {} WHERE key >= 50 AND key < 250",
-            "SELECT key, val FROM {} WHERE key IN (0, 150, 299) ORDER BY key",
+            "SELECT count(*) c, sum(val) s FROM {} WHERE id >= 50 AND id < 250",
+            "SELECT id, val FROM {} WHERE id IN (0, 150, 299) ORDER BY id",
             "SELECT count(*) FROM {}",
         ] {
             let m = run(&ctx, &tmpl.replace("{}", "multi")).await;
@@ -329,10 +334,10 @@ mod tests {
         assert_eq!(prov.num_parts(), 1);
         let ctx = SessionContext::new();
         ctx.register_table("t", Arc::new(prov)).unwrap();
-        let out = run(&ctx, "SELECT sum(val) FROM t WHERE key >= 2").await;
+        let out = run(&ctx, "SELECT sum(val) FROM t WHERE id >= 2").await;
         assert!(
             out.contains("90"),
-            "sum(val where key>=2)=20+30+40=90; got {out}"
+            "sum(val where id>=2)=20+30+40=90; got {out}"
         );
     }
 }
