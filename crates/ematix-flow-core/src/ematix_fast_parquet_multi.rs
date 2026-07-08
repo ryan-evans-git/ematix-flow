@@ -31,7 +31,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Statistics;
-use datafusion::common::stats::{ColumnStatistics, Precision};
+use datafusion::common::stats::Precision;
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
@@ -146,15 +146,29 @@ impl TableProvider for EmatixFastParquetMultiTableProvider {
         self.parts[0].supports_filters_pushdown(filters)
     }
 
-    /// Exact total row count (so the planner sizes this table correctly).
-    /// Per-column min/max are left unknown for now — a conservative, correct
-    /// input; merging the parts' typed stats is a follow-up.
+    /// Exact total row count + MERGED per-column stats across parts: `min` =
+    /// min of mins, `max` = max of maxes, `null_count`/`sum` = sums,
+    /// `distinct_count` = unknown (can't be merged across parts). This gives the
+    /// join planner the same selectivity signal the single-file provider gives;
+    /// without it, a partitioned fact table looks stats-less and the planner
+    /// picks a memory-blowing join order that OOMs at SF100 (observed on Q07).
     fn statistics(&self) -> Option<Statistics> {
-        let cols = self.schema.fields().len();
+        let mut cols = self.parts[0].statistics()?.column_statistics;
+        for part in &self.parts[1..] {
+            if let Some(s) = part.statistics() {
+                for (a, b) in cols.iter_mut().zip(s.column_statistics.iter()) {
+                    a.null_count = a.null_count.add(&b.null_count);
+                    a.min_value = a.min_value.min(&b.min_value);
+                    a.max_value = a.max_value.max(&b.max_value);
+                    a.sum_value = a.sum_value.add(&b.sum_value);
+                    a.distinct_count = Precision::Absent;
+                }
+            }
+        }
         Some(Statistics {
             num_rows: Precision::Exact(self.num_rows),
             total_byte_size: Precision::Absent,
-            column_statistics: vec![ColumnStatistics::new_unknown(); cols],
+            column_statistics: cols,
         })
     }
 
@@ -185,6 +199,7 @@ impl TableProvider for EmatixFastParquetMultiTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::ScalarValue;
     use datafusion::physical_plan::ExecutionPlanProperties;
     use datafusion::prelude::SessionContext;
     use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
@@ -287,6 +302,28 @@ mod tests {
             3,
             "union should expose one partition per part (parallel scan)"
         );
+    }
+
+    /// Merged statistics fold the row count and SPAN the parts' ranges — the
+    /// signal the join planner needs (a stats-less partitioned fact table
+    /// mis-plans and OOMs at SF100).
+    #[tokio::test]
+    async fn merged_stats_fold_rowcount_and_span_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parts, _combined) = fixture(dir.path()); // 3 parts, key 0..=299
+        let prov = EmatixFastParquetMultiTableProvider::try_new_files(parts).unwrap();
+        let s = prov.statistics().unwrap();
+        assert_eq!(s.num_rows, Precision::Exact(300), "row count = Σ parts");
+        assert_eq!(s.column_statistics.len(), 2, "key, val");
+        // When the parts carry exact footer min/max, the merge must span all of
+        // them: key ranges 0..99, 100..199, 200..299 -> [0, 299].
+        if let (Precision::Exact(min), Precision::Exact(max)) = (
+            &s.column_statistics[0].min_value,
+            &s.column_statistics[0].max_value,
+        ) {
+            assert_eq!(min, &ScalarValue::Int64(Some(0)), "min spans all parts");
+            assert_eq!(max, &ScalarValue::Int64(Some(299)), "max spans all parts");
+        }
     }
 
     #[tokio::test]
