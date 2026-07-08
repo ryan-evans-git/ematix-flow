@@ -22,6 +22,13 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege GITHUB_TOKEN for the whole workflow: every job here only
+# checks out + builds + tests, so read-only contents is sufficient (no job
+# writes to the repo, comments, or publishes). Satisfies CodeQL's
+# actions/missing-workflow-permissions and covers all jobs, not just one.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
