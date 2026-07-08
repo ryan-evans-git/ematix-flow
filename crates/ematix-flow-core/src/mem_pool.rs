@@ -421,20 +421,38 @@ mod tests {
     /// process-global env and must not interleave with each other.
     #[test]
     fn default_pool_bounds_and_caller_env_wins() {
-        // Arm 1: UNSET = unbounded (the shipped default — the 0.7
-        // blanket cap was refuted by the full-suite re-bench, see
-        // module docs).
+        // Arm 1: UNSET = the shipped default, which is PLATFORM-
+        // DEPENDENT by design: elastic floor guard where MemAvailable
+        // is sensable (Linux), unbounded legacy elsewhere (macOS dev).
+        // (The 0.7 blanket cap was refuted by the full-suite re-bench —
+        // see module docs; the floor is the guard that replaced it.)
         // SAFETY: single-threaded within this test; restored before exit.
         unsafe { std::env::remove_var("EMAT_MEM_POOL_FRACTION") };
+        unsafe { std::env::remove_var("EMAT_MEM_FLOOR_BYTES") };
         let state =
             apply_default_memory_pool(SessionStateBuilder::new().with_default_features()).build();
         let pool = state.runtime_env().memory_pool.clone();
-        let r = MemoryConsumer::new("test-default-unbounded").register(&pool);
-        assert!(
-            r.try_grow(1 << 40).is_ok(),
-            "default (unset) pool must be unbounded — accept 1 TiB"
-        );
-        r.free();
+        let r = MemoryConsumer::new("test-default").register(&pool);
+        if sensed_available_bytes().is_some() {
+            // Elastic floor: small requests succeed; an absurd 1 TiB
+            // request that would blow past physical memory is refused —
+            // the whole point: per-query error, not a kernel OOM-kill.
+            assert!(r.try_grow(1 << 20).is_ok(), "1 MiB fits on a healthy box");
+            r.free();
+            let r2 = MemoryConsumer::new("test-default-absurd").register(&pool);
+            let err = r2.try_grow(1 << 40).unwrap_err().to_string();
+            assert!(
+                err.contains("ElasticFloorPool"),
+                "1 TiB must be refused by the floor guard, got: {err}"
+            );
+            r2.free();
+        } else {
+            assert!(
+                r.try_grow(1 << 40).is_ok(),
+                "sensor-less platform stays unbounded — accept 1 TiB"
+            );
+            r.free();
+        }
 
         // Arm 2: explicit opt-in bounds the pool.
         unsafe { std::env::set_var("EMAT_MEM_POOL_FRACTION", "0.7") };
