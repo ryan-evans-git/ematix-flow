@@ -199,69 +199,75 @@ pub fn sidecar_i64_eq_opt(
     target_column: usize,
     max_selectivity: f64,
 ) -> DfResult<Option<Vec<i64>>> {
-    // Cheap pre-check so the metadata load below only happens when a sidecar
-    // file exists at all.
-    if !sidecar_path(source_path).exists() {
+    // Cheap pre-check so nothing below runs when there is no sidecar at all.
+    let idx_path = sidecar_path(source_path);
+    if !idx_path.exists() {
         SIDECAR_MISS.fetch_add(1, Ordering::Relaxed);
         return Ok(None);
     }
+
+    // Open source + sidecar ONCE and share them across the gate and the
+    // lookup — the P5 bench measured the sidecar open at ~140 ms on a
+    // 10M-row fixture, so a gate that re-opened for its own bounds check
+    // doubled the constant cost of every lookup.
+    let source = ematix_parquet_io::ParquetFile::open(source_path).map_err(|e| {
+        DataFusionError::Execution(format!("sidecar: open source {source_path:?}: {e:?}"))
+    })?;
+    let idx = match ematix_parquet_codec::index::ParquetIndex::open(&idx_path, &source) {
+        Ok(idx) => idx,
+        Err(e) if is_stale(&e) => {
+            SIDECAR_STALE.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(DataFusionError::Execution(format!(
+                "sidecar: open index {idx_path:?}: {e:?}"
+            )));
+        }
+    };
+    let Some(entry) = idx
+        .manifest()
+        .indexes
+        .iter()
+        .find(|entry| entry.name == index_name)
+    else {
+        // Sidecar exists but does not carry this index — not covered.
+        SIDECAR_MISS.fetch_add(1, Ordering::Relaxed);
+        return Ok(None);
+    };
 
     // Gate on the indexed column's footer stats. The indexed column is named
     // by the sidecar manifest; resolving its stats costs one footer read (no
     // data pages). Missing/untyped bounds → no estimate → default to the
     // index path (pre-P3 behavior: someone built this index on purpose).
-    if let Some((min, max)) = indexed_column_bounds(source_path, index_name)? {
-        let est = estimate_eq_selectivity(min, max, key);
-        if est > max_selectivity {
-            SIDECAR_SKIPPED_SELECTIVITY.fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
+    if let ematix_parquet_codec::index::IndexKind::Sorted { source_column, .. } = &entry.kind {
+        if let Some((min, max)) = footer_i64_bounds(source_path, source_column)? {
+            let est = estimate_eq_selectivity(min, max, key);
+            if est > max_selectivity {
+                SIDECAR_SKIPPED_SELECTIVITY.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
         }
     }
 
-    let looked_up = indexed_i64_eq(source_path, index_name, key, target_column)?;
-    match &looked_up {
-        Some(_) => SIDECAR_HIT.fetch_add(1, Ordering::Relaxed),
-        // Sidecar file existed but the open/cover check fell through
-        // (stale counts separately inside `indexed_i64_eq`).
-        None => SIDECAR_MISS.fetch_add(1, Ordering::Relaxed),
-    };
-    Ok(looked_up)
+    let values = idx
+        .read_column_i64_where_eq(&source, index_name, key, target_column)
+        .map_err(|e| {
+            DataFusionError::Execution(format!("sidecar: eq lookup {index_name}: {e:?}"))
+        })?;
+    SIDECAR_HIT.fetch_add(1, Ordering::Relaxed);
+    Ok(Some(values))
 }
 
-/// Footer `[min, max]` of the column the sidecar's `index_name` covers, or
-/// `None` when it cannot be determined (uncovered index, stale sidecar,
-/// non-i64 stats, footer without bounds) — every `None` case is "no
-/// estimate", never an error, so the decision safely defaults to the lookup
-/// path which has its own fallbacks.
-fn indexed_column_bounds(source_path: &Path, index_name: &str) -> DfResult<Option<(i64, i64)>> {
-    let source = ematix_parquet_io::ParquetFile::open(source_path).map_err(|e| {
-        DataFusionError::Execution(format!("sidecar: open source {source_path:?}: {e:?}"))
-    })?;
-    let idx =
-        match ematix_parquet_codec::index::ParquetIndex::open(sidecar_path(source_path), &source) {
-            Ok(idx) => idx,
-            // Stale/unreadable — let the primitive handle (and count) it.
-            Err(_) => return Ok(None),
-        };
-    let source_column = idx.manifest().indexes.iter().find_map(|e| {
-        if e.name != index_name {
-            return None;
-        }
-        match &e.kind {
-            ematix_parquet_codec::index::IndexKind::Sorted { source_column, .. } => {
-                Some(source_column.clone())
-            }
-            _ => None,
-        }
-    });
-    let Some(source_column) = source_column else {
-        return Ok(None);
-    };
-
+/// Footer `[min, max]` of `column` (by name), or `None` when it cannot be
+/// determined (unknown column, non-i64 stats, footer without bounds) — every
+/// `None` case is "no estimate", never an error, so the gate safely defaults
+/// to the lookup path which has its own fallbacks.
+fn footer_i64_bounds(source_path: &Path, column: &str) -> DfResult<Option<(i64, i64)>> {
     let md = crate::emat_parquet_metadata::load_provider_metadata(source_path).map_err(|e| {
         DataFusionError::Execution(format!("sidecar: read footer {source_path:?}: {e:?}"))
     })?;
-    let Ok(ordinal) = md.schema.index_of(&source_column) else {
+    let Ok(ordinal) = md.schema.index_of(column) else {
         return Ok(None);
     };
     let stats = &md.column_stats[ordinal];

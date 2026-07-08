@@ -1,6 +1,7 @@
 # Sidecar indexes in ematix-flow — design & plan
 
-Status: **draft / pre-implementation.** Branch: `feat/sidecar-indexes`.
+Status: **in progress — P1/P2/P3/P5 + I.1/I.3/I.4 landed** (see "Status by
+phase"). Branch: `feat/sidecar-indexes`.
 
 ## What this is
 
@@ -143,6 +144,113 @@ and makes its file-enumeration step a manifest prune.
 
 Milestone target: prove manifest-prune + sidecar + fan-out on the parted TPC-H
 layout (SF100 first, SF1000 once data-gen is affordable).
+
+## Status by phase (updated 2026-07-08)
+
+Per-phase: what landed, and any deviation from the section below that
+specified it.
+
+- **Phase 1 (read-side eq primitive)** — LANDED `014cd21f`
+  (`sidecar_index::indexed_i64_eq`). Deviations: eq-only (range deferred, as
+  the open questions anticipated); the `sidecar_{hit,miss,stale}` metric
+  slipped to P3, where it landed.
+- **Phase 2 (write-side + `flow index build` CLI)** — LANDED `5b69bad0`
+  (`sidecar_build::build_sorted_sidecar` + CLI). No deviations.
+- **Phase 3 (planner selectivity gate)** — LANDED `fec3419d`.
+  `sidecar_i64_eq(_opt)` gates index-vs-scan on a uniform-model estimate from
+  the indexed column's footer `[min,max]`; `EMAT_SIDECAR_MAX_SELECTIVITY`
+  (default 0.05, `docs/EMAT_FLAGS.md`). Also lands the
+  `sidecar_{hit,miss,stale,skipped_selectivity}` counters
+  (`sidecar_metrics()`). Deviations: threshold default 0.05, far below the
+  codec's advertised ~60% crossover — deliberate (crude estimator, asymmetric
+  miscall costs), and vindicated by the P5 numbers below. Follow-up inside
+  P3 (same branch): the gate shares one source+sidecar open with the lookup
+  after the P5 bench showed the open costs ~140 ms at 10M rows.
+- **Phase 4 (site documentation)** — NOT STARTED.
+- **Phase 5 (with/without-index bench)** — LANDED (this commit):
+  `examples/sidecar_bench.rs`, local fixture, no AWS. Deviations: fixture is
+  a clustered-duplicate id column (16 rows/id) written at 8 192-row row
+  groups — a fully-unique single-page id column (first attempt) is the
+  builder's worst case and overflows snappy's 4 GiB buffer cap below 300K
+  rows (see Results). Results below; the headline is a **negative** local
+  result that re-scopes where the index pays.
+- **I.1 (feature scaffold)** — LANDED `c6c92b7a` (`iceberg` feature on
+  ematix-flow-core, off by default).
+- **I.2 (single-node IcebergTableProvider MVP)** — NOT STARTED. The
+  single-node multi-file provider it plans to build on landed independently
+  (`076ea8e8`, `ematix_fast_parquet_multi`).
+- **I.3 (distributed manifest prune → fan-out)** — LANDED across
+  `c6c92b7a` (prune planner), `319c598c` (WorkUnit wire schema), and
+  `f2c33ed7` (coordinator lowering `ematix-flow-distributed::iceberg_lower`,
+  new off-by-default `iceberg` feature on that crate + worker decode in
+  `flow run-shard`). Deviations: worker decode lives in
+  `ematix-flow-cli/src/run_shard.rs` (that is where WorkUnits are executed),
+  not in ematix-flow-distributed; the wire schema gained additive v1 fields
+  (`predicate` now optional, `Query::Sql`) because Iceberg scans are not
+  bound to the TPC-H catalog; worker-side per-file sidecar lookup on
+  `Indexed` targets is carried but not yet exercised (Phase 3 provider
+  wiring is the hook point); execution knobs (dict-preservation/late-mat)
+  are not yet threaded through the multi-file provider.
+- **I.4 (write-side manifest stamping)** — LANDED `f9dad871`
+  (`iceberg_stamp`: `summary_from_footer` / `extension_from_footer` /
+  `stamped_data_file`). Deviations: bounds come from the parquet footer
+  statistics (self-contained, no sidecar open) rather than from the sidecar;
+  round-trip proven via manual `ManifestWriterBuilder` construction (the
+  buildable-today path) rather than a full catalog transaction.
+- **I.5 (async sidecar opener)** — NOT STARTED (cross-repo ask; unchanged).
+
+## Phase 5 results (2026-07-08, local)
+
+Machine: Apple Silicon dev box (darwin 25.5), local NVMe, warm page cache.
+`sidecar_bench` defaults: N=10M rows `(id, val)` i64 pairs, 8 192-row row
+groups (one PLAIN page each), clustered-duplicate ids (16 rows/id ≈ 626K
+distinct), planted keys per match fraction scattered at uniform stride,
+median of 5. Scan = `SELECT val FROM t WHERE id = K` through
+`EmatixFastParquetTableProvider`; index = `sidecar_i64_eq_opt` with the P3
+gate held open. Both paths oracle-checked identical (count + checksum)
+before any number is reported.
+
+uncompressed:
+
+| fraction | matches | scan ms (median) | index ms (median) | speedup | P3 gate @ 0.05 |
+| --- | --- | --- | --- | --- | --- |
+| 0.0001 | 1000 | 7.22 | 573.79 | 0.0x | index (est 1.60e-6) |
+| 0.001 | 10000 | 7.10 | 681.15 | 0.0x | index (est 1.60e-6) |
+| 0.01 | 100000 | 6.76 | 687.52 | 0.0x | index (est 1.60e-6) |
+| 0.1 | 1000000 | 7.63 | 694.58 | 0.0x | index (est 1.60e-6) |
+
+snappy (`--codec snappy`):
+
+| fraction | matches | scan ms (median) | index ms (median) | speedup | P3 gate @ 0.05 |
+| --- | --- | --- | --- | --- | --- |
+| 0.0001 | 1000 | 6.39 | 570.34 | 0.0x | index (est 1.60e-6) |
+| 0.001 | 10000 | 6.39 | 676.04 | 0.0x | index (est 1.60e-6) |
+| 0.01 | 100000 | 6.66 | 681.73 | 0.0x | index (est 1.60e-6) |
+| 0.1 | 1000000 | 6.74 | 686.17 | 0.0x | index (est 1.60e-6) |
+
+**Findings (honest negative result):**
+
+1. **No crossover exists in this configuration** — the index path loses at
+   every fraction, by ~80-100×. A separate probe split the cost: sidecar
+   open ≈ 140 ms + `read_column_i64_where_eq` ≈ 450 ms even for 1 000
+   matches on a pre-opened index. The codec's eq lookup appears to decode
+   the entire index body (~630K sorted entries + rowset bitmaps) per call,
+   so its cost is O(index size), not O(log n + matches).
+2. The flow scan baseline is simply brutal locally: 10M rows, 2 columns,
+   pushdown, ~6-7 ms — and snappy vs uncompressed barely moves it. The
+   codec's advertised 26-40× (`bench_indexed_lookup`) is measured against a
+   different baseline/shape; on flow's local read path the advantage
+   evaporates.
+3. **Consequences:** (a) the P3 gate's conservative default is the right
+   call — an over-eager index path is a large regression here; (b) the
+   index's realistic wins move to where the scan is expensive (S3-resident
+   data, wide tables, cold cache — the SF1000/I.5 territory) or after the
+   codec gains partial index-body reads (binary search into the sorted
+   body) + an open cache. Both are codec-side asks to file alongside I.5.
+4. Builder scaling note: sidecar build wants **clustered duplicates and
+   small pages**. A unique-id single-page source allocates one page-sized
+   rowset bitmap per row and overflows snappy's 4 GiB cap below 300K rows;
+   with the clustered fixture it builds 10M rows in ~1.2 s.
 
 ## Decisions (owner, 2026-07-07)
 
