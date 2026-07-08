@@ -364,7 +364,8 @@ fn subtree_contains_join(p: &Arc<dyn ExecutionPlan>) -> bool {
     if p.as_any().is::<HashJoinExec>() {
         return true;
     }
-    p.children().iter().any(subtree_contains_join)
+    // `children()` yields `&&Arc<dyn ExecutionPlan>`; deref one layer.
+    p.children().iter().any(|c| subtree_contains_join(c))
 }
 
 /// Rows if `p` is a bare scan chain (no join beneath it); else `None`.
