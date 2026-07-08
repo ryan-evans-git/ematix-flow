@@ -151,12 +151,17 @@ def build_spark(app_name: str):
 
 
 def register_tables(spark, bucket: str, sf: int) -> None:
-    """Register each TPC-H table as a temp view from its single parquet
-    file in S3. We register a view (not a managed table) so there is no
-    Hive metastore / Glue dependency."""
-    prefix = f"s3a://{bucket}/tpch-data/sf{sf}"
+    """Register each TPC-H table as a temp view from its parquet files in
+    S3. We register a view (not a managed table) so there is no Hive
+    metastore / Glue dependency. `DATA_PREFIX` (env, default `tpch-data`)
+    selects the single-file layout vs the multi-file `tpch-data-parted`
+    layout; Spark reads the per-table directory either way."""
+    data_prefix = os.environ.get("DATA_PREFIX", "tpch-data")
+    prefix = f"s3a://{bucket}/{data_prefix}/sf{sf}"
     for tbl in TPCH_TABLES:
-        path = f"{prefix}/{tbl}.parquet"
+        # Per-table directory layout — Spark reads every parquet file in the
+        # dir (1 file for single-file data, K parts for the parted layout).
+        path = f"{prefix}/{tbl}/"
         spark.read.parquet(path).createOrReplaceTempView(tbl)
         print(f"  registered {tbl} <- {path}", flush=True)
 
@@ -285,7 +290,7 @@ def cluster_size_from_spark(spark) -> int:
 # -----------------------------------------------------------------------------
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PySpark TPC-H benchmark")
-    p.add_argument("--sf", type=int, required=True, choices=[10, 100],
+    p.add_argument("--sf", type=int, required=True, choices=[1, 10, 100],
                    help="TPC-H scale factor")
     p.add_argument("--bucket", required=True, help="S3 bucket (data + results)")
     p.add_argument("--trials", type=int, default=5, help="measured trials per query")

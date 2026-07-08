@@ -45,7 +45,11 @@ locals {
   # joins fit in 16 GB; SF=100 lineitem is ~75 GB and the Q18/Q21
   # build sides won't fit on 16 GB workers.
   instance_type = var.scale_factor == 100 ? "c7i.4xlarge" : "c7i.2xlarge"
-  ebs_size_gb   = var.scale_factor == 100 ? 250 : 100
+  # SF100: 1 TB. Spark spills shuffle to local disk aggressively and DNF'd Q5
+  # at SF100 on 250 GB with "No space left on device"; 1 TB gives the full
+  # 22-query suite (154 warmup+trial iters) headroom. Trino survived on 250 GB
+  # but shares this sizing harmlessly.
+  ebs_size_gb   = var.scale_factor == 100 ? 1000 : 100
 
   # Bench bucket name (input) — referenced in IAM policies + userdata.
   # Validate caller provided it.
@@ -83,30 +87,33 @@ data "aws_subnet" "anchor" {
 # External traffic: nothing. Operator access is via SSM Session
 # Manager, which doesn't require any inbound rule.
 
+# NO inline ingress/egress blocks here: mixing inline rules with the
+# standalone intra_cluster_all rule resource makes terraform treat the
+# inline set as authoritative — the SECOND apply strips the standalone
+# rule and partitions the running cluster (workers can't announce).
+# All rules live as standalone resources below.
 resource "aws_security_group" "cluster" {
   name        = "${local.base_name}-cluster"
-  description = "ematix-flow distributed cluster — intra-SG traffic only"
+  description = "ematix-flow distributed cluster - intra-SG traffic only"
   vpc_id      = data.aws_vpc.default.id
+}
 
-  # SSH only if pubkey provided (emergency console)
-  dynamic "ingress" {
-    for_each = var.ssh_pubkey == "" ? [] : [1]
-    content {
-      description = "SSH from operator"
-      from_port   = 22
-      to_port     = 22
-      protocol    = "tcp"
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-  }
+# SSH only if pubkey provided (emergency console)
+resource "aws_vpc_security_group_ingress_rule" "ssh_operator" {
+  count             = var.ssh_pubkey == "" ? 0 : 1
+  security_group_id = aws_security_group.cluster.id
+  description       = "SSH from operator"
+  ip_protocol       = "tcp"
+  from_port         = 22
+  to_port           = 22
+  cidr_ipv4         = "0.0.0.0/0"
+}
 
-  egress {
-    description = "All outbound (S3, Glue, dnf, github)"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+resource "aws_vpc_security_group_egress_rule" "all_outbound" {
+  security_group_id = aws_security_group.cluster.id
+  description       = "All outbound (S3, Glue, dnf, github)"
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
 }
 
 # Self-referential rule (separate resource to avoid the chicken-and-egg
@@ -269,6 +276,7 @@ data "cloudinit_config" "coordinator" {
         bench_bucket       = var.bench_bucket
         glue_database_name = var.glue_database_name
         scale_factor       = var.scale_factor
+        data_prefix        = var.data_prefix
       })
     }
   }
@@ -288,7 +296,10 @@ resource "aws_instance" "coordinator" {
 
   associate_public_ip_address = true
 
-  user_data_base64 = data.cloudinit_config.coordinator[0].rendered
+  # One-time spot instances can't be stopped for an in-place user_data
+  # update — force replacement instead.
+  user_data_base64            = data.cloudinit_config.coordinator[0].rendered
+  user_data_replace_on_change = true
 
   root_block_device {
     volume_size = local.ebs_size_gb
@@ -340,6 +351,7 @@ data "cloudinit_config" "worker" {
         bench_bucket       = var.bench_bucket
         glue_database_name = var.glue_database_name
         scale_factor       = var.scale_factor
+        data_prefix        = var.data_prefix
       })
     }
   }
@@ -356,7 +368,10 @@ resource "aws_instance" "worker" {
 
   associate_public_ip_address = true
 
-  user_data_base64 = data.cloudinit_config.worker[count.index].rendered
+  # One-time spot instances can't be stopped for an in-place user_data
+  # update — force replacement instead.
+  user_data_base64            = data.cloudinit_config.worker[count.index].rendered
+  user_data_replace_on_change = true
 
   root_block_device {
     volume_size = local.ebs_size_gb

@@ -22,6 +22,13 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege GITHUB_TOKEN for the whole workflow: every job here only
+# checks out + builds + tests, so read-only contents is sufficient (no job
+# writes to the repo, comments, or publishes). Satisfies CodeQL's
+# actions/missing-workflow-permissions and covers all jobs, not just one.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -35,6 +42,22 @@ env:
   RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
+  # Fast static guards (no Rust toolchain). Keep these cheap so they fail
+  # in seconds, before the expensive build/test jobs.
+  guards:
+    name: static guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ematix-parquet must be the ONLY parquet scan path in shipped runtime
+      # code — a silent drift to arrow-rs `register_parquet` is what made the
+      # AWS TPC-H campaign under-measure the engine. The guard self-tests its
+      # own comment/string/cfg(test) stripping first, then scans crates/*/src.
+      - name: Forbid arrow-rs register_parquet in shipped runtime code
+        run: |
+          python3 scripts/ci/forbid_runtime_register_parquet.py --self-test
+          python3 scripts/ci/forbid_runtime_register_parquet.py --root .
+
   rust:
     name: rust (ubuntu-latest)
     runs-on: ubuntu-latest

@@ -40,8 +40,8 @@ use tokio::sync::watch;
 
 use crate::backend::{ArrowBatchStream, Backend, BackendError, TargetTable, WriteMode};
 use crate::dlq::{
-    DeadLetterStore, DlqMeta, DlqRecord, DlqRecordId, DlqStage, KafkaTopicDlq, TableDlq,
-    truncate_error,
+    DeadLetterStore, DlqError, DlqMeta, DlqRecord, DlqRecordId, DlqSelection, DlqStage,
+    KafkaTopicDlq, ReplayOptions, ReplayReport, TableDlq, truncate_error,
 };
 use crate::kafka_backend::KafkaBackend;
 use crate::state_store::{RecoveredState, StateStore};
@@ -669,6 +669,13 @@ pub struct StreamingPipeline {
     /// pipeline where nothing fails performs zero DLQ work) via
     /// [`Self::resolve_dlq_store`].
     dlq_store: tokio::sync::OnceCell<Arc<dyn DeadLetterStore>>,
+    /// DLQ Phase 2: lazily-resolved TABLE store poison records park
+    /// into when the pipeline's own store cannot express `park` (a
+    /// Kafka topic) and [`ReplayOptions::park_store`] wasn't given.
+    /// Cached so successive replays park into the SAME store (the
+    /// in-memory fallback would otherwise drop parked records
+    /// between calls). See [`Self::resolve_park_fallback_store`].
+    park_fallback_store: tokio::sync::OnceCell<Arc<dyn DeadLetterStore>>,
 }
 
 impl StreamingPipeline {
@@ -688,6 +695,7 @@ impl StreamingPipeline {
             watermark_state,
             cdc_target_specs: tokio::sync::OnceCell::new(),
             dlq_store: tokio::sync::OnceCell::new(),
+            park_fallback_store: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -745,6 +753,7 @@ impl StreamingPipeline {
             watermark_state,
             cdc_target_specs: tokio::sync::OnceCell::new(),
             dlq_store: tokio::sync::OnceCell::new(),
+            park_fallback_store: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -1461,9 +1470,11 @@ impl StreamingPipeline {
     ///    a LOUD once-per-pipeline warning — dead-lettered records
     ///    are lost on process exit, mirroring the
     ///    `InMemoryStateStore` convention.
-    pub(crate) async fn resolve_dlq_store(
-        &self,
-    ) -> Result<&Arc<dyn DeadLetterStore>, BackendError> {
+    ///
+    /// Public since DLQ Phase 2: the Python/HTTP layer (Phase 4)
+    /// resolves the same store to serve depth / browse / park /
+    /// purge without re-implementing the resolution rules.
+    pub async fn resolve_dlq_store(&self) -> Result<&Arc<dyn DeadLetterStore>, BackendError> {
         self.dlq_store
             .get_or_try_init(|| async {
                 // 1. Explicit store wins.
@@ -1596,6 +1607,343 @@ impl StreamingPipeline {
         let n = records.len() as u64;
         store.append(records).await?;
         Ok(n)
+    }
+
+    /// DLQ Phase 2: replay (redrive) the pipeline's dead-lettered
+    /// records **through the pipeline's own transform + targets**.
+    ///
+    /// Bounded, single-pass: exactly one `take_for_replay` leases
+    /// the `selection`; every leased record is then resolved —
+    ///
+    /// - **success** (decode → transform → every target write OK):
+    ///   acked (removed) from the store;
+    /// - **failure** (decode, transform, or any target write):
+    ///   re-dead-lettered as a NEW record with `attempt + 1`, the
+    ///   fresh error string, and `failed_at` = this run's clock —
+    ///   then the original is acked. Redriven records are NOT
+    ///   re-taken by the same run (no hot retry loop against a
+    ///   still-broken sink);
+    /// - **poison** (`attempt + 1` would exceed
+    ///   `options.max_attempts`, or the record arrived already past
+    ///   the budget): parked. Table stores park in place (the
+    ///   record is neither acked nor retried). Stores that answer
+    ///   `park` with a typed `Unsupported` (a Kafka topic) park a
+    ///   copy into [`ReplayOptions::park_store`] — or the
+    ///   pipeline's table fallback
+    ///   ([`Self::resolve_park_fallback_store`]) — and the original
+    ///   IS acked so the topic cursor advances.
+    ///
+    /// ## Ordering / at-least-once
+    ///
+    /// Redrive appends and fallback parks land durably BEFORE any
+    /// original is acked, and acks are issued in take order (which
+    /// is per-partition offset order on a Kafka store — the only
+    /// order its contiguous group cursor can express). A crash
+    /// mid-run leaves originals leased; the lease expires and a
+    /// later replay re-takes them. Replay is therefore
+    /// at-least-once into the targets, same as the pipeline itself
+    /// (idempotent-target assumption unchanged, PRD non-goal:
+    /// exactly-once).
+    ///
+    /// ## Serialization
+    ///
+    /// When the resolved store's lease is process-local
+    /// ([`DeadLetterStore::replay_requires_serialization`], i.e.
+    /// `KafkaTopicDlq`), same-pipeline replays in this process are
+    /// serialized behind an in-process mutex. Cross-process
+    /// concurrency is NOT guarded (single-operator assumption; see
+    /// `dlq/replay.rs` module docs).
+    ///
+    /// ## Scope notes (Phase 2)
+    ///
+    /// - CDC-mode pipelines (`config.cdc`) are typed-rejected:
+    ///   replay re-applies through `write_arrow_stream`, which
+    ///   would break per-event CDC semantics.
+    /// - Stateful (windowed/session) transforms absorb replayed
+    ///   rows into their CURRENT state — replay does not
+    ///   reconstruct the original event-time context.
+    /// - Records are reprocessed one at a time (exact per-record
+    ///   attribution for the report + per-partition ack order);
+    ///   batching successive same-format records is a perf
+    ///   follow-up if DLQ drains ever get large.
+    ///
+    /// RunHistory registration (`kind=replay`) is Phase 4's job —
+    /// the returned [`ReplayReport`] (counts + wall-clock window)
+    /// is the hook it builds on.
+    pub async fn run_dlq_replay(
+        &self,
+        selection: DlqSelection,
+        options: ReplayOptions,
+    ) -> Result<ReplayReport, BackendError> {
+        if self.config.cdc.is_some() {
+            return Err(BackendError::Other(format!(
+                "DLQ replay is not supported for CDC-mode pipelines yet \
+                 (pipeline '{}'): replayed batches would re-apply through \
+                 write_arrow_stream, bypassing run_cdc's per-event semantics",
+                self.config.pipeline_name
+            )));
+        }
+        let store = Arc::clone(self.resolve_dlq_store().await?);
+
+        // Serialize same-pipeline replays when the store's lease
+        // can't (process-local; see method docs).
+        let _guard = if store.replay_requires_serialization() {
+            Some(
+                crate::dlq::replay::replay_lock(&self.config.pipeline_name)
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
+
+        // The engine is the emission boundary — it reads the clock;
+        // stores never do (house convention, same as
+        // `route_batches_to_dlq`).
+        let now_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        };
+        let started_at_ms = now_ms();
+        let mut report = ReplayReport {
+            started_at_ms,
+            ..Default::default()
+        };
+
+        let pipeline = self.config.pipeline_name.as_str();
+        let mut source = crate::dlq::DlqReplaySource::new(
+            Arc::clone(&store),
+            pipeline,
+            selection,
+            options.lease,
+        );
+        let taken = source
+            .take(started_at_ms)
+            .await
+            .map_err(BackendError::from)?;
+        report.taken = taken.len() as u64;
+        if taken.is_empty() {
+            report.finished_at_ms = now_ms();
+            return Ok(report);
+        }
+
+        // Kafka handle for Avro/Protobuf decode (schema-registry
+        // machinery lives on the source backend).
+        let kafka = self.sources.first().and_then(|(b, _)| b.as_kafka());
+
+        /// Per-record resolution, index-aligned with `taken`.
+        enum Outcome {
+            /// Reprocessed OK → ack.
+            Succeeded,
+            /// Re-dead-lettered (new record appended) → ack original.
+            Redriven,
+            /// Poison → park (in place, or fallback + ack).
+            Parked,
+        }
+
+        let mut outcomes: Vec<Outcome> = Vec::with_capacity(taken.len());
+        let mut redrive: Vec<DlqRecord> = Vec::new();
+        for record in &taken {
+            // Already past the budget (e.g. a previous run used a
+            // higher max_attempts): park without burning a retry.
+            if record.meta.attempt > options.max_attempts {
+                outcomes.push(Outcome::Parked);
+                continue;
+            }
+            match self.replay_dlq_record(record, kafka).await {
+                Ok(()) => outcomes.push(Outcome::Succeeded),
+                Err(e) => {
+                    let next_attempt = record.meta.attempt.saturating_add(1);
+                    if next_attempt > options.max_attempts {
+                        tracing::warn!(
+                            pipeline,
+                            record_id = %record.id,
+                            attempt = record.meta.attempt,
+                            max_attempts = options.max_attempts,
+                            error = %e,
+                            "DLQ replay: attempt budget exhausted — parking poison record"
+                        );
+                        outcomes.push(Outcome::Parked);
+                    } else {
+                        tracing::warn!(
+                            pipeline,
+                            record_id = %record.id,
+                            next_attempt,
+                            error = %e,
+                            "DLQ replay: record failed again — re-dead-lettering"
+                        );
+                        redrive.push(DlqRecord {
+                            id: DlqRecordId(uuid::Uuid::new_v4().to_string()),
+                            meta: DlqMeta {
+                                error: truncate_error(&e.to_string()),
+                                failed_at: now_ms(),
+                                attempt: next_attempt,
+                                ..record.meta.clone()
+                            },
+                            payload: record.payload.clone(),
+                        });
+                        outcomes.push(Outcome::Redriven);
+                    }
+                }
+            }
+        }
+
+        // Durability order: redrives + parks land BEFORE any
+        // original is acked (a crash in between re-delivers, never
+        // loses).
+        if !redrive.is_empty() {
+            let n = redrive.len() as u64;
+            store.append(redrive).await?;
+            self.metrics.dlq_writes.inc_by(n);
+        }
+
+        let parked_ids: Vec<DlqRecordId> = taken
+            .iter()
+            .zip(outcomes.iter())
+            .filter(|(_, o)| matches!(o, Outcome::Parked))
+            .map(|(r, _)| r.id.clone())
+            .collect();
+        // Whether parked originals must ALSO be acked (only when
+        // the park landed in a fallback store, so the topic cursor
+        // can advance past them).
+        let mut ack_parked = false;
+        if !parked_ids.is_empty() {
+            match store.park(pipeline, &parked_ids).await {
+                Ok(()) => {}
+                Err(DlqError::Unsupported(_)) => {
+                    let fallback = match &options.park_store {
+                        Some(s) => Arc::clone(s),
+                        None => Arc::clone(self.resolve_park_fallback_store().await?),
+                    };
+                    let park_records: Vec<DlqRecord> = taken
+                        .iter()
+                        .zip(outcomes.iter())
+                        .filter(|(_, o)| matches!(o, Outcome::Parked))
+                        .map(|(r, _)| r.clone())
+                        .collect();
+                    fallback.append(park_records).await?;
+                    fallback.park(pipeline, &parked_ids).await?;
+                    ack_parked = true;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Ack in take order — per-partition offset order on a Kafka
+        // store, whose group cursor is contiguous.
+        let ack_ids: Vec<DlqRecordId> = taken
+            .iter()
+            .zip(outcomes.iter())
+            .filter(|(_, o)| match o {
+                Outcome::Succeeded | Outcome::Redriven => true,
+                Outcome::Parked => ack_parked,
+            })
+            .map(|(r, _)| r.id.clone())
+            .collect();
+        if !ack_ids.is_empty() {
+            store.ack_replayed(pipeline, &ack_ids).await?;
+        }
+
+        for o in &outcomes {
+            match o {
+                Outcome::Succeeded => report.succeeded += 1,
+                Outcome::Redriven => report.redeadlettered += 1,
+                Outcome::Parked => report.parked += 1,
+            }
+        }
+        report.finished_at_ms = now_ms();
+        tracing::info!(
+            pipeline,
+            taken = report.taken,
+            succeeded = report.succeeded,
+            redeadlettered = report.redeadlettered,
+            parked = report.parked,
+            "DLQ replay run finished"
+        );
+        Ok(report)
+    }
+
+    /// Reprocess ONE dead-lettered record through the pipeline's
+    /// own transform + targets. Ok(()) iff the decoded batches
+    /// cleared the transform and every target write succeeded. A
+    /// transform that emits zero rows (filtered / absorbed into
+    /// windowed state) counts as success — the record was consumed.
+    async fn replay_dlq_record(
+        &self,
+        record: &DlqRecord,
+        kafka: Option<&KafkaBackend>,
+    ) -> Result<(), BackendError> {
+        let batches = crate::dlq::DlqReplaySource::decode(record, kafka).await?;
+
+        let batches: Vec<RecordBatch> = match &self.config.transform {
+            None => batches,
+            Some(t) => {
+                let ctx = BatchContext {
+                    global_wm: None,
+                    source_id: Some(record.meta.source_id.clone()),
+                };
+                let mut out = Vec::new();
+                for b in batches {
+                    out.extend(t.transform(b, &ctx).await?);
+                }
+                out
+            }
+        };
+
+        let n_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        if n_rows == 0 {
+            return Ok(());
+        }
+
+        let writes = self.targets.iter().map(|(backend, table)| {
+            let batches_for_target: Vec<RecordBatch> = batches.clone();
+            let target_stream: ArrowBatchStream = Box::pin(futures_util::stream::iter(
+                batches_for_target.into_iter().map(Ok),
+            ));
+            let mode = self.config.mode;
+            async move { backend.write_arrow_stream(table, target_stream, mode).await }
+        });
+        let results: Vec<Result<u64, BackendError>> = futures_util::future::join_all(writes).await;
+        if let Some(e) = results.into_iter().find_map(|r| r.err()) {
+            return Err(e);
+        }
+        self.metrics.rows_written.inc_by(n_rows);
+        Ok(())
+    }
+
+    /// DLQ Phase 2: the TABLE store poison records park into when
+    /// the pipeline's own store cannot express `park` and no
+    /// explicit [`ReplayOptions::park_store`] was provided.
+    /// Resolution mirrors rules 3–4 of [`Self::resolve_dlq_store`]:
+    /// the configured state store's SQL family, else an in-process
+    /// SQLite `:memory:` store with a LOUD warning (parked records
+    /// are then lost on process exit). Cached per pipeline instance
+    /// so successive replays park into the same store.
+    pub async fn resolve_park_fallback_store(
+        &self,
+    ) -> Result<&Arc<dyn DeadLetterStore>, BackendError> {
+        self.park_fallback_store
+            .get_or_try_init(|| async {
+                if let Some(state_store) = &self.config.state_store
+                    && let Some(store) = state_store.dead_letter_store().await?
+                {
+                    return Ok(store);
+                }
+                tracing::warn!(
+                    pipeline = %self.config.pipeline_name,
+                    "DLQ replay must park poison records but the pipeline's \
+                     dead-letter store cannot express park and no park_store / \
+                     state-store SQL family is configured — falling back to an \
+                     IN-MEMORY SQLite store. Parked records WILL BE LOST when \
+                     this process exits. Configure a Postgres state store or \
+                     pass ReplayOptions::park_store for durability."
+                );
+                let store = TableDlq::open_sqlite(":memory:").await?;
+                Ok(Arc::new(store) as Arc<dyn DeadLetterStore>)
+            })
+            .await
     }
 }
 
@@ -3631,6 +3979,731 @@ mod tests {
             );
             let store = pipeline.resolve_dlq_store().await.unwrap();
             assert_eq!(store.depth("fb").await.unwrap().pending, 1);
+        }
+
+        // --- DLQ Phase 2: replay engine (redrive through the pipeline) ----
+        //
+        // TDD note: this suite was committed FIRST, red, against a
+        // `run_dlq_replay` stub that returns an "unimplemented"
+        // error — same discipline as Phase 1's contract suite.
+
+        mod dlq_replay {
+            use super::*;
+            use crate::dlq::{DlqDepth, DlqError, DlqRecordStatus, DlqSelection, ReplayOptions};
+            use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+
+            /// A record shaped exactly like the emission path writes
+            /// for a non-Kafka source: JSONL payload,
+            /// `payload_format = "json"`, attempt 1.
+            fn seeded_json_record(pipeline: &str, n: u32) -> DlqRecord {
+                DlqRecord {
+                    id: DlqRecordId(format!("{pipeline}-seed-{n:04}")),
+                    meta: DlqMeta {
+                        pipeline: pipeline.to_string(),
+                        stage: DlqStage::Write,
+                        error: "seeded failure".into(),
+                        source_id: "seed-src".into(),
+                        offset_bytes: None,
+                        event_ts: None,
+                        failed_at: 1_700_000_000_000,
+                        attempt: 1,
+                        payload_format: "json".into(),
+                    },
+                    payload: format!("{{\"v\": {n}}}").into_bytes(),
+                }
+            }
+
+            /// (target, pipeline) with an explicit DLQ store and an
+            /// optional transform. The target's writes are the
+            /// replay's observable output.
+            fn mk_pipeline(
+                pipeline: &str,
+                dlq: Arc<dyn DeadLetterStore>,
+                transform: Option<Arc<dyn crate::transform::BatchTransform>>,
+            ) -> (Arc<TestBackend>, StreamingPipeline) {
+                let source = Arc::new(TestBackend::new("src"));
+                let target = Arc::new(TestBackend::new("tgt"));
+                let table = TargetTable {
+                    schema: "".into(),
+                    name: "events".into(),
+                };
+                let mut cfg = StreamingPipelineConfig::new("seed-src", table.clone(), pipeline)
+                    .with_dead_letter_store(dlq);
+                if let Some(t) = transform {
+                    cfg = cfg.with_transform(t);
+                }
+                let p = StreamingPipeline::new(
+                    source as Arc<dyn Backend>,
+                    vec![(Arc::clone(&target) as Arc<dyn Backend>, table)],
+                    cfg,
+                );
+                (target, p)
+            }
+
+            /// The PRD round trip on the table family, end to end
+            /// through the real emission path: sink fails (one-shot)
+            /// → rows dead-letter → sink is fixed → replay All →
+            /// rows present at the target, DLQ drained, report
+            /// counts exact.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn replay_round_trip_after_sink_fix() {
+                let source = Arc::new(TestBackend::new("src"));
+                source.enqueue_read(vec![one_row_batch(7), one_row_batch(8)]);
+                let target = Arc::new(TestBackend::new("tgt"));
+                target.fail_next();
+                let table = TargetTable {
+                    schema: "".into(),
+                    name: "events".into(),
+                };
+                let dlq: Arc<dyn DeadLetterStore> =
+                    Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+                let cfg = StreamingPipelineConfig::new("orders-topic", table.clone(), "rt-p")
+                    .with_dead_letter_store(Arc::clone(&dlq));
+                let pipeline = StreamingPipeline::new(
+                    source.clone() as Arc<dyn Backend>,
+                    vec![(target.clone() as Arc<dyn Backend>, table)],
+                    cfg,
+                );
+
+                // 1. Sink fails → both rows dead-letter.
+                let (sig, trigger) = ShutdownSignal::new();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    trigger.trigger();
+                });
+                pipeline.run(sig).await.unwrap();
+                assert_eq!(dlq.depth("rt-p").await.unwrap().pending, 2);
+                assert!(target.writes().is_empty());
+
+                // 2. Sink is "fixed" (fail_next is one-shot). Replay.
+                let report = pipeline
+                    .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (
+                        report.taken,
+                        report.succeeded,
+                        report.redeadlettered,
+                        report.parked
+                    ),
+                    (2, 2, 0, 0),
+                    "exact report counts"
+                );
+                assert!(report.started_at_ms > 0);
+                assert!(report.finished_at_ms >= report.started_at_ms);
+
+                // 3. Rows present at the target; DLQ drained (acked).
+                let rows: usize = target.writes().iter().map(|(_, n)| n).sum();
+                assert_eq!(rows, 2, "both rows reprocessed into the target");
+                assert_eq!(dlq.depth("rt-p").await.unwrap(), DlqDepth::default());
+                assert!(
+                    dlq.take_for_replay(
+                        "rt-p",
+                        DlqSelection::All,
+                        Duration::from_secs(60),
+                        i64::MAX - 1
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                    "acked records never come back"
+                );
+            }
+
+            /// Poison guard: a record whose replay keeps failing has
+            /// its attempt bumped on every re-dead-letter and parks
+            /// once the budget (max_attempts, default 3) is
+            /// exhausted — never loops, and parked records are
+            /// excluded from later takes.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn replay_poison_parks_at_max_attempts() {
+                let dlq: Arc<dyn DeadLetterStore> =
+                    Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+                dlq.append(vec![seeded_json_record("poison-p", 1)])
+                    .await
+                    .unwrap();
+                let (target, pipeline) = mk_pipeline(
+                    "poison-p",
+                    Arc::clone(&dlq),
+                    Some(Arc::new(FailingTransform)),
+                );
+
+                // Replay #1: fails again → re-dead-lettered, attempt 2.
+                let r1 = pipeline
+                    .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (r1.taken, r1.succeeded, r1.redeadlettered, r1.parked),
+                    (1, 0, 1, 0)
+                );
+                let after1 = dlq.browse("poison-p", 0, 10, None).await.unwrap();
+                assert_eq!(after1.len(), 1);
+                assert_eq!(after1[0].meta.attempt, 2, "attempt incremented");
+                assert_eq!(
+                    after1[0].payload,
+                    seeded_json_record("poison-p", 1).payload,
+                    "payload preserved across the redrive"
+                );
+                assert!(
+                    after1[0].meta.error.contains("scripted transform failure"),
+                    "error refreshed to the replay failure: {}",
+                    after1[0].meta.error
+                );
+
+                // Replay #2: attempt 3.
+                let r2 = pipeline
+                    .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (r2.taken, r2.succeeded, r2.redeadlettered, r2.parked),
+                    (1, 0, 1, 0)
+                );
+                let after2 = dlq.browse("poison-p", 0, 10, None).await.unwrap();
+                assert_eq!(after2[0].meta.attempt, 3);
+
+                // Replay #3: budget exhausted → parked, not redriven.
+                let r3 = pipeline
+                    .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (r3.taken, r3.succeeded, r3.redeadlettered, r3.parked),
+                    (1, 0, 0, 1)
+                );
+                assert_eq!(
+                    dlq.depth("poison-p").await.unwrap(),
+                    DlqDepth {
+                        pending: 0,
+                        parked: 1
+                    }
+                );
+                let parked = dlq
+                    .browse("poison-p", 0, 10, Some(DlqRecordStatus::Parked))
+                    .await
+                    .unwrap();
+                assert_eq!(parked.len(), 1);
+                assert_eq!(parked[0].meta.attempt, 3, "parked at max_attempts");
+
+                // Replay #4: parked records are excluded — nothing taken.
+                let r4 = pipeline
+                    .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (r4.taken, r4.succeeded, r4.redeadlettered, r4.parked),
+                    (0, 0, 0, 0)
+                );
+                assert!(
+                    target.writes().is_empty(),
+                    "the poison record never reached the target"
+                );
+            }
+
+            /// Fails only for odd `v` values — drives exact report
+            /// accounting under partial failure.
+            #[derive(Debug)]
+            struct FailOddTransform;
+
+            #[async_trait]
+            impl crate::transform::BatchTransform for FailOddTransform {
+                fn input_schema(&self) -> arrow_schema::SchemaRef {
+                    Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]))
+                }
+                fn output_schema(&self) -> arrow_schema::SchemaRef {
+                    self.input_schema()
+                }
+                async fn transform(
+                    &self,
+                    input: RecordBatch,
+                    _ctx: &crate::transform::BatchContext,
+                ) -> Result<Vec<RecordBatch>, BackendError> {
+                    let v = input
+                        .column_by_name("v")
+                        .expect("v column present")
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .expect("JSON decode infers Int64");
+                    if (0..v.len()).any(|i| v.value(i) % 2 == 1) {
+                        return Err(BackendError::Other("odd row rejected".into()));
+                    }
+                    Ok(vec![input])
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn replay_report_exact_under_partial_failure() {
+                let dlq: Arc<dyn DeadLetterStore> =
+                    Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+                dlq.append(
+                    (1..=4)
+                        .map(|n| seeded_json_record("partial-p", n))
+                        .collect(),
+                )
+                .await
+                .unwrap();
+                let (target, pipeline) = mk_pipeline(
+                    "partial-p",
+                    Arc::clone(&dlq),
+                    Some(Arc::new(FailOddTransform)),
+                );
+
+                let r = pipeline
+                    .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (r.taken, r.succeeded, r.redeadlettered, r.parked),
+                    (4, 2, 2, 0),
+                    "v=2,4 succeed; v=1,3 re-dead-letter"
+                );
+                assert_eq!(
+                    r.taken,
+                    r.succeeded + r.redeadlettered + r.parked,
+                    "report invariant"
+                );
+                let rows: usize = target.writes().iter().map(|(_, n)| n).sum();
+                assert_eq!(rows, 2, "only the even rows reached the target");
+                let pending = dlq.browse("partial-p", 0, 10, None).await.unwrap();
+                assert_eq!(pending.len(), 2);
+                assert!(
+                    pending.iter().all(|rec| rec.meta.attempt == 2),
+                    "redriven records carry attempt 2"
+                );
+            }
+
+            /// Records the exact batches the transform receives.
+            #[derive(Debug, Default)]
+            struct CaptureTransform {
+                seen: Mutex<Vec<RecordBatch>>,
+            }
+
+            #[async_trait]
+            impl crate::transform::BatchTransform for CaptureTransform {
+                fn input_schema(&self) -> arrow_schema::SchemaRef {
+                    Arc::new(Schema::empty())
+                }
+                fn output_schema(&self) -> arrow_schema::SchemaRef {
+                    self.input_schema()
+                }
+                async fn transform(
+                    &self,
+                    input: RecordBatch,
+                    _ctx: &crate::transform::BatchContext,
+                ) -> Result<Vec<RecordBatch>, BackendError> {
+                    self.seen.lock().unwrap().push(input.clone());
+                    Ok(vec![input])
+                }
+            }
+
+            /// Format fidelity (JSON): the batch the transform sees
+            /// on replay is the one produced by the SAME JSONL
+            /// decode path the Kafka source uses on live reads.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn replay_json_decodes_through_source_path() {
+                let dlq: Arc<dyn DeadLetterStore> =
+                    Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+                let record = seeded_json_record("fmt-json-p", 41);
+                dlq.append(vec![record.clone()]).await.unwrap();
+
+                let capture = Arc::new(CaptureTransform::default());
+                let (_target, pipeline) = mk_pipeline(
+                    "fmt-json-p",
+                    Arc::clone(&dlq),
+                    Some(Arc::clone(&capture) as Arc<dyn crate::transform::BatchTransform>),
+                );
+                let r = pipeline
+                    .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!((r.taken, r.succeeded), (1, 1));
+
+                let seen = capture.seen.lock().unwrap().clone();
+                assert_eq!(seen.len(), 1);
+                let expected =
+                    crate::kafka_backend::decode_payloads_as_jsonl(vec![record.payload.clone()])
+                        .unwrap();
+                assert_eq!(
+                    seen, expected,
+                    "replayed batch is identical to the source-side JSONL decode"
+                );
+            }
+
+            /// Format fidelity (RawBytes): the opaque payload
+            /// reaches the transform byte-identically as the single
+            /// Binary column the RawBytes source format decodes to.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn replay_raw_bytes_byte_identical_into_transform() {
+                let dlq: Arc<dyn DeadLetterStore> =
+                    Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+                let mut record = seeded_json_record("fmt-raw-p", 1);
+                record.meta.payload_format = "raw_bytes".into();
+                record.payload = vec![0x00, 0xff, 0x01, 0x80, 0x7f]; // non-UTF8
+                dlq.append(vec![record.clone()]).await.unwrap();
+
+                let capture = Arc::new(CaptureTransform::default());
+                let (_target, pipeline) = mk_pipeline(
+                    "fmt-raw-p",
+                    Arc::clone(&dlq),
+                    Some(Arc::clone(&capture) as Arc<dyn crate::transform::BatchTransform>),
+                );
+                let r = pipeline
+                    .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!((r.taken, r.succeeded), (1, 1));
+
+                let seen = capture.seen.lock().unwrap().clone();
+                assert_eq!(seen.len(), 1);
+                assert_eq!(seen[0].num_columns(), 1);
+                assert_eq!(seen[0].num_rows(), 1);
+                let bin = seen[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>()
+                    .expect("RawBytes decodes to a single Binary column");
+                assert_eq!(
+                    bin.value(0),
+                    record.payload.as_slice(),
+                    "payload replays byte-identically"
+                );
+            }
+
+            /// FirstN leases the oldest n; Ids replays exactly the
+            /// named records.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn replay_first_n_and_ids_selections() {
+                let dlq: Arc<dyn DeadLetterStore> =
+                    Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+                dlq.append((1..=3).map(|n| seeded_json_record("sel-p", n)).collect())
+                    .await
+                    .unwrap();
+                let (target, pipeline) = mk_pipeline("sel-p", Arc::clone(&dlq), None);
+
+                let r1 = pipeline
+                    .run_dlq_replay(DlqSelection::FirstN(2), ReplayOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!((r1.taken, r1.succeeded), (2, 2), "oldest two replayed");
+                assert_eq!(dlq.depth("sel-p").await.unwrap().pending, 1);
+
+                let left = dlq.browse("sel-p", 0, 10, None).await.unwrap();
+                assert_eq!(left.len(), 1);
+                assert_eq!(left[0].id, seeded_json_record("sel-p", 3).id);
+
+                let r2 = pipeline
+                    .run_dlq_replay(
+                        DlqSelection::Ids(vec![left[0].id.clone()]),
+                        ReplayOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!((r2.taken, r2.succeeded), (1, 1));
+                assert_eq!(dlq.depth("sel-p").await.unwrap(), DlqDepth::default());
+                let rows: usize = target.writes().iter().map(|(_, n)| n).sum();
+                assert_eq!(rows, 3);
+            }
+
+            /// Two overlapping replays over one table store must not
+            /// double-process: leases are exclusive, so every record
+            /// is written to exactly one replay's target.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn concurrent_replays_over_table_store_do_not_double_process() {
+                let dlq: Arc<dyn DeadLetterStore> =
+                    Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+                dlq.append((1..=10).map(|n| seeded_json_record("conc-p", n)).collect())
+                    .await
+                    .unwrap();
+                let (target_a, pa) = mk_pipeline("conc-p", Arc::clone(&dlq), None);
+                let (target_b, pb) = mk_pipeline("conc-p", Arc::clone(&dlq), None);
+
+                let (ra, rb) = tokio::join!(
+                    pa.run_dlq_replay(DlqSelection::All, ReplayOptions::default()),
+                    pb.run_dlq_replay(DlqSelection::All, ReplayOptions::default()),
+                );
+                let (ra, rb) = (ra.unwrap(), rb.unwrap());
+
+                assert_eq!(ra.taken + rb.taken, 10, "leases are exclusive");
+                assert_eq!(ra.succeeded + rb.succeeded, 10);
+                let rows: usize = target_a
+                    .writes()
+                    .iter()
+                    .chain(target_b.writes().iter())
+                    .map(|(_, n)| n)
+                    .sum();
+                assert_eq!(rows, 10, "every record written exactly once");
+                assert_eq!(dlq.depth("conc-p").await.unwrap(), DlqDepth::default());
+            }
+
+            /// Mimics KafkaTopicDlq's process-local lease: flags any
+            /// overlap between one replay's take and its ack.
+            #[derive(Debug)]
+            struct SerializedStubStore {
+                active: AtomicUsize,
+                overlap: AtomicBool,
+                served: AtomicU32,
+            }
+
+            #[async_trait]
+            impl DeadLetterStore for SerializedStubStore {
+                async fn append(&self, _records: Vec<DlqRecord>) -> Result<(), DlqError> {
+                    Ok(())
+                }
+                async fn depth(&self, _pipeline: &str) -> Result<DlqDepth, DlqError> {
+                    Ok(DlqDepth::default())
+                }
+                async fn browse(
+                    &self,
+                    _pipeline: &str,
+                    _page: u64,
+                    _page_size: u64,
+                    _status_filter: Option<DlqRecordStatus>,
+                ) -> Result<Vec<DlqRecord>, DlqError> {
+                    Ok(Vec::new())
+                }
+                async fn take_for_replay(
+                    &self,
+                    pipeline: &str,
+                    _selection: DlqSelection,
+                    _lease: Duration,
+                    _now_ms: i64,
+                ) -> Result<Vec<DlqRecord>, DlqError> {
+                    if self.active.fetch_add(1, Ordering::SeqCst) > 0 {
+                        self.overlap.store(true, Ordering::SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let n = self.served.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![seeded_json_record(pipeline, n + 100)])
+                }
+                async fn ack_replayed(
+                    &self,
+                    _pipeline: &str,
+                    _ids: &[DlqRecordId],
+                ) -> Result<(), DlqError> {
+                    self.active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                }
+                async fn park(
+                    &self,
+                    _pipeline: &str,
+                    _ids: &[DlqRecordId],
+                ) -> Result<(), DlqError> {
+                    Ok(())
+                }
+                async fn purge(
+                    &self,
+                    _pipeline: &str,
+                    _selection: DlqSelection,
+                ) -> Result<u64, DlqError> {
+                    Ok(0)
+                }
+                fn replay_requires_serialization(&self) -> bool {
+                    true
+                }
+            }
+
+            /// Stores whose lease is process-local (KafkaTopicDlq)
+            /// declare `replay_requires_serialization` — the engine
+            /// then serializes same-pipeline replays behind an
+            /// in-process mutex.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn replay_serialized_for_stores_requiring_it() {
+                let store = Arc::new(SerializedStubStore {
+                    active: AtomicUsize::new(0),
+                    overlap: AtomicBool::new(false),
+                    served: AtomicU32::new(0),
+                });
+                let (_ta, pa) =
+                    mk_pipeline("ser-p", store.clone() as Arc<dyn DeadLetterStore>, None);
+                let (_tb, pb) =
+                    mk_pipeline("ser-p", store.clone() as Arc<dyn DeadLetterStore>, None);
+
+                let (ra, rb) = tokio::join!(
+                    pa.run_dlq_replay(DlqSelection::All, ReplayOptions::default()),
+                    pb.run_dlq_replay(DlqSelection::All, ReplayOptions::default()),
+                );
+                ra.unwrap();
+                rb.unwrap();
+                assert!(
+                    !store.overlap.load(Ordering::SeqCst),
+                    "same-pipeline replays over a topic-style store must serialize"
+                );
+            }
+
+            /// A store whose `park` is inexpressible (a Kafka
+            /// topic): parking must fall back to the provided table
+            /// store, and the original must still be acked so the
+            /// topic cursor advances.
+            #[derive(Debug)]
+            struct ParkUnsupportedStore {
+                served: AtomicBool,
+                acked: Mutex<Vec<String>>,
+            }
+
+            #[async_trait]
+            impl DeadLetterStore for ParkUnsupportedStore {
+                async fn append(&self, _records: Vec<DlqRecord>) -> Result<(), DlqError> {
+                    Ok(())
+                }
+                async fn depth(&self, _pipeline: &str) -> Result<DlqDepth, DlqError> {
+                    Ok(DlqDepth::default())
+                }
+                async fn browse(
+                    &self,
+                    _pipeline: &str,
+                    _page: u64,
+                    _page_size: u64,
+                    _status_filter: Option<DlqRecordStatus>,
+                ) -> Result<Vec<DlqRecord>, DlqError> {
+                    Ok(Vec::new())
+                }
+                async fn take_for_replay(
+                    &self,
+                    pipeline: &str,
+                    _selection: DlqSelection,
+                    _lease: Duration,
+                    _now_ms: i64,
+                ) -> Result<Vec<DlqRecord>, DlqError> {
+                    if !self.served.swap(true, Ordering::SeqCst) {
+                        let mut r = seeded_json_record(pipeline, 1);
+                        r.meta.attempt = 99; // way past any budget
+                        Ok(vec![r])
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
+                async fn ack_replayed(
+                    &self,
+                    _pipeline: &str,
+                    ids: &[DlqRecordId],
+                ) -> Result<(), DlqError> {
+                    self.acked
+                        .lock()
+                        .unwrap()
+                        .extend(ids.iter().map(|i| i.0.clone()));
+                    Ok(())
+                }
+                async fn park(
+                    &self,
+                    _pipeline: &str,
+                    _ids: &[DlqRecordId],
+                ) -> Result<(), DlqError> {
+                    Err(DlqError::Unsupported("no park on a topic".into()))
+                }
+                async fn purge(
+                    &self,
+                    _pipeline: &str,
+                    _selection: DlqSelection,
+                ) -> Result<u64, DlqError> {
+                    Ok(0)
+                }
+                fn replay_requires_serialization(&self) -> bool {
+                    true
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn park_falls_back_to_park_store_when_unsupported() {
+                let store = Arc::new(ParkUnsupportedStore {
+                    served: AtomicBool::new(false),
+                    acked: Mutex::new(Vec::new()),
+                });
+                let fallback: Arc<dyn DeadLetterStore> =
+                    Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+                let (target, pipeline) =
+                    mk_pipeline("parkfb-p", store.clone() as Arc<dyn DeadLetterStore>, None);
+
+                let opts = ReplayOptions {
+                    park_store: Some(Arc::clone(&fallback)),
+                    ..Default::default()
+                };
+                let r = pipeline
+                    .run_dlq_replay(DlqSelection::All, opts)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (r.taken, r.succeeded, r.redeadlettered, r.parked),
+                    (1, 0, 0, 1),
+                    "attempt (99) past the budget parks without reprocessing"
+                );
+
+                // Parked into the fallback table store.
+                assert_eq!(
+                    fallback.depth("parkfb-p").await.unwrap(),
+                    DlqDepth {
+                        pending: 0,
+                        parked: 1
+                    }
+                );
+                let parked = fallback
+                    .browse("parkfb-p", 0, 10, Some(DlqRecordStatus::Parked))
+                    .await
+                    .unwrap();
+                assert_eq!(parked.len(), 1);
+                assert_eq!(parked[0].meta.attempt, 99);
+
+                // The original was acked on the topic-style store
+                // (cursor advanced past it) — only AFTER the park
+                // landed durably in the fallback.
+                assert_eq!(
+                    store.acked.lock().unwrap().clone(),
+                    vec![parked[0].id.0.clone()]
+                );
+                assert!(
+                    target.writes().is_empty(),
+                    "budget exhausted — never reprocessed"
+                );
+            }
+
+            /// CDC-mode pipelines are typed-rejected for now: replay
+            /// re-applies through `write_arrow_stream`, which would
+            /// break per-event CDC semantics.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn replay_rejects_cdc_pipelines() {
+                use crate::cdc::{CdcConfig, EnvelopeKind};
+                let dlq: Arc<dyn DeadLetterStore> =
+                    Arc::new(TableDlq::open_sqlite(":memory:").await.unwrap());
+                let source = Arc::new(TestBackend::new("src"));
+                let target = Arc::new(TestBackend::new("tgt"));
+                let table = TargetTable {
+                    schema: "".into(),
+                    name: "events".into(),
+                };
+                let cfg = StreamingPipelineConfig::new("q", table.clone(), "cdc-p")
+                    .with_dead_letter_store(dlq)
+                    .with_cdc(CdcConfig::for_envelope(EnvelopeKind::Debezium));
+                let pipeline = StreamingPipeline::new(
+                    source as Arc<dyn Backend>,
+                    vec![(target as Arc<dyn Backend>, table)],
+                    cfg,
+                );
+                let err = pipeline
+                    .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string().to_lowercase().contains("cdc"),
+                    "typed rejection names CDC: {err}"
+                );
+            }
+
+            /// The serialization flag as landed on the real stores:
+            /// topic store requires it, table store doesn't.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn topic_store_requires_serialization_table_does_not() {
+                let table = TableDlq::open_sqlite(":memory:").await.unwrap();
+                assert!(!table.replay_requires_serialization());
+
+                let kafka: Arc<dyn Backend> =
+                    Arc::new(KafkaBackend::open("localhost:9092", Some("g")).unwrap());
+                let topic = KafkaTopicDlq::new(kafka, "t", "p").unwrap();
+                assert!(
+                    topic.replay_requires_serialization(),
+                    "process-local group-offset lease → replays must serialize"
+                );
+            }
         }
     }
 }

@@ -51,6 +51,14 @@ Options:
     --sf <FACTOR>   TPC-H scale factor (1, 10, 100, 1000). Required.
     --out <DIR>     Output directory. One Parquet file per TPC-H table.
                     Created if missing. Required.
+    --parts <K>     Split each table into K physical Parquet files using
+                    tpchgen's native partitioning (default 1). With K=1
+                    (or absent), writes a single flat <out>/<table>.parquet
+                    per table. With K>=2, writes K shards into a per-table
+                    subdirectory: <out>/<table>/<table>-{p:04}.parquet.
+                    The fixed tiny tables nation (25 rows) and region (5
+                    rows) are never partitioned — under K>=2 they get a
+                    single <out>/<table>/<table>-0001.parquet.
 
     --reemit <FILE> Σ.AH.4: rewrite an existing Parquet file in place
                     with a different row-group size, through the SAME
@@ -74,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out: Option<PathBuf> = None;
     let mut reemit: Option<PathBuf> = None;
     let mut rg_rows: Option<usize> = None;
+    let mut parts: usize = 1;
 
     let mut i = 0;
     while i < args.len() {
@@ -94,6 +103,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--rg-rows" => {
                 rg_rows = Some(args.get(i + 1).ok_or("--rg-rows needs a value")?.parse()?);
+                i += 2;
+            }
+            "--parts" => {
+                parts = args.get(i + 1).ok_or("--parts needs a value")?.parse()?;
+                if parts == 0 {
+                    return Err("--parts must be >= 1".into());
+                }
                 i += 2;
             }
             "-h" | "--help" => {
@@ -128,21 +144,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RecordBatches, append to one ArrowWriter; finalize once. Peak memory
     // ≈ one chunk (~260 MB for lineitem) regardless of scale factor.
     const CHUNK_ROWS: usize = 2_000_000;
+
+    // Per-table generation. The macro accepts the generator TYPE (so each
+    // part can be constructed fresh as `<Type>::new(sf, p, K)`) plus a
+    // `$partitionable` bool. With --parts 1 (or a non-partitionable table),
+    // writes exactly one flat/single file with the legacy `(sf, 1, 1)`
+    // construction. With --parts K>=2 on a partitionable table, writes K
+    // shards into a per-table subdirectory.
     macro_rules! gen_table {
-        ($name:literal, $schema:expr, $generator:expr, $csv:ident) => {{
-            let path = out.join(concat!($name, ".parquet"));
-            if path.exists() {
-                println!("    skip {} (already exists)", path.display());
+        ($name:literal, $schema:expr, $gen_ty:ident, $csv:ident, $partitionable:expr) => {{
+            let schema = $schema;
+            let header = format!("{}\n", $csv::header());
+
+            // How many shards this table actually gets, and whether we lay
+            // them out flat (legacy single file) or in a subdirectory.
+            let effective_parts: usize = if parts >= 2 && $partitionable {
+                parts
             } else {
+                1
+            };
+            let subdir_layout = parts >= 2;
+
+            if subdir_layout {
+                fs::create_dir_all(out.join($name))?;
+            }
+
+            for p in 1..=effective_parts {
+                // Flat legacy path when --parts 1 / absent; per-table subdir
+                // with a 1-indexed, zero-padded shard name otherwise.
+                let path = if subdir_layout {
+                    out.join($name)
+                        .join(format!(concat!($name, "-{:04}.parquet"), p))
+                } else {
+                    out.join(concat!($name, ".parquet"))
+                };
+
+                if path.exists() {
+                    println!("    skip {} (already exists)", path.display());
+                    continue;
+                }
                 println!("    gen  {}", path.display());
-                let schema = $schema;
+
+                // Non-partitionable tables (and the --parts 1 path) always
+                // use the legacy (sf, 1, 1) construction — byte-identical to
+                // today. Partitioned tables get the p-th of K shards.
+                let generator = $gen_ty::new(sf, p as i32, effective_parts as i32);
+
                 let mut writer = open_parquet_writer(&path, schema.clone())?;
-                let header = format!("{}\n", $csv::header());
                 let mut csv = String::with_capacity(96 << 20);
                 csv.push_str(&header);
                 let mut chunk_rows = 0usize;
                 let mut total_rows: i64 = 0;
-                for row in $generator.iter() {
+                for row in generator.iter() {
                     writeln!(&mut csv, "{}", $csv::new(row))?;
                     chunk_rows += 1;
                     if chunk_rows >= CHUNK_ROWS {
@@ -161,48 +214,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
 
-    gen_table!(
-        "nation",
-        nation_schema(),
-        NationGenerator::new(sf, 1, 1),
-        NationCsv
-    );
-    gen_table!(
-        "region",
-        region_schema(),
-        RegionGenerator::new(sf, 1, 1),
-        RegionCsv
-    );
+    // nation + region are fixed tiny tables (25 / 5 rows) — never partition.
+    gen_table!("nation", nation_schema(), NationGenerator, NationCsv, false);
+    gen_table!("region", region_schema(), RegionGenerator, RegionCsv, false);
     gen_table!(
         "supplier",
         supplier_schema(),
-        SupplierGenerator::new(sf, 1, 1),
-        SupplierCsv
+        SupplierGenerator,
+        SupplierCsv,
+        true
     );
     gen_table!(
         "customer",
         customer_schema(),
-        CustomerGenerator::new(sf, 1, 1),
-        CustomerCsv
+        CustomerGenerator,
+        CustomerCsv,
+        true
     );
-    gen_table!("part", part_schema(), PartGenerator::new(sf, 1, 1), PartCsv);
+    gen_table!("part", part_schema(), PartGenerator, PartCsv, true);
     gen_table!(
         "partsupp",
         partsupp_schema(),
-        PartSuppGenerator::new(sf, 1, 1),
-        PartSuppCsv
+        PartSuppGenerator,
+        PartSuppCsv,
+        true
     );
-    gen_table!(
-        "orders",
-        orders_schema(),
-        OrderGenerator::new(sf, 1, 1),
-        OrderCsv
-    );
+    gen_table!("orders", orders_schema(), OrderGenerator, OrderCsv, true);
     gen_table!(
         "lineitem",
         lineitem_schema(),
-        LineItemGenerator::new(sf, 1, 1),
-        LineItemCsv
+        LineItemGenerator,
+        LineItemCsv,
+        true
     );
 
     println!("==> done");

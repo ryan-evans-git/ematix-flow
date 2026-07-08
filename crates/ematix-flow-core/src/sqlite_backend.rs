@@ -1309,15 +1309,28 @@ impl Backend for SQLiteBackend {
             }
             // Wrap inserts in a single transaction so the per-row
             // INSERTs aren't flushed individually — orders of magnitude
-            // faster on SQLite.
+            // faster on SQLite. On ANY failure the transaction is
+            // rolled back explicitly: the connection is pooled, and a
+            // dangling BEGIN would poison every later write with
+            // "cannot start a transaction within a transaction"
+            // (found by the DLQ Phase 2 fail-at-sink → fix → replay
+            // round trip).
             c.execute_batch("BEGIN")
                 .map_err(|e| BackendError::Query(e.to_string()))?;
             let mut total: u64 = 0;
             for batch in &batches {
-                total += insert_record_batch(c, &target, batch)?;
+                match insert_record_batch(c, &target, batch) {
+                    Ok(n) => total += n,
+                    Err(e) => {
+                        let _ = c.execute_batch("ROLLBACK");
+                        return Err(e);
+                    }
+                }
             }
-            c.execute_batch("COMMIT")
-                .map_err(|e| BackendError::Query(e.to_string()))?;
+            if let Err(e) = c.execute_batch("COMMIT") {
+                let _ = c.execute_batch("ROLLBACK");
+                return Err(BackendError::Query(e.to_string()));
+            }
             Ok(total)
         })
         .await
@@ -1763,6 +1776,56 @@ mod tests {
         b.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
             .await
             .unwrap();
+    }
+
+    /// DLQ Phase 2 regression: a FAILED `write_arrow_stream` must
+    /// roll its transaction back — otherwise the pooled connection
+    /// is left inside an open `BEGIN` and every subsequent write
+    /// fails with "cannot start a transaction within a
+    /// transaction". This is exactly the fail-at-sink → fix →
+    /// replay lifecycle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_write_rolls_back_and_connection_stays_usable() {
+        use arrow_array::{Int64Array as I64, RecordBatch as RB};
+        use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+
+        let b = SQLiteBackend::open(":memory:").unwrap();
+
+        let mk_stream = || {
+            let schema = std::sync::Arc::new(S::new(vec![F::new("id", Dt::Int64, false)]));
+            let batch = RB::try_new(
+                schema,
+                vec![std::sync::Arc::new(I64::from(vec![1_i64, 2_i64]))],
+            )
+            .unwrap();
+            let s: crate::backend::ArrowBatchStream =
+                Box::pin(futures_util::stream::iter(vec![Ok(batch)]));
+            s
+        };
+        let target = TargetTable {
+            schema: "main".into(),
+            name: "events".into(),
+        };
+
+        // 1. Sink broken: no `events` table → the write fails.
+        let err = b
+            .write_arrow_stream(&target, mk_stream(), WriteMode::Append)
+            .await
+            .expect_err("write into a missing table must fail");
+        assert!(
+            err.to_string().contains("no such table"),
+            "expected the missing-table error, got: {err}"
+        );
+
+        // 2. Fix the sink; the SAME backend must be able to write —
+        //    i.e. the failed write rolled back instead of leaving
+        //    the connection mid-transaction.
+        b.execute("CREATE TABLE events (id INTEGER)").await.unwrap();
+        let written = b
+            .write_arrow_stream(&target, mk_stream(), WriteMode::Append)
+            .await
+            .expect("connection must be usable after a failed write");
+        assert_eq!(written, 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

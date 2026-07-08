@@ -1,22 +1,13 @@
-```
-███████╗███╗   ███╗ █████╗ ████████╗██╗██╗  ██╗
-██╔════╝████╗ ████║██╔══██╗╚══██╔══╝██║╚██╗██╔╝
-█████╗  ██╔████╔██║███████║   ██║   ██║ ╚███╔╝
-██╔══╝  ██║╚██╔╝██║██╔══██║   ██║   ██║ ██╔██╗
-███████╗██║ ╚═╝ ██║██║  ██║   ██║   ██║██╔╝ ██╗
-╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝╚═╝  ╚═╝
-```
-
 # ematix-flow
 
-**Declarative Python data pipelines. Rust + Apache Arrow under the hood.**
+Declarative data pipelines for Python, with a Rust and Apache Arrow core.
 
 Move data between databases, files, and streams with one decorator. Cron
 schedules, DAG dependencies, watermarks, schema evolution, restart-safe state,
-and at-least-once delivery are all built in — no extra scheduler service to
-deploy.
+and at-least-once delivery are built in — there is no separate scheduler
+service to deploy.
 
-Project site: **[ematix.dev](https://ematix.dev)**.
+Documentation and project site: [ematix.dev](https://ematix.dev)
 
 ```python
 from ematix_flow import ematix, ManagedTable, Annotated, BigInt, Text, TimestampTZ, pk
@@ -55,18 +46,13 @@ pip install ematix-flow
 flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k8s CronJob
 ```
 
-## Why ematix-flow
+## Features
 
-- **Fast.** TPC-H, 22 queries, single Apple M4 Max, measured at three
-  scales through the production preset (fresh context per query, each
-  engine in its own process — no bench-only tricks): ematix-flow takes
-  **22 / 22** at SF=1 (**2.35×** DuckDB, **3.89×** Polars, **17×**
-  single-node PySpark), **22 / 22** at SF=10 (**1.58×** DuckDB), and
-  **14 / 22** at SF=100 (**1.18×** DuckDB) — head-to-head vs DuckDB it
-  wins **22 / 22 / 14** of 22 in the same isolated protocol (at SF=100,
-  Q8 + Q10 are consistent losses and 6 more sit within run-to-run noise),
-  and leads the geomean at every scale. Full numbers, the losses
-  included, and the reproducer in [Benchmarks](#benchmarks).
+- **Performance.** Competitive with DuckDB on single-node TPC-H across
+  SF1–SF100, measured through the production configuration with per-query
+  process isolation. The [Benchmarks](#benchmarks) section has the full
+  per-query numbers, including the queries where it loses, and the
+  reproducer.
 - **Scheduling + DAG, no service to operate.** Pipelines carry their own
   cron schedule and `depends_on=` edges (with cycle detection and exponential-
   backoff retries). Run `flow run-due` from cron, systemd, a k8s `CronJob`,
@@ -81,11 +67,10 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
   delivery, credential redaction, structured run history, Prometheus +
   OpenTelemetry metrics, Slack alerts.
 
-> Status: **v0.11.0 on PyPI** as `ematix-flow` (alpha). All four surfaces —
-> declarative pipelines, multi-backend, streaming, stream processing — are
-> shipped end-to-end, with warehouse pipelines (cron + retries + DAG),
-> Schema Registry (Confluent + AWS Glue), and timezone-aware cron
-> schedules. See CHANGELOG for the release history.
+Status: beta; the API is stabilizing toward 1.0. Published on PyPI as
+`ematix-flow`. All four surfaces — declarative pipelines, multi-backend,
+streaming, and stream processing — are shipped end-to-end. See
+[CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ---
 
@@ -706,6 +691,54 @@ unintended cycles, or fan-out hotspots before they bite at scheduler
 tick time.
 
 More screenshots + walkthrough: [ematix.dev/specs/04-web-ui-screenshots](https://ematix.dev/specs/04-web-ui-screenshots).
+
+### Analytics — SQL Lab, Charts, Dashboards
+
+Beyond operating pipelines, the UI is a self-service analytics surface
+that runs every query through **ematix's own engine** (Arrow-native,
+no pyarrow/pandas in the request path). Register one or more data
+sources at launch:
+
+```sh
+flow web \
+    --datasource warehouse=postgres://user:pw@host/db \
+    --datasource local=duckdb:///data.duckdb \
+    --analytics-db /var/lib/ematix/analytics.db   # persist saved objects
+```
+
+**SQL Lab** (`#/sql`) — a CodeMirror editor with a live schema browser
+(schemas → tables → columns, click-to-insert), autocomplete, run
+(`⌘⏎`), a typed results grid, and saved queries. Ad-hoc SQL is
+**read-only by default**: only `SELECT` / `WITH` / `EXPLAIN` pass, and
+filesystem / network / cross-DB functions (`read_csv`, `read_parquet`,
+`*_scan`, `ATTACH`, …) are blocked so a query can't escape the
+registered sources. A row cap and per-query timeout bound each run.
+
+![SQL Lab — schema browser, editor, and a typed results grid](docs/screenshots/sql-lab.png)
+
+**Charts** (`#/charts`) — turn a query into a chart: pick a viz type
+(table / big-number / bar / line / area / pie / scatter), map columns
+to encodings, and preview live via Apache ECharts. A no-SQL **Build**
+mode generates the `GROUP BY` for you from a table + dimensions +
+metrics. Charts are saved and reused on dashboards.
+
+![Chart Builder — SQL/Build toggle, viz-type picker, and a live ECharts preview](docs/screenshots/chart-builder.png)
+
+**Dashboards** (`#/dashboards`) — a drag/resize grid of saved charts.
+One batch call runs every tile's query (with a short result cache);
+clicking a bar or slice **cross-filters** the whole board, and a
+drill-down modal shows the underlying rows. Optional auto-refresh.
+
+![Dashboard — drag/resize tiles with a cross-filter bar](docs/screenshots/dashboard.png)
+
+**Auth (RBAC).** Front the app with an SSO proxy and trust its identity
+header to enable role-based access — `viewer` (read), `editor` (read +
+run + edit), `admin` — with objects shared org-wide:
+
+```sh
+flow web --auth-header x-forwarded-email \
+    --auth-group-role analysts=editor --auth-admin lead@you.io
+```
 
 ### Run history
 

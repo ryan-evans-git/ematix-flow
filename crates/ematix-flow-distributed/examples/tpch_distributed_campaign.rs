@@ -42,6 +42,13 @@
 //!                           accepted as a legacy alias). Unset ⇒ the
 //!                           preset's concurrency-aware AUTO resolution.
 //!   NO_DISTRIBUTE           set ⇒ single-node diagnostic run (no mesh)
+//!   EMAT_MESH               tri-state gate on the stage splitter:
+//!                           1=always distribute, 0=never (plans stay
+//!                           byte-identical to single-node), unset=AUTO
+//!                           per query from scan-byte statistics. See
+//!                           `ematix_flow_distributed::mesh_gate`.
+//!   EMAT_MESH_MIN_BYTES     AUTO threshold in bytes (default 4 GiB,
+//!                           initial value pending campaign calibration)
 //!   CUSTOM_SQL / EXPLAIN_ONLY  diagnostics, unchanged (see below)
 //!
 //! ## Output
@@ -65,11 +72,11 @@ use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::DataFusionError;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_distributed::{
-    CompressionType, DistributedExt, DistributedPhysicalOptimizerRule, WorkerResolver,
-};
+use datafusion_distributed::{CompressionType, DistributedExt, WorkerResolver};
 use ematix_flow_core::preset::{self, HarnessOverrides};
+use ematix_flow_distributed::mesh_gate::AdaptiveMeshGateRule;
 use serde::Serialize;
 use url::Url;
 
@@ -99,6 +106,81 @@ struct QueryStats {
     first_trial_ms: f64,
     median_trials_3_5_ms: f64,
     rows_returned: usize,
+    /// What the adaptive mesh gate (`EMAT_MESH`, see
+    /// `ematix_flow_distributed::mesh_gate`) decided for THIS query's
+    /// physical plan: "mesh" when the optimized plan carries the
+    /// datafusion-distributed stage wrapper, "single" when it stayed
+    /// a single-node plan, "unknown" when planning failed before the
+    /// walk (the trials will show the same failure). Detected via
+    /// [`plan_mode_of`]; the flag state itself is in
+    /// `provenance.emat_env` (EMAT_MESH / EMAT_MESH_MIN_BYTES).
+    plan_mode: String,
+    /// Summed `total_byte_size` (uncompressed, projection-narrowed) of
+    /// this query's scan leaves — the exact quantity the AUTO mesh gate
+    /// compares against `EMAT_MESH_MIN_BYTES`. `None` when no leaf
+    /// reports a byte size. Recorded so a single+mesh run pair yields
+    /// the empirical (scan_bytes → single-vs-mesh) crossover used to
+    /// calibrate the AUTO threshold. See [`sum_scan_leaf_bytes`].
+    scan_bytes: Option<u64>,
+}
+
+/// Walk the optimized physical plan for the datafusion-distributed
+/// stage/flight boundary nodes. Node names discovered from the
+/// datafusion-distributed 1.0.0 source (not guessed):
+/// `DistributedExec` is the root wrapper the stage splitter installs
+/// around every plan it actually splits (execution_plans/distributed.rs),
+/// with `NetworkShuffleExec` / `NetworkCoalesceExec` /
+/// `NetworkBroadcastExec` as the Arrow Flight boundaries inside the
+/// stages. Matching any of them ⇒ the query runs on the mesh. Note
+/// the splitter returns the ORIGINAL plan when no stage split
+/// happens, so "peers configured + EMAT_MESH=1" can still legitimately
+/// report "single" for a plan with no network boundaries.
+fn plan_is_mesh(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if matches!(
+        plan.name(),
+        "DistributedExec" | "NetworkShuffleExec" | "NetworkCoalesceExec" | "NetworkBroadcastExec"
+    ) {
+        return true;
+    }
+    plan.children().into_iter().any(plan_is_mesh)
+}
+
+/// `plan_mode` label for [`QueryStats`] (see [`plan_is_mesh`]).
+fn plan_mode_of(plan: &Arc<dyn ExecutionPlan>) -> &'static str {
+    if plan_is_mesh(plan) { "mesh" } else { "single" }
+}
+
+/// Sum `total_byte_size` across the plan's scan leaves — the exact
+/// quantity the AUTO mesh gate thresholds against `EMAT_MESH_MIN_BYTES`
+/// (mirrors `mesh_gate::collect_scan_leaf_bytes`). `Exact`/`Inexact`
+/// count; `Absent` contributes nothing. Returns `None` when NO leaf
+/// reports a size (the gate's "all-unknown → distribute" path). Recorded
+/// per query so a single+mesh run pair gives the empirical
+/// scan_bytes→(single-vs-mesh) crossover for threshold calibration.
+fn sum_scan_leaf_bytes(plan: &Arc<dyn ExecutionPlan>) -> Option<u64> {
+    fn walk(plan: &Arc<dyn ExecutionPlan>, sum: &mut u64, any: &mut bool) {
+        let children = plan.children();
+        if children.is_empty() {
+            if let Ok(s) = plan.partition_statistics(None) {
+                match s.total_byte_size {
+                    datafusion::common::stats::Precision::Exact(n)
+                    | datafusion::common::stats::Precision::Inexact(n) => {
+                        *any = true;
+                        *sum = sum.saturating_add(n as u64);
+                    }
+                    datafusion::common::stats::Precision::Absent => {}
+                }
+            }
+            return;
+        }
+        for c in children {
+            walk(c, sum, any);
+        }
+    }
+    let mut sum = 0u64;
+    let mut any = false;
+    walk(plan, &mut sum, &mut any);
+    any.then_some(sum)
 }
 
 /// Run provenance — the campaign-side equivalent of the strict local
@@ -150,9 +232,14 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 fn parse_peers() -> Vec<String> {
-    std::env::var("EMATIX_PEERS")
-        .expect("EMATIX_PEERS env var required (comma-separated worker URLs)")
-        .split(',')
+    // A single-node diagnostic run (NO_DISTRIBUTE) has no mesh, so peers are
+    // optional there; only the distributed path truly requires them.
+    let raw = match std::env::var("EMATIX_PEERS") {
+        Ok(v) => v,
+        Err(_) if std::env::var_os("NO_DISTRIBUTE").is_some() => return Vec::new(),
+        Err(_) => panic!("EMATIX_PEERS env var required (comma-separated worker URLs)"),
+    };
+    raw.split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
@@ -242,11 +329,17 @@ fn explicit_partitions() -> Option<usize> {
 /// node resolves to full cores) and sizes the rayon decode pool once
 /// per process.
 ///
-/// `distributed` appends `DistributedPhysicalOptimizerRule` LAST (the
-/// standard datafusion-distributed integration: split the
-/// *fully-optimized* plan into network stages) + the worker resolver +
-/// LZ4_FRAME exchange compression — identical composition to
-/// `DistributedBackend::build_context`.
+/// `distributed` appends the EMAT_MESH [`AdaptiveMeshGateRule`] LAST
+/// (the adaptive wrapper around datafusion-distributed's stage
+/// splitter: split the *fully-optimized* plan into network stages —
+/// or leave it single-node per the gate's tri-state / per-query
+/// AUTO decision) + the worker resolver + LZ4_FRAME exchange
+/// compression — identical composition to
+/// `DistributedBackend::build_context`. `from_env()` snapshots
+/// EMAT_MESH / EMAT_MESH_MIN_BYTES once here at session build; the
+/// gate decision itself replays per query at plan-optimization time
+/// (the rule runs on every plan), reported per query as
+/// `QueryStats::plan_mode`.
 fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState {
     let explicit = explicit_partitions();
     let mut cfg = SessionConfig::new().with_collect_statistics(true);
@@ -265,15 +358,44 @@ fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState
 
     if distributed {
         let builder = builder
-            .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
+            .with_physical_optimizer_rule(Arc::new(AdaptiveMeshGateRule::from_env()))
             .with_distributed_worker_resolver(resolver);
         builder
             .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
             .expect("LZ4_FRAME is a valid compression type")
+            // Match production (`DistributedBackend::build_context`): pin
+            // files_per_task=1 so the per-stage task count auto-derives as
+            // min(scan file-splits, worker count) instead of the library's
+            // core-count default, which collapses single-file scans to a
+            // single task and silently prevents the mesh from engaging.
+            .with_distributed_files_per_task(1)
+            .expect("files_per_task = 1 is valid")
             .build()
     } else {
         builder.build()
     }
+}
+
+/// Resolve a table's on-disk parquet source, preferring the multi-file
+/// parts layout that lets the distributed planner fan a scan out:
+/// - `<data_dir>/<table>/` — a directory of `<table>-NNNN.parquet` parts,
+///   registered as a multi-file listing so each part is its own scan
+///   split (returned when the dir exists and is non-empty); else
+/// - `<data_dir>/<table>.parquet` — the legacy single flat file; else
+/// - `None` (pre-flight turns this into a hard error).
+fn table_source(data_dir: &std::path::Path, table: &str) -> Option<PathBuf> {
+    let dir = data_dir.join(table);
+    let dir_has_files = std::fs::read_dir(&dir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if dir.is_dir() && dir_has_files {
+        return Some(dir);
+    }
+    let flat = data_dir.join(format!("{table}.parquet"));
+    if flat.exists() {
+        return Some(flat);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -419,12 +541,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  workspace:    {}", workspace_root.display());
     eprintln!();
 
-    // Pre-flight: confirm every table file exists on the coordinator.
-    // (Workers need them too, but that's userdata's responsibility.)
+    // Pre-flight: confirm every table's data is present on the
+    // coordinator. Two layouts are accepted (see `table_source`):
+    // the multi-file parts dir `<data_dir>/<table>/` OR the legacy flat
+    // `<data_dir>/<table>.parquet`. (Workers need them too, but that's
+    // userdata's responsibility.)
     for table in TPCH_TABLES {
-        let p = data_dir.join(format!("{table}.parquet"));
-        if !p.exists() {
-            return Err(format!("missing parquet: {}", p.display()).into());
+        if table_source(&data_dir, table).is_none() {
+            let dir = data_dir.join(table);
+            let flat = data_dir.join(format!("{table}.parquet"));
+            return Err(format!(
+                "missing parquet for {table}: neither dir {} nor file {} exists",
+                dir.display(),
+                flat.display()
+            )
+            .into());
         }
     }
 
@@ -447,10 +578,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provenance.instance_type,
     );
     let ctx = Arc::new(SessionContext::from(state));
+    // Match the SHIPPED engine: read parquet via the hand-rolled ematix-parquet
+    // reader (EmatixFastParquetTableProvider — late-materialization + fused
+    // NEON/AVX2 predicate kernels), which is what run_shard/work_unit use in
+    // production. The generic arrow-rs `register_parquet` is used ONLY when we
+    // fan out (distributed): the DistributedPhysicalOptimizerRule splits an
+    // arrow-rs ListingTable across peers, and each peer's shard then reads via
+    // ematix-parquet itself. So single-node (NO_DISTRIBUTE) uses ematix-parquet
+    // directly — no code path benchmarks the arrow-rs reader as "ematix".
+    let use_fast = !distributed;
     for table in TPCH_TABLES {
-        let p = data_dir.join(format!("{table}.parquet"));
-        ctx.register_parquet(*table, p.to_str().unwrap(), Default::default())
-            .await?;
+        // `table_source` resolves the multi-file parts dir `<table>/` (each
+        // holding `<table>-NNNN.parquet`) when present, else the legacy flat
+        // `<table>.parquet`. Registering a DIRECTORY makes DataFusion list
+        // every part file as a separate scan split — the file count the
+        // distributed planner divides by `files_per_task` (pinned to 1) to
+        // fan the scan out across peers. A single flat file yields one split
+        // (single-node), which is why the parts layout matters for the mesh.
+        let p = table_source(&data_dir, table)
+            .unwrap_or_else(|| panic!("pre-flight passed but {table} source vanished"));
+        if use_fast {
+            let prov =
+                ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider::try_new(
+                    p.to_string_lossy().to_string(),
+                )?;
+            ctx.register_table(*table, Arc::new(prov))?;
+        } else {
+            ctx.register_parquet(*table, p.to_str().unwrap(), Default::default())
+                .await?;
+        }
     }
 
     // CUSTOM_SQL=<sql> — run one ad-hoc query through the distributed ctx
@@ -510,6 +666,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        // What did the adaptive mesh gate decide for this query?
+        // Planning here is cheap relative to a trial (and each trial
+        // re-plans anyway via ctx.sql); "unknown" means planning
+        // itself failed — the warmups/trials below will surface the
+        // same error.
+        let (plan_mode, scan_bytes): (String, Option<u64>) = match ctx.sql(&sql).await {
+            Ok(df) => match df.create_physical_plan().await {
+                Ok(plan) => (plan_mode_of(&plan).to_string(), sum_scan_leaf_bytes(&plan)),
+                Err(e) => {
+                    eprintln!("  plan_mode probe failed (physical): {e}");
+                    ("unknown".to_string(), None)
+                }
+            },
+            Err(e) => {
+                eprintln!("  plan_mode probe failed (logical): {e}");
+                ("unknown".to_string(), None)
+            }
+        };
+        eprintln!(
+            "  plan_mode={plan_mode} scan_bytes={}",
+            scan_bytes.map_or("none".to_string(), |b| b.to_string())
+        );
+
         // Warmups (untimed, but verify it runs cleanly).
         for w in 0..warmups {
             match run_query(&ctx, &sql).await {
@@ -556,6 +735,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 first_trial_ms: first,
                 median_trials_3_5_ms: med35,
                 rows_returned,
+                plan_mode,
+                scan_bytes,
             },
         );
     }
@@ -666,12 +847,56 @@ mod campaign_preset_parity_tests {
         assert_eq!(
             physical.len(),
             n + 1,
-            "distributed chain must add exactly one rule (the stage splitter): {physical:?}"
+            "distributed chain must add exactly one rule (the mesh-gated stage splitter): {physical:?}"
         );
         assert!(
             physical[n].to_lowercase().contains("distributed"),
-            "the appended rule must be the datafusion-distributed stage splitter, got {}",
+            "the appended rule must wrap the datafusion-distributed stage splitter, got {}",
             physical[n]
         );
+        // 2026-07 adaptive mesh gate: the appended rule is no longer
+        // the BARE splitter but the EMAT_MESH tri-state gate wrapping
+        // it (ematix_flow_distributed::mesh_gate). Pin the exact name
+        // so a silent revert to the ungated splitter trips here.
+        assert_eq!(
+            physical[n], "ematix_adaptive_distributed_mesh_gate",
+            "the appended rule must be the EMAT_MESH adaptive mesh gate"
+        );
+    }
+
+    /// `plan_mode` detection: a session with no stage splitter can
+    /// never produce a mesh plan, so the walker must report "single".
+    /// (The mesh-positive side — a real `DistributedExec` root — is
+    /// pinned by `tests/mesh_gate_plan.rs` against an in-process
+    /// worker mesh.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_mode_walker_reports_single_for_non_distributed_session() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::datasource::MemTable;
+
+        let state = build_session_state(false, no_peers());
+        let ctx = SessionContext::from(state);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "n",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mem = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("nums", Arc::new(mem)).unwrap();
+
+        let plan = ctx
+            .sql("SELECT SUM(n) FROM nums")
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert_eq!(plan_mode_of(&plan), "single");
     }
 }

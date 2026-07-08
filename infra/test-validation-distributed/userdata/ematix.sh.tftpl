@@ -27,10 +27,15 @@
 #     flow-worker process is solo on its instance, so the partition
 #     registry senses live=1 and resolves full cores.
 
+set -euo pipefail
 set -uo pipefail
 exec > >(tee /var/log/ematix-userdata.log) 2>&1
 
 echo "=== ematix bootstrap: role=${role}: $(date -u +%FT%TZ) ==="
+
+# Build prerequisites: the workspace needs a C toolchain (ring/librdkafka/
+# mimalloc build scripts) — rustup alone is NOT enough on a stock AL2023 AMI.
+dnf install -y -q gcc gcc-c++ cmake make perl
 
 # Rust toolchain — install for ec2-user (not root) so cargo cache lives
 # under /home/ec2-user.
@@ -43,43 +48,73 @@ rustc --version
 INSTALL_RUST
 
 # TPC-H parquet: pull from the campaign bucket to the local path shared
-# by coordinator + workers. S3 layout is a directory per table (Trino
-# hive-connector requirement); local layout is flat files (what the
-# campaign binary registers).
+# by coordinator + workers. S3 layout is a directory per table. We sync
+# the ENTIRE table dir into a local per-table dir: that's 1 file for the
+# legacy single-file layout, or K `<table>-NNNN.parquet` parts for the
+# multi-file ("parted") layout. ematix registers the DIRECTORY, so each
+# part becomes its own scan split — the file count the distributed
+# planner divides by files_per_task (pinned to 1) to fan a scan out
+# across peers. `data_prefix` selects tpch-data (single) vs
+# tpch-data-parted (multi-file) without disturbing the other.
 mkdir -p /opt/ematix/data/sf${scale_factor}
 for t in region nation supplier customer part partsupp orders lineitem; do
-  if [ ! -s "/opt/ematix/data/sf${scale_factor}/$t.parquet" ]; then
-    /usr/local/bin/aws s3 cp \
-      "s3://${bench_bucket}/tpch-data/sf${scale_factor}/$t/$t.parquet" \
-      "/opt/ematix/data/sf${scale_factor}/$t.parquet" --only-show-errors
+  dst="/opt/ematix/data/sf${scale_factor}/$t"
+  if [ ! -d "$dst" ] || [ -z "$(ls -A "$dst" 2>/dev/null)" ]; then
+    /usr/local/bin/aws s3 cp --recursive \
+      "s3://${bench_bucket}/${data_prefix}/sf${scale_factor}/$t/" \
+      "$dst/" --only-show-errors
   fi
 done
 chown -R ec2-user:ec2-user /opt/ematix/data
-ls -lh /opt/ematix/data/sf${scale_factor}/
+ls -lhR /opt/ematix/data/sf${scale_factor}/ | head -60
 
-# Build flow-worker (every node). Reuses the cached target dir if present.
-# Real cargo exit captured from PIPESTATUS (tail would otherwise mask it).
-sudo -u ec2-user bash <<'BUILD'
+# Binaries: prefer PREBUILT artifacts uploaded to s3://<bucket>/bin/<sha>/
+# by the gen box (skips the ~15-min compile). Fall back to cargo build if
+# the artifacts for this exact cloned SHA aren't present. flow-worker on
+# every node; the campaign orchestrator on the coordinator only.
+SHA=$(sudo -u ec2-user git -C /opt/ematix/ematix-flow rev-parse HEAD 2>/dev/null || echo unknown)
+BINDIR=/opt/ematix/ematix-flow/target/release
+mkdir -p "$BINDIR/examples"
+# This script runs as root, so mkdir creates target/ root-owned. The compile
+# fallback runs as ec2-user and would fail to write target/release/.cargo-build-lock
+# (Permission denied). Hand target/ to ec2-user so the fresh-compile path works.
+chown -R ec2-user:ec2-user /opt/ematix/ematix-flow/target
+echo "resolving binaries for SHA=$SHA"
+
+if /usr/local/bin/aws s3 cp "s3://${bench_bucket}/bin/$SHA/flow-worker" "$BINDIR/flow-worker" --only-show-errors 2>/dev/null; then
+  chmod +x "$BINDIR/flow-worker"; chown ec2-user:ec2-user "$BINDIR/flow-worker"
+  echo "flow-worker: PREBUILT $SHA"
+else
+  echo "flow-worker: no prebuilt for $SHA, compiling"
+  sudo -u ec2-user bash <<'BUILD'
 set -uo pipefail
 source $HOME/.cargo/env
 cd /opt/ematix/ematix-flow
-cargo build --release -p ematix-flow-distributed --bin flow-worker 2>&1 | tail -20
+cargo build --release -p ematix-flow-distributed --bin flow-worker > /tmp/build-worker.log 2>&1 || { echo 'FLOW-WORKER BUILD FAILED'; tail -40 /tmp/build-worker.log; exit 1; }
+tail -3 /tmp/build-worker.log
 rc=$${PIPESTATUS[0]}
 echo "flow-worker build exit: $rc"
 exit $rc
 BUILD
+fi
 
-# Coordinator additionally builds the campaign orchestrator example.
 if [ "${role}" = "coordinator" ]; then
-  sudo -u ec2-user bash <<'BUILD_CAMPAIGN'
+  if /usr/local/bin/aws s3 cp "s3://${bench_bucket}/bin/$SHA/tpch_distributed_campaign" "$BINDIR/examples/tpch_distributed_campaign" --only-show-errors 2>/dev/null; then
+    chmod +x "$BINDIR/examples/tpch_distributed_campaign"; chown ec2-user:ec2-user "$BINDIR/examples/tpch_distributed_campaign"
+    echo "campaign: PREBUILT $SHA"
+  else
+    echo "campaign: no prebuilt for $SHA, compiling"
+    sudo -u ec2-user bash <<'BUILD_CAMPAIGN'
 set -uo pipefail
 source $HOME/.cargo/env
 cd /opt/ematix/ematix-flow
-cargo build --release -p ematix-flow-distributed --example tpch_distributed_campaign 2>&1 | tail -20
+cargo build --release -p ematix-flow-distributed --example tpch_distributed_campaign > /tmp/build-campaign.log 2>&1 || { echo 'CAMPAIGN BUILD FAILED'; tail -40 /tmp/build-campaign.log; exit 1; }
+tail -3 /tmp/build-campaign.log
 rc=$${PIPESTATUS[0]}
 echo "campaign example build exit: $rc"
 exit $rc
 BUILD_CAMPAIGN
+  fi
 fi
 
 # systemd unit. Coordinator vs worker share the same flow-worker

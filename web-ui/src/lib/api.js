@@ -86,3 +86,142 @@ export async function runJobNow(name, { cascadeDownstream = false } = {}) {
     body: JSON.stringify({ cascade_downstream: !!cascadeDownstream }),
   });
 }
+
+// ---- SQL Lab / analytics ------------------------------------------
+
+export async function listDatasources() {
+  return _request("/datasources");
+}
+
+const _ds = (id) => `/datasources/${encodeURIComponent(id)}`;
+
+export async function listSchemas(datasourceId) {
+  return _request(`${_ds(datasourceId)}/schemas`);
+}
+
+export async function listTables(datasourceId, schema) {
+  return _request(`${_ds(datasourceId)}/schemas/${encodeURIComponent(schema)}/tables`);
+}
+
+export async function listColumns(datasourceId, schema, table) {
+  return _request(
+    `${_ds(datasourceId)}/schemas/${encodeURIComponent(schema)}/tables/${encodeURIComponent(table)}/columns`,
+  );
+}
+
+export async function runQuery({ datasourceId, sql, maxRows } = {}) {
+  const body = { datasource_id: datasourceId, sql };
+  if (maxRows != null) body.max_rows = maxRows;
+  return _request("/query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function listSavedQueries() {
+  return _request("/saved-queries");
+}
+
+export async function createSavedQuery({ name, datasourceId, sql } = {}) {
+  return _request("/saved-queries", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, datasource_id: datasourceId, sql }),
+  });
+}
+
+export async function updateSavedQuery(id, { name, datasourceId, sql } = {}) {
+  const body = {};
+  if (name != null) body.name = name;
+  if (datasourceId != null) body.datasource_id = datasourceId;
+  if (sql != null) body.sql = sql;
+  return _request(`/saved-queries/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteSavedQuery(id) {
+  return _request(`/saved-queries/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function listCharts() {
+  return _request("/charts");
+}
+
+export async function getChart(id) {
+  return _request(`/charts/${encodeURIComponent(id)}`);
+}
+
+export async function createChart({ name, datasourceId, sql, vizType, encoding } = {}) {
+  return _request("/charts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name,
+      datasource_id: datasourceId,
+      sql,
+      viz_type: vizType,
+      encoding: encoding || {},
+    }),
+  });
+}
+
+export async function updateChart(id, { name, datasourceId, sql, vizType, encoding } = {}) {
+  const body = {};
+  if (name != null) body.name = name;
+  if (datasourceId != null) body.datasource_id = datasourceId;
+  if (sql != null) body.sql = sql;
+  if (vizType != null) body.viz_type = vizType;
+  if (encoding != null) body.encoding = encoding;
+  return _request(`/charts/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteChart(id) {
+  return _request(`/charts/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function listDashboards() {
+  return _request("/dashboards");
+}
+
+export async function getDashboard(id) {
+  return _request(`/dashboards/${encodeURIComponent(id)}`);
+}
+
+export async function createDashboard({ name, layout } = {}) {
+  return _request("/dashboards", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, layout: layout || { tiles: [] } }),
+  });
+}
+
+export async function updateDashboard(id, { name, layout } = {}) {
+  const body = {};
+  if (name != null) body.name = name;
+  if (layout != null) body.layout = layout;
+  return _request(`/dashboards/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteDashboard(id) {
+  return _request(`/dashboards/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function queryDashboard(id, filters = []) {
+  return _request(`/dashboards/${encodeURIComponent(id)}/query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filters }),
+  });
+}

@@ -1438,6 +1438,51 @@ impl KafkaBackend {
         self.batch_config
     }
 
+    /// Decode raw message payloads under this backend's configured
+    /// `payload_format` — the single decode dispatch shared by
+    /// `read_arrow_stream` and the DLQ replay source (DLQ Phase 2),
+    /// so replayed payloads take byte-identical paths to live ones.
+    ///
+    /// Format prerequisites (schema-registry URL / Glue config for
+    /// Avro, SR URL for Protobuf) must hold, same as on the read
+    /// path — violations surface as the decode call's own errors.
+    pub(crate) async fn decode_payloads(
+        &self,
+        payloads: Vec<Vec<u8>>,
+    ) -> Result<Vec<RecordBatch>, BackendError> {
+        let batches = match self.payload_format {
+            KafkaPayloadFormat::Json => decode_payloads_as_jsonl(payloads)?,
+            KafkaPayloadFormat::RawBytes => decode_payloads_as_raw_bytes(payloads)?,
+            KafkaPayloadFormat::Avro => match &self.schema_registry_kind {
+                SchemaRegistryKind::Confluent => {
+                    decode_payloads_as_avro(payloads, &self.sr_auth()?).await?
+                }
+                SchemaRegistryKind::Glue {
+                    region,
+                    registry_name,
+                    schema_lookup_callback,
+                    ..
+                } => {
+                    // Glue path: schema fetched via the named callback
+                    // (typically the Python boto3 wrapper). Cache
+                    // lives on the backend so a hot topic only pays
+                    // the network round-trip once per UUID.
+                    decode_payloads_as_glue_avro(
+                        payloads,
+                        region,
+                        registry_name,
+                        schema_lookup_callback,
+                        &self.glue_schema_cache,
+                    )?
+                }
+            },
+            KafkaPayloadFormat::Protobuf => {
+                decode_payloads_as_protobuf(payloads, &self.sr_auth()?).await?
+            }
+        };
+        Ok(batches)
+    }
+
     /// Build a fresh `ClientConfig` populated with this backend's
     /// bootstrap servers + optional group_id. 36f will layer auth
     /// settings (SASL/PLAIN, SASL/SCRAM, mTLS, MSK IAM
@@ -1730,38 +1775,7 @@ impl Backend for KafkaBackend {
             let stream = futures_util::stream::empty();
             return Ok(Box::pin(stream));
         }
-        let batches = match self.payload_format {
-            KafkaPayloadFormat::Json => decode_payloads_as_jsonl(payloads)?,
-            KafkaPayloadFormat::RawBytes => decode_payloads_as_raw_bytes(payloads)?,
-            KafkaPayloadFormat::Avro => match &self.schema_registry_kind {
-                SchemaRegistryKind::Confluent => {
-                    // schema_registry_url presence already validated above.
-                    decode_payloads_as_avro(payloads, &self.sr_auth()?).await?
-                }
-                SchemaRegistryKind::Glue {
-                    region,
-                    registry_name,
-                    schema_lookup_callback,
-                    ..
-                } => {
-                    // Glue path: schema fetched via the named callback
-                    // (typically the Python boto3 wrapper). Cache
-                    // lives on the backend so a hot topic only pays
-                    // the network round-trip once per UUID.
-                    decode_payloads_as_glue_avro(
-                        payloads,
-                        region,
-                        registry_name,
-                        schema_lookup_callback,
-                        &self.glue_schema_cache,
-                    )?
-                }
-            },
-            KafkaPayloadFormat::Protobuf => {
-                // schema_registry_url presence already validated above.
-                decode_payloads_as_protobuf(payloads, &self.sr_auth()?).await?
-            }
-        };
+        let batches = self.decode_payloads(payloads).await?;
         let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
         Ok(Box::pin(stream))
     }
@@ -2312,7 +2326,9 @@ pub fn decode_payloads_as_jsonl(payloads: Vec<Vec<u8>>) -> Result<Vec<RecordBatc
 /// opaque blob. Tombstones (zero-byte payloads on the read path are
 /// already filtered upstream as None) reach this function as
 /// already-collected `Vec<u8>`s.
-fn decode_payloads_as_raw_bytes(payloads: Vec<Vec<u8>>) -> Result<Vec<RecordBatch>, BackendError> {
+pub(crate) fn decode_payloads_as_raw_bytes(
+    payloads: Vec<Vec<u8>>,
+) -> Result<Vec<RecordBatch>, BackendError> {
     use arrow_array::BinaryArray;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 

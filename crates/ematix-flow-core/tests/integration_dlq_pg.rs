@@ -205,3 +205,261 @@ async fn pg_state_store_provides_dlq_on_same_family() {
     let direct = TableDlq::connect_postgres(&url, "public").await.unwrap();
     assert_eq!(direct.depth("family-p").await.unwrap().pending, 3);
 }
+
+// ----- DLQ Phase 2: replay engine over the Postgres table store ----------
+//
+// TDD note: committed red against the `run_dlq_replay` stub before
+// the engine existed (same discipline as the Phase 1 contract
+// suite).
+
+use std::sync::Arc;
+
+use ematix_flow_core::backend::{Backend, TargetTable};
+use ematix_flow_core::dlq::{DlqSelection, ReplayOptions};
+use ematix_flow_core::streaming::{StreamingPipeline, StreamingPipelineConfig};
+use futures_util::TryStreamExt;
+
+/// A transform that always fails — drives the poison-park path.
+#[derive(Debug)]
+struct AlwaysFailTransform;
+
+#[async_trait::async_trait]
+impl ematix_flow_core::transform::BatchTransform for AlwaysFailTransform {
+    fn input_schema(&self) -> arrow_schema::SchemaRef {
+        Arc::new(arrow_schema::Schema::empty())
+    }
+    fn output_schema(&self) -> arrow_schema::SchemaRef {
+        self.input_schema()
+    }
+    async fn transform(
+        &self,
+        _input: arrow_array::RecordBatch,
+        _ctx: &ematix_flow_core::transform::BatchContext,
+    ) -> Result<Vec<arrow_array::RecordBatch>, ematix_flow_core::backend::BackendError> {
+        Err(ematix_flow_core::backend::BackendError::Other(
+            "replay poison: scripted transform failure".into(),
+        ))
+    }
+}
+
+/// A pipeline whose DLQ is the given store and whose (single)
+/// target is a fresh in-proc SQLite database. The source backend is
+/// never read during a replay (the DLQ selection IS the source).
+fn mk_replay_pipeline(
+    pipeline: &str,
+    store: Arc<dyn DeadLetterStore>,
+    transform: Option<Arc<dyn ematix_flow_core::transform::BatchTransform>>,
+) -> (Arc<dyn Backend>, StreamingPipeline) {
+    let source: Arc<dyn Backend> =
+        Arc::new(ematix_flow_core::SQLiteBackend::open(":memory:").unwrap());
+    let target: Arc<dyn Backend> =
+        Arc::new(ematix_flow_core::SQLiteBackend::open(":memory:").unwrap());
+    let table = TargetTable {
+        schema: "main".into(),
+        name: "events".into(),
+    };
+    let mut cfg = StreamingPipelineConfig::new("seed-src", table.clone(), pipeline)
+        .with_dead_letter_store(store);
+    if let Some(t) = transform {
+        cfg = cfg.with_transform(t);
+    }
+    let p = StreamingPipeline::new(source, vec![(Arc::clone(&target), table)], cfg);
+    (target, p)
+}
+
+async fn count_events(backend: &Arc<dyn Backend>) -> i64 {
+    let stream = backend
+        .read_arrow_stream("SELECT count(*) FROM events")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap()
+        .value(0)
+}
+
+/// PRD round trip on the Postgres store family: sink broken →
+/// replay re-dead-letters with attempt+1 → fix sink → replay All →
+/// rows present, DLQ drained, reports exact.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pg_replay_round_trip_after_sink_fix() {
+    let (_c, store) = fresh_store().await;
+    let store: Arc<dyn DeadLetterStore> = Arc::new(store);
+    store
+        .append(vec![
+            h::mk_record("pgrt", 1),
+            h::mk_record("pgrt", 2),
+            h::mk_record("pgrt", 3),
+        ])
+        .await
+        .unwrap();
+
+    let (target, pipeline) = mk_replay_pipeline("pgrt", Arc::clone(&store), None);
+
+    // Sink broken (`events` doesn't exist): everything fails again
+    // and returns to the DLQ at attempt 2.
+    let r1 = pipeline
+        .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        (r1.taken, r1.succeeded, r1.redeadlettered, r1.parked),
+        (3, 0, 3, 0)
+    );
+    assert_eq!(store.depth("pgrt").await.unwrap().pending, 3);
+    let pending = store.browse("pgrt", 0, 10, None).await.unwrap();
+    assert!(
+        pending.iter().all(|r| r.meta.attempt == 2),
+        "redriven records carry attempt 2"
+    );
+
+    // Fix the sink; replay again.
+    target
+        .execute("CREATE TABLE events (id INTEGER, name TEXT)")
+        .await
+        .unwrap();
+    let r2 = pipeline
+        .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        (r2.taken, r2.succeeded, r2.redeadlettered, r2.parked),
+        (3, 3, 0, 0)
+    );
+
+    assert_eq!(count_events(&target).await, 3, "rows present at the target");
+    assert_eq!(
+        store.depth("pgrt").await.unwrap(),
+        ematix_flow_core::dlq::DlqDepth::default(),
+        "DLQ drained — replays acked"
+    );
+}
+
+/// Poison-park on Postgres: attempt increments on every redrive and
+/// the record parks (in place — table stores CAN express park) at
+/// max_attempts; parked records are excluded from later takes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pg_replay_poison_parks_at_max_attempts() {
+    let (_c, store) = fresh_store().await;
+    let store: Arc<dyn DeadLetterStore> = Arc::new(store);
+    store
+        .append(vec![h::mk_record("pgpoison", 1)])
+        .await
+        .unwrap();
+
+    let (target, pipeline) = mk_replay_pipeline(
+        "pgpoison",
+        Arc::clone(&store),
+        Some(Arc::new(AlwaysFailTransform)),
+    );
+    target
+        .execute("CREATE TABLE events (id INTEGER, name TEXT)")
+        .await
+        .unwrap();
+
+    let r1 = pipeline
+        .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+        .await
+        .unwrap();
+    assert_eq!((r1.taken, r1.redeadlettered, r1.parked), (1, 1, 0));
+    let after1 = store.browse("pgpoison", 0, 10, None).await.unwrap();
+    assert_eq!(after1[0].meta.attempt, 2);
+
+    let r2 = pipeline
+        .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+        .await
+        .unwrap();
+    assert_eq!((r2.taken, r2.redeadlettered, r2.parked), (1, 1, 0));
+    let after2 = store.browse("pgpoison", 0, 10, None).await.unwrap();
+    assert_eq!(after2[0].meta.attempt, 3);
+
+    let r3 = pipeline
+        .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+        .await
+        .unwrap();
+    assert_eq!((r3.taken, r3.redeadlettered, r3.parked), (1, 0, 1));
+
+    let depth = store.depth("pgpoison").await.unwrap();
+    assert_eq!((depth.pending, depth.parked), (0, 1));
+    let parked = store
+        .browse(
+            "pgpoison",
+            0,
+            10,
+            Some(ematix_flow_core::dlq::DlqRecordStatus::Parked),
+        )
+        .await
+        .unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].meta.attempt, 3, "parked at max_attempts");
+
+    let r4 = pipeline
+        .run_dlq_replay(DlqSelection::All, ReplayOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r4.taken, 0, "parked records excluded from take");
+    assert_eq!(
+        count_events(&target).await,
+        0,
+        "poison never reached the sink"
+    );
+}
+
+/// Two overlapping replays over the SAME Postgres DLQ (separate
+/// handles → separate pools → real `FOR UPDATE SKIP LOCKED`
+/// contention) must not double-process any record.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pg_concurrent_replays_do_not_double_process() {
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("failed to start postgres testcontainer");
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let store_a: Arc<dyn DeadLetterStore> =
+        Arc::new(TableDlq::connect_postgres(&url, "public").await.unwrap());
+    let store_b: Arc<dyn DeadLetterStore> =
+        Arc::new(TableDlq::connect_postgres(&url, "public").await.unwrap());
+
+    let records: Vec<_> = (1..=20).map(|n| h::mk_record("pgconc", n)).collect();
+    store_a.append(records).await.unwrap();
+
+    let (target_a, pa) = mk_replay_pipeline("pgconc", Arc::clone(&store_a), None);
+    let (target_b, pb) = mk_replay_pipeline("pgconc", Arc::clone(&store_b), None);
+    target_a
+        .execute("CREATE TABLE events (id INTEGER, name TEXT)")
+        .await
+        .unwrap();
+    target_b
+        .execute("CREATE TABLE events (id INTEGER, name TEXT)")
+        .await
+        .unwrap();
+
+    let (ra, rb) = tokio::join!(
+        pa.run_dlq_replay(DlqSelection::All, ReplayOptions::default()),
+        pb.run_dlq_replay(DlqSelection::All, ReplayOptions::default()),
+    );
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+
+    assert_eq!(
+        ra.taken + rb.taken,
+        20,
+        "SKIP LOCKED leases are exclusive — no double-take"
+    );
+    assert_eq!(ra.succeeded + rb.succeeded, 20);
+    let total = count_events(&target_a).await + count_events(&target_b).await;
+    assert_eq!(total, 20, "every record written exactly once");
+    assert_eq!(
+        store_a.depth("pgconc").await.unwrap(),
+        ematix_flow_core::dlq::DlqDepth::default()
+    );
+}
