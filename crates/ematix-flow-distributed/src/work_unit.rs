@@ -96,6 +96,63 @@ pub enum Input {
         #[serde(default)]
         row_group_range: std::collections::BTreeMap<String, (u32, u32)>,
     },
+    /// A **pre-pruned** Iceberg scan. The coordinator (built
+    /// `--features iceberg`) has already walked the table's manifest and
+    /// run the conservative `(min,max)` summary prune
+    /// (`ematix_flow_core::iceberg_scan`), so this carries the *explicit*
+    /// surviving files — no prefix listing on the worker. Deliberately
+    /// **iceberg-free**: plain strings + i64 only, so the worker never
+    /// links iceberg-rust and the wire schema is stable.
+    IcebergScan {
+        /// Table these files belong to (for multi-table queries).
+        table: String,
+        /// The index the coordinator pruned on. The worker uses it for the
+        /// per-file sidecar lookup on the [`IcebergScanTarget::Indexed`]
+        /// files.
+        index_name: String,
+        /// The predicate that was pruned on, replayed by the worker as the
+        /// sidecar lookup (and re-applied on the full-scan files).
+        predicate: IcebergPredicate,
+        /// Surviving files, post manifest-prune, each tagged index-readable
+        /// vs must-full-scan. Mirrors
+        /// `ematix_flow_core::iceberg_scan::IcebergScanPlan`.
+        targets: Vec<IcebergScanTarget>,
+    },
+}
+
+/// The predicate an [`Input::IcebergScan`] was pruned on, in a wire-stable,
+/// iceberg-free form. INT64 only for now — matches the sidecar read-side
+/// primitive (`ematix_flow_core::sidecar_index`); other physical types follow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum IcebergPredicate {
+    /// `WHERE <indexed_col> = key`.
+    Eq { key: i64 },
+    /// `WHERE <indexed_col> BETWEEN low AND high`, either bound open (`null`).
+    Range {
+        #[serde(default)]
+        low: Option<i64>,
+        #[serde(default)]
+        high: Option<i64>,
+    },
+}
+
+/// One surviving file in an [`Input::IcebergScan`], tagged with how the worker
+/// should read it. The iceberg-free wire twin of
+/// `ematix_flow_core::iceberg_scan::ScanTarget`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "read", rename_all = "snake_case")]
+pub enum IcebergScanTarget {
+    /// Survived the prune and has a covering sidecar: the worker opens
+    /// `sidecar_uri` and does an index lookup + masked decode of `data_uri`.
+    Indexed {
+        data_uri: String,
+        sidecar_uri: String,
+    },
+    /// Survived the prune with no covering sidecar: the worker **must**
+    /// full-scan `data_uri` and re-apply the predicate (the manifest prune is
+    /// conservative, not exact — dropping this would lose rows).
+    FullScan { data_uri: String },
 }
 
 /// Where the worker writes its partial result.
@@ -253,7 +310,83 @@ mod tests {
             } => {
                 assert!(row_group_range.is_empty());
             }
+            other => panic!("expected ParquetPartition, got {other:?}"),
         }
+    }
+
+    /// A pre-pruned Iceberg scan round-trips through JSON, and the tagged
+    /// target/predicate payloads decode to the right variants.
+    #[test]
+    fn iceberg_scan_input_round_trip() {
+        let json = r#"{
+            "id": "wu-ice-1",
+            "query": {"kind": "tpch", "id": "Q06"},
+            "input": {
+                "kind": "iceberg_scan",
+                "table": "lineitem",
+                "index_name": "idx_l_shipdate",
+                "predicate": {"op": "range", "low": 8766, "high": 9131},
+                "targets": [
+                    {"read": "indexed", "data_uri": "s3://b/lineitem/p0.parquet", "sidecar_uri": "s3://b/lineitem/p0.parquet.idx"},
+                    {"read": "full_scan", "data_uri": "s3://b/lineitem/p1.parquet"}
+                ]
+            },
+            "output": {"kind": "arrow_ipc", "uri": "file:///out.arrow"}
+        }"#;
+        let wu: WorkUnit = serde_json::from_str(json).expect("parse iceberg_scan");
+        match &wu.input {
+            Input::IcebergScan {
+                table,
+                index_name,
+                predicate,
+                targets,
+            } => {
+                assert_eq!(table, "lineitem");
+                assert_eq!(index_name, "idx_l_shipdate");
+                assert_eq!(
+                    *predicate,
+                    IcebergPredicate::Range {
+                        low: Some(8766),
+                        high: Some(9131),
+                    }
+                );
+                assert_eq!(targets.len(), 2);
+                assert_eq!(
+                    targets[0],
+                    IcebergScanTarget::Indexed {
+                        data_uri: "s3://b/lineitem/p0.parquet".into(),
+                        sidecar_uri: "s3://b/lineitem/p0.parquet.idx".into(),
+                    }
+                );
+                assert_eq!(
+                    targets[1],
+                    IcebergScanTarget::FullScan {
+                        data_uri: "s3://b/lineitem/p1.parquet".into(),
+                    }
+                );
+            }
+            other => panic!("expected IcebergScan, got {other:?}"),
+        }
+        // Full serialize → deserialize identity.
+        let s = serde_json::to_string(&wu).unwrap();
+        let wu2: WorkUnit = serde_json::from_str(&s).unwrap();
+        assert_eq!(wu, wu2);
+    }
+
+    /// An open-ended range (`high` omitted) defaults the missing bound to
+    /// `None`, and eq predicates tag as `eq`.
+    #[test]
+    fn iceberg_predicate_shapes() {
+        let eq: IcebergPredicate = serde_json::from_str(r#"{"op":"eq","key":42}"#).unwrap();
+        assert_eq!(eq, IcebergPredicate::Eq { key: 42 });
+        let open: IcebergPredicate = serde_json::from_str(r#"{"op":"range","low":100}"#).unwrap();
+        assert_eq!(
+            open,
+            IcebergPredicate::Range {
+                low: Some(100),
+                high: None,
+            }
+        );
     }
 
     /// Unknown schema is reported, not silently accepted.
