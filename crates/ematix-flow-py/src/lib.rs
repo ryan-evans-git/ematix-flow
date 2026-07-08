@@ -15,6 +15,17 @@ mod udf;
 // pyo3 `extension-module` feature suppresses libpython linking, so this crate
 // is verified by a build + `python -c "import ..."` import smoke, not a
 // standalone `cargo test` (which wouldn't link).
+//
+// NOT on macOS: pyarrow's libarrow bundles its own mimalloc (v2.x), and two
+// mimalloc instances in one process corrupt each other's thread-local heap
+// metadata there — `import pandas; import ematix_flow` segfaulted mid-call or
+// at interpreter shutdown (lldb: EXC_BAD_ACCESS in libarrow.dylib
+// `_mi_theap_collect_retired`, called from `mi_process_done` via
+// `__cxa_finalize_ranges`). macOS builds fall back to the system allocator;
+// Linux (the perf-measured production target) keeps mimalloc. Regression pin:
+// tests/python/test_pyarrow_coexistence.py; full writeup:
+// docs/MACOS_PYARROW_MIMALLOC.md.
+#[cfg(not(target_os = "macos"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
