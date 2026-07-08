@@ -454,6 +454,7 @@ __all__ = [
 
 
 _VALID_TRANSFORM_ON_ERROR = ("fail", "drop", "dlq")
+_VALID_DLQ_STORE = ("auto", "topic", "table")
 
 
 @dataclass(frozen=True)
@@ -701,6 +702,8 @@ def run_streaming_pipeline(
     targets: list[Target] | None = None,
     idle_pause_ms: int = 500,
     dead_letter_topic: str | None = None,
+    dlq_store: str | None = None,
+    dlq_max_attempts: int | None = None,
     transform_sql: str | None = None,
     lookups: dict[str, Lookup] | None = None,
     window: Window | None = None,
@@ -800,6 +803,8 @@ def run_streaming_pipeline(
         targets=targets,
         idle_pause_ms=idle_pause_ms,
         dead_letter_topic=dead_letter_topic,
+        dlq_store=dlq_store,
+        dlq_max_attempts=dlq_max_attempts,
         transform_sql=transform_sql,
         lookups=lookups,
         window=window,
@@ -830,6 +835,8 @@ def _run_streaming_pipeline_emit_toml(
     targets: list[Target] | None = None,
     idle_pause_ms: int = 500,
     dead_letter_topic: str | None = None,
+    dlq_store: str | None = None,
+    dlq_max_attempts: int | None = None,
     transform_sql: str | None = None,
     lookups: dict[str, Lookup] | None = None,
     window: Window | None = None,
@@ -934,6 +941,8 @@ def _run_streaming_pipeline_emit_toml(
         targets=target_specs,
         idle_pause_ms=idle_pause_ms,
         dead_letter_topic=dead_letter_topic,
+        dlq_store=dlq_store,
+        dlq_max_attempts=dlq_max_attempts,
         transform_sql=transform_sql,
         lookups=lookups,
         window=window,
@@ -1003,6 +1012,8 @@ def _build_toml_multi(
     targets: list[Target],
     idle_pause_ms: int,
     dead_letter_topic: str | None,
+    dlq_store: str | None = None,
+    dlq_max_attempts: int | None = None,
     transform_sql: str | None = None,
     lookups: dict[str, Lookup] | None = None,
     window: Window | None = None,
@@ -1043,6 +1054,23 @@ def _build_toml_multi(
         lines.insert(1, f"source_query = {_q(sources[0].query)}")
     if dead_letter_topic is not None:
         lines.append(f"dead_letter_topic = {_q(dead_letter_topic)}")
+    # DLQ Phase 4: store-family + replay-budget knobs. Validation
+    # mirrors ``transform_on_error`` — fail in Python with the valid
+    # set named rather than deferring to the Rust config-load error.
+    if dlq_store is not None:
+        if dlq_store not in _VALID_DLQ_STORE:
+            raise ValueError(
+                f"dlq_store must be one of {_VALID_DLQ_STORE!r}, "
+                f"got {dlq_store!r}"
+            )
+        lines.append(f"dlq_store = {_q(dlq_store)}")
+    if dlq_max_attempts is not None:
+        if int(dlq_max_attempts) < 1:
+            raise ValueError(
+                "dlq_max_attempts must be >= 1 (a record's original "
+                f"emission is attempt 1), got {dlq_max_attempts!r}"
+            )
+        lines.append(f"dlq_max_attempts = {int(dlq_max_attempts)}")
 
     lines.append("")
     if len(sources) == 1:

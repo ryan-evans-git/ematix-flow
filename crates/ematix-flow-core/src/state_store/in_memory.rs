@@ -78,4 +78,21 @@ impl StateStore for InMemoryStateStore {
         p.state_version = snapshot.state_version;
         Ok(())
     }
+
+    /// DLQ Phase 3: clear + REPLACE under the single mutex — the
+    /// in-memory analogue of the SQL stores' one-transaction rule.
+    async fn reset(
+        &self,
+        pipeline: &str,
+        offsets: HashMap<SourceId, Vec<u8>>,
+    ) -> Result<(), BackendError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("InMemoryStateStore mutex poisoned");
+        let p = guard.entry(pipeline.to_string()).or_default();
+        p.state_by_key.clear();
+        p.offsets = offsets;
+        Ok(())
+    }
 }

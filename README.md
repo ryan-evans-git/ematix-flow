@@ -283,10 +283,16 @@ take the `INSERT … SELECT` fast path automatically.
   the same surface.
 - **Exactly-once.** Kafka producer-side via transactions;
   consumer-coordinated end-to-end via `KafkaToKafkaEosPipeline`.
-- **DLQ.** Both app-level (`dead_letter_topic` routes failed batch
-  rows to a separate target) and broker-level (RabbitMQ
-  `x-dead-letter-exchange`, Pub/Sub subscription
-  `dead_letter_policy`).
+- **DLQ + replay + rewind.** App-level dead-letter stores with a
+  uniform surface (Kafka topic with metadata headers, or a SQL
+  table riding the state store's family), one-click replay that
+  redrives records through the pipeline's OWN transform + targets
+  (poison records park at an attempt budget), and stream rewind to
+  a timestamp/offset with an atomic state reset for windowed
+  pipelines. Managed from the web UI (`#/streams/{name}/dlq`) and
+  the HTTP API; see `docs/DLQ_REPLAY_GUIDE.md`. Broker-level DLQs
+  (RabbitMQ `x-dead-letter-exchange`, Pub/Sub
+  `dead_letter_policy`) still work unchanged.
 - **Schema Registry.** Avro and Protobuf decode/encode via
   Confluent SR or Apicurio. AWS Glue Schema Registry support lands
   in the next release.
@@ -1292,15 +1298,23 @@ run_streaming_pipeline(
 )
 ```
 
-### Per-batch error policy
+### Per-batch error policy + DLQ
 
 ```python
 run_streaming_pipeline(
     ...,
     transform_on_error="dlq",         # "fail" (default) | "drop" | "dlq"
     dead_letter_topic="events-failed",
+    dlq_store="auto",                 # "auto" | "topic" | "table"
+    dlq_max_attempts=3,               # replay budget; poison records park past it
 )
 ```
+
+Dead-lettered records are browsable, replayable (through the
+pipeline's own transform + targets), parkable, and purgeable from
+the web UI + HTTP API; streams can also be rewound wholesale to a
+timestamp or offset. The full error-policy → DLQ → replay → rewind
+lifecycle is documented in `docs/DLQ_REPLAY_GUIDE.md`.
 
 ### Object-store file formats
 

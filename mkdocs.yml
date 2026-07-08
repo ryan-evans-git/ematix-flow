@@ -101,6 +101,7 @@ plugins:
 nav:
   - Home: index.md
   - User guide: USER_GUIDE.md
+  - DLQ, replay + rewind: DLQ_REPLAY_GUIDE.md
   - Roadmap: ROADMAP.md
   - Cutting a release: RELEASE.md
 

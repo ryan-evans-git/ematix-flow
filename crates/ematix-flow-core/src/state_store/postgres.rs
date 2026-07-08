@@ -270,6 +270,56 @@ impl StateStore for PostgresStateStore {
         let dlq = TableDlq::from_postgres_pool(self.pool.clone(), &self.schema).await?;
         Ok(Some(Arc::new(dlq)))
     }
+
+    /// DLQ Phase 3: rewind primitive. Clears every state blob and
+    /// REPLACES the offset rows (delete-then-insert, so source ids
+    /// absent from `offsets` disappear) inside ONE transaction —
+    /// the atomicity the rewind orchestration depends on.
+    async fn reset(
+        &self,
+        pipeline: &str,
+        offsets: HashMap<String, Vec<u8>>,
+    ) -> Result<(), BackendError> {
+        let schema = quote_ident(&self.schema);
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(pg_err)?;
+
+        tx.execute(
+            &format!(
+                "DELETE FROM {schema}.ematix_streaming_state
+                 WHERE pipeline_name = $1"
+            ),
+            &[&pipeline],
+        )
+        .await
+        .map_err(pg_err)?;
+        tx.execute(
+            &format!(
+                "DELETE FROM {schema}.ematix_streaming_offsets
+                 WHERE pipeline_name = $1"
+            ),
+            &[&pipeline],
+        )
+        .await
+        .map_err(pg_err)?;
+
+        if !offsets.is_empty() {
+            let insert_sql = format!(
+                "INSERT INTO {schema}.ematix_streaming_offsets
+                     (pipeline_name, source_id, offset_bytes, state_version, updated_at)
+                 VALUES ($1, $2, $3, 0, now())"
+            );
+            let stmt = tx.prepare(&insert_sql).await.map_err(pg_err)?;
+            for (source_id, bytes) in &offsets {
+                tx.execute(&stmt, &[&pipeline, &source_id.as_str(), &bytes.as_slice()])
+                    .await
+                    .map_err(pg_err)?;
+            }
+        }
+
+        tx.commit().await.map_err(pg_err)?;
+        Ok(())
+    }
 }
 
 fn pg_err(e: tokio_postgres::Error) -> BackendError {

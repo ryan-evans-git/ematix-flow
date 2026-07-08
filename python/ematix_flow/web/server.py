@@ -217,6 +217,7 @@ def create_app(
     datasources: dict[str, str] | None = None,
     analytics_store: Any = None,
     rbac: Any = None,
+    dlq_ops: Any = None,
 ):
     """Build the FastAPI app.
 
@@ -232,6 +233,11 @@ def create_app(
       ``ematix_flow.web.ui_dist`` data dir, which is populated by
       the Vite build at wheel-build time. If absent, the server
       serves a friendly placeholder HTML page.
+    - ``dlq_ops`` — DLQ Phase 4: the DLQ/rewind operations layer
+      for ``/api/streams/{name}/dlq*`` + ``/rewind``. Defaults to
+      :class:`ematix_flow.web.dlq.StreamDlqOps` (pyo3-backed,
+      resolved lazily on first use); tests inject a fake with the
+      same duck-typed surface.
     - ``bearer_token`` — when set, ``/api/*`` routes require an
       ``Authorization: Bearer <token>`` header that matches. Lets
       operators bind the server to non-loopback addresses safely.
@@ -1457,6 +1463,282 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"status": "resume_requested"}
+
+    # ---- DLQ + rewind (DLQ Phase 4) ---------------------------------
+    #
+    # Server-side gating mirrors the existing mutating actions:
+    # mutations (replay / park / purge / rewind) require a
+    # configured history store (replay runs register there), rewind
+    # additionally refuses while the stream's latest run is
+    # `running`. Bearer-token rules are unchanged — the /api/*
+    # middleware already covers these routes.
+
+    _dlq_ops_holder: list[Any] = [dlq_ops]
+
+    def _dlq() -> Any:
+        if _dlq_ops_holder[0] is None:
+            from ematix_flow.web.dlq import StreamDlqOps
+
+            _dlq_ops_holder[0] = StreamDlqOps()
+        return _dlq_ops_holder[0]
+
+    def _now_ms() -> int:
+        # The HTTP handler is the emission boundary that reads the
+        # clock; the Rust ops layers below take now_ms as a
+        # parameter (house convention).
+        import time
+
+        return int(time.time() * 1000)
+
+    def _dlq_call(fn, *args):
+        """Run one ops call, mapping the protocol's error shapes to
+        HTTP statuses: unknown stream → 404, typed operation errors
+        (ValueError from the Rust layer) → 400."""
+        try:
+            return fn(*args)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"unknown stream {exc.args[0]!r}"
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _PAYLOAD_PREVIEW_BYTES = 4096
+
+    def _record_summary(stream: str, r: dict[str, Any]) -> dict[str, Any]:
+        """List-JSON shape for one DLQ record: metadata + a bounded
+        payload preview + the raw-bytes download link. The full
+        payload never rides the list response."""
+        import base64
+
+        payload: bytes = r.get("payload") or b""
+        offset = r.get("offset_bytes")
+        return {
+            "id": r["id"],
+            "stage": r["stage"],
+            "error": r["error"],
+            "source_id": r["source_id"],
+            "offset_base64": (
+                base64.b64encode(bytes(offset)).decode("ascii")
+                if offset is not None
+                else None
+            ),
+            "event_ts": r.get("event_ts"),
+            "failed_at": r["failed_at"],
+            "attempt": r["attempt"],
+            "payload_format": r["payload_format"],
+            "payload_preview": payload[:_PAYLOAD_PREVIEW_BYTES].decode(
+                "utf-8", "replace"
+            ),
+            "payload_size": len(payload),
+            "payload_truncated": len(payload) > _PAYLOAD_PREVIEW_BYTES,
+            "download": f"/api/streams/{stream}/dlq/records/{r['id']}/payload",
+        }
+
+    @app.get("/api/streams/{name}/dlq")
+    def get_stream_dlq(name: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        stats = _dlq_call(_dlq().stats, name, _now_ms())
+        return {
+            "pipeline": name,
+            "depth": {"pending": stats["pending"], "parked": stats["parked"]},
+            "by_stage": stats["by_stage"],
+            "arrivals": stats["arrivals"],
+            "scanned": stats["scanned"],
+            "truncated": stats["truncated"],
+        }
+
+    @app.get("/api/streams/{name}/dlq/records")
+    def get_stream_dlq_records(  # type: ignore[unused-function]
+        name: str,
+        status: str | None = None,
+        page: int = 0,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        page = max(page, 0)
+        page_size = max(1, min(page_size, 500))
+        records = _dlq_call(_dlq().records, name, status, page, page_size)
+        return {
+            "pipeline": name,
+            "page": page,
+            "page_size": page_size,
+            "records": [_record_summary(name, r) for r in records],
+        }
+
+    @app.get("/api/streams/{name}/dlq/records/{record_id}/payload")
+    def get_stream_dlq_payload(name: str, record_id: str):  # type: ignore[unused-function]
+        from fastapi.responses import Response
+
+        record = _dlq_call(_dlq().record_by_id, name, record_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"DLQ record {record_id!r} not found"
+            )
+        return Response(
+            content=bytes(record.get("payload") or b""),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{record_id}.'
+                    f'{record.get("payload_format", "bin")}"'
+                )
+            },
+        )
+
+    _VALID_SELECTION_KINDS = {"all", "first_n", "ids"}
+
+    def _parse_selection(
+        body: dict[str, Any], *, default_all: bool
+    ) -> dict[str, Any]:
+        selection = body.get("selection")
+        if selection is None:
+            if default_all:
+                return {"kind": "all"}
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "selection is required — pass "
+                    '{"selection": {"kind": "all"}} explicitly for '
+                    "destructive whole-DLQ operations"
+                ),
+            )
+        if (
+            not isinstance(selection, dict)
+            or selection.get("kind") not in _VALID_SELECTION_KINDS
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "selection must be one of "
+                    '{"kind":"all"}, {"kind":"first_n","n":N}, '
+                    '{"kind":"ids","ids":[…]}'
+                ),
+            )
+        return selection
+
+    @app.post("/api/streams/{name}/dlq/replay")
+    def post_stream_dlq_replay(  # type: ignore[unused-function]
+        name: str,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        _require_history()
+        assert history is not None
+        selection = _parse_selection(body, default_all=True)
+        max_attempts = body.get("max_attempts")
+        if max_attempts is not None and int(max_attempts) < 1:
+            raise HTTPException(
+                status_code=400, detail="max_attempts must be >= 1"
+            )
+        import uuid
+        from datetime import datetime
+
+        run_id = f"replay-{name}-{uuid.uuid4().hex[:12]}"
+        try:
+            report = _dlq_call(_dlq().replay, name, selection, max_attempts)
+        except HTTPException as exc:
+            if exc.status_code == 400:
+                # Register the failed replay too — operators should
+                # see failed redrive attempts in Runs.
+                history.record_run_record(
+                    RunRecord(
+                        run_id=run_id,
+                        pipeline=name,
+                        status="failed",
+                        started_at=datetime.now(UTC),
+                        finished_at=datetime.now(UTC),
+                        attempt=1,
+                        kind="replay",
+                        error_summary=str(exc.detail),
+                        extras={"selection": selection},
+                    )
+                )
+            raise
+        started = datetime.fromtimestamp(report["started_at_ms"] / 1000.0, UTC)
+        finished = datetime.fromtimestamp(report["finished_at_ms"] / 1000.0, UTC)
+        history.record_run_record(
+            RunRecord(
+                run_id=run_id,
+                pipeline=name,
+                status="succeeded",
+                started_at=started,
+                finished_at=finished,
+                attempt=1,
+                kind="replay",
+                extras={"replay_report": dict(report), "selection": selection},
+            )
+        )
+        return {"run_id": run_id, "report": dict(report)}
+
+    @app.post("/api/streams/{name}/dlq/park")
+    def post_stream_dlq_park(  # type: ignore[unused-function]
+        name: str,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        _require_history()
+        selection = _parse_selection(body, default_all=False)
+        parked = _dlq_call(_dlq().park, name, selection)
+        return {"parked": parked}
+
+    @app.post("/api/streams/{name}/dlq/purge")
+    def post_stream_dlq_purge(  # type: ignore[unused-function]
+        name: str,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        _require_history()
+        selection = _parse_selection(body, default_all=False)
+        purged = _dlq_call(_dlq().purge, name, selection)
+        return {"purged": purged}
+
+    _VALID_REWIND_KINDS = {"timestamp", "offset"}
+
+    @app.post("/api/streams/{name}/rewind")
+    def post_stream_rewind(  # type: ignore[unused-function]
+        name: str,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        _require_history()
+        assert history is not None
+        to = body.get("to")
+        if (
+            not isinstance(to, dict)
+            or to.get("kind") not in _VALID_REWIND_KINDS
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    'to is required: {"kind":"timestamp","ms":N} or '
+                    '{"kind":"offset","bytes":[…]}'
+                ),
+            )
+        confirm = bool(body.get("confirm_state_reset", False))
+        # Server-side gate: a rewind mutates read positions + state;
+        # it must not race a live consume loop. Latest run status
+        # is the server's view of liveness.
+        try:
+            latest, _total = history.list_runs(pipeline=name, limit=1, offset=0)
+        except Exception:
+            latest = []
+        if latest and latest[0].status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"stream {name!r} is running — stop it before "
+                    "rewinding (rewind must not race the consume loop)"
+                ),
+            )
+        result = _dlq_call(_dlq().rewind, name, to, confirm)
+        import base64
+
+        return {
+            "pipeline": name,
+            "state_cleared": bool(result["state_cleared"]),
+            "sources": [
+                {
+                    "source": src,
+                    "offset_base64": base64.b64encode(bytes(off)).decode("ascii"),
+                }
+                for (src, off) in result.get("sources", [])
+            ],
+        }
 
     # ---- SPA bundle ------------------------------------------------
 

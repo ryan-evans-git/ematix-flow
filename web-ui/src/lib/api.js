@@ -225,3 +225,53 @@ export async function queryDashboard(id, filters = []) {
     body: JSON.stringify({ filters }),
   });
 }
+
+// ---- Streams: DLQ + rewind (DLQ Phase 5) --------------------------
+
+const _stream = (name) => `/streams/${encodeURIComponent(name)}`;
+
+export async function getStreamDlq(name) {
+  return _request(`${_stream(name)}/dlq`);
+}
+
+export async function listStreamDlqRecords(name, { status, page = 0, pageSize = 25 } = {}) {
+  const params = new URLSearchParams();
+  if (status) params.set("status", status);
+  params.set("page", String(page));
+  params.set("page_size", String(pageSize));
+  return _request(`${_stream(name)}/dlq/records?${params.toString()}`);
+}
+
+export async function replayStreamDlq(name, { selection, maxAttempts } = {}) {
+  const body = { selection: selection || { kind: "all" } };
+  if (maxAttempts != null) body.max_attempts = maxAttempts;
+  return _request(`${_stream(name)}/dlq/replay`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function parkStreamDlq(name, selection) {
+  return _request(`${_stream(name)}/dlq/park`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ selection }),
+  });
+}
+
+export async function purgeStreamDlq(name, selection) {
+  return _request(`${_stream(name)}/dlq/purge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ selection }),
+  });
+}
+
+export async function rewindStream(name, { to, confirmStateReset = false } = {}) {
+  return _request(`${_stream(name)}/rewind`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ to, confirm_state_reset: !!confirmStateReset }),
+  });
+}

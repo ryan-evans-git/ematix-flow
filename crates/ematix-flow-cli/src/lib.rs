@@ -68,6 +68,7 @@ use ematix_flow_core::windowed::{
 use futures_util::TryStreamExt;
 use std::collections::BTreeMap;
 
+pub mod dlq_ops;
 pub mod metrics_server;
 // Phase Z α: ephemeral one-shot worker — execute a single WorkUnit
 // shard against EmatixFastParquetTableProvider + write Arrow IPC.
@@ -380,6 +381,18 @@ pub struct PipelineCliConfig {
     /// is configured). Set to override either field independently.
     #[serde(default)]
     pub watermark: Option<WatermarkConfigToml>,
+    /// DLQ Phase 4: dead-letter store family — `"auto"` (default),
+    /// `"topic"`, or `"table"`. Validated at config load and lowered
+    /// to `ematix_flow_core::dlq::DlqStoreMode`; `"topic"` /
+    /// `"table"` are demands that hard-error at resolution when the
+    /// pipeline can't satisfy them.
+    #[serde(default)]
+    pub dlq_store: Option<String>,
+    /// DLQ Phase 4: default replay attempt budget for this
+    /// pipeline (poison records park past it). Must be ≥ 1; omit
+    /// for the core default (3).
+    #[serde(default)]
+    pub dlq_max_attempts: Option<u32>,
 }
 
 /// `[watermark]` TOML block.
@@ -2064,6 +2077,7 @@ impl PipelineCliConfig {
         cfg.validate_state_store_session_pairing()?;
         cfg.validate_join_config()?;
         cfg.validate_transform_on_error()?;
+        cfg.validate_dlq_config()?;
         cfg.validate_transform_dialect()?;
         cfg.validate_transform_engine()?;
         cfg.validate_transform_cdc()?;
@@ -2271,6 +2285,29 @@ impl PipelineCliConfig {
                  (use \"fail\", \"drop\", or \"dlq\")"
             ))),
         }
+    }
+
+    /// DLQ Phase 4: validate the top-level `dlq_store` /
+    /// `dlq_max_attempts` knobs. Mirrors
+    /// [`Self::validate_transform_on_error`]'s style: unknown
+    /// strings fail at config load with the valid set named.
+    fn validate_dlq_config(&self) -> Result<(), ConfigError> {
+        if let Some(mode) = &self.dlq_store
+            && ematix_flow_core::dlq::DlqStoreMode::parse(mode).is_none()
+        {
+            return Err(ConfigError::Parse(format!(
+                "dlq_store = {mode:?} not supported \
+                 (use \"auto\", \"topic\", or \"table\")"
+            )));
+        }
+        if self.dlq_max_attempts == Some(0) {
+            return Err(ConfigError::Parse(
+                "dlq_max_attempts must be >= 1 (a record's original emission \
+                 is attempt 1)"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Phase 39.5a follow-up (P1.10): emit a loud `tracing::warn!`
@@ -3097,6 +3134,15 @@ impl PipelineCliConfig {
         cfg.mode = WriteMode::Append;
         if let Some(dlt) = &self.dead_letter_topic {
             cfg = cfg.with_dead_letter_topic(dlt.clone());
+        }
+        // DLQ Phase 4: store-family + replay-budget knobs.
+        if let Some(mode) = &self.dlq_store {
+            let mode = ematix_flow_core::dlq::DlqStoreMode::parse(mode)
+                .expect("dlq_store already validated at config-load");
+            cfg = cfg.with_dlq_store(mode);
+        }
+        if let Some(n) = self.dlq_max_attempts {
+            cfg = cfg.with_dlq_max_attempts(n);
         }
         if let Some(t) = &self.transform {
             // Phase Δ PR 5.5: CDC apply mode is mutually exclusive
@@ -4477,6 +4523,138 @@ mod tests {
             cfg.streaming_config_with_lookups(table, Vec::new())
         }));
         assert!(result.is_err(), "reopen requires allowed_lateness_ms");
+    }
+
+    // ----- DLQ Phase 4: dlq_store / dlq_max_attempts knobs -----
+    //
+    // TDD note: written FIRST, red, before the knobs were parsed
+    // or mapped — same discipline as the earlier phases.
+
+    #[test]
+    fn parses_dlq_store_and_max_attempts() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            dlq_store = "table"
+            dlq_max_attempts = 5
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            group_id = "g"
+
+            [target]
+            kind = "postgres"
+            url = "postgres://localhost/mydb"
+
+            [target.table]
+            schema = "public"
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.dlq_store.as_deref(), Some("table"));
+        assert_eq!(cfg.dlq_max_attempts, Some(5));
+    }
+
+    #[test]
+    fn rejects_unknown_dlq_store() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            dlq_store = "yolo"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            group_id = "g"
+
+            [target]
+            kind = "postgres"
+            url = "postgres://localhost/mydb"
+
+            [target.table]
+            schema = "public"
+            name = "events"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dlq_store") && msg.contains("yolo"),
+            "error names the field + bad value: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_dlq_max_attempts() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            dlq_max_attempts = 0
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            group_id = "g"
+
+            [target]
+            kind = "postgres"
+            url = "postgres://localhost/mydb"
+
+            [target.table]
+            schema = "public"
+            name = "events"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("dlq_max_attempts"),
+            "error names the field: {err}"
+        );
+    }
+
+    #[test]
+    fn streaming_config_passes_through_dlq_knobs() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            dlq_store = "table"
+            dlq_max_attempts = 7
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            group_id = "g"
+
+            [target]
+            kind = "postgres"
+            url = "postgres://localhost/mydb"
+
+            [target.table]
+            schema = "public"
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let sc = cfg.streaming_config(ematix_flow_core::backend::TargetTable {
+            schema: "public".into(),
+            name: "events".into(),
+        });
+        assert_eq!(sc.dlq_store, ematix_flow_core::dlq::DlqStoreMode::Table);
+        assert_eq!(sc.dlq_max_attempts, 7);
+    }
+
+    #[test]
+    fn dlq_knobs_default_to_none() {
+        let cfg = PipelineCliConfig::from_toml_str(kafka_to_pg_toml()).unwrap();
+        assert_eq!(cfg.dlq_store, None);
+        assert_eq!(cfg.dlq_max_attempts, None);
+        let sc = cfg.streaming_config(ematix_flow_core::backend::TargetTable {
+            schema: "public".into(),
+            name: "events".into(),
+        });
+        assert_eq!(sc.dlq_store, ematix_flow_core::dlq::DlqStoreMode::Auto);
+        assert_eq!(
+            sc.dlq_max_attempts,
+            ematix_flow_core::dlq::DEFAULT_MAX_ATTEMPTS
+        );
     }
 
     // ----- Phase 39.5a P2.15: transform on_error policy -----
