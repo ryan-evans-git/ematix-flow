@@ -174,7 +174,7 @@ fn sum_scan_leaf_bytes(plan: &Arc<dyn ExecutionPlan>) -> Option<u64> {
             return;
         }
         for c in children {
-            walk(&c, sum, any);
+            walk(c, sum, any);
         }
     }
     let mut sum = 0u64;
