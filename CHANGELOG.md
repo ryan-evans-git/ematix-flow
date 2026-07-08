@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **macOS: segfault when `_core` and pyarrow share a process.** The
+  Python extension set mimalloc (v3) as the Rust `#[global_allocator]`;
+  pyarrow's `libarrow` bundles its own mimalloc (v2), and with pyarrow
+  24 the two instances corrupt each other's thread-local heap metadata
+  on macOS — importing `ematix_flow` after pandas/pyarrow crashed
+  mid-call or at interpreter shutdown (SIGSEGV in libarrow's
+  `mi_process_done → _mi_theap_collect_retired`). macOS builds of
+  `_core` now use the system allocator; Linux wheels keep mimalloc
+  (benchmark-allocator parity unchanged). Regression pinned by
+  `tests/python/test_pyarrow_coexistence.py`; investigation in
+  `docs/MACOS_PYARROW_MIMALLOC.md`.
+
 ## [0.13.0] - 2026-07-07
 
 ### Fixed
