@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import SqlEditor from "../lib/SqlEditor.svelte";
   import EChart from "../lib/EChart.svelte";
+  import VisualQueryBuilder from "../lib/VisualQueryBuilder.svelte";
   import {
     VIZ_TYPES,
     isNumericType,
@@ -30,6 +31,14 @@
 
   let vizType = "bar";
   let encoding = {};
+  let mode = "sql"; // "sql" | "build" (no-SQL query builder)
+
+  function onGenerated(e) {
+    if (editor) editor.setDoc(e.detail);
+    sql = e.detail;
+    mode = "sql";
+    run();
+  }
 
   let charts = [];
   let currentId = null;
@@ -181,12 +190,19 @@
       <button class="run" on:click={run} disabled={running || !datasourceId}>
         {running ? "Running…" : "▶ Run"} <kbd>⌘⏎</kbd>
       </button>
+      <div class="mode">
+        <button class:on={mode === "sql"} on:click={() => (mode = "sql")}>SQL</button>
+        <button class:on={mode === "build"} on:click={() => (mode = "build")}>Build</button>
+      </div>
       <input class="chart-name" placeholder="Untitled chart" bind:value={currentName} />
       <button class="secondary" on:click={save} disabled={!result}>{currentId ? "Update" : "Save"}</button>
       <span class="spacer"></span>
       <label class="rows">Limit <input type="number" min="1" max="100000" bind:value={maxRows} /></label>
     </div>
 
+    {#if mode === "build"}
+      <VisualQueryBuilder {datasourceId} on:generate={onGenerated} />
+    {/if}
     <div class="editor-wrap">
       <SqlEditor bind:this={editor} bind:value={sql} onRun={run} />
     </div>
@@ -333,6 +349,9 @@
   .rows { font-size: 12px; color: var(--fg-muted); display: flex; align-items: center; gap: 6px; }
   .rows input { width: 72px; }
 
+  .mode { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm, 5px); overflow: hidden; }
+  .mode button { background: var(--surface-2); color: var(--fg-muted); border: none; padding: 6px 12px; font-size: 12px; cursor: pointer; }
+  .mode button.on { background: var(--accent-soft); color: var(--fg); }
   .editor-wrap { height: 26%; min-height: 110px; }
 
   .viz-bar { display: flex; gap: 4px; flex-wrap: wrap; }

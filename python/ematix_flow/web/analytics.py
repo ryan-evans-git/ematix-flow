@@ -16,6 +16,7 @@ applied here, in front of the engine — never trust the client SQL.
 """
 from __future__ import annotations
 
+import operator
 import os
 import re
 import threading
@@ -68,6 +69,42 @@ _DANGEROUS_SQL = re.compile(
 
 # Wall-clock ceiling for a single query, overridable per deployment.
 DEFAULT_QUERY_TIMEOUT_S = 30.0
+
+# Result cache (used for repeated dashboard-tile queries so a refresh
+# doesn't re-run every chart). Keyed on (url, sql, cap); TTL from
+# ``EMATIX_FLOW_CACHE_TTL_S`` (default 0 = disabled). Ad-hoc editor
+# queries are never cached (always fresh).
+_RESULT_CACHE: dict[tuple, tuple[float, dict]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_ttl() -> float:
+    try:
+        return float(os.environ.get("EMATIX_FLOW_CACHE_TTL_S", "0"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _cache_get(key: tuple) -> dict | None:
+    with _CACHE_LOCK:
+        entry = _RESULT_CACHE.get(key)
+        if entry is None:
+            return None
+        expiry, value = entry
+        if expiry < time.monotonic():
+            _RESULT_CACHE.pop(key, None)
+            return None
+        return value
+
+
+def _cache_put(key: tuple, value: dict, ttl: float) -> None:
+    with _CACHE_LOCK:
+        _RESULT_CACHE[key] = (time.monotonic() + ttl, value)
+
+
+def clear_result_cache() -> None:
+    with _CACHE_LOCK:
+        _RESULT_CACHE.clear()
 
 
 class QueryError(ValueError):
@@ -245,7 +282,9 @@ def _run_with_timeout(fn, timeout_s: float):
     return box["ok"]
 
 
-def run_query(url: str, sql: str, max_rows: int | None = None) -> dict[str, Any]:
+def run_query(
+    url: str, sql: str, max_rows: int | None = None, use_cache: bool = False
+) -> dict[str, Any]:
     """Execute a validated read-only query and return a JSON payload.
 
     ``sql`` must already be the cleaned string from :func:`guard_readonly`.
@@ -258,9 +297,18 @@ def run_query(url: str, sql: str, max_rows: int | None = None) -> dict[str, Any]
     native segfaults, and keeps the API path lean.
 
     The engine call runs under a wall-clock timeout
-    (``EMATIX_FLOW_QUERY_TIMEOUT_S``, default 30s).
+    (``EMATIX_FLOW_QUERY_TIMEOUT_S``, default 30s). When ``use_cache`` and
+    a TTL is configured, an identical recent result is served from cache
+    (``stats.cached == True``).
     """
     cap = _clamp_max_rows(max_rows)
+    ttl = _cache_ttl() if use_cache else 0.0
+    cache_key = (url, sql, cap)
+    if ttl > 0:
+        hit = _cache_get(cache_key)
+        if hit is not None:
+            return {**hit, "stats": {**hit["stats"], "cached": True}}
+
     started = time.perf_counter()
 
     def _call():
@@ -277,15 +325,19 @@ def run_query(url: str, sql: str, max_rows: int | None = None) -> dict[str, Any]
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
     rows = result["rows"]
-    return {
+    payload = {
         "columns": result["columns"],
         "rows": rows,
         "stats": {
             "row_count": len(rows),
             "truncated": result["truncated"],
             "elapsed_ms": elapsed_ms,
+            "cached": False,
         },
     }
+    if ttl > 0:
+        _cache_put(cache_key, payload, ttl)
+    return payload
 
 
 def execute_query_request(
@@ -293,13 +345,14 @@ def execute_query_request(
     datasource_id: str,
     sql: str,
     max_rows: int | None = None,
+    use_cache: bool = False,
 ) -> dict[str, Any]:
     """Full path for one ``POST /api/query``: resolve datasource,
     guard the SQL, execute. Raises :class:`DatasourceNotFound` (404) or
     :class:`QueryError` (400)."""
     datasource = registry.get(datasource_id)  # may raise DatasourceNotFound
     cleaned = guard_readonly(sql)  # may raise QueryError
-    return run_query(datasource.url, cleaned, max_rows)
+    return run_query(datasource.url, cleaned, max_rows, use_cache=use_cache)
 
 
 # ---- Catalog / schema browsing -------------------------------------
@@ -461,11 +514,58 @@ def execute_chart_for_dashboard(
     """Run a chart's query for a dashboard tile, applying dashboard
     filters where the chart's output has the filtered column. Raises
     :class:`DatasourceNotFound` / :class:`QueryError`."""
-    data = execute_query_request(registry, chart["datasource_id"], chart["sql"])
+    data = execute_query_request(
+        registry, chart["datasource_id"], chart["sql"], use_cache=True
+    )
     if filters:
         colnames = [c["name"] for c in data["columns"]]
         cleaned = guard_readonly(chart["sql"])
         wrapped = build_filtered_sql(cleaned, filters, colnames)
         if wrapped is not None:
-            data = execute_query_request(registry, chart["datasource_id"], wrapped)
+            data = execute_query_request(
+                registry, chart["datasource_id"], wrapped, use_cache=True
+            )
     return data
+
+
+# ---- Alerts --------------------------------------------------------
+
+_ALERT_OPS = {
+    ">": operator.gt,
+    "<": operator.lt,
+    ">=": operator.ge,
+    "<=": operator.le,
+    "==": operator.eq,
+    "!=": operator.ne,
+}
+
+
+def evaluate_alert(
+    registry: DatasourceRegistry,
+    chart: dict[str, Any],
+    column: str,
+    op: str,
+    threshold: float,
+) -> dict[str, Any]:
+    """Run ``chart`` and test its ``column`` against ``op threshold``.
+    Triggers if any row satisfies the condition. Raises
+    :class:`QueryError` for a bad operator / missing column."""
+    cmp = _ALERT_OPS.get(op)
+    if cmp is None:
+        raise QueryError(f"unsupported operator {op!r} (use one of {', '.join(_ALERT_OPS)})")
+    data = execute_query_request(registry, chart["datasource_id"], chart["sql"])
+    col_idx = next(
+        (i for i, c in enumerate(data["columns"]) if c["name"] == column), None
+    )
+    if col_idx is None:
+        raise QueryError(f"column {column!r} is not in the chart's output")
+    matched = [
+        row[col_idx]
+        for row in data["rows"]
+        if isinstance(row[col_idx], (int, float)) and cmp(row[col_idx], threshold)
+    ]
+    return {
+        "triggered": bool(matched),
+        "matched_values": matched,
+        "rows_evaluated": len(data["rows"]),
+    }

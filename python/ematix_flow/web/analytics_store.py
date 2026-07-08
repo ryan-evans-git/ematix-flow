@@ -18,7 +18,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 _SCHEMA = """
     CREATE TABLE IF NOT EXISTS analytics_schema_version (
@@ -59,6 +59,20 @@ _SCHEMA = """
         updated_at  TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_dashboards_name ON dashboards(name);
+    -- v4: alerts. Evaluate a chart's `column` against `op` `threshold`
+    -- on a schedule (or on demand) and notify when it triggers.
+    CREATE TABLE IF NOT EXISTS alerts (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        chart_id   TEXT NOT NULL,
+        column     TEXT NOT NULL,
+        op         TEXT NOT NULL,
+        threshold  REAL NOT NULL,
+        owner      TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_alerts_chart ON alerts(chart_id);
 """
 
 
@@ -365,4 +379,60 @@ class AnalyticsStore:
             cur = self._conn.execute(
                 "DELETE FROM dashboards WHERE id = ?", (dashboard_id,)
             )
+            return cur.rowcount > 0
+
+    # ---- alerts -----------------------------------------------------
+
+    @staticmethod
+    def _alert_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "chart_id": row["chart_id"],
+            "column": row["column"],
+            "op": row["op"],
+            "threshold": row["threshold"],
+            "owner": row["owner"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_alerts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM alerts ORDER BY updated_at DESC"
+            ).fetchall()
+        return [self._alert_row_to_dict(r) for r in rows]
+
+    def get_alert(self, alert_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM alerts WHERE id = ?", (alert_id,)
+            ).fetchone()
+        return self._alert_row_to_dict(row) if row else None
+
+    def create_alert(
+        self,
+        *,
+        name: str,
+        chart_id: str,
+        column: str,
+        op: str,
+        threshold: float,
+        owner: str | None = None,
+    ) -> dict[str, Any]:
+        now = _now_iso()
+        alert_id = uuid.uuid4().hex
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO alerts"
+                '(id, name, chart_id, "column", op, threshold, owner, '
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (alert_id, name, chart_id, column, op, threshold, owner, now, now),
+            )
+        return self.get_alert(alert_id)  # type: ignore[return-value]
+
+    def delete_alert(self, alert_id: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
             return cur.rowcount > 0

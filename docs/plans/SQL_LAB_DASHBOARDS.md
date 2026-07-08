@@ -156,17 +156,26 @@ lazily and don't bloat the existing workflows UI (the memory notes the bundle is
   7 dashboard tests green; verified end-to-end (2 tiles render via batch query; drag + resize snap
   and persist to backend). ★ grid geometry must be a reactive `$:` derived array, not a helper fn —
   a fn hides the `cellStride` dependency and tiles stick at 0-width until first interaction.
-- **Phase 4 — Superset parity.** _In progress._
-  - **4a — Dashboard filters + cross-filtering. ✅ SHIPPED.** `build_filtered_sql` wraps a chart's
-    query in a subquery and ANDs `IN (…)` predicates only for columns the chart outputs (identifier +
-    value escaping); `execute_chart_for_dashboard`; `POST /api/dashboards/{id}/query` takes
-    `{filters}`. Frontend: `EChart` emits `pointclick` → `ChartView` maps to `{column,value}` via the
-    encoding → `Dashboards` filter bar (chips, manual add, clear) re-queries all tiles. Click a bar/
-    slice to cross-filter. 5 tests; verified (region=west collapses bar 4→1 + pie to one ring; remove
-    restores). *Note: synthetic canvas clicks can't drive ECharts hit-testing in the harness — the
-    click path was code-verified + shares the proven `toggleFilter` pipeline.*
-  - **Remaining:** drill-down, async long-query execution + result cache, scheduled refresh/alerts,
-    no-SQL chart builder, real auth + per-user ownership/roles (schema already carries `owner`).
+- **Phase 4 — Superset parity. ✅ SHIPPED (except full auth — see below).**
+  - **Filters + cross-filtering.** `build_filtered_sql` subquery-wraps + ANDs `IN (…)` for columns
+    the chart outputs; `POST /api/dashboards/{id}/query` takes `{filters}`; filter bar (chips/add/clear)
+    re-queries all tiles. Verified: region=west collapses bar 4→1 + pie to one ring.
+  - **Result cache + async jobs.** TTL cache (`EMATIX_FLOW_CACHE_TTL_S`) used by dashboard tiles
+    (`stats.cached`); `POST /api/query/async` + `GET /api/query/jobs/{id}` (`query_jobs.py`) for slow
+    queries; `POST /api/cache/clear`.
+  - **Alerts.** `alerts` table + CRUD; `POST /api/alerts/{id}/check` evaluates a chart column vs
+    `op`/`threshold` (`evaluate_alert`). Cron wiring = call `/check` from the existing scheduler.
+  - **No-SQL chart builder.** `VisualQueryBuilder.svelte` (table + dimensions + metrics/aggregation →
+    GROUP BY SQL) behind a SQL/Build toggle in the Chart Builder. Verified: generates + runs.
+  - **Drill-down.** Click a dashboard chart → modal of the underlying rows for that category + a
+    "Filter dashboard by this" button.
+  - **Ownership.** `owner` set from the bearer-token identity (`_identity`) on create across
+    saved-queries/charts/dashboards/alerts. Verified.
+  - **Deferred (needs a decision):** *full auth* — real login / SSO / per-user tokens + RBAC. The
+    ownership plumbing is in and single-tenant identity works; the identity model is the operator's
+    call. Also: per-query memory ceiling; true mid-query cancellation.
+  - *Note: ECharts data-clicks (cross-filter + drill trigger) can't be synthetically driven in the
+    preview harness — those paths are code-verified + share verified downstream pipelines.*
 
 ## 7. Open decisions (not blocking Phase 0)
 - Datasources config format & where credentials live (reuse pipeline connection config vs. new file).

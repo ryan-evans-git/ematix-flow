@@ -79,6 +79,23 @@
     }
   }
 
+  // Drill-down: clicking a chart point opens a modal with the
+  // underlying rows for that category, and offers to cross-filter.
+  let drill = null; // {column, value, columns, rows}
+
+  function openDrill(tile, detail) {
+    const d = tileData[tile.chart_id];
+    if (!d || !d.columns) return;
+    const idx = d.columns.findIndex((c) => c.name === detail.column);
+    const rows = idx < 0 ? [] : d.rows.filter((r) => String(r[idx]) === String(detail.value));
+    drill = { column: detail.column, value: detail.value, columns: d.columns, rows };
+  }
+
+  function drillFilter() {
+    if (drill) toggleFilter(drill.column, drill.value);
+    drill = null;
+  }
+
   // Cross-filter: a click on a chart toggles a {column: value} filter,
   // re-querying every tile.
   function toggleFilter(column, value) {
@@ -258,7 +275,7 @@
                 result={d && d.columns ? { columns: d.columns, rows: d.rows } : null}
                 vizType={d?.viz_type || "table"}
                 encoding={d?.encoding || {}}
-                on:filter={(e) => toggleFilter(e.detail.column, e.detail.value)}
+                on:filter={(e) => openDrill(tile, e.detail)}
               />
             </svelte:fragment>
           </DashboardGrid>
@@ -266,9 +283,47 @@
       {/if}
     {/if}
   </section>
+
+  {#if drill}
+    <div class="drill-bg" on:click={() => (drill = null)} role="presentation">
+      <div class="drill" on:click|stopPropagation role="dialog" aria-label="Drill-down">
+        <div class="drill-head">
+          <span><b>{drill.column}</b> = <span class="mono">{drill.value}</span> · {drill.rows.length} row{drill.rows.length === 1 ? "" : "s"}</span>
+          <button class="drill-x" on:click={() => (drill = null)}>×</button>
+        </div>
+        <div class="drill-body">
+          <table class="grid">
+            <thead><tr>{#each drill.columns as c}<th>{c.name}</th>{/each}</tr></thead>
+            <tbody>
+              {#each drill.rows as row}
+                <tr>{#each row as cell}<td class:null={cell === null}>{cell === null ? "NULL" : cell}</td>{/each}</tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+        <div class="drill-foot">
+          <button class="secondary" on:click={drillFilter}>Filter dashboard by this</button>
+          <button class="ghost" on:click={() => (drill = null)}>Close</button>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
+  .drill-bg { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .drill { background: var(--surface-1); border: 1px solid var(--border-strong, var(--border)); border-radius: var(--radius-lg, 10px); width: min(720px, 92vw); max-height: 80vh; display: flex; flex-direction: column; overflow: hidden; }
+  .drill-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 14px; }
+  .drill-head .mono { font-family: var(--font-mono); color: var(--accent); }
+  .drill-x { background: none; border: none; color: var(--fg-muted); font-size: 18px; cursor: pointer; }
+  .drill-body { overflow: auto; padding: 8px; }
+  .drill-foot { display: flex; gap: 8px; justify-content: flex-end; padding: 12px 16px; border-top: 1px solid var(--border); }
+  .mono { font-family: var(--font-mono); }
+  .drill table.grid { border-collapse: collapse; width: 100%; font-size: 13px; }
+  .drill .grid th, .drill .grid td { border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); padding: 5px 10px; text-align: left; white-space: nowrap; }
+  .drill .grid thead th { position: sticky; top: 0; background: var(--surface-2); }
+  .drill .grid td { font-family: var(--font-mono); }
+  .drill .grid td.null { color: var(--fg-faint); font-style: italic; }
   .dash {
     display: grid;
     grid-template-columns: 220px 1fr;

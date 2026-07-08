@@ -294,11 +294,25 @@ def create_app(
         catalog_columns,
         catalog_schemas,
         catalog_tables,
+        clear_result_cache,
+        evaluate_alert,
         execute_chart_for_dashboard,
         execute_query_request,
     )
+    from ematix_flow.web.query_jobs import QueryJobRegistry
 
     datasource_registry = DatasourceRegistry(datasources)
+    query_jobs = QueryJobRegistry()
+
+    from fastapi import Header  # local, like the other fastapi imports
+
+    def _identity(authorization: str | None) -> str | None:
+        """Single-tenant identity: a valid bearer token maps to the
+        operator, otherwise no owner is recorded. A real multi-user
+        identity (login / SSO / per-user tokens) drops in here."""
+        if bearer_token is None:
+            return None
+        return "operator" if (authorization or "").startswith("Bearer ") else None
 
     def _catalog(fn, *args):
         """Run a catalog introspection call, mapping its failures to
@@ -348,7 +362,7 @@ def create_app(
         return {"saved_queries": analytics_store.list_saved_queries()}
 
     @app.post("/api/saved-queries")
-    def create_saved_query(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+    def create_saved_query(payload: dict[str, Any] = Body(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:  # type: ignore[unused-function]
         name = (payload.get("name") or "").strip()
         sql = (payload.get("sql") or "").strip()
         datasource_id = (payload.get("datasource_id") or "").strip()
@@ -358,7 +372,7 @@ def create_app(
                 detail="name, datasource_id and sql are required",
             )
         return analytics_store.create_saved_query(
-            name=name, datasource_id=datasource_id, sql=sql
+            name=name, datasource_id=datasource_id, sql=sql, owner=_identity(authorization)
         )
 
     @app.get("/api/saved-queries/{query_id}")
@@ -397,7 +411,7 @@ def create_app(
         return {"charts": analytics_store.list_charts()}
 
     @app.post("/api/charts")
-    def create_chart(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+    def create_chart(payload: dict[str, Any] = Body(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:  # type: ignore[unused-function]
         name = (payload.get("name") or "").strip()
         sql = (payload.get("sql") or "").strip()
         datasource_id = (payload.get("datasource_id") or "").strip()
@@ -413,6 +427,7 @@ def create_app(
             sql=sql,
             viz_type=viz_type,
             encoding=payload.get("encoding") or {},
+            owner=_identity(authorization),
         )
 
     @app.get("/api/charts/{chart_id}")
@@ -452,12 +467,14 @@ def create_app(
         return {"dashboards": analytics_store.list_dashboards()}
 
     @app.post("/api/dashboards")
-    def create_dashboard(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+    def create_dashboard(payload: dict[str, Any] = Body(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:  # type: ignore[unused-function]
         name = (payload.get("name") or "").strip()
         if not name:
             raise HTTPException(status_code=400, detail="name is required")
         return analytics_store.create_dashboard(
-            name=name, layout=payload.get("layout") or {"tiles": []}
+            name=name,
+            layout=payload.get("layout") or {"tiles": []},
+            owner=_identity(authorization),
         )
 
     @app.get("/api/dashboards/{dashboard_id}")
@@ -522,6 +539,72 @@ def create_app(
                 results[chart_id] = {"error": str(exc)}
         return {"results": results}
 
+    # ---- Alerts ----------------------------------------------------
+
+    @app.get("/api/alerts")
+    def list_alerts() -> dict[str, Any]:  # type: ignore[unused-function]
+        return {"alerts": analytics_store.list_alerts()}
+
+    @app.post("/api/alerts")
+    def create_alert(payload: dict[str, Any] = Body(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:  # type: ignore[unused-function]
+        name = (payload.get("name") or "").strip()
+        chart_id = (payload.get("chart_id") or "").strip()
+        column = (payload.get("column") or "").strip()
+        op = (payload.get("op") or "").strip()
+        if not name or not chart_id or not column or not op:
+            raise HTTPException(
+                status_code=400,
+                detail="name, chart_id, column and op are required",
+            )
+        try:
+            threshold = float(payload.get("threshold"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="threshold must be a number")
+        if analytics_store.get_chart(chart_id) is None:
+            raise HTTPException(status_code=404, detail="chart not found")
+        return analytics_store.create_alert(
+            name=name,
+            chart_id=chart_id,
+            column=column,
+            op=op,
+            threshold=threshold,
+            owner=_identity(authorization),
+        )
+
+    @app.get("/api/alerts/{alert_id}")
+    def get_alert(alert_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        item = analytics_store.get_alert(alert_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="alert not found")
+        return item
+
+    @app.delete("/api/alerts/{alert_id}")
+    def delete_alert(alert_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        if not analytics_store.delete_alert(alert_id):
+            raise HTTPException(status_code=404, detail="alert not found")
+        return {"deleted": True}
+
+    @app.post("/api/alerts/{alert_id}/check")
+    def check_alert(alert_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        """Evaluate an alert now. A scheduled runner would call this on
+        a cron (via the existing scheduler) and dispatch notifications
+        when ``triggered``."""
+        alert = analytics_store.get_alert(alert_id)
+        if alert is None:
+            raise HTTPException(status_code=404, detail="alert not found")
+        chart = analytics_store.get_chart(alert["chart_id"])
+        if chart is None:
+            raise HTTPException(status_code=404, detail="alert's chart not found")
+        try:
+            outcome = evaluate_alert(
+                datasource_registry, chart, alert["column"], alert["op"], alert["threshold"]
+            )
+        except DatasourceNotFound:
+            raise HTTPException(status_code=404, detail="datasource not found")
+        except QueryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"alert_id": alert_id, **outcome}
+
     @app.post("/api/query")
     def run_query(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
         datasource_id = payload.get("datasource_id")
@@ -543,6 +626,40 @@ def create_app(
             raise HTTPException(status_code=504, detail=str(exc))
         except QueryError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/query/async")
+    def run_query_async(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+        """Submit a query to run on a background thread; returns a
+        job id to poll at ``/api/query/jobs/{id}``. For queries too slow
+        to hold the request open. Datasource + SQL are validated up
+        front so bad requests fail fast."""
+        from ematix_flow.web.analytics import guard_readonly, run_query
+
+        datasource_id = payload.get("datasource_id")
+        if not datasource_id:
+            raise HTTPException(status_code=400, detail="datasource_id is required")
+        try:
+            datasource = datasource_registry.get(datasource_id)
+            cleaned = guard_readonly(payload.get("sql", ""))
+        except DatasourceNotFound:
+            raise HTTPException(status_code=404, detail=f"datasource {datasource_id!r} not found")
+        except QueryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        max_rows = payload.get("max_rows")
+        job_id = query_jobs.submit(lambda: run_query(datasource.url, cleaned, max_rows))
+        return {"job_id": job_id, "status": "pending"}
+
+    @app.get("/api/query/jobs/{job_id}")
+    def get_query_job(job_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        job = query_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="query job not found")
+        return job
+
+    @app.post("/api/cache/clear")
+    def clear_cache() -> dict[str, Any]:  # type: ignore[unused-function]
+        clear_result_cache()
+        return {"cleared": True}
 
     @app.get("/api/runs")
     def list_runs(
