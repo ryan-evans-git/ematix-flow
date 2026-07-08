@@ -1,7 +1,7 @@
 # Plan — DLQ management + stream replayability
 
 **PRD:** [docs/prds/2026-07-04-dlq-replay.md](../prds/2026-07-04-dlq-replay.md)
-**Status:** Phase 1 landed on `feat/dlq-store-phase1` (2026-07-04); Phase 2 next
+**Status:** Phases 1–2 landed (2026-07-04; Phase 2 on `feat/dlq-replay-phase2`); Phase 3 next
 **Discipline:** TDD per phase (contract tests written first, shared across
 store impls); every phase independently green + shippable; strict CI gates
 unchanged. Rust core in `ematix-flow-core`, orchestration/API in
@@ -55,6 +55,38 @@ unchanged. Rust core in `ematix-flow-core`, orchestration/API in
 - Exit: round-trip integration (fail → fix sink → replay → row present,
   DLQ drained) on both store families; poison-park test; concurrent-replay
   lease test.
+- **Landed 2026-07-04** (`feat/dlq-replay-phase2`), core primitive only —
+  RunHistory `kind=replay` registration deferred to Phase 4 as planned
+  (the returned `ReplayReport { taken, succeeded, redeadlettered, parked,
+  started_at_ms, finished_at_ms }` is its hook). As landed:
+  `StreamingPipeline::run_dlq_replay(selection, ReplayOptions
+  { max_attempts = 3, lease = 60 s, park_store })` +
+  `dlq::replay::DlqReplaySource` (one-shot lease + per-record decode via
+  the SAME source decode paths — JSONL/RawBytes shared fns,
+  Avro/Protobuf through the primary Kafka source's
+  `decode_payloads`). Deviations/notes for Phases 3–4:
+  (a) **single-pass semantics** — one `take_for_replay` per run; records
+  re-dead-lettered by a run are NOT re-taken by it (no hot loop against a
+  still-broken sink), so a poison record parks after `max_attempts`
+  *runs*, with `attempt` incremented per run and the parked record
+  showing `attempt == max_attempts`;
+  (b) **park on a Kafka store** = typed-`Unsupported` fallback: the
+  record is appended + parked into `ReplayOptions::park_store`, else the
+  state-store SQL family, else a LOUD in-memory SQLite store (cached per
+  pipeline via `resolve_park_fallback_store`), and the original IS acked
+  so the topic cursor advances;
+  (c) topic-store replays are serialized per pipeline via an in-process
+  mutex behind the new `DeadLetterStore::replay_requires_serialization`
+  hook (cross-process replays can still double-take — at-least-once,
+  single-operator assumption documented in `dlq/replay.rs`);
+  (d) acks are issued in take order (per-partition offset order on
+  Kafka — its group cursor is contiguous); redrives + fallback parks land
+  durably BEFORE originals are acked;
+  (e) CDC-mode pipelines are typed-rejected by `run_dlq_replay` (replay
+  would bypass `run_cdc` per-event semantics) — CDC replay is a
+  follow-up;
+  (f) `resolve_dlq_store` is now `pub` (Phase 4's depth/browse/park/purge
+  API resolves the same store).
 
 ## Phase 3 — Rewind (offset/timestamp, atomic state reset)
 

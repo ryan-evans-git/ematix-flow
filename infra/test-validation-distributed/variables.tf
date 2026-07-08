@@ -37,12 +37,12 @@ variable "max_lifetime_hours" {
 # ============================================================
 
 variable "scale_factor" {
-  description = "TPC-H scale factor. 10 → c7i.2xlarge / 100 GB EBS. 100 → c7i.4xlarge / 250 GB EBS for Q18/Q21 RAM headroom."
+  description = "TPC-H scale factor. 1/10 → c7i.2xlarge / 100 GB EBS. 100 → c7i.4xlarge / 250 GB EBS for Q18/Q21 RAM headroom."
   type        = number
   default     = 10
   validation {
-    condition     = contains([10, 100], var.scale_factor)
-    error_message = "scale_factor must be 10 or 100."
+    condition     = contains([1, 10, 100], var.scale_factor)
+    error_message = "scale_factor must be 1, 10, or 100."
   }
 }
 
@@ -85,6 +85,12 @@ variable "engine" {
 variable "bench_bucket" {
   description = "S3 bucket holding TPC-H parquet at s3://<bucket>/tpch-data/sf{10,100}/<table>.parquet AND receiving results at s3://<bucket>/results/<stamp>/. Required — generate the data first via infra/test-validation/scripts/gen-sf{10,100}-data.sh OR via the single-node Phase A campaign."
   type        = string
+}
+
+variable "data_prefix" {
+  description = "S3 key prefix under the bucket holding the TPC-H parquet, e.g. s3://<bucket>/<data_prefix>/sf{N}/<table>/. Use 'tpch-data' for the legacy single-file-per-table layout, or 'tpch-data-parted' for the multi-file (K parts per table) layout that lets the distributed planner fan scans out across peers. All engines read the same prefix."
+  type        = string
+  default     = "tpch-data"
 }
 
 variable "git_ref" {

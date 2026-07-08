@@ -26,8 +26,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$SF" != "10" && "$SF" != "100" ]]; then
-    echo "--sf must be 10 or 100 (got: ${SF:-<empty>})" >&2
+if [[ "$SF" != "1" && "$SF" != "10" && "$SF" != "100" ]]; then
+    echo "--sf must be 1, 10, or 100 (got: ${SF:-<empty>})" >&2
     exit 2
 fi
 if [[ -z "${BENCH_BUCKET:-}" ]]; then
@@ -35,15 +35,19 @@ if [[ -z "${BENCH_BUCKET:-}" ]]; then
 fi
 
 SCHEMA="tpch_sf${SF}"
-SRC="s3://${BENCH_BUCKET}/tpch-data/sf${SF}"
+# DATA_PREFIX selects the S3 layout: tpch-data (single file per table) or
+# tpch-data-parted (K parts per table). external_location points at the
+# per-table dir either way, so Trino reads whatever files are in it.
+DATA_PREFIX="${DATA_PREFIX:-tpch-data}"
+SRC="s3://${BENCH_BUCKET}/${DATA_PREFIX}/sf${SF}"
 TABLES=(region nation supplier customer part partsupp orders lineitem)
 
 # --- 1. ensure each table lives under <table>/ subdir -----------------------
 # Skip the move if the destination already exists. `aws s3 ls` exits non-zero
 # if the prefix is empty, so we test stdout.
 for t in "${TABLES[@]}"; do
-    dst_prefix="tpch-data/sf${SF}/${t}/"
-    src_key="tpch-data/sf${SF}/${t}.parquet"
+    dst_prefix="${DATA_PREFIX}/sf${SF}/${t}/"
+    src_key="${DATA_PREFIX}/sf${SF}/${t}.parquet"
     has_dir="$(aws s3 ls "s3://${BENCH_BUCKET}/${dst_prefix}" 2>/dev/null | head -n 1 || true)"
     has_file="$(aws s3 ls "s3://${BENCH_BUCKET}/${src_key}" 2>/dev/null | head -n 1 || true)"
     if [[ -n "$has_dir" ]]; then

@@ -65,15 +65,20 @@ pub mod bloom_flight;
 // end-to-end.
 pub mod bloom_emitter;
 
+// Adaptive mesh gate — tri-state `EMAT_MESH` wrapper around the
+// datafusion-distributed stage splitter. Off → byte-identical
+// single-node plans with peers configured; AUTO → per-query decision
+// from scan-leaf byte statistics (`EMAT_MESH_MIN_BYTES` threshold).
+// See module docs.
+pub mod mesh_gate;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::common::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
-use datafusion_distributed::{
-    CompressionType, DistributedExt, DistributedPhysicalOptimizerRule, WorkerResolver,
-};
+use datafusion_distributed::{CompressionType, DistributedExt, WorkerResolver};
 use ematix_flow_core::backend::{
     ArrowBatchStream, Backend, BackendConfig, BackendError, DeleteHandling, Dialect,
     DistributedConfig, DistributedTlsConfig, StrategyRunResult, TargetTable, WriteMode,
@@ -200,8 +205,31 @@ impl DistributedBackend {
         let mut builder = ematix_flow_core::preset::with_optimizer_rules(
             SessionStateBuilder::new().with_default_features(),
         );
+        // 2026-07 adaptive mesh gate: the stage splitter is installed
+        // behind the EMAT_MESH tri-state gate (see [`mesh_gate`]).
+        // `from_env()` snapshots EMAT_MESH / EMAT_MESH_MIN_BYTES once
+        // HERE at session build; the distribute-or-not decision then
+        // runs PER QUERY at plan-optimization time (the rule executes
+        // on every physical plan), so one session can mesh its big
+        // scans while keeping small queries free of Flight overhead.
+        let gate = mesh_gate::AdaptiveMeshGateRule::from_env();
+        // Log the resolved gate ONCE at session build. Without this an
+        // operator debugging "why isn't my mesh being used" has zero
+        // signal — and a "distributed" run that silently executed
+        // single-node is exactly what gets a benchmark table challenged.
+        let cfg = gate.config();
+        tracing::info!(
+            mode = match cfg.mode {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "auto",
+            },
+            min_bytes = cfg.min_bytes,
+            peers = self.peers.len(),
+            "distributed session: adaptive mesh gate resolved"
+        );
         builder = builder
-            .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
+            .with_physical_optimizer_rule(Arc::new(gate))
             .with_distributed_worker_resolver(resolver);
         // Σ.B follow-up: install the TLS-aware channel resolver
         // when a TLS config is present. `TlsChannelResolver::new`
@@ -229,6 +257,23 @@ impl DistributedBackend {
         builder = builder
             .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
             .expect("LZ4_FRAME is a valid compression type");
+        // Cross-cluster fan-out derivation. datafusion-distributed sizes a
+        // stage's task count as `ceil(scan_file_splits / files_per_task)`,
+        // capped at `max_tasks_per_stage` (which auto-defaults to the worker
+        // count). Its default `files_per_task` is the LOCAL core count — the
+        // wrong basis for spreading work across peers: on a single-file-per-
+        // table dataset it collapses `ceil(<=cores / cores)` to 1 task, so NO
+        // network boundary is inserted and the mesh silently never engages
+        // (this is exactly what made an earlier "distributed" TPC-H run
+        // execute single-node). Pinning it to 1 makes the per-stage task count
+        // auto-derive as `min(scan_file_splits, worker_count)` — the two
+        // quantities are already known automatically (DataFusion range-splits
+        // large scans; the worker count is the cap), so fan-out adapts to the
+        // data and the cluster with zero per-run tuning. The cap keeps a many-
+        // file dataset from exploding into more tasks than workers.
+        builder = builder
+            .with_distributed_files_per_task(1)
+            .expect("files_per_task = 1 is valid");
         Arc::new(SessionContext::from(builder.build()))
     }
 }
@@ -824,6 +869,33 @@ mod tests {
         let backend = DistributedBackend::open(DistributedConfig::default()).unwrap();
         let dsn = backend.dsn().unwrap();
         assert!(dsn.contains("local"));
+    }
+
+    /// Regression guard for the silent-single-node bug: the mesh only
+    /// fans out when a stage's task count exceeds 1, and datafusion-
+    /// distributed derives that as `ceil(files / files_per_task)`. Its
+    /// default `files_per_task` (local core count) collapses single-file
+    /// scans to one task, so a peers-configured session silently ran
+    /// single-node. `build_context` pins `files_per_task = 1` so fan-out
+    /// auto-derives from scan splits × worker count. Assert it reaches the
+    /// live session's resolved config.
+    #[test]
+    fn build_context_pins_files_per_task_to_one_for_fanout() {
+        use datafusion_distributed::DistributedConfig as DfDistributedConfig;
+        let backend = DistributedBackend::open(DistributedConfig {
+            peers: vec!["http://a:50051".into(), "http://b:50051".into()],
+            tls: None,
+        })
+        .expect("open");
+        let ctx = backend.build_context();
+        let state = ctx.state();
+        let d_cfg = DfDistributedConfig::from_config_options(state.config().options())
+            .expect("distributed config extension present in a peers-configured session");
+        assert_eq!(
+            d_cfg.files_per_task, 1,
+            "cross-cluster fan-out requires files_per_task=1; got {}",
+            d_cfg.files_per_task
+        );
     }
 
     /// `Arc<dyn Backend>` is the shape Σ.B's executors use over Arrow

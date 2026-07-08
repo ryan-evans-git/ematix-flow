@@ -85,7 +85,9 @@ NODE_ID_FILE="$TRINO_DATA/node.id"
 
 # --- packages ---------------------------------------------------------------
 echo "==> installing Corretto 25 + tools"
-sudo dnf install -y java-25-amazon-corretto-headless tar gzip curl python3 python3-pip uuid
+# No `curl` here: AL2023 ships curl-minimal, which provides the curl
+# binary and CONFLICTS with the full curl package (dnf hard-fails).
+sudo dnf install -y java-25-amazon-corretto-headless tar gzip python3 python3-pip uuid
 
 # Create dedicated user. -r = system user, -m = home dir for cli history.
 if ! id -u "$TRINO_USER" >/dev/null 2>&1; then
@@ -98,7 +100,9 @@ sudo chown -R "$TRINO_USER:$TRINO_USER" "$TRINO_DATA"
 if [[ ! -x "$TRINO_HOME/bin/launcher" ]]; then
     echo "==> downloading Trino $TRINO_VERSION"
     cd /tmp
-    curl -fsSLO "https://repo1.maven.org/maven2/io/trino/trino-server/${TRINO_VERSION}/trino-server-${TRINO_VERSION}.tar.gz"
+    # Trino stopped publishing server tarballs to Maven Central after 476;
+    # 477+ ship as GitHub release assets (verified live 2026-07-04).
+    curl -fsSLO "https://github.com/trinodb/trino/releases/download/${TRINO_VERSION}/trino-server-${TRINO_VERSION}.tar.gz"
     tar -xzf "trino-server-${TRINO_VERSION}.tar.gz"
     sudo cp -a "trino-server-${TRINO_VERSION}/." "$TRINO_HOME/"
     sudo chown -R "$TRINO_USER:$TRINO_USER" "$TRINO_HOME"
@@ -110,10 +114,20 @@ fi
 # --- Trino CLI (only on coordinator; useful for register-tables + bench) ----
 if [[ "$ROLE" == "coordinator" && ! -x /usr/local/bin/trino ]]; then
     echo "==> installing Trino CLI"
+    # CLI also moved to GitHub releases; the asset is the extensionless
+    # executable jar named trino-cli-<version> (per current CLI docs).
     curl -fsSL -o /tmp/trino-cli.jar \
-        "https://repo1.maven.org/maven2/io/trino/trino-cli/${TRINO_VERSION}/trino-cli-${TRINO_VERSION}-executable.jar"
+        "https://github.com/trinodb/trino/releases/download/${TRINO_VERSION}/trino-cli-${TRINO_VERSION}"
     sudo install -m 0755 /tmp/trino-cli.jar /usr/local/bin/trino
     rm -f /tmp/trino-cli.jar
+fi
+
+# bench.py deps (coordinator-only): trino client + boto3 for result upload.
+# As ec2-user with --user (the bench's actual runtime user): a system-wide
+# install tries to upgrade RPM-owned deps (requests) and pip hard-fails
+# ("RECORD file not found"); root's --user lands in /root/.local, invisible.
+if [[ "$ROLE" == "coordinator" ]]; then
+    sudo -u ec2-user python3 -m pip install --user --quiet trino boto3
 fi
 
 # --- node.properties --------------------------------------------------------
@@ -141,9 +155,15 @@ IMDS_TOKEN="$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' \
 INSTANCE_TYPE="$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
     http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown)"
 case "$INSTANCE_TYPE" in
-    c7i.2xlarge) TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB"  ;;
-    c7i.4xlarge) TRINO_XMX="24G"; MAX_MEM_PER_NODE="18GB" ;;
-    *)           TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB"  ;;
+    # Constraint: max-mem-per-node + heap headroom (default 0.3*Xmx) <= Xmx,
+    # i.e. per-node query memory can be at most 0.7*Xmx. 18GB on a 24G heap
+    # violated this (18 + 7.2 > 24) and Trino refused to start.
+    # MAX_MEM_TOTAL (query.max-memory, the distributed cap) = 3 workers x
+    # per-node: 40GB undersold the SF100 cluster and killed Q09/Q21 with
+    # EXCEEDED_GLOBAL_MEMORY_LIMIT.
+    c7i.2xlarge) TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB";  MAX_MEM_TOTAL="24GB" ;;
+    c7i.4xlarge) TRINO_XMX="24G"; MAX_MEM_PER_NODE="16GB"; MAX_MEM_TOTAL="48GB" ;;
+    *)           TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB";  MAX_MEM_TOTAL="24GB" ;;
 esac
 echo "==> instance=$INSTANCE_TYPE  Xmx=$TRINO_XMX  max-memory-per-node=$MAX_MEM_PER_NODE"
 
@@ -173,22 +193,32 @@ EOF
 # --- config.properties ------------------------------------------------------
 # Discovery: workers + coordinator both point at coordinator:8080. The
 # coordinator additionally hosts the discovery service.
+# Spill-to-disk: SF100 Q21 provably exceeds even the 48GB distributed cap
+# on this cluster; spill (docs: spill-enabled + spiller-spill-path) lets
+# genuinely-over-memory queries complete at the cost of latency.
+sudo mkdir -p "$TRINO_DATA/spill"
+sudo chown "$TRINO_USER:$TRINO_USER" "$TRINO_DATA/spill"
+
 if [[ "$ROLE" == "coordinator" ]]; then
     sudo tee "$TRINO_HOME/etc/config.properties" >/dev/null <<EOF
 coordinator=true
 node-scheduler.include-coordinator=false
 http-server.http.port=8080
 discovery.uri=http://${COORDINATOR_HOST}:8080
-query.max-memory=40GB
+query.max-memory=${MAX_MEM_TOTAL}
 query.max-memory-per-node=${MAX_MEM_PER_NODE}
+spill-enabled=true
+spiller-spill-path=${TRINO_DATA}/spill
 EOF
 else
     sudo tee "$TRINO_HOME/etc/config.properties" >/dev/null <<EOF
 coordinator=false
 http-server.http.port=8080
 discovery.uri=http://${COORDINATOR_HOST}:8080
-query.max-memory=40GB
+query.max-memory=${MAX_MEM_TOTAL}
 query.max-memory-per-node=${MAX_MEM_PER_NODE}
+spill-enabled=true
+spiller-spill-path=${TRINO_DATA}/spill
 EOF
 fi
 

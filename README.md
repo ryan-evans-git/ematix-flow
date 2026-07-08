@@ -1,22 +1,13 @@
-```
-███████╗███╗   ███╗ █████╗ ████████╗██╗██╗  ██╗
-██╔════╝████╗ ████║██╔══██╗╚══██╔══╝██║╚██╗██╔╝
-█████╗  ██╔████╔██║███████║   ██║   ██║ ╚███╔╝
-██╔══╝  ██║╚██╔╝██║██╔══██║   ██║   ██║ ██╔██╗
-███████╗██║ ╚═╝ ██║██║  ██║   ██║   ██║██╔╝ ██╗
-╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝╚═╝  ╚═╝
-```
-
 # ematix-flow
 
-**Declarative Python data pipelines. Rust + Apache Arrow under the hood.**
+Declarative data pipelines for Python, with a Rust and Apache Arrow core.
 
 Move data between databases, files, and streams with one decorator. Cron
 schedules, DAG dependencies, watermarks, schema evolution, restart-safe state,
-and at-least-once delivery are all built in — no extra scheduler service to
-deploy.
+and at-least-once delivery are built in — there is no separate scheduler
+service to deploy.
 
-Project site: **[ematix.dev](https://ematix.dev)**.
+Documentation and project site: [ematix.dev](https://ematix.dev)
 
 ```python
 from ematix_flow import ematix, ManagedTable, Annotated, BigInt, Text, TimestampTZ, pk
@@ -55,18 +46,13 @@ pip install ematix-flow
 flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k8s CronJob
 ```
 
-## Why ematix-flow
+## Features
 
-- **Fast.** TPC-H, 22 queries, single Apple M4 Max, measured at three
-  scales through the production preset (fresh context per query, each
-  engine in its own process — no bench-only tricks): ematix-flow takes
-  **22 / 22** at SF=1 (**2.35×** DuckDB, **3.89×** Polars, **17×**
-  single-node PySpark), **22 / 22** at SF=10 (**1.58×** DuckDB), and
-  **14 / 22** at SF=100 (**1.18×** DuckDB) — head-to-head vs DuckDB it
-  wins **22 / 22 / 14** of 22 in the same isolated protocol (at SF=100,
-  Q8 + Q10 are consistent losses and 6 more sit within run-to-run noise),
-  and leads the geomean at every scale. Full numbers, the losses
-  included, and the reproducer in [Benchmarks](#benchmarks).
+- **Performance.** Competitive with DuckDB on single-node TPC-H across
+  SF1–SF100, measured through the production configuration with per-query
+  process isolation. The [Benchmarks](#benchmarks) section has the full
+  per-query numbers, including the queries where it loses, and the
+  reproducer.
 - **Scheduling + DAG, no service to operate.** Pipelines carry their own
   cron schedule and `depends_on=` edges (with cycle detection and exponential-
   backoff retries). Run `flow run-due` from cron, systemd, a k8s `CronJob`,
@@ -81,11 +67,10 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
   delivery, credential redaction, structured run history, Prometheus +
   OpenTelemetry metrics, Slack alerts.
 
-> Status: **v0.11.0 on PyPI** as `ematix-flow` (alpha). All four surfaces —
-> declarative pipelines, multi-backend, streaming, stream processing — are
-> shipped end-to-end, with warehouse pipelines (cron + retries + DAG),
-> Schema Registry (Confluent + AWS Glue), and timezone-aware cron
-> schedules. See CHANGELOG for the release history.
+Status: beta; the API is stabilizing toward 1.0. Published on PyPI as
+`ematix-flow`. All four surfaces — declarative pipelines, multi-backend,
+streaming, and stream processing — are shipped end-to-end. See
+[CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ---
 

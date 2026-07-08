@@ -12,3 +12,11 @@ rustflags = [
     "-C", "link-arg=-undefined",
     "-C", "link-arg=dynamic_lookup",
 ]
+
+# x86-64 Linux (cloud benchmark boxes, e.g. AWS c7i). Rust arrow/DataFusion and
+# the ematix-parquet codec get SIMD only via compile-time autovectorization, so
+# a default `cargo build` (baseline SSE2) leaves AVX2/AVX-512 on the table while
+# DuckDB's wheel runtime-dispatches to AVX-512. Target x86-64-v3 (AVX2 + FMA +
+# BMI) — portable across every modern cloud x86 (Haswell 2013+), no SIGILL risk.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

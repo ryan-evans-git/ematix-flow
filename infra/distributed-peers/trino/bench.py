@@ -197,7 +197,7 @@ def bench_one(conn, qid: str, sql: str, trials: int, warmups: int) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--sf", type=int, choices=[10, 100], required=True)
+    p.add_argument("--sf", type=int, choices=[1, 10, 100], required=True)
     p.add_argument("--bucket", required=True, help="S3 results bucket name (no s3:// prefix)")
     p.add_argument("--trials", type=int, default=5)
     p.add_argument("--warmups", type=int, default=2)

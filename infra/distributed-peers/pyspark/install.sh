@@ -73,14 +73,28 @@ SPARK_USER="spark"
 # Packages: JDK 21, Python 3.12, basic tools
 # -----------------------------------------------------------------------------
 echo "==> installing JDK 21 + Python 3.12"
+# No `curl` here: AL2023 ships curl-minimal, which provides the curl
+# binary and CONFLICTS with the full curl package (dnf hard-fails).
 dnf install -y \
     java-21-amazon-corretto-headless \
     python3.12 python3.12-pip \
-    tar gzip curl which procps-ng
+    tar gzip which procps-ng
 
 # Provide a stable `python3.12` -> ensurepip / venv path
 python3.12 -m ensurepip --upgrade >/dev/null 2>&1 || true
 python3.12 -m pip install --upgrade pip >/dev/null
+
+# bench.py deps (README's manual step, automated): system-wide, NOT --user —
+# cloud-init runs as root but the bench runs as ec2-user.
+if [ "$ROLE" = "master" ]; then
+    # As ec2-user with --user (the bench's runtime user): a system-wide pip
+    # tries to upgrade RPM-owned deps (requests) and hard-fails.
+    sudo -u ec2-user python3.12 -m pip install --user --quiet "pyspark==${SPARK_VERSION}" boto3
+    # Without SPARK_HOME the pip pyspark runs self-contained: no s3a jars,
+    # no spark-defaults.conf (master URL!) — the bench would silently run
+    # local-mode. Point it at the real install for every login shell.
+    echo "export SPARK_HOME=${SPARK_HOME}" >> /etc/profile.d/ematix-env.sh
+fi
 
 # -----------------------------------------------------------------------------
 # Spark user
@@ -150,14 +164,27 @@ INSTANCE_TYPE="$(curl -fsS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
 AWS_REGION="$(curl -fsS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
     http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || echo us-east-2)"
 
+# EXECUTOR_MEMORY = the heap ONE executor takes. Spark's default is 1g, so
+# without this every executor OOMs on any SF100 join ("Lost task …
+# executor N"). BUT oversizing is just as fatal the other way: 10g on a
+# 16g box (62%) drove the workers into GC thrash → heartbeat timeouts →
+# the master deregistered them → re-registration storm → app stuck at 0
+# cores (and the boxes so starved sshd stopped answering). So size the
+# executor heap to leave GENEROUS absolute headroom for the worker
+# daemon (~1g), OS + parquet page cache (~3-4g), and the ~10% executor
+# memory overhead — roughly 55-60% of box RAM, not 75%+. WORKER_MEMORY
+# (advertised pool) only needs to cover one executor.
 case "$INSTANCE_TYPE" in
-    c7i.2xlarge) WORKER_MEMORY="12g" ;;
-    c7i.4xlarge) WORKER_MEMORY="28g" ;;
-    c7i.8xlarge) WORKER_MEMORY="56g" ;;
+    c7i.2xlarge) WORKER_MEMORY="10g"; EXECUTOR_MEMORY="8g";  DRIVER_MEMORY="3g" ;;  # 16g box
+    c7i.4xlarge) WORKER_MEMORY="22g"; EXECUTOR_MEMORY="20g"; DRIVER_MEMORY="6g" ;;  # 32g box
+    c7i.8xlarge) WORKER_MEMORY="44g"; EXECUTOR_MEMORY="40g"; DRIVER_MEMORY="8g" ;;  # 64g box
     *)
-        # Fallback: 75% of detected RAM, in whole GiB.
+        # Fallback: executor ≈ 55% of detected RAM, worker pool a touch above.
         TOTAL_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-        WORKER_MEMORY="$(( TOTAL_KB * 75 / 100 / 1024 / 1024 ))g"
+        TOTAL_GB=$(( TOTAL_KB / 1024 / 1024 ))
+        EXECUTOR_MEMORY="$(( TOTAL_GB * 55 / 100 ))g"
+        WORKER_MEMORY="$(( TOTAL_GB * 60 / 100 ))g"
+        DRIVER_MEMORY="4g"
         ;;
 esac
 
@@ -195,9 +222,16 @@ cat >"$SPARK_HOME/conf/spark-defaults.conf" <<EOF
 spark.master                                   spark://${MASTER_HOST}:7077
 spark.serializer                               org.apache.spark.serializer.KryoSerializer
 spark.sql.parquet.enableVectorizedReader       true
+spark.executor.memory                          ${EXECUTOR_MEMORY}
+spark.executor.cores                           ${WORKER_CORES}
+spark.driver.memory                            ${DRIVER_MEMORY}
 spark.sql.adaptive.enabled                     true
 spark.sql.adaptive.coalescePartitions.enabled  true
-spark.sql.shuffle.partitions                   ${WORKER_CORES}
+# 400 initial shuffle partitions (was WORKER_CORES≈16 — far too coarse
+# for SF100: each partition held ~1/16 of a shuffled fact relation and
+# OOM'd the executor). AQE coalescePartitions merges these back down for
+# small stages, so 400 is safe across SF10/SF100.
+spark.sql.shuffle.partitions                   400
 
 # s3a access via the EC2 instance profile (no static creds on disk).
 # hadoop-aws 3.4.x runs on AWS SDK **v2**: the provider below is the
