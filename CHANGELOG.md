@@ -48,7 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `post_rebalance` (which intermittently hit "Local: Erroneous
   state" — the #539 flake). Restart/rewind seeks are deterministic.
 
-### Fixed
 
 - **macOS: segfault when `_core` and pyarrow share a process.** The
   Python extension set mimalloc (v3) as the Rust `#[global_allocator]`;
