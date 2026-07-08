@@ -36,7 +36,6 @@ MAX_ROWS_CEILING = 100_000
 _READONLY_LEADING_KEYWORDS = frozenset({"SELECT", "WITH", "EXPLAIN"})
 
 _LINE_COMMENT = re.compile(r"--[^\n]*")
-_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LEADING_WORD = re.compile(r"[A-Za-z]+")
 
 # Engine functions that read the filesystem or the network — the real
@@ -183,8 +182,28 @@ class DatasourceRegistry:
 # ---- Read-only guard -----------------------------------------------
 
 
+def _strip_block_comments(sql: str) -> str:
+    """Replace ``/* ... */`` blocks with a space in guaranteed linear
+    time. A backtracking regex here (`/\\*.*?\\*/`) is a ReDoS surface on
+    hostile input (`/*` + many `a/*`); a two-``str.find`` scan is O(n)."""
+    out: list[str] = []
+    i = 0
+    while True:
+        start = sql.find("/*", i)
+        if start == -1:
+            out.append(sql[i:])
+            break
+        out.append(sql[i:start])
+        out.append(" ")
+        end = sql.find("*/", start + 2)
+        if end == -1:
+            break  # unterminated comment — drop the remainder
+        i = end + 2
+    return "".join(out)
+
+
 def _strip_comments(sql: str) -> str:
-    return _LINE_COMMENT.sub(" ", _BLOCK_COMMENT.sub(" ", sql))
+    return _LINE_COMMENT.sub(" ", _strip_block_comments(sql))
 
 
 def guard_readonly(sql: str) -> str:

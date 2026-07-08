@@ -20,10 +20,10 @@ use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow_array::RecordBatch;
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use pyo3::IntoPyObjectExt;
 
 /// Short, UI-friendly label for a column's Arrow type.
 fn type_label(dt: &DataType) -> String {
@@ -66,7 +66,10 @@ fn column_cells<'py>(py: Python<'py>, arr: &ArrayRef) -> PyResult<Vec<Bound<'py,
     let n = arr.len();
     match arr.data_type() {
         DataType::Boolean => {
-            let a = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| err("bool"))?;
+            let a = arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| err("bool"))?;
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
                 out.push(if a.is_null(i) {
@@ -86,7 +89,10 @@ fn column_cells<'py>(py: Python<'py>, arr: &ArrayRef) -> PyResult<Vec<Bound<'py,
         | DataType::UInt32
         | DataType::UInt64 => {
             let casted = cast(arr.as_ref(), &DataType::Int64).map_err(err)?;
-            let a = casted.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err("int64"))?;
+            let a = casted
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| err("int64"))?;
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
                 out.push(if a.is_null(i) {
@@ -99,7 +105,10 @@ fn column_cells<'py>(py: Python<'py>, arr: &ArrayRef) -> PyResult<Vec<Bound<'py,
         }
         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
             let casted = cast(arr.as_ref(), &DataType::Float64).map_err(err)?;
-            let a = casted.as_any().downcast_ref::<Float64Array>().ok_or_else(|| err("f64"))?;
+            let a = casted
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| err("f64"))?;
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
                 out.push(if a.is_null(i) {
@@ -112,7 +121,10 @@ fn column_cells<'py>(py: Python<'py>, arr: &ArrayRef) -> PyResult<Vec<Bound<'py,
         }
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             let casted = cast(arr.as_ref(), &DataType::Utf8).map_err(err)?;
-            let a = casted.as_any().downcast_ref::<StringArray>().ok_or_else(|| err("utf8"))?;
+            let a = casted
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| err("utf8"))?;
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
                 out.push(if a.is_null(i) {
