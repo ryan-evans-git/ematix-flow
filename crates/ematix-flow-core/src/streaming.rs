@@ -1983,10 +1983,103 @@ impl StreamingPipeline {
         to: RewindTarget,
         confirm_state_reset: bool,
     ) -> Result<RewindReport, BackendError> {
-        let _ = (to, confirm_state_reset);
-        Err(BackendError::Other(
-            "StreamingPipeline::rewind is not implemented yet (DLQ Phase 3)".into(),
-        ))
+        let pipeline = self.config.pipeline_name.as_str();
+
+        // 1. Confirmation gate. Stateful = the transform says so —
+        //    the state store alone doesn't make a pipeline stateful
+        //    (a stateless pipeline checkpoints only offsets).
+        let stateful = self
+            .config
+            .transform
+            .as_ref()
+            .is_some_and(|t| t.is_stateful());
+        if stateful && !confirm_state_reset {
+            return Err(BackendError::Other(format!(
+                "pipeline `{pipeline}` has a stateful (windowed/session) transform — \
+                 rewinding it clears ALL accumulated window state so re-consumed rows \
+                 don't double-count. Pass confirm_state_reset = true to proceed."
+            )));
+        }
+
+        // 2. Resolve per-source offset bytes and validate
+        //    seekability BEFORE anything mutates, so any failure
+        //    here leaves the pipeline untouched. Resolution runs
+        //    first: its typed error ("no timestamp index") is more
+        //    actionable than the generic seek complaint.
+        let mut resolved: Vec<(String, Vec<u8>)> = Vec::with_capacity(self.sources.len());
+        match &to {
+            RewindTarget::Offset(bytes) => {
+                // Offset bytes are backend-opaque; one blob cannot
+                // honestly address N sources.
+                if self.sources.len() != 1 {
+                    return Err(BackendError::Other(format!(
+                        "pipeline `{pipeline}` has {} sources — offset-bytes rewind is \
+                         single-source only; rewind by timestamp instead",
+                        self.sources.len()
+                    )));
+                }
+                resolved.push((self.sources[0].1.clone(), bytes.clone()));
+            }
+            RewindTarget::Timestamp(ts_ms) => {
+                for (backend, query) in &self.sources {
+                    let bytes = backend.offsets_for_timestamp(query, *ts_ms).await?;
+                    resolved.push((query.clone(), bytes));
+                }
+            }
+        }
+        for (backend, query) in &self.sources {
+            if !backend.supports_seek_to() {
+                return Err(BackendError::Other(format!(
+                    "pipeline `{pipeline}`: source `{query}` does not support seek_to — \
+                     it cannot be rewound"
+                )));
+            }
+        }
+
+        // 3. Durable reset FIRST: state-clear + offset-write in one
+        //    state-store transaction, so a crash mid-rewind can
+        //    never pair cleared state with stale offsets (or vice
+        //    versa). Stateless pipelines with a store still go
+        //    through reset — their committed offsets must move too,
+        //    or the next restart would seek right back.
+        if let Some(store) = &self.config.state_store {
+            let offsets: std::collections::HashMap<String, Vec<u8>> =
+                resolved.iter().cloned().collect();
+            store.reset(pipeline, offsets).await?;
+        }
+
+        // 4. In-memory state: transform accumulators + the
+        //    pipeline's watermark bookkeeping. The rewound run must
+        //    re-derive watermarks from the re-consumed rows — a
+        //    stale high watermark would mis-classify them as late.
+        if stateful {
+            if let Some(t) = &self.config.transform {
+                t.clear_state().await?;
+            }
+        }
+        {
+            let mut wm = self
+                .watermark_state
+                .lock()
+                .expect("watermark_state mutex poisoned");
+            *wm = WatermarkState::new(self.sources.len());
+        }
+
+        // 5. Seek every source to its resolved position.
+        for ((backend, _query), (_id, bytes)) in self.sources.iter().zip(resolved.iter()) {
+            backend.seek_to(bytes).await?;
+        }
+
+        tracing::info!(
+            pipeline,
+            sources = resolved.len(),
+            state_cleared = stateful,
+            "rewind applied"
+        );
+        Ok(RewindReport {
+            sources: resolved,
+            state_cleared: stateful,
+        })
     }
 }
 

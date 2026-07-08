@@ -2571,6 +2571,24 @@ impl BatchTransform for WindowedAggregateTransform {
         let mut state = self.state.lock().await;
         Ok(std::mem::take(&mut state.dlq_pending))
     }
+
+    /// DLQ Phase 3: every window kind accumulates cross-batch state
+    /// (open windows / sessions), so rewinding a windowed pipeline
+    /// requires `confirm_state_reset`.
+    fn is_stateful(&self) -> bool {
+        true
+    }
+
+    /// DLQ Phase 3: drop ALL windowed state — open tumbling/hopping
+    /// accumulators, session lists, dirty/evicted tracking, and any
+    /// pending late-data DLQ rows. Called by the rewind
+    /// orchestration after the durable store reset; leftover
+    /// accumulators would double-count the re-consumed rows.
+    async fn clear_state(&self) -> Result<(), BackendError> {
+        let mut state = self.state.lock().await;
+        *state = WindowState::new();
+        Ok(())
+    }
 }
 
 // =====================================================================

@@ -453,55 +453,91 @@ impl ClientContext for EmatixKafkaContext {
 }
 
 impl ConsumerContext for EmatixKafkaContext {
-    /// P4 #26: bridge `seek_to`-recovered offsets into the
-    /// consumer-group rebalance protocol. Replaces the prior
-    /// "manual `assign + Offset::Offset(...)` at acquire time"
-    /// path with `subscribe()` + this callback — the result is
-    /// equivalent for single-worker pipelines (initial assign-all
-    /// rebalance triggers the seek), and correctly handles
+    /// P4 #26 (reworked in DLQ Phase 3): bridge `seek_to`-recovered
+    /// offsets into the consumer-group rebalance protocol. Replaces
+    /// the prior "manual `assign + Offset::Offset(...)` at acquire
+    /// time" path with `subscribe()` + this callback — equivalent
+    /// for single-worker pipelines (the initial assign-all
+    /// rebalance applies the offsets), and correctly handles
     /// partition reassignment when a future multi-worker setup
     /// (Σ.D) joins or leaves the group mid-stream.
     ///
-    /// Each entry is consumed (removed) the first time the
-    /// callback applies it, so a subsequent rebalance reads
-    /// broker-stored committed offsets instead of re-applying
-    /// the now-stale recovery point.
-    fn post_rebalance(
+    /// The recovered offsets are applied by MUTATING the
+    /// assignment TPL before the assign call, not by `seek()`ing
+    /// from `post_rebalance`: seek races the partition fetcher's
+    /// startup ("Local: Erroneous state" — the #539 flake), while
+    /// assigning with explicit offsets is deterministic. The
+    /// assign/unassign dispatch below mirrors rdkafka's default
+    /// `rebalance` body, minus the raw-FFI calls.
+    ///
+    /// Each seek-map entry is consumed (removed) the first time
+    /// it's applied, so a subsequent rebalance reads broker-stored
+    /// committed offsets instead of re-applying the now-stale
+    /// recovery point.
+    fn rebalance(
         &self,
         base_consumer: &rdkafka::consumer::BaseConsumer<Self>,
-        rebalance: &rdkafka::consumer::Rebalance<'_>,
+        err: rdkafka::types::RDKafkaRespErr,
+        tpl: &mut TopicPartitionList,
     ) {
-        let rdkafka::consumer::Rebalance::Assign(tpl) = rebalance else {
-            return;
-        };
-        let Ok(mut map) = self.seek_map.lock() else {
-            return;
-        };
-        if map.is_empty() {
-            return;
-        }
-        for elem in tpl.elements() {
-            let partition = elem.partition();
-            let Some(offset) = map.remove(&partition) else {
-                continue;
-            };
-            // Best-effort: a failed seek surfaces on the next
-            // poll as a Kafka error and the supervisor handles
-            // it. We don't want to panic from inside the
-            // librdkafka rebalance callback.
-            if let Err(e) = base_consumer.seek(
-                elem.topic(),
-                partition,
-                Offset::Offset(offset),
-                std::time::Duration::from_secs(5),
-            ) {
-                tracing::warn!(
-                    topic = %elem.topic(),
-                    partition,
-                    offset,
-                    error = %e,
-                    "kafka post_rebalance seek failed; partition will use \
-                     broker-stored committed offset (or auto.offset.reset)"
+        use rdkafka::consumer::{Rebalance, RebalanceProtocol};
+        use rdkafka::types::RDKafkaRespErr;
+
+        match err {
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => {
+                // Apply recovered offsets to the assignment.
+                if let Ok(mut map) = self.seek_map.lock()
+                    && !map.is_empty()
+                {
+                    let parts: Vec<(String, i32)> = tpl
+                        .elements()
+                        .iter()
+                        .map(|e| (e.topic().to_string(), e.partition()))
+                        .collect();
+                    for (topic, partition) in parts {
+                        let Some(offset) = map.remove(&partition) else {
+                            continue;
+                        };
+                        if let Some(mut elem) = tpl.find_partition(&topic, partition)
+                            && let Err(e) = elem.set_offset(Offset::Offset(offset))
+                        {
+                            tracing::warn!(
+                                topic,
+                                partition,
+                                offset,
+                                error = %e,
+                                "kafka rebalance: failed to set recovered offset; \
+                                 partition will use broker-stored committed offset \
+                                 (or auto.offset.reset)"
+                            );
+                        }
+                    }
+                }
+                let res = match base_consumer.rebalance_protocol() {
+                    RebalanceProtocol::Cooperative => base_consumer.incremental_assign(tpl),
+                    _ => base_consumer.assign(tpl),
+                };
+                if let Err(e) = res {
+                    tracing::error!(error = %e, "kafka rebalance: assign failed");
+                }
+                self.post_rebalance(base_consumer, &Rebalance::Assign(tpl));
+            }
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS => {
+                let res = match base_consumer.rebalance_protocol() {
+                    RebalanceProtocol::Cooperative => base_consumer.incremental_unassign(tpl),
+                    _ => base_consumer.unassign(),
+                };
+                if let Err(e) = res {
+                    tracing::error!(error = %e, "kafka rebalance: unassign failed");
+                }
+                self.post_rebalance(base_consumer, &Rebalance::Revoke(tpl));
+            }
+            other => {
+                let code: rdkafka::types::RDKafkaErrorCode = other.into();
+                tracing::error!(error = %code, "kafka rebalance error");
+                self.post_rebalance(
+                    base_consumer,
+                    &Rebalance::Error(rdkafka::error::KafkaError::Rebalance(code)),
                 );
             }
         }
@@ -2146,6 +2182,90 @@ impl Backend for KafkaBackend {
         }
         let bytes = encode_kafka_offsets(&session.pending_offsets)?;
         Ok(Some(bytes))
+    }
+
+    /// DLQ Phase 3: timestamp → per-partition offsets via the
+    /// broker's `offsets_for_times`. `query` is the topic; the
+    /// result is the same v=1 JSON offset blob `seek_to` /
+    /// `offset_snapshot` round-trip, so the rewind orchestration
+    /// can hand it straight to `seek_to` and `StateStore::reset`.
+    ///
+    /// Partitions with no message at-or-after `ts_ms` resolve to
+    /// their high watermark (seek-to-end) — rewinding past the tail
+    /// of one partition must not replay it from zero.
+    async fn offsets_for_timestamp(
+        &self,
+        query: &str,
+        ts_ms: i64,
+    ) -> Result<Vec<u8>, BackendError> {
+        const OP_TIMEOUT: Duration = Duration::from_secs(10);
+        let topic = query.to_string();
+        let mut config = self.client_config();
+        // Ephemeral probe consumer: never joins a group, never
+        // commits — the group id only satisfies librdkafka's
+        // consumer construction requirement.
+        config.set("group.id", "emat-rewind-probe");
+        config.set("enable.auto.commit", "false");
+        let context = self.build_context();
+
+        tokio::task::spawn_blocking(move || {
+            use rdkafka::consumer::BaseConsumer;
+
+            let consumer: BaseConsumer<EmatixKafkaContext> =
+                config.create_with_context(context).map_err(|e| {
+                    BackendError::Connection(format!("kafka rewind consumer create: {e}"))
+                })?;
+
+            let metadata = consumer
+                .fetch_metadata(Some(&topic), OP_TIMEOUT)
+                .map_err(|e| BackendError::Query(format!("kafka rewind metadata {topic}: {e}")))?;
+            let partitions: Vec<i32> = metadata
+                .topics()
+                .iter()
+                .find(|t| t.name() == topic)
+                .map(|t| t.partitions().iter().map(|p| p.id()).collect())
+                .unwrap_or_default();
+            if partitions.is_empty() {
+                return Err(BackendError::Query(format!(
+                    "kafka rewind: topic {topic} has no partitions (does it exist?)"
+                )));
+            }
+
+            // rdkafka's offsets_for_times convention: pass the
+            // target timestamp (ms) as the "offset" of each entry.
+            let mut tpl = TopicPartitionList::new();
+            for p in &partitions {
+                tpl.add_partition_offset(&topic, *p, Offset::Offset(ts_ms))
+                    .map_err(|e| BackendError::Other(format!("kafka rewind tpl: {e}")))?;
+            }
+            let resolved = consumer.offsets_for_times(tpl, OP_TIMEOUT).map_err(|e| {
+                BackendError::Query(format!("kafka rewind offsets_for_times {topic}: {e}"))
+            })?;
+
+            let mut offsets: HashMap<i32, i64> = HashMap::with_capacity(partitions.len());
+            for e in resolved.elements() {
+                let off = match e.offset() {
+                    Offset::Offset(o) => o,
+                    // No message at/after ts on this partition →
+                    // high watermark (consume nothing old).
+                    _ => {
+                        consumer
+                            .fetch_watermarks(&topic, e.partition(), OP_TIMEOUT)
+                            .map_err(|err| {
+                                BackendError::Query(format!(
+                                    "kafka rewind watermarks {topic}/{}: {err}",
+                                    e.partition()
+                                ))
+                            })?
+                            .1
+                    }
+                };
+                offsets.insert(e.partition(), off);
+            }
+            encode_kafka_offsets(&offsets)
+        })
+        .await
+        .map_err(|e| BackendError::Other(format!("kafka rewind task join: {e}")))?
     }
 }
 
