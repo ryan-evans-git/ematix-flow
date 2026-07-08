@@ -5,6 +5,9 @@
   import Jobs from "./routes/Pipelines.svelte";
   import Workflows from "./routes/Workflows.svelte";
   import Dag from "./routes/Dag.svelte";
+  import SqlLab from "./routes/SqlLab.svelte";
+  import ChartBuilder from "./routes/ChartBuilder.svelte";
+  import Dashboards from "./routes/Dashboards.svelte";
 
   // Hash-based router. v0.5.1 nav model:
   //   #/workflows      → top-level grouping of jobs (default)
@@ -34,6 +37,9 @@
     if (m === "/jobs" || m === "/pipelines" || m.startsWith("/jobs?") || m.startsWith("/pipelines?")) {
       return { name: "jobs" };
     }
+    if (m === "/sql" || m.startsWith("/sql?")) return { name: "sql" };
+    if (m === "/charts" || m.startsWith("/charts")) return { name: "charts" };
+    if (m === "/dashboards" || m.startsWith("/dashboards")) return { name: "dashboards" };
     return { name: "workflows" };
   }
 
@@ -63,6 +69,9 @@
   $: jobsActive = route.name === "jobs";
   $: runsActive = route.name === "runs" || route.name === "run_detail";
   $: dagActive = route.name === "dag";
+  $: sqlActive = route.name === "sql";
+  $: chartsActive = route.name === "charts";
+  $: dashboardsActive = route.name === "dashboards";
 </script>
 
 <div class="app">
@@ -72,6 +81,9 @@
     <a href="#/jobs" class:active={jobsActive}>Jobs</a>
     <a href="#/runs" class:active={runsActive}>Runs</a>
     <a href="#/dag" class:active={dagActive}>DAG</a>
+    <a href="#/sql" class:active={sqlActive}>SQL Lab</a>
+    <a href="#/charts" class:active={chartsActive}>Charts</a>
+    <a href="#/dashboards" class:active={dashboardsActive}>Dashboards</a>
     <span style="flex: 1"></span>
     <a href="/api/docs" target="_blank" rel="noopener">API Docs ↗</a>
     <button
@@ -94,5 +106,11 @@
     <Runs />
   {:else if route.name === "dag"}
     <Dag focus={route.focus} />
+  {:else if route.name === "sql"}
+    <SqlLab />
+  {:else if route.name === "charts"}
+    <ChartBuilder />
+  {:else if route.name === "dashboards"}
+    <Dashboards />
   {/if}
 </div>

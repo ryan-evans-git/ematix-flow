@@ -214,6 +214,8 @@ def create_app(
     history: RunHistoryStore | None = None,
     ui_dist_dir: Path | None = None,
     bearer_token: str | None = None,
+    datasources: dict[str, str] | None = None,
+    analytics_store: Any = None,
 ):
     """Build the FastAPI app.
 
@@ -284,9 +286,263 @@ def create_app(
                 )
             return await call_next(request)
 
+    from ematix_flow.web.analytics import (
+        DatasourceNotFound,
+        DatasourceRegistry,
+        QueryError,
+        QueryTimeout,
+        catalog_columns,
+        catalog_schemas,
+        catalog_tables,
+        execute_chart_for_dashboard,
+        execute_query_request,
+    )
+
+    datasource_registry = DatasourceRegistry(datasources)
+
+    def _catalog(fn, *args):
+        """Run a catalog introspection call, mapping its failures to
+        the right HTTP status."""
+        try:
+            return fn(datasource_registry, *args)
+        except DatasourceNotFound as exc:
+            raise HTTPException(status_code=404, detail=f"datasource {exc.args[0]!r} not found")
+        except QueryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     @app.get("/api/health")
     def health() -> dict[str, str]:  # type: ignore[unused-function]
         return {"status": "ok"}
+
+    @app.get("/api/datasources")
+    def list_datasources() -> dict[str, Any]:  # type: ignore[unused-function]
+        return {
+            "datasources": [d.public_dict() for d in datasource_registry.list()]
+        }
+
+    @app.get("/api/datasources/{datasource_id}/schemas")
+    def get_schemas(datasource_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        return {"schemas": _catalog(catalog_schemas, datasource_id)}
+
+    @app.get("/api/datasources/{datasource_id}/schemas/{schema}/tables")
+    def get_tables(datasource_id: str, schema: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        return {"tables": _catalog(catalog_tables, datasource_id, schema)}
+
+    @app.get(
+        "/api/datasources/{datasource_id}/schemas/{schema}/tables/{table}/columns"
+    )
+    def get_columns(datasource_id: str, schema: str, table: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        return {"columns": _catalog(catalog_columns, datasource_id, schema, table)}
+
+    # ---- Saved queries ---------------------------------------------
+    # If no store is configured, fall back to an ephemeral in-memory
+    # one so the SQL Lab's save button works out of the box (the CLI
+    # launcher wires a file-backed store for persistence).
+    if analytics_store is None:
+        from ematix_flow.web.analytics_store import AnalyticsStore
+
+        analytics_store = AnalyticsStore(":memory:")
+
+    @app.get("/api/saved-queries")
+    def list_saved_queries() -> dict[str, Any]:  # type: ignore[unused-function]
+        return {"saved_queries": analytics_store.list_saved_queries()}
+
+    @app.post("/api/saved-queries")
+    def create_saved_query(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+        name = (payload.get("name") or "").strip()
+        sql = (payload.get("sql") or "").strip()
+        datasource_id = (payload.get("datasource_id") or "").strip()
+        if not name or not sql or not datasource_id:
+            raise HTTPException(
+                status_code=400,
+                detail="name, datasource_id and sql are required",
+            )
+        return analytics_store.create_saved_query(
+            name=name, datasource_id=datasource_id, sql=sql
+        )
+
+    @app.get("/api/saved-queries/{query_id}")
+    def get_saved_query(query_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        item = analytics_store.get_saved_query(query_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="saved query not found")
+        return item
+
+    @app.put("/api/saved-queries/{query_id}")
+    def update_saved_query(query_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+        name = payload.get("name")
+        sql = payload.get("sql")
+        if name is not None and not str(name).strip():
+            raise HTTPException(status_code=400, detail="name cannot be empty")
+        item = analytics_store.update_saved_query(
+            query_id,
+            name=str(name).strip() if name is not None else None,
+            datasource_id=payload.get("datasource_id"),
+            sql=sql,
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="saved query not found")
+        return item
+
+    @app.delete("/api/saved-queries/{query_id}")
+    def delete_saved_query(query_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        if not analytics_store.delete_saved_query(query_id):
+            raise HTTPException(status_code=404, detail="saved query not found")
+        return {"deleted": True}
+
+    # ---- Charts ----------------------------------------------------
+
+    @app.get("/api/charts")
+    def list_charts() -> dict[str, Any]:  # type: ignore[unused-function]
+        return {"charts": analytics_store.list_charts()}
+
+    @app.post("/api/charts")
+    def create_chart(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+        name = (payload.get("name") or "").strip()
+        sql = (payload.get("sql") or "").strip()
+        datasource_id = (payload.get("datasource_id") or "").strip()
+        viz_type = (payload.get("viz_type") or "").strip()
+        if not name or not sql or not datasource_id or not viz_type:
+            raise HTTPException(
+                status_code=400,
+                detail="name, datasource_id, sql and viz_type are required",
+            )
+        return analytics_store.create_chart(
+            name=name,
+            datasource_id=datasource_id,
+            sql=sql,
+            viz_type=viz_type,
+            encoding=payload.get("encoding") or {},
+        )
+
+    @app.get("/api/charts/{chart_id}")
+    def get_chart(chart_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        item = analytics_store.get_chart(chart_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="chart not found")
+        return item
+
+    @app.put("/api/charts/{chart_id}")
+    def update_chart(chart_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+        name = payload.get("name")
+        if name is not None and not str(name).strip():
+            raise HTTPException(status_code=400, detail="name cannot be empty")
+        item = analytics_store.update_chart(
+            chart_id,
+            name=str(name).strip() if name is not None else None,
+            datasource_id=payload.get("datasource_id"),
+            sql=payload.get("sql"),
+            viz_type=payload.get("viz_type"),
+            encoding=payload.get("encoding"),
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="chart not found")
+        return item
+
+    @app.delete("/api/charts/{chart_id}")
+    def delete_chart(chart_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        if not analytics_store.delete_chart(chart_id):
+            raise HTTPException(status_code=404, detail="chart not found")
+        return {"deleted": True}
+
+    # ---- Dashboards ------------------------------------------------
+
+    @app.get("/api/dashboards")
+    def list_dashboards() -> dict[str, Any]:  # type: ignore[unused-function]
+        return {"dashboards": analytics_store.list_dashboards()}
+
+    @app.post("/api/dashboards")
+    def create_dashboard(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+        name = (payload.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="name is required")
+        return analytics_store.create_dashboard(
+            name=name, layout=payload.get("layout") or {"tiles": []}
+        )
+
+    @app.get("/api/dashboards/{dashboard_id}")
+    def get_dashboard(dashboard_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        item = analytics_store.get_dashboard(dashboard_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="dashboard not found")
+        return item
+
+    @app.put("/api/dashboards/{dashboard_id}")
+    def update_dashboard(dashboard_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+        name = payload.get("name")
+        if name is not None and not str(name).strip():
+            raise HTTPException(status_code=400, detail="name cannot be empty")
+        item = analytics_store.update_dashboard(
+            dashboard_id,
+            name=str(name).strip() if name is not None else None,
+            layout=payload.get("layout"),
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="dashboard not found")
+        return item
+
+    @app.delete("/api/dashboards/{dashboard_id}")
+    def delete_dashboard(dashboard_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        if not analytics_store.delete_dashboard(dashboard_id):
+            raise HTTPException(status_code=404, detail="dashboard not found")
+        return {"deleted": True}
+
+    @app.post("/api/dashboards/{dashboard_id}/query")
+    def query_dashboard(dashboard_id: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:  # type: ignore[unused-function]
+        """Run every tile's chart query and return results keyed by
+        chart_id, each self-contained ({name, viz_type, encoding,
+        columns, rows, truncated} or {error}).
+
+        An optional ``filters`` list (``[{column, values}]``) restricts
+        each chart to matching rows where its output has that column —
+        the dashboard-filter / cross-filter path."""
+        dashboard = analytics_store.get_dashboard(dashboard_id)
+        if dashboard is None:
+            raise HTTPException(status_code=404, detail="dashboard not found")
+        filters = payload.get("filters") or []
+        tiles = (dashboard.get("layout") or {}).get("tiles") or []
+        chart_ids = list(dict.fromkeys(t.get("chart_id") for t in tiles if t.get("chart_id")))
+        results: dict[str, Any] = {}
+        for chart_id in chart_ids:
+            chart = analytics_store.get_chart(chart_id)
+            if chart is None:
+                results[chart_id] = {"error": "chart not found"}
+                continue
+            try:
+                data = execute_chart_for_dashboard(datasource_registry, chart, filters)
+                results[chart_id] = {
+                    "name": chart["name"],
+                    "viz_type": chart["viz_type"],
+                    "encoding": chart["encoding"],
+                    **data,
+                }
+            except DatasourceNotFound:
+                results[chart_id] = {"error": f"datasource {chart['datasource_id']!r} not found"}
+            except QueryError as exc:
+                results[chart_id] = {"error": str(exc)}
+        return {"results": results}
+
+    @app.post("/api/query")
+    def run_query(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
+        datasource_id = payload.get("datasource_id")
+        if not datasource_id:
+            raise HTTPException(status_code=400, detail="datasource_id is required")
+        try:
+            return execute_query_request(
+                datasource_registry,
+                datasource_id=datasource_id,
+                sql=payload.get("sql", ""),
+                max_rows=payload.get("max_rows"),
+            )
+        except DatasourceNotFound:
+            raise HTTPException(
+                status_code=404,
+                detail=f"datasource {datasource_id!r} not found",
+            )
+        except QueryTimeout as exc:
+            raise HTTPException(status_code=504, detail=str(exc))
+        except QueryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     @app.get("/api/runs")
     def list_runs(
@@ -1128,6 +1384,8 @@ def run_server(
     log_level: str = "info",
     bearer_token: str | None = None,
     history: RunHistoryStore | None = None,
+    datasources: dict[str, str] | None = None,
+    analytics_store: Any = None,
 ) -> None:
     """Launch the uvicorn server.
 
@@ -1156,5 +1414,10 @@ def run_server(
             file=sys.stderr,
         )
 
-    app = create_app(bearer_token=bearer_token, history=history)
+    app = create_app(
+        bearer_token=bearer_token,
+        history=history,
+        datasources=datasources,
+        analytics_store=analytics_store,
+    )
     uvicorn.run(app, host=host, port=port, log_level=log_level)

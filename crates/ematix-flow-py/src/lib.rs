@@ -1,4 +1,5 @@
 mod arrow_iter;
+mod arrow_to_py;
 mod kafka;
 mod kinesis;
 mod pubsub;
@@ -246,6 +247,48 @@ impl Connection {
         let pool = self.pg_pool()?;
         py.detach(|| rt().block_on(async move { pool.execute_in_transaction(&sqls).await }))
             .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Run a read query and return its result set as native Python
+    /// objects: `{"columns": [{"name", "type"}], "rows": [[...]],
+    /// "truncated": bool}`.
+    ///
+    /// Unlike `execute`/`fetch_scalar_int` (Postgres-only via the
+    /// `pg_pool()` downcast), this dispatches through the trait-level
+    /// [`Backend::read_arrow_stream`], so it works for every backend
+    /// that implements Arrow streaming (SQLite, DuckDB, MySQL, object
+    /// storage / DataFusion, …). It powers the web SQL-editor
+    /// (`POST /api/query`); read-only enforcement and timeouts are
+    /// applied by the Python caller before this is invoked.
+    ///
+    /// The result is drained inside a single `block_on` (the same
+    /// shape as `cross_backend_arrow_sync`) and converted to Python
+    /// natively (see [`arrow_to_py`]). We deliberately avoid pyarrow /
+    /// `RecordBatch::to_pyarrow`: pyarrow bundles its own mimalloc,
+    /// which corrupts `_core`'s global mimalloc when both live in one
+    /// process (segfaults). `max_rows` caps the result here (Rust);
+    /// pushing `LIMIT` into the engine is a follow-up.
+    #[pyo3(signature = (sql, max_rows=None))]
+    fn query<'py>(
+        &self,
+        py: Python<'py>,
+        sql: String,
+        max_rows: Option<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use arrow_array::RecordBatch;
+        use futures_util::TryStreamExt;
+
+        let backend = self.backend.clone();
+        let batches: Vec<RecordBatch> = py
+            .detach(|| {
+                rt().block_on(async move {
+                    let stream = backend.read_arrow_stream(&sql).await?;
+                    stream.try_collect::<Vec<_>>().await
+                })
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        arrow_to_py::batches_to_py_dict(py, &batches, max_rows.unwrap_or(usize::MAX))
     }
 
     /// Phase 27a: record a transforms_post step in run_history. The

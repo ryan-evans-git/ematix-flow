@@ -1279,10 +1279,46 @@ def main(argv: list[str] | None = None) -> int:
         "Repeatable. Without this flag the UI still works but next-run + DAG "
         "fall back to history-only data.",
     )
+    web_p.add_argument(
+        "--datasource",
+        action="append",
+        default=None,
+        metavar="NAME=URL",
+        help="register a queryable data source for the SQL editor / charts / "
+        "dashboards as NAME=CONNECTION_URL (e.g. "
+        "--datasource warehouse=postgres://user:pass@host/db or "
+        "--datasource local=duckdb:///data.db). Repeatable. Supported schemes: "
+        "postgres:// , mysql:// , sqlite:///<path> , duckdb:///<path>.",
+    )
+    web_p.add_argument(
+        "--analytics-db",
+        default=None,
+        metavar="PATH",
+        help="SQLite file to persist saved queries / charts / dashboards. "
+        "Falls back to $EMATIX_FLOW_ANALYTICS_DB. Without it, those persist "
+        "only in memory and are lost on restart.",
+    )
     web_p.set_defaults(func=_cmd_web)
 
     args = parser.parse_args(argv)
     return args.func(args)
+
+
+def _parse_datasource_specs(specs) -> dict[str, str]:
+    """Parse repeated ``--datasource NAME=URL`` values into a dict,
+    warning on (and skipping) malformed entries."""
+    out: dict[str, str] = {}
+    for spec in specs or []:
+        name, sep, url = spec.partition("=")
+        name, url = name.strip(), url.strip()
+        if not sep or not name or not url:
+            print(
+                f"warning: --datasource {spec!r} is not NAME=URL; ignoring",
+                file=sys.stderr,
+            )
+            continue
+        out[name] = url
+    return out
 
 
 def _cmd_web(args) -> int:
@@ -1343,10 +1379,33 @@ def _cmd_web(args) -> int:
                 "to stub data. SqliteRunLog has the in-tree implementation.",
                 file=sys.stderr,
             )
+    # SQL editor / analytics data sources: --datasource NAME=URL (repeatable).
+    datasources = _parse_datasource_specs(getattr(args, "datasource", None))
+
+    # Persistence for saved queries / charts / dashboards.
+    analytics_store = None
+    analytics_db = getattr(args, "analytics_db", None) or os.environ.get(
+        "EMATIX_FLOW_ANALYTICS_DB"
+    )
+    if analytics_db:
+        try:
+            from ematix_flow.web.analytics_store import AnalyticsStore
+
+            analytics_store = AnalyticsStore(analytics_db)
+        except Exception as exc:
+            print(
+                f"warning: --analytics-db {analytics_db!r} could not be opened "
+                f"({exc!r}); saved queries / charts / dashboards will be "
+                "in-memory only",
+                file=sys.stderr,
+            )
+
     run_server(
         host=args.bind, port=args.port, log_level=args.log_level,
         bearer_token=token,
         history=history,
+        datasources=datasources or None,
+        analytics_store=analytics_store,
     )
     return 0
 
