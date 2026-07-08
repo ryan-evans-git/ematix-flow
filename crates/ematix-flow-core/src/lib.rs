@@ -8,6 +8,8 @@ pub mod ddl;
 pub mod delta_backend;
 /// Central `EMAT_*` env-flag accessors + active-config dump (see `docs/EMAT_FLAGS.md`).
 pub mod flags;
+/// Σ.AI.6 bounded-by-default DataFusion memory pool (`EMAT_MEM_POOL_FRACTION`).
+pub mod mem_pool;
 // Σ.A2 PR 1: SQL dialect translator. Namespaced (`ematix_flow_core::
 // dialect::Dialect`) so it doesn't collide with `backend::Dialect`,
 // which names backend kinds (Postgres / MySQL / Kafka / …) rather

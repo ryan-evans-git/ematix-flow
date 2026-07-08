@@ -300,6 +300,14 @@ pub fn with_optimizer_rules_overridden(
 ) -> (SessionStateBuilder, HarnessHandles) {
     let registry = Arc::new(SharedSubtreeRegistry::new());
     let mut builder = builder;
+    // Σ.AI.6 (2026-07-08): bounded-by-default memory pool — the Q09
+    // SF100 memory-cliff fix (94.3 s unbounded → 6.58 s at 0.7 × RAM
+    // on the 32 GB campaign box; see `crate::mem_pool` module docs).
+    // Applied at THIS choke point so production, harnesses, and
+    // library sessions all get the same bound (bench == release). A
+    // caller-installed RuntimeEnv always wins; `EMAT_MEM_POOL_FRACTION=0`
+    // restores the unbounded legacy.
+    builder = crate::mem_pool::apply_default_memory_pool(builder);
     // Registry-driven rayon global pool (campaign-2026-07-03): sized
     // once per process at session build so the intra-column-chunk page
     // decode fan-out (emat_arrow_reader's rayon par_iter) tracks the
