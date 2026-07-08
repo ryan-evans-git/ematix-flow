@@ -34,11 +34,26 @@ default is fast when RAM suffices and *lethal* when it doesn't.
    spill-tax/livelock shape cannot form: if a spillable consumer spills,
    real RAM frees and the floor un-binds.
 
-Expected SF100 behavior on the 32 GB box under the shipped default:
-flat = unchanged (82.5 s); parted = Q07(±Q09/Q21) fail individually with
-a clear error naming the floor, the other queries bank, the process
-survives. The honest single-node guidance stays "use distributed for
-SF100 parted on 32 GB" — now enforced gracefully instead of by kernel.
+Validation (run6, 2026-07-08, zero-override default build):
+
+- **flat SF100 = zero tax CONFIRMED** — 89.9 s total (unbounded-regime
+  spread 82.5–89.9 across runs 3/4/6), Q10 3.44 s (the refuted cap's
+  57.5 s spill tax absent), Q09 42.2 s (thrash regime, floor never
+  fired, correct rows).
+- **parted SF100 = floor DOES NOT GUARD this path.** The box entered an
+  SSH-starving thrash tar pit (>35 min, no kernel OOM-kill, no floor
+  refusal) — the pressure comes from allocations the DataFusion pool
+  never sees: the ematix decode buffers / rayon decode fan-out under
+  the 8-part union scan are **untracked**, so `try_grow` is never asked
+  and the floor has nothing to hook. Box force-terminated.
+
+Scope conclusion: the floor guards **tracked** consumers (joins, sorts,
+aggregates, repartition buffers — Linux CI pins the 1 TiB refusal) and
+is still the right default; the parted decode path needs **option 3
+(decode-pressure shedding)** below — the shedding hook is exactly the
+missing link between MemAvailable and the untracked decode memory.
+Honest guidance unchanged: distributed is the SF100-parted story on
+32 GB boxes.
 
 ## The paging arc (future — the actual Q09 fix)
 
