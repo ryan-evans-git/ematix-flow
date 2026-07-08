@@ -692,6 +692,54 @@ tick time.
 
 More screenshots + walkthrough: [ematix.dev/specs/04-web-ui-screenshots](https://ematix.dev/specs/04-web-ui-screenshots).
 
+### Analytics — SQL Lab, Charts, Dashboards
+
+Beyond operating pipelines, the UI is a self-service analytics surface
+that runs every query through **ematix's own engine** (Arrow-native,
+no pyarrow/pandas in the request path). Register one or more data
+sources at launch:
+
+```sh
+flow web \
+    --datasource warehouse=postgres://user:pw@host/db \
+    --datasource local=duckdb:///data.duckdb \
+    --analytics-db /var/lib/ematix/analytics.db   # persist saved objects
+```
+
+**SQL Lab** (`#/sql`) — a CodeMirror editor with a live schema browser
+(schemas → tables → columns, click-to-insert), autocomplete, run
+(`⌘⏎`), a typed results grid, and saved queries. Ad-hoc SQL is
+**read-only by default**: only `SELECT` / `WITH` / `EXPLAIN` pass, and
+filesystem / network / cross-DB functions (`read_csv`, `read_parquet`,
+`*_scan`, `ATTACH`, …) are blocked so a query can't escape the
+registered sources. A row cap and per-query timeout bound each run.
+
+![SQL Lab — schema browser, editor, and a typed results grid](docs/screenshots/sql-lab.png)
+
+**Charts** (`#/charts`) — turn a query into a chart: pick a viz type
+(table / big-number / bar / line / area / pie / scatter), map columns
+to encodings, and preview live via Apache ECharts. A no-SQL **Build**
+mode generates the `GROUP BY` for you from a table + dimensions +
+metrics. Charts are saved and reused on dashboards.
+
+![Chart Builder — SQL/Build toggle, viz-type picker, and a live ECharts preview](docs/screenshots/chart-builder.png)
+
+**Dashboards** (`#/dashboards`) — a drag/resize grid of saved charts.
+One batch call runs every tile's query (with a short result cache);
+clicking a bar or slice **cross-filters** the whole board, and a
+drill-down modal shows the underlying rows. Optional auto-refresh.
+
+![Dashboard — drag/resize tiles with a cross-filter bar](docs/screenshots/dashboard.png)
+
+**Auth (RBAC).** Front the app with an SSO proxy and trust its identity
+header to enable role-based access — `viewer` (read), `editor` (read +
+run + edit), `admin` — with objects shared org-wide:
+
+```sh
+flow web --auth-header x-forwarded-email \
+    --auth-group-role analysts=editor --auth-admin lead@you.io
+```
+
 ### Run history
 
 Every run lands in the configured RunLog with a `run_id`, status,
