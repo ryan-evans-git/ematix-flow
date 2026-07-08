@@ -351,7 +351,7 @@ mod tests {
             gib,
             Box::new(move || Some(8 * (1 << 30))),
         ));
-        let mut r = MemoryConsumer::new("healthy").register(&pool);
+        let r = MemoryConsumer::new("healthy").register(&pool);
         assert!(r.try_grow(2 * gib).is_ok(), "plenty available → grow");
         assert_eq!(pool.reserved(), 2 * gib, "reserved tracks grow");
         r.free();
@@ -364,7 +364,7 @@ mod tests {
             gib,
             Box::new(move || Some(gib + gib / 2)),
         ));
-        let mut r = MemoryConsumer::new("pressured").register(&pool);
+        let r = MemoryConsumer::new("pressured").register(&pool);
         let err = r.try_grow(gib).unwrap_err().to_string();
         assert!(
             err.contains("ElasticFloorPool") && err.contains("OOM"),
@@ -380,7 +380,7 @@ mod tests {
         // Unknown availability (sensor None, e.g. macOS): never refuses.
         let pool: std::sync::Arc<dyn MemoryPool> =
             std::sync::Arc::new(ElasticFloorPool::new(gib, Box::new(|| None)));
-        let mut r = MemoryConsumer::new("unknown").register(&pool);
+        let r = MemoryConsumer::new("unknown").register(&pool);
         assert!(
             r.try_grow(1 << 40).is_ok(),
             "unknown availability → unguarded"
