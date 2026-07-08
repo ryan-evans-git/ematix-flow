@@ -598,11 +598,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let p = table_source(&data_dir, table)
             .unwrap_or_else(|| panic!("pre-flight passed but {table} source vanished"));
         if use_fast {
-            let prov =
-                ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider::try_new(
-                    p.to_string_lossy().to_string(),
-                )?;
-            ctx.register_table(*table, Arc::new(prov))?;
+            // Single-node via the ematix codec. `table_source` may hand back a
+            // parts DIRECTORY (parted layout) or a single flat FILE. The
+            // single-file provider (`try_new`) opens one file only, so a parted
+            // dir needs the multi-file provider — which reads every part through
+            // the same ematix codec and unions them (single-node scan
+            // parallelism, no arrow-rs). This is what makes a clean single-node
+            // *parted* measurement possible; before it, parted single-node
+            // could only go through the arrow-rs `register_parquet` path.
+            if p.is_dir() {
+                let prov =
+                    ematix_flow_core::ematix_fast_parquet_multi::EmatixFastParquetMultiTableProvider::try_new_dir(&p)?;
+                ctx.register_table(*table, Arc::new(prov))?;
+            } else {
+                let prov =
+                    ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider::try_new(
+                        p.to_string_lossy().to_string(),
+                    )?;
+                ctx.register_table(*table, Arc::new(prov))?;
+            }
         } else {
             ctx.register_parquet(*table, p.to_str().unwrap(), Default::default())
                 .await?;

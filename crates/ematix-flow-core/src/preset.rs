@@ -300,6 +300,15 @@ pub fn with_optimizer_rules_overridden(
 ) -> (SessionStateBuilder, HarnessHandles) {
     let registry = Arc::new(SharedSubtreeRegistry::new());
     let mut builder = builder;
+    // Σ.AI.6 (2026-07-08): OPT-IN bounded memory pool
+    // (`EMAT_MEM_POOL_FRACTION`, default OFF/unbounded). The 0.7
+    // blanket default was refuted by the full-suite re-bench (flat
+    // SF100 82.5→140.2 s, parted SF100 livelock) after winning the
+    // isolated Q09 A/B — see `crate::mem_pool` module docs. Applied at
+    // THIS choke point so an opted-in deployment behaves identically
+    // in production, harnesses, and library sessions (bench ==
+    // release). A caller-installed RuntimeEnv always wins.
+    builder = crate::mem_pool::apply_default_memory_pool(builder);
     // Registry-driven rayon global pool (campaign-2026-07-03): sized
     // once per process at session build so the intra-column-chunk page
     // decode fan-out (emat_arrow_reader's rayon par_iter) tracks the

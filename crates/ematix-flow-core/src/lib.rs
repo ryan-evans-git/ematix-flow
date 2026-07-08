@@ -8,6 +8,8 @@ pub mod ddl;
 pub mod delta_backend;
 /// Central `EMAT_*` env-flag accessors + active-config dump (see `docs/EMAT_FLAGS.md`).
 pub mod flags;
+/// Σ.AI.6 bounded-by-default DataFusion memory pool (`EMAT_MEM_POOL_FRACTION`).
+pub mod mem_pool;
 // Σ.A2 PR 1: SQL dialect translator. Namespaced (`ematix_flow_core::
 // dialect::Dialect`) so it doesn't collide with `backend::Dialect`,
 // which names backend kinds (Postgres / MySQL / Kafka / …) rather
@@ -97,6 +99,10 @@ pub mod ematix_parquet_bridge;
 // of parquet-rs. Supports primitive columns only; non-primitive
 // callers continue using `FastParquetTableProvider`.
 pub mod ematix_fast_parquet;
+// Single-node multi-file provider — read a directory of Parquet parts as one
+// table through the ematix codec (closes the gap where single-node could only
+// read multi-file via arrow-rs or distribution).
+pub mod ematix_fast_parquet_multi;
 // Σ.E5.1: streaming Arrow `RecordBatch` reader over ematix-parquet.
 // Emits 65 536-row batches sliced from a per-row-group dict-aware
 // decode. Replaces the whole-RG emission of `ematix_parquet_bridge`
