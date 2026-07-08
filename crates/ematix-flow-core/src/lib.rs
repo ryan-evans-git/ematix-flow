@@ -10,6 +10,12 @@ pub mod delta_backend;
 pub mod flags;
 /// Σ.AI.6 bounded-by-default DataFusion memory pool (`EMAT_MEM_POOL_FRACTION`).
 pub mod mem_pool;
+// Σ.AI.6d (2026-07-08): decode-pressure shedding — the scan-side
+// MemAvailable hook for the UNTRACKED decode memory the DataFusion
+// pool floor cannot see (MEMORY_BUDGET.md option 3). Opt-in
+// `EMAT_DECODE_SHED=1`; the 32 GB-box full-suite A/B decides the
+// default.
+pub mod mem_pressure;
 // Σ.A2 PR 1: SQL dialect translator. Namespaced (`ematix_flow_core::
 // dialect::Dialect`) so it doesn't collide with `backend::Dialect`,
 // which names backend kinds (Postgres / MySQL / Kafka / …) rather

@@ -742,6 +742,13 @@ impl EmatPageStreamingReader {
     }
 
     fn open_row_group(&mut self, rg: usize) -> DfResult<()> {
+        // Σ.AI.6d — decode-pressure gate. The page reader's decode
+        // threads run AHEAD of the emit thread, so this permit bounds
+        // RG-open admission (how fast new RG fan-outs start), not the
+        // full decode duration — the deadlock-safe v1 scope: it drops
+        // before any downstream send can block us. Disabled (default)
+        // this is a single OnceLock load.
+        let _shed_permit = crate::mem_pressure::decode_gate_enter();
         // Σ.E5.6: use cached metadata snapshot — no thrift re-parse.
         self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
 
@@ -986,6 +993,12 @@ impl EmatInlineStreamingReader {
     }
 
     fn open_row_group(&mut self, rg: usize) -> DfResult<()> {
+        // Σ.AI.6d — decode-pressure gate. The inline reader decodes
+        // page-by-page inside `next_batch`, so this permit bounds
+        // RG-open admission only (deadlock-safe v1 scope — dropped
+        // before any downstream send). Disabled (default) = one
+        // OnceLock load.
+        let _shed_permit = crate::mem_pressure::decode_gate_enter();
         self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
         let mut streams: Vec<Box<dyn ColumnPageStream>> = Vec::with_capacity(self.projection.len());
         for (i, &leaf) in self.projection.iter().enumerate() {

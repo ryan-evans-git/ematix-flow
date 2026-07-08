@@ -203,6 +203,18 @@ impl RowGroupDecodeCache {
         (inner.hits, inner.misses, inner.bytes_used)
     }
 
+    /// Σ.AI.6d — drop every cached column and return the bytes to the
+    /// allocator (cache-shed action of `mem_pressure::DecodeShedGate`:
+    /// under memory pressure the cache's up-to-1-GiB is page-cache the
+    /// scan working set needs more). Hit/miss counters survive — they
+    /// describe lookup history, not current contents.
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.entries.clear();
+        inner.insertion_order.clear();
+        inner.bytes_used = 0;
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().entries.len()
     }
@@ -1438,6 +1450,14 @@ impl EmatArrowBatchReader {
     }
 
     fn load_row_group(&mut self, rg: usize) -> DfResult<()> {
+        // Σ.AI.6d — decode-pressure gate (opt-in `EMAT_DECODE_SHED=1`).
+        // The eager reader decodes the WHOLE row group synchronously
+        // inside this call, so the permit brackets exactly one RG's
+        // decode-buffer lifetime; it drops before `slice_batch`/send,
+        // so a decode slot is never held while blocked on a downstream
+        // consumer (no cross-scan wait cycles). Disabled (default) this
+        // is a single OnceLock load.
+        let _shed_permit = crate::mem_pressure::decode_gate_enter();
         // L9.ADAPT LATE-ARM — adopt a tight-rescued wrap's published
         // predicates at the row-group boundary. One `is_ready()` read
         // per RG until the build lands; arming merges the predicates
@@ -4347,6 +4367,35 @@ mod tests {
         let _ = read_all_with_rg_cache(&path, schema_three_primitives(), cache.clone());
         // Entry is larger than cap → skipped, cache stays empty.
         assert_eq!(cache.len(), 0);
+    }
+
+    /// Σ.AI.6d — `clear()` (the mem_pressure cache-shed action) empties
+    /// the cache and zeroes bytes_used, and a subsequent read repopulates
+    /// with identical rows (the cache is a pure accelerator).
+    #[test]
+    fn rg_decode_cache_clear_empties_and_repopulates_identically() {
+        let path = tmp_parquet("rg_cache_clear");
+        write_three_primitives(&path, 4096);
+        let cache = std::sync::Arc::new(RowGroupDecodeCache::new());
+
+        let before = read_all_with_rg_cache(&path, schema_three_primitives(), cache.clone());
+        assert!(!cache.is_empty(), "warm read populates the cache");
+
+        cache.clear();
+        assert_eq!(cache.len(), 0, "clear() empties the entries");
+        let (_, _, bytes) = cache.stats();
+        assert_eq!(bytes, 0, "clear() returns every byte");
+
+        let (_, m_before, _) = cache.stats();
+        let after = read_all_with_rg_cache(&path, schema_three_primitives(), cache.clone());
+        let (_, m_after, _) = cache.stats();
+        assert!(m_after > m_before, "post-clear read re-decodes (misses)");
+        assert!(!cache.is_empty(), "post-clear read repopulates");
+        assert_eq!(
+            format!("{before:?}"),
+            format!("{after:?}"),
+            "cleared-and-repopulated rows are identical"
+        );
     }
 
     /// L9.ADAPT LATE-ARM — a tight-rescued wrap's sideband published

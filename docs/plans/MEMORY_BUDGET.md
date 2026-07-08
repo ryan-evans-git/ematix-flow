@@ -1,6 +1,8 @@
 # Memory budget — evidence, what shipped, and the paging arc
 
-Status: **ElasticFloorPool landed (Σ.AI.6c, 2026-07-08)**; per-query paging
+Status: **ElasticFloorPool landed (Σ.AI.6c, 2026-07-08)**;
+**decode-pressure shedding prototype landed (Σ.AI.6d, 2026-07-08 —
+opt-in `EMAT_DECODE_SHED=1`, box A/B pending)**; per-query paging
 = designed, not started. Owner ask: make SF100-class workloads safe and
 eventually fast on memory-tight boxes, with **bench == release** (no
 bench-only settings).
@@ -68,11 +70,25 @@ Candidate designs, in rough order of leverage:
    blast radius without cross-query interference. Needs a session-rebuild
    (or TaskContext override) hook at ematix's `run_query` layer; measure
    plan-cache interaction first.
-3. **Build-side paging shim.** A `MemoryPool` that, when the floor
-   approaches, triggers ematix-side mitigation (drop decode caches,
-   shrink RG-decode fan-out via the partition registry) before refusing —
-   "degrade decode parallelism instead of failing the join". Cheap,
-   composable with (1).
+3. **Decode-pressure shedding.** Status: **prototype landed (Σ.AI.6d,
+   2026-07-08, opt-in `EMAT_DECODE_SHED=1`), box A/B pending.**
+   Design note: instead of a `MemoryPool` shim (the pool never sees the
+   decode side — run6 proved `try_grow` is simply not asked), the gate
+   lives in the decode path itself: `mem_pressure::decode_gate_enter()`
+   is consulted at every row-group-decode entry point (the eager
+   reader's `load_row_group`, both streaming readers' `open_row_group`,
+   and the legacy whole-RG bridge loop). While sensed `MemAvailable` <
+   `EMAT_SHED_AVAILABLE_FRACTION` (0.10) × RAM, a `max(1, cores/4)`
+   semaphore bounds concurrent RG decodes — "degrade decode parallelism
+   instead of tar-pitting the box" — and the Normal→Shed transition
+   clears the RG decode cache once, returning its up-to-1-GiB to the
+   page cache. Healthy path pays one `OnceLock` load (disabled) or the
+   25 ms-cached sensor read + one relaxed atomic load (enabled+Normal):
+   no locks, no syscalls — the refuted blanket-cap's healthy-run tax is
+   structurally excluded. Permits are never held across a downstream
+   send (no cross-scan wait cycles). Counters `shed_gate_entries` /
+   `shed_cache_drops` via `mem_pressure_metrics()`. Default stays OFF
+   until the FULL 22q suite A/B on the 32 GB box decides it.
 
 Decision gate: reassess after the next DataFusion upgrade (spillable
 hash join is on their roadmap); if not landed, prototype (3) then (2),

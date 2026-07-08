@@ -4097,12 +4097,22 @@ fn build_partition_stream(
 
     tokio::task::spawn_blocking(move || {
         for rg in row_groups {
-            let batch_result = match (&filter, late_mat) {
-                (Some(f), true) => {
-                    decode_one_rg_filtered_late_mat(&path_buf, rg, &schema, &projection, f)
+            let batch_result = {
+                // Σ.AI.6d — decode-pressure gate on the legacy whole-RG
+                // bridge path. Scoped so the permit drops BEFORE
+                // `blocking_send`: a decode slot is never held while
+                // blocked on a downstream consumer (no cross-scan wait
+                // cycles). Disabled (default) = one OnceLock load.
+                let _shed_permit = crate::mem_pressure::decode_gate_enter();
+                match (&filter, late_mat) {
+                    (Some(f), true) => {
+                        decode_one_rg_filtered_late_mat(&path_buf, rg, &schema, &projection, f)
+                    }
+                    (Some(f), false) => {
+                        decode_one_rg_filtered(&path_buf, rg, &schema, &projection, f)
+                    }
+                    (None, _) => decode_one_rg(&path_buf, rg, &schema, &projection),
                 }
-                (Some(f), false) => decode_one_rg_filtered(&path_buf, rg, &schema, &projection, f),
-                (None, _) => decode_one_rg(&path_buf, rg, &schema, &projection),
             };
             if tx.blocking_send(batch_result).is_err() {
                 return; // consumer dropped
