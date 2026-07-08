@@ -205,3 +205,26 @@ async fn pg_commit_is_atomic_under_failure() {
         "failed commit must roll back: offsets must NOT be visible"
     );
 }
+
+// ----- DLQ Phase 3: reset (rewind primitive) --------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pg_reset_clears_state_and_replaces_offsets() {
+    let (_c, store) = fresh_store().await;
+    h::run_reset_clears_state_and_replaces_offsets(&store, "p").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pg_reset_leaves_other_pipelines_alone() {
+    let (_c, store) = fresh_store().await;
+    h::run_reset_leaves_other_pipelines_alone(&store, "p1", "p2").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pg_reset_of_unknown_pipeline_writes_offsets() {
+    let (_c, store) = fresh_store().await;
+    h::run_reset_of_unknown_pipeline_writes_offsets(&store, "p").await;
+}

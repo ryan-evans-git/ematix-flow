@@ -1945,6 +1945,75 @@ impl StreamingPipeline {
             })
             .await
     }
+
+    /// DLQ Phase 3: rewind the pipeline's read position to `to`,
+    /// atomically resetting durable state for stateful pipelines.
+    ///
+    /// Orchestration (the pipeline loop must be paused — i.e. not
+    /// currently inside [`Self::run`] — for the duration; the
+    /// caller stops the loop before and resumes it after, which is
+    /// what the Phase 4 API layer does):
+    ///
+    /// 1. **Gate** — a stateful pipeline (`transform.is_stateful()`)
+    ///    hard-errors unless `confirm_state_reset` is `true`:
+    ///    rewinding it destroys accumulated window/session state
+    ///    (it MUST be destroyed, or re-consumed rows would
+    ///    double-count) and the operator has to say so explicitly.
+    /// 2. **Resolve** — [`RewindTarget::Timestamp`] resolves to
+    ///    per-source offset bytes via each backend's
+    ///    [`Backend::offsets_for_timestamp`] (Kafka:
+    ///    `offsets_for_times`; backends without a timestamp index
+    ///    return their typed error). [`RewindTarget::Offset`]
+    ///    carries backend-opaque offset bytes directly and is
+    ///    single-source-only (bytes are per-backend; there is no
+    ///    honest way to apply one blob to N sources).
+    /// 3. **Reset** — when a `state_store` is configured, its
+    ///    [`StateStore::reset`] clears every state blob and
+    ///    REPLACES the committed offsets in ONE transaction.
+    ///    Then the in-memory transform state is cleared
+    ///    ([`BatchTransform::clear_state`]) and the pipeline's
+    ///    watermark bookkeeping is zeroed so the rewound run
+    ///    re-derives watermarks from the re-consumed rows.
+    /// 4. **Seek** — every source backend's [`Backend::seek_to`]
+    ///    is applied with its resolved bytes. Sources that don't
+    ///    support seeking fail the whole rewind up-front (step 2
+    ///    validates before anything mutates).
+    pub async fn rewind(
+        &self,
+        to: RewindTarget,
+        confirm_state_reset: bool,
+    ) -> Result<RewindReport, BackendError> {
+        let _ = (to, confirm_state_reset);
+        Err(BackendError::Other(
+            "StreamingPipeline::rewind is not implemented yet (DLQ Phase 3)".into(),
+        ))
+    }
+}
+
+/// DLQ Phase 3: where a rewind seeks the pipeline's sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewindTarget {
+    /// Backend-opaque offset bytes (the same encoding
+    /// [`Backend::offset_snapshot`] / [`Backend::seek_to`] round-
+    /// trip). Single-source pipelines only.
+    Offset(Vec<u8>),
+    /// Wall-clock timestamp, milliseconds since the Unix epoch,
+    /// passed in by the caller (house convention — the library
+    /// never reads a clock). Resolved per source via
+    /// [`Backend::offsets_for_timestamp`].
+    Timestamp(i64),
+}
+
+/// DLQ Phase 3: what a completed rewind actually did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RewindReport {
+    /// `(source query, resolved offset bytes)` per source, in
+    /// `sources` order — the positions the pipeline will resume
+    /// from.
+    pub sources: Vec<(String, Vec<u8>)>,
+    /// Whether transform + store state was cleared (stateful
+    /// pipelines only).
+    pub state_cleared: bool,
 }
 
 /// Phase 36j.2: Kafka→Kafka exactly-once pipeline. Bundles the
@@ -4702,6 +4771,612 @@ mod tests {
                 assert!(
                     topic.replay_requires_serialization(),
                     "process-local group-offset lease → replays must serialize"
+                );
+            }
+        }
+
+        // --- DLQ Phase 3: rewind (offset/timestamp, atomic state reset) ---
+        //
+        // TDD note: this suite was committed FIRST, red, against a
+        // `rewind` stub that returns an "unimplemented" error — same
+        // discipline as Phases 1–2.
+
+        mod rewind {
+            use super::*;
+            use crate::state_store::{InMemoryStateStore, StateStore};
+            use crate::transform::BatchTransform;
+            use crate::windowed::{
+                AggKind, AggregationSpec, LateDataPolicy, WindowConfig, WindowKind,
+                WindowedAggregateTransform,
+            };
+            use arrow_array::types::{Int64Type, TimestampMicrosecondType};
+            use arrow_array::{Int64Array, TimestampMicrosecondArray};
+            use arrow_schema::TimeUnit;
+
+            /// A seekable scripted backend for rewind tests: source
+            /// side replays `data[cursor..limit]` one batch per
+            /// read; target side captures written batches whole.
+            /// Offset bytes are the JSON-encoded cursor index —
+            /// backend-opaque, per the `offset_snapshot`/`seek_to`
+            /// contract.
+            struct SeekableBackend {
+                label: String,
+                data: Vec<RecordBatch>,
+                cursor: Mutex<usize>,
+                /// Reads past this index report "no data" — lets a
+                /// test end a run mid-stream (open windows) and
+                /// release more data for the rewound run.
+                limit: Mutex<usize>,
+                captured: Mutex<Vec<RecordBatch>>,
+            }
+
+            impl SeekableBackend {
+                fn new(label: &str, data: Vec<RecordBatch>) -> Self {
+                    let limit = data.len();
+                    Self {
+                        label: label.into(),
+                        data,
+                        cursor: Mutex::new(0),
+                        limit: Mutex::new(limit),
+                        captured: Mutex::new(Vec::new()),
+                    }
+                }
+
+                fn target(label: &str) -> Self {
+                    Self::new(label, Vec::new())
+                }
+
+                fn set_limit(&self, limit: usize) {
+                    *self.limit.lock().unwrap() = limit;
+                }
+
+                fn cursor(&self) -> usize {
+                    *self.cursor.lock().unwrap()
+                }
+
+                fn captured(&self) -> Vec<RecordBatch> {
+                    self.captured.lock().unwrap().clone()
+                }
+
+                fn encode(idx: usize) -> Vec<u8> {
+                    serde_json::to_vec(&idx).unwrap()
+                }
+
+                fn decode(bytes: &[u8]) -> usize {
+                    serde_json::from_slice(bytes).unwrap()
+                }
+            }
+
+            #[async_trait]
+            impl Backend for SeekableBackend {
+                fn dialect(&self) -> Dialect {
+                    Dialect::Postgres
+                }
+                fn connection_info(&self) -> ConnectionInfo {
+                    ConnectionInfo {
+                        host: self.label.clone(),
+                        port: 0,
+                        dbname: self.label.clone(),
+                        user: "test".into(),
+                    }
+                }
+                fn dsn(&self) -> Option<String> {
+                    None
+                }
+                async fn ping(&self) -> Result<(), BackendError> {
+                    Ok(())
+                }
+                async fn execute(&self, _statement: &str) -> Result<u64, BackendError> {
+                    Ok(0)
+                }
+                async fn read_arrow_stream(
+                    &self,
+                    _query: &str,
+                ) -> Result<ArrowBatchStream, BackendError> {
+                    let limit = *self.limit.lock().unwrap();
+                    let mut cursor = self.cursor.lock().unwrap();
+                    let next: Vec<RecordBatch> = if *cursor < limit.min(self.data.len()) {
+                        let b = self.data[*cursor].clone();
+                        *cursor += 1;
+                        vec![b]
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Box::pin(futures_util::stream::iter(
+                        next.into_iter().map(Ok),
+                    )))
+                }
+                async fn write_arrow_stream(
+                    &self,
+                    _target: &TargetTable,
+                    stream: ArrowBatchStream,
+                    _mode: WriteMode,
+                ) -> Result<u64, BackendError> {
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    let n: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+                    self.captured.lock().unwrap().extend(batches);
+                    Ok(n)
+                }
+                async fn run_append(
+                    &self,
+                    _spec: &crate::types::TableSpec,
+                    _source_query: &str,
+                    _pipeline_name: &str,
+                    _source_backend: Option<&dyn Backend>,
+                    _incremental_column: Option<&str>,
+                    _last_value_literal: Option<&str>,
+                    _dry_run: bool,
+                ) -> Result<StrategyRunResult, BackendError> {
+                    unreachable!("SeekableBackend::run_append")
+                }
+                async fn run_truncate(
+                    &self,
+                    _spec: &crate::types::TableSpec,
+                    _source_query: &str,
+                    _pipeline_name: &str,
+                    _source_backend: Option<&dyn Backend>,
+                    _dry_run: bool,
+                ) -> Result<StrategyRunResult, BackendError> {
+                    unreachable!("SeekableBackend::run_truncate")
+                }
+                async fn run_merge(
+                    &self,
+                    _spec: &crate::types::TableSpec,
+                    _source_query: &str,
+                    _keys: &[String],
+                    _update_columns: &[String],
+                    _pipeline_name: &str,
+                    _mode_label: &str,
+                    _source_backend: Option<&dyn Backend>,
+                    _delete_handling: Option<crate::backend::DeleteHandling>,
+                    _dry_run: bool,
+                ) -> Result<StrategyRunResult, BackendError> {
+                    unreachable!("SeekableBackend::run_merge")
+                }
+                async fn run_scd2(
+                    &self,
+                    _spec: &crate::types::TableSpec,
+                    _source_query: &str,
+                    _keys: &[String],
+                    _compare_columns: &[String],
+                    _pipeline_name: &str,
+                    _source_backend: Option<&dyn Backend>,
+                    _delete_handling: Option<crate::backend::DeleteHandling>,
+                    _event_timestamp_column: Option<&str>,
+                    _ttl_seconds: Option<i64>,
+                    _dry_run: bool,
+                ) -> Result<StrategyRunResult, BackendError> {
+                    unreachable!("SeekableBackend::run_scd2")
+                }
+                fn supports_seek_to(&self) -> bool {
+                    true
+                }
+                async fn seek_to(&self, offset_bytes: &[u8]) -> Result<(), BackendError> {
+                    *self.cursor.lock().unwrap() = Self::decode(offset_bytes);
+                    Ok(())
+                }
+                async fn offset_snapshot(&self) -> Result<Option<Vec<u8>>, BackendError> {
+                    Ok(Some(Self::encode(*self.cursor.lock().unwrap())))
+                }
+                /// First batch whose max `_event_ts` is ≥ `ts_ms` —
+                /// the same "earliest offset at-or-after t" contract
+                /// Kafka's `offsets_for_times` implements.
+                async fn offsets_for_timestamp(
+                    &self,
+                    _query: &str,
+                    ts_ms: i64,
+                ) -> Result<Vec<u8>, BackendError> {
+                    let ts_us = ts_ms * 1_000;
+                    let idx = self
+                        .data
+                        .iter()
+                        .position(|b| batch_max_event_ts(b).is_some_and(|t| t >= ts_us))
+                        .unwrap_or(self.data.len());
+                    Ok(Self::encode(idx))
+                }
+            }
+
+            /// One-row batch carrying (g, v, _event_ts).
+            fn event_batch(g: i64, v: i64, ts_us: i64) -> RecordBatch {
+                let schema = Schema::new(vec![
+                    Field::new("g", DataType::Int64, false),
+                    Field::new("v", DataType::Int64, true),
+                    Field::new(
+                        "_event_ts",
+                        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                        false,
+                    ),
+                ]);
+                RecordBatch::try_new(
+                    Arc::new(schema),
+                    vec![
+                        Arc::new(Int64Array::from(vec![g])),
+                        Arc::new(Int64Array::from(vec![Some(v)])),
+                        Arc::new(TimestampMicrosecondArray::from(vec![ts_us]).with_timezone("UTC")),
+                    ],
+                )
+                .unwrap()
+            }
+
+            /// Tumbling 1s window over `g`, summing `v` as `total`.
+            fn tumbling_config() -> WindowConfig {
+                WindowConfig {
+                    kind: WindowKind::Tumbling,
+                    duration_ms: 1_000,
+                    hop_ms: 1_000,
+                    gap_ms: None,
+                    max_session_duration_ms: None,
+                    event_time_column: "_event_ts".into(),
+                    group_by: vec!["g".into()],
+                    aggregations: vec![AggregationSpec::new(
+                        AggKind::Sum,
+                        Some("v".into()),
+                        "total",
+                    )],
+                    late_data: LateDataPolicy::Drop,
+                    max_groups_per_window: 100,
+                    window_start_column: "window_start".into(),
+                    window_end_column: "window_end".into(),
+                    session_id_column: "session_id".into(),
+                }
+            }
+
+            /// Extract (window_start_us, total) pairs from captured
+            /// windowed-output batches, sorted for comparison.
+            fn window_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+                let mut rows = Vec::new();
+                for b in batches {
+                    let ws = b
+                        .column_by_name("window_start")
+                        .expect("window_start column")
+                        .as_primitive::<TimestampMicrosecondType>();
+                    let total = b
+                        .column_by_name("total")
+                        .expect("total column")
+                        .as_primitive::<Int64Type>();
+                    for i in 0..b.num_rows() {
+                        rows.push((ws.value(i), total.value(i)));
+                    }
+                }
+                rows.sort_unstable();
+                rows
+            }
+
+            /// Run `pipeline` until its source drains + idles, then
+            /// shut down.
+            async fn run_until_idle(pipeline: &StreamingPipeline) {
+                let (sig, trigger) = ShutdownSignal::new();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    trigger.trigger();
+                });
+                pipeline.run(sig).await.expect("pipeline run");
+            }
+
+            /// The Phase 3 gate: a stateful (windowed) pipeline
+            /// refuses to rewind without `confirm_state_reset` —
+            /// hard error, nothing mutated.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn stateful_rewind_requires_confirm_state_reset() {
+                let source = Arc::new(SeekableBackend::new(
+                    "src",
+                    vec![event_batch(1, 1, 500_000)],
+                ));
+                let target = Arc::new(SeekableBackend::target("tgt"));
+                let table = TargetTable {
+                    schema: "".into(),
+                    name: "out".into(),
+                };
+                let transform: Arc<dyn BatchTransform> =
+                    Arc::new(WindowedAggregateTransform::new(tumbling_config(), None).unwrap());
+                let cfg = StreamingPipelineConfig::new("q", table.clone(), "rw-gate")
+                    .with_transform(transform)
+                    .with_watermark(WatermarkConfig::default());
+                let pipeline = StreamingPipeline::new(
+                    Arc::clone(&source) as Arc<dyn Backend>,
+                    vec![(target as Arc<dyn Backend>, table)],
+                    cfg,
+                );
+
+                let err = pipeline
+                    .rewind(RewindTarget::Offset(SeekableBackend::encode(0)), false)
+                    .await
+                    .expect_err("stateful rewind without confirmation must hard-error");
+                assert!(
+                    err.to_string().contains("confirm_state_reset"),
+                    "error must name the missing confirmation flag: {err}"
+                );
+                assert_eq!(source.cursor(), 0, "nothing seeked on the refused rewind");
+            }
+
+            /// Stateless rewind (plan exit criterion): seek lands,
+            /// the state store's offsets are REPLACED, and the
+            /// rewound run re-consumes from the target offset.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn stateless_rewind_replays_from_offset() {
+                let data = vec![
+                    event_batch(1, 10, 500_000),
+                    event_batch(1, 20, 1_500_000),
+                    event_batch(1, 30, 2_500_000),
+                ];
+                let source = Arc::new(SeekableBackend::new("src", data));
+                let target = Arc::new(SeekableBackend::target("tgt"));
+                let table = TargetTable {
+                    schema: "".into(),
+                    name: "out".into(),
+                };
+                let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+                let cfg = StreamingPipelineConfig::new("q", table.clone(), "rw-stateless")
+                    .with_state_store(Arc::clone(&store));
+                let pipeline = StreamingPipeline::new(
+                    Arc::clone(&source) as Arc<dyn Backend>,
+                    vec![(Arc::clone(&target) as Arc<dyn Backend>, table)],
+                    cfg,
+                );
+
+                run_until_idle(&pipeline).await;
+                assert_eq!(source.cursor(), 3, "first run drained the script");
+                assert_eq!(target.captured().len(), 3);
+
+                // Rewind to batch 1. Stateless → no confirmation needed.
+                let report = pipeline
+                    .rewind(RewindTarget::Offset(SeekableBackend::encode(1)), false)
+                    .await
+                    .expect("stateless rewind");
+                assert_eq!(
+                    report.sources,
+                    vec![("q".to_string(), SeekableBackend::encode(1))]
+                );
+                assert!(!report.state_cleared, "no stateful transform to clear");
+                assert_eq!(source.cursor(), 1, "seek applied");
+
+                // The durable offsets were replaced in the store —
+                // a restart would also resume from the rewound spot.
+                let recovered = store.load("rw-stateless").await.unwrap();
+                assert_eq!(
+                    recovered.offsets.get("q").map(|v| v.as_slice()),
+                    Some(SeekableBackend::encode(1).as_slice()),
+                    "state store offsets replaced by the rewind"
+                );
+
+                // Rewound run re-delivers batches 1..3.
+                run_until_idle(&pipeline).await;
+                assert_eq!(
+                    target.captured().len(),
+                    5,
+                    "two batches re-consumed after the rewind"
+                );
+            }
+
+            /// Rewind-equivalence (plan exit criterion): on a
+            /// windowed pipeline, rewind-to-T then run ≡ a fresh
+            /// pipeline started at T. The first run is cut
+            /// mid-stream so an open window holds accumulator state
+            /// — if rewind failed to clear it, the re-consumed rows
+            /// would double-count and the outputs would diverge.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn rewind_equivalence_windowed() {
+                // b0..b3 in 1s windows w0..w3; the flush batch (1h
+                // later) closes every open window deterministically.
+                let data = vec![
+                    event_batch(1, 10, 500_000),
+                    event_batch(1, 20, 1_500_000),
+                    event_batch(1, 30, 2_500_000),
+                    event_batch(1, 40, 3_500_000),
+                    event_batch(1, 0, 3_600_000_000),
+                ];
+
+                fn build(
+                    name: &str,
+                    data: Vec<RecordBatch>,
+                ) -> (
+                    Arc<SeekableBackend>,
+                    Arc<SeekableBackend>,
+                    StreamingPipeline,
+                ) {
+                    let source = Arc::new(SeekableBackend::new("q", data));
+                    let target = Arc::new(SeekableBackend::target("tgt"));
+                    let table = TargetTable {
+                        schema: "".into(),
+                        name: "out".into(),
+                    };
+                    let transform: Arc<dyn crate::transform::BatchTransform> =
+                        Arc::new(WindowedAggregateTransform::new(tumbling_config(), None).unwrap());
+                    let store: Arc<dyn crate::state_store::StateStore> =
+                        Arc::new(crate::state_store::InMemoryStateStore::new());
+                    let cfg = StreamingPipelineConfig::new("q", table.clone(), name)
+                        .with_transform(transform)
+                        .with_watermark(WatermarkConfig::default())
+                        .with_state_store(store);
+                    let p = StreamingPipeline::new(
+                        Arc::clone(&source) as Arc<dyn Backend>,
+                        vec![(Arc::clone(&target) as Arc<dyn Backend>, table)],
+                        cfg,
+                    );
+                    (source, target, p)
+                }
+
+                // P1: consume b0..b3 only (flush withheld) so w3
+                // stays open with v=40 accumulated in memory.
+                let (src1, tgt1, p1) = build("rw-eq", data.clone());
+                src1.set_limit(4);
+                run_until_idle(&p1).await;
+                let first_run_rows = window_rows(&tgt1.captured());
+                assert_eq!(
+                    first_run_rows,
+                    vec![(0, 10), (1_000_000, 20), (2_000_000, 30)],
+                    "w0..w2 emitted; w3 still open when the run stopped"
+                );
+
+                // Rewind P1 to T = 2000ms → resolves to b2 (first
+                // event ≥ T). Stateful → confirmation required.
+                src1.set_limit(5);
+                let report = p1
+                    .rewind(RewindTarget::Timestamp(2_000), true)
+                    .await
+                    .expect("stateful rewind with confirmation");
+                assert!(report.state_cleared);
+                assert_eq!(src1.cursor(), 2, "seeked to first event ≥ T");
+                run_until_idle(&p1).await;
+                let rewound_rows_all = window_rows(&tgt1.captured());
+                let rewound_rows: Vec<(i64, i64)> =
+                    rewound_rows_all[first_run_rows.len()..].to_vec();
+
+                // P2: fresh pipeline, fresh transform + store, source
+                // seeked straight to b2 — a genuine start-at-T.
+                let (src2, tgt2, p2) = build("rw-eq-fresh", data);
+                (src2.as_ref() as &dyn Backend)
+                    .seek_to(&SeekableBackend::encode(2))
+                    .await
+                    .unwrap();
+                run_until_idle(&p2).await;
+                let fresh_rows = window_rows(&tgt2.captured());
+
+                assert_eq!(
+                    rewound_rows, fresh_rows,
+                    "rewind-to-T output must equal fresh-start-at-T output; \
+                     a divergence means leftover window state double-counted"
+                );
+                // And the discriminating value: w3 = 40 exactly once.
+                assert_eq!(
+                    fresh_rows,
+                    vec![(2_000_000, 30), (3_000_000, 40)],
+                    "w2 + w3 emit exactly their own rows"
+                );
+            }
+
+            /// Timestamp rewind resolves per source — each backend
+            /// maps T through its own event timeline.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn rewind_timestamp_resolves_per_source() {
+                let a = Arc::new(SeekableBackend::new(
+                    "a",
+                    vec![
+                        event_batch(1, 1, 500_000),
+                        event_batch(1, 2, 1_500_000),
+                        event_batch(1, 3, 2_500_000),
+                    ],
+                ));
+                let b = Arc::new(SeekableBackend::new(
+                    "b",
+                    vec![event_batch(2, 1, 2_200_000), event_batch(2, 2, 2_900_000)],
+                ));
+                let target = Arc::new(SeekableBackend::target("tgt"));
+                let table = TargetTable {
+                    schema: "".into(),
+                    name: "out".into(),
+                };
+                let cfg = StreamingPipelineConfig::new("unused", table.clone(), "rw-multi");
+                let pipeline = StreamingPipeline::new_multi_source(
+                    vec![
+                        (Arc::clone(&a) as Arc<dyn Backend>, "qa".into()),
+                        (Arc::clone(&b) as Arc<dyn Backend>, "qb".into()),
+                    ],
+                    vec![(target as Arc<dyn Backend>, table)],
+                    cfg,
+                );
+                // Pretend both sources were fully consumed.
+                (a.as_ref() as &dyn Backend)
+                    .seek_to(&SeekableBackend::encode(3))
+                    .await
+                    .unwrap();
+                (b.as_ref() as &dyn Backend)
+                    .seek_to(&SeekableBackend::encode(2))
+                    .await
+                    .unwrap();
+
+                let report = pipeline
+                    .rewind(RewindTarget::Timestamp(2_000), false)
+                    .await
+                    .expect("timestamp rewind");
+                assert_eq!(a.cursor(), 2, "source a: first event ≥ 2000ms is index 2");
+                assert_eq!(b.cursor(), 0, "source b: first event ≥ 2000ms is index 0");
+                assert_eq!(report.sources.len(), 2);
+                assert_eq!(report.sources[0].0, "qa");
+                assert_eq!(report.sources[1].0, "qb");
+            }
+
+            /// Offset bytes are backend-opaque — applying one blob
+            /// to N sources would be dishonest. Typed rejection.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn rewind_offset_bytes_rejected_for_multi_source() {
+                let a = Arc::new(SeekableBackend::new("a", vec![event_batch(1, 1, 1)]));
+                let b = Arc::new(SeekableBackend::new("b", vec![event_batch(2, 1, 1)]));
+                let target = Arc::new(SeekableBackend::target("tgt"));
+                let table = TargetTable {
+                    schema: "".into(),
+                    name: "out".into(),
+                };
+                let cfg = StreamingPipelineConfig::new("unused", table.clone(), "rw-multi-off");
+                let pipeline = StreamingPipeline::new_multi_source(
+                    vec![
+                        (a as Arc<dyn Backend>, "qa".into()),
+                        (b as Arc<dyn Backend>, "qb".into()),
+                    ],
+                    vec![(target as Arc<dyn Backend>, table)],
+                    cfg,
+                );
+                let err = pipeline
+                    .rewind(RewindTarget::Offset(SeekableBackend::encode(0)), false)
+                    .await
+                    .expect_err("offset rewind on a multi-source pipeline");
+                assert!(
+                    err.to_string().contains("single-source"),
+                    "typed error names the single-source constraint: {err}"
+                );
+            }
+
+            /// A source that can't seek fails the rewind up-front —
+            /// silently skipping it would leave the pipeline
+            /// straddling two positions.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn rewind_errors_when_source_lacks_seek_to() {
+                let source = Arc::new(TestBackend::new("src"));
+                let target = Arc::new(TestBackend::new("tgt"));
+                let table = TargetTable {
+                    schema: "".into(),
+                    name: "out".into(),
+                };
+                let cfg = StreamingPipelineConfig::new("q", table.clone(), "rw-noseek");
+                let pipeline = StreamingPipeline::new(
+                    source as Arc<dyn Backend>,
+                    vec![(target as Arc<dyn Backend>, table)],
+                    cfg,
+                );
+                let err = pipeline
+                    .rewind(RewindTarget::Offset(vec![0]), false)
+                    .await
+                    .expect_err("non-seekable source must fail the rewind");
+                assert!(
+                    err.to_string().contains("seek_to"),
+                    "error names the missing capability: {err}"
+                );
+            }
+
+            /// Timestamp rewind on a backend without a timestamp
+            /// index surfaces the typed default error (Kinesis/SQL
+            /// precedent: typed-Unsupported, not a silent fallback).
+            #[tokio::test(flavor = "multi_thread")]
+            async fn rewind_timestamp_typed_error_on_unsupported_backend() {
+                let source = Arc::new(TestBackend::new("src"));
+                let target = Arc::new(TestBackend::new("tgt"));
+                let table = TargetTable {
+                    schema: "".into(),
+                    name: "out".into(),
+                };
+                let cfg = StreamingPipelineConfig::new("q", table.clone(), "rw-nots");
+                let pipeline = StreamingPipeline::new(
+                    source as Arc<dyn Backend>,
+                    vec![(target as Arc<dyn Backend>, table)],
+                    cfg,
+                );
+                let err = pipeline
+                    .rewind(RewindTarget::Timestamp(1_000), false)
+                    .await
+                    .expect_err("timestamp resolution unsupported");
+                assert!(
+                    err.to_string().contains("timestamp"),
+                    "typed error mentions timestamp resolution: {err}"
                 );
             }
         }

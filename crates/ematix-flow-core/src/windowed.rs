@@ -4902,6 +4902,96 @@ mod tests {
         assert!(deletes.is_empty());
     }
 
+    // ----- DLQ Phase 3: rewind hooks (is_stateful / clear_state) -----
+
+    /// Every window kind accumulates cross-batch state, so the
+    /// rewind orchestration must demand `confirm_state_reset` for
+    /// any windowed pipeline.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn windowed_transform_reports_stateful() {
+        use crate::transform::BatchTransform;
+        let tumbling = WindowedAggregateTransform::new(basic_config(), None).unwrap();
+        assert!(
+            BatchTransform::is_stateful(&tumbling),
+            "tumbling windows hold open accumulators across batches"
+        );
+        let session = WindowedAggregateTransform::new(session_config_for_test(), None).unwrap();
+        assert!(BatchTransform::is_stateful(&session));
+    }
+
+    /// `clear_state` wipes session state entirely: no pending
+    /// commit rows, and nothing emits once the watermark passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clear_state_discards_sessions_and_dirty_keys() {
+        use crate::transform::BatchTransform;
+        let t = WindowedAggregateTransform::new(session_config_for_test(), None).unwrap();
+        let b = batch_event(vec![1, 2], vec![Some(10), Some(20)], vec![5, 5]);
+        let _ = t
+            .transform(
+                b,
+                &BatchContext {
+                    global_wm: Some(0),
+                    source_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        BatchTransform::clear_state(&t).await.unwrap();
+
+        let (upserts, deletes) = t.take_state_commit().await.unwrap();
+        assert!(
+            upserts.is_empty() && deletes.is_empty(),
+            "clear_state wipes dirty/evicted tracking"
+        );
+        let out = t
+            .on_idle_tick(&BatchContext {
+                global_wm: Some(50_000),
+                source_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(out.is_empty(), "cleared sessions never emit");
+    }
+
+    /// `clear_state` also drops open tumbling/hopping windows — a
+    /// rewound pipeline re-consumes their rows, so leftover
+    /// accumulators would double-count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clear_state_discards_open_tumbling_windows() {
+        use crate::transform::BatchTransform;
+        let t = WindowedAggregateTransform::new(basic_config(), None).unwrap();
+        let b = batch_event(vec![1], vec![Some(10)], vec![1_000_000]);
+        let out = t
+            .transform(
+                b,
+                &BatchContext {
+                    global_wm: Some(0),
+                    source_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(out.is_empty(), "window still open");
+
+        BatchTransform::clear_state(&t).await.unwrap();
+
+        // Watermark passes the window end — nothing to emit.
+        let empty = batch_event(vec![], vec![], vec![]);
+        let out = t
+            .transform(
+                empty,
+                &BatchContext {
+                    global_wm: Some(60_000_000),
+                    source_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 0, "cleared windows never emit");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn session_max_groups_cap_fails_loud() {
         let mut cfg = session_config_for_test();
