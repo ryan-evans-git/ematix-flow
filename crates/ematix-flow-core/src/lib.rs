@@ -99,6 +99,11 @@ pub mod ematix_parquet_bridge;
 pub mod ematix_fast_parquet;
 // feat/sidecar-indexes Phase 1: read-side sidecar (`.parquet.idx`) lookups.
 pub mod sidecar_index;
+// feat/sidecar-indexes Phase I.3: Iceberg manifest-level file pruning for the
+// mesh coordinator. Off by default; needs `--features iceberg` (pulls
+// iceberg-rust). Combines with `sidecar_index` for the SF1000 pruning stack.
+#[cfg(feature = "iceberg")]
+pub mod iceberg_scan;
 // Σ.E5.1: streaming Arrow `RecordBatch` reader over ematix-parquet.
 // Emits 65 536-row batches sliced from a per-row-group dict-aware
 // decode. Replaces the whole-RG emission of `ematix_parquet_bridge`

@@ -42,9 +42,19 @@ treat Iceberg as an optional later phase.**
 flow-core already depends on `ematix-parquet-codec = "0.17"`. The index API
 (`ematix_parquet_codec::index::{IndexBuilder, ParquetIndex, Tokenizer}`) is in
 the published 0.17 (`pub mod index` on `release/v0.17.0`). No ematix-parquet
-release is needed for phases 1–3. (Iceberg phase would add the `ematix-iceberg`
-crate + an async `ParquetIndex` opener that ematix-parquet still has as
-"planned.")
+release is needed for phases 1–3.
+
+**Iceberg is also buildable today** (scouted 2026-07-07, verdict revised — it is
+*not* "planned"): `ematix-iceberg` v0.17.0 is a published, feature-gated
+(`--features iceberg`, off by default) workspace crate wrapping iceberg-rust 0.6.
+It ships and end-to-end tests the full read path — `collect_data_files(table)`
+(async), `prune_data_files_eq` / `prune_data_files_range` (conservative,
+never a false-negative skip), `pair_with_extensions`, `resolve_sidecar_uri` —
+and the write path (`attach_extension`, `encode_key_metadata` stamp the
+per-index `(min_key, max_key)` summary + relative sidecar path into
+`DataFile.key_metadata`). The **only** missing piece is an *async*
+`ParquetIndex` opener for S3 sidecars; MVP workaround is sync
+`ParquetIndex::open` under `spawn_blocking` on `file://`-stripped paths.
 
 ## Integration points (from `ematix-parquet/docs/ematix-flow-integration.md`)
 
@@ -96,9 +106,43 @@ crate + an async `ParquetIndex` opener that ematix-parquet still has as
   against a source with and without a sidecar; report the speedup and the
   selectivity crossover. Single-node first; distributed/Iceberg later.
 
-### Phase 6 (optional, deferred) — Iceberg table-level pruning
-- Add `ematix-iceberg` behind `--features iceberg`; manifest-summary pruning
-  before opening sidecars; write-side manifest stamping.
+### Phase 6 — Iceberg table-level pruning (IN SCOPE, owner request 2026-07-07)
+
+Promoted from "optional/deferred" to a first-class track: combine manifest-level
+file pruning with the per-file sidecar for the SF1000 goal. Buildable today
+against `ematix-iceberg` v0.17.0 (see Dependency status). The real gap on the
+flow side is that **no multi-file TableProvider exists** — this track builds it,
+and makes its file-enumeration step a manifest prune.
+
+- **I.1 — feature scaffold.** Add optional `ematix-iceberg` dep + `iceberg`
+  feature to `ematix-flow-core` (off by default; keeps the PyPI wheel lean and
+  matches the parquet side). Compile-gate a new `iceberg` module. No behavior yet.
+- **I.2 — single-node `IcebergTableProvider` (MVP).** A DataFusion
+  `TableProvider` that opens an Iceberg table, `collect_data_files`, prunes by
+  the pushed predicate (`prune_data_files_eq/range`), pairs survivors with
+  sidecar URIs, and builds an `ExecutionPlan` over the surviving files — reusing
+  the existing single-file `EmatixFastParquetExec` + `BridgeFilter` +
+  `compute_scan_rg_assignments` machinery (files become transparent RG
+  containers). Sidecar row-level lookup layers in the Phase 1 primitive. Sync
+  opener under `spawn_blocking` for now.
+  - Tests: oracle (Iceberg-pruned result == full-scan result) on a fixture table
+    with 3 non-overlapping files; a predicate that prunes to 1 file skips the
+    other two (assert via a scan-count metric); no-sidecar file still full-scans.
+- **I.3 — distributed manifest prune → fan-out.** Move the prune to the mesh
+  **coordinator**: run `collect_data_files` + prune once, emit WorkUnits carrying
+  only surviving files (extend `Input::ParquetPartition` with an explicit file
+  list, or add `Input::IcebergScan`). This is the compounding win — the mesh
+  starts with a strictly smaller task set.
+- **I.4 — write-side manifest stamping.** When flow writes an Iceberg table,
+  emit a sidecar per data file (Phase 2) and `attach_extension` the summary +
+  sidecar path into each `DataFile.key_metadata`.
+- **I.5 — async sidecar opener (ematix-parquet ask).** Only true blocker for
+  fully-async S3 SF1000: an async `ParquetIndex` opener over `object_store`.
+  File as a cross-repo request; the `spawn_blocking` path unblocks everything up
+  to this.
+
+Milestone target: prove manifest-prune + sidecar + fan-out on the parted TPC-H
+layout (SF100 first, SF1000 once data-gen is affordable).
 
 ## Decisions (owner, 2026-07-07)
 
