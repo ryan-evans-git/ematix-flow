@@ -1,6 +1,7 @@
 <script>
   import { onMount } from "svelte";
   import SqlEditor from "../lib/SqlEditor.svelte";
+  import { me, can } from "../lib/session.js";
   import {
     listDatasources,
     listSchemas,
@@ -30,6 +31,9 @@
 
   let savedQueries = [];
   let catalogError = "";
+
+  $: canQuery = can($me, "query");
+  $: canWrite = can($me, "write");
 
   onMount(async () => {
     try {
@@ -207,10 +211,10 @@
 
   <section class="main">
     <div class="toolbar">
-      <button class="run" on:click={run} disabled={running || !datasourceId}>
+      <button class="run" on:click={run} disabled={running || !datasourceId || !canQuery} title={canQuery ? "" : "Requires the query permission"}>
         {running ? "Running…" : "▶ Run"} <kbd>⌘⏎</kbd>
       </button>
-      <button class="secondary" on:click={save} disabled={!datasourceId}>Save</button>
+      <button class="secondary" on:click={save} disabled={!datasourceId || !canWrite} title={canWrite ? "" : "Requires the write permission"}>Save</button>
       <span class="spacer"></span>
       <label class="rows">
         Limit

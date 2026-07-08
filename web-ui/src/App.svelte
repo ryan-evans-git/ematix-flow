@@ -8,6 +8,7 @@
   import SqlLab from "./routes/SqlLab.svelte";
   import ChartBuilder from "./routes/ChartBuilder.svelte";
   import Dashboards from "./routes/Dashboards.svelte";
+  import { me, loadMe } from "./lib/session.js";
 
   // Hash-based router. v0.5.1 nav model:
   //   #/workflows      → top-level grouping of jobs (default)
@@ -56,6 +57,7 @@
 
   onMount(() => {
     theme = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+    loadMe();
     window.addEventListener("hashchange", () => {
       route = parseHash(window.location.hash);
     });
@@ -85,6 +87,11 @@
     <a href="#/charts" class:active={chartsActive}>Charts</a>
     <a href="#/dashboards" class:active={dashboardsActive}>Dashboards</a>
     <span style="flex: 1"></span>
+    {#if $me.rbac_enabled && $me.identity}
+      <span class="user-badge" title="Signed in via SSO">
+        {$me.identity}<span class="role role-{$me.role}">{$me.role}</span>
+      </span>
+    {/if}
     <a href="/api/docs" target="_blank" rel="noopener">API Docs ↗</a>
     <button
       class="theme-toggle"
@@ -114,3 +121,26 @@
     <Dashboards />
   {/if}
 </div>
+
+<style>
+  .user-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--fg-muted);
+    margin-right: 10px;
+  }
+  .role {
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .role-admin { color: var(--danger); border-color: var(--danger); }
+  .role-editor { color: var(--accent); border-color: var(--accent); }
+  .role-viewer { color: var(--fg-muted); }
+</style>

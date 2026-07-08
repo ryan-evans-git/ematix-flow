@@ -216,6 +216,7 @@ def create_app(
     bearer_token: str | None = None,
     datasources: dict[str, str] | None = None,
     analytics_store: Any = None,
+    rbac: Any = None,
 ):
     """Build the FastAPI app.
 
@@ -246,6 +247,14 @@ def create_app(
             "fastapi is required for the ematix-flow web UI; install with "
             "`pip install ematix-flow[web]`"
         ) from exc
+
+    # Make `Request` resolvable as a route-handler annotation. Under
+    # `from __future__ import annotations` all annotations are strings,
+    # and FastAPI resolves them against the module globals — where
+    # `Request` isn't present because fastapi is imported lazily here.
+    # Injecting it into the module namespace lets handlers use
+    # `request: Request` (needed to read the trusted identity header).
+    globals().setdefault("Request", Request)
 
     app = FastAPI(
         title="ematix-flow Web UI",
@@ -286,6 +295,38 @@ def create_app(
                 )
             return await call_next(request)
 
+    # RBAC (reverse-proxy / SSO trust). When configured, every /api/*
+    # call (except health + /api/me) requires an authenticated identity
+    # from the trusted header, and the caller's role must grant the
+    # action's permission. Identity + role are stashed on request.state
+    # for the handlers (ownership) and /api/me.
+    if rbac is not None:
+        from ematix_flow.web import auth as _auth
+
+        @app.middleware("http")
+        async def _rbac_gate(request: Request, call_next):
+            perm = _auth.required_permission(request.method, request.url.path)
+            if perm is None:
+                # Still resolve identity for /api/me + ownership.
+                ident = _auth.resolve_identity(request.headers, rbac)
+                request.state.identity = ident
+                request.state.role = _auth.resolve_role(ident, request.headers, rbac) if ident else None
+                return await call_next(request)
+            from fastapi.responses import JSONResponse
+
+            identity = _auth.resolve_identity(request.headers, rbac)
+            if identity is None:
+                return JSONResponse({"detail": "authentication required"}, status_code=401)
+            role = _auth.resolve_role(identity, request.headers, rbac)
+            if not _auth.role_has(role, perm):
+                return JSONResponse(
+                    {"detail": f"role {role!r} lacks the {perm!r} permission"},
+                    status_code=403,
+                )
+            request.state.identity = identity
+            request.state.role = role
+            return await call_next(request)
+
     from ematix_flow.web.analytics import (
         DatasourceNotFound,
         DatasourceRegistry,
@@ -304,15 +345,36 @@ def create_app(
     datasource_registry = DatasourceRegistry(datasources)
     query_jobs = QueryJobRegistry()
 
-    from fastapi import Header  # local, like the other fastapi imports
+    def _identity(request) -> str | None:
+        """Resolve the caller's identity for ownership. With RBAC, the
+        proxy-trusted identity (stashed by the middleware) is used;
+        otherwise a valid bearer token maps to the single-tenant
+        ``operator``; otherwise no owner is recorded."""
+        ident = getattr(getattr(request, "state", None), "identity", None)
+        if ident:
+            return ident
+        if bearer_token is not None:
+            auth = request.headers.get("authorization", "")
+            return "operator" if auth.startswith("Bearer ") else None
+        return None
 
-    def _identity(authorization: str | None) -> str | None:
-        """Single-tenant identity: a valid bearer token maps to the
-        operator, otherwise no owner is recorded. A real multi-user
-        identity (login / SSO / per-user tokens) drops in here."""
-        if bearer_token is None:
-            return None
-        return "operator" if (authorization or "").startswith("Bearer ") else None
+    @app.get("/api/me")
+    def whoami(request: Request) -> dict[str, Any]:  # type: ignore[unused-function]
+        """Who the caller is + their role/permissions, for the UI to
+        gate controls. Anonymous when no identity is present."""
+        from ematix_flow.web.auth import permissions_for
+
+        identity = _identity(request)
+        role = getattr(getattr(request, "state", None), "role", None)
+        if role is None and identity is not None and rbac is None:
+            role = "admin"  # non-RBAC single-tenant operator has full access
+        return {
+            "authenticated": identity is not None,
+            "identity": identity,
+            "role": role,
+            "permissions": permissions_for(role) if role else [],
+            "rbac_enabled": rbac is not None,
+        }
 
     def _catalog(fn, *args):
         """Run a catalog introspection call, mapping its failures to
@@ -362,7 +424,7 @@ def create_app(
         return {"saved_queries": analytics_store.list_saved_queries()}
 
     @app.post("/api/saved-queries")
-    def create_saved_query(payload: dict[str, Any] = Body(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:  # type: ignore[unused-function]
+    def create_saved_query(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
         name = (payload.get("name") or "").strip()
         sql = (payload.get("sql") or "").strip()
         datasource_id = (payload.get("datasource_id") or "").strip()
@@ -372,7 +434,7 @@ def create_app(
                 detail="name, datasource_id and sql are required",
             )
         return analytics_store.create_saved_query(
-            name=name, datasource_id=datasource_id, sql=sql, owner=_identity(authorization)
+            name=name, datasource_id=datasource_id, sql=sql, owner=_identity(request)
         )
 
     @app.get("/api/saved-queries/{query_id}")
@@ -411,7 +473,7 @@ def create_app(
         return {"charts": analytics_store.list_charts()}
 
     @app.post("/api/charts")
-    def create_chart(payload: dict[str, Any] = Body(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:  # type: ignore[unused-function]
+    def create_chart(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
         name = (payload.get("name") or "").strip()
         sql = (payload.get("sql") or "").strip()
         datasource_id = (payload.get("datasource_id") or "").strip()
@@ -427,7 +489,7 @@ def create_app(
             sql=sql,
             viz_type=viz_type,
             encoding=payload.get("encoding") or {},
-            owner=_identity(authorization),
+            owner=_identity(request),
         )
 
     @app.get("/api/charts/{chart_id}")
@@ -467,14 +529,14 @@ def create_app(
         return {"dashboards": analytics_store.list_dashboards()}
 
     @app.post("/api/dashboards")
-    def create_dashboard(payload: dict[str, Any] = Body(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:  # type: ignore[unused-function]
+    def create_dashboard(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
         name = (payload.get("name") or "").strip()
         if not name:
             raise HTTPException(status_code=400, detail="name is required")
         return analytics_store.create_dashboard(
             name=name,
             layout=payload.get("layout") or {"tiles": []},
-            owner=_identity(authorization),
+            owner=_identity(request),
         )
 
     @app.get("/api/dashboards/{dashboard_id}")
@@ -546,7 +608,7 @@ def create_app(
         return {"alerts": analytics_store.list_alerts()}
 
     @app.post("/api/alerts")
-    def create_alert(payload: dict[str, Any] = Body(...), authorization: str | None = Header(default=None)) -> dict[str, Any]:  # type: ignore[unused-function]
+    def create_alert(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
         name = (payload.get("name") or "").strip()
         chart_id = (payload.get("chart_id") or "").strip()
         column = (payload.get("column") or "").strip()
@@ -568,7 +630,7 @@ def create_app(
             column=column,
             op=op,
             threshold=threshold,
-            owner=_identity(authorization),
+            owner=_identity(request),
         )
 
     @app.get("/api/alerts/{alert_id}")
@@ -1503,6 +1565,7 @@ def run_server(
     history: RunHistoryStore | None = None,
     datasources: dict[str, str] | None = None,
     analytics_store: Any = None,
+    rbac: Any = None,
 ) -> None:
     """Launch the uvicorn server.
 
@@ -1536,5 +1599,6 @@ def run_server(
         history=history,
         datasources=datasources,
         analytics_store=analytics_store,
+        rbac=rbac,
     )
     uvicorn.run(app, host=host, port=port, log_level=log_level)

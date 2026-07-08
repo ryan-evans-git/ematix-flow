@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import DashboardGrid from "../lib/DashboardGrid.svelte";
   import ChartView from "../lib/ChartView.svelte";
+  import { me, can } from "../lib/session.js";
   import {
     listDashboards,
     getDashboard,
@@ -190,9 +191,11 @@
 
 <div class="dash">
   <aside class="sidebar">
-    <div class="side-section">
-      <button class="secondary full" on:click={newDashboard}>+ New dashboard</button>
-    </div>
+    {#if can($me, "write")}
+      <div class="side-section">
+        <button class="secondary full" on:click={newDashboard}>+ New dashboard</button>
+      </div>
+    {/if}
     <div class="side-section grow">
       <div class="side-label">Dashboards</div>
       {#if !dashboards.length}
@@ -203,7 +206,9 @@
             <li>
               <button class="row" class:active={d.id === currentId} on:click={() => select(d)}>
                 <span class="name">{d.name}</span>
-                <button class="del" on:click={(e) => removeDashboard(d, e)} title="Delete">×</button>
+                {#if can($me, "write")}
+                  <button class="del" on:click={(e) => removeDashboard(d, e)} title="Delete">×</button>
+                {/if}
               </button>
             </li>
           {/each}
@@ -218,9 +223,11 @@
     {:else}
       <div class="toolbar">
         <span class="title">{currentName}</span>
-        <button class="secondary" class:on={editing} on:click={() => (editing = !editing)}>
-          {editing ? "Done" : "Edit"}
-        </button>
+        {#if can($me, "write")}
+          <button class="secondary" class:on={editing} on:click={() => (editing = !editing)}>
+            {editing ? "Done" : "Edit"}
+          </button>
+        {/if}
         {#if editing}
           <select class="add" on:change={(e) => { const c = charts.find((x) => x.id === e.target.value); addChart(c); e.target.value = ""; }}>
             <option value="">+ Add chart…</option>

@@ -1298,6 +1298,46 @@ def main(argv: list[str] | None = None) -> int:
         "Falls back to $EMATIX_FLOW_ANALYTICS_DB. Without it, those persist "
         "only in memory and are lost on restart.",
     )
+    # RBAC (reverse-proxy / SSO trust). Enabled when --auth-header is set;
+    # front the app with an SSO proxy that sets that trusted header.
+    web_p.add_argument(
+        "--auth-header",
+        default=None,
+        metavar="HEADER",
+        help="enable RBAC by trusting this identity header set by an upstream "
+        "SSO proxy (e.g. --auth-header x-forwarded-email). Only bind behind "
+        "such a proxy. Roles: viewer(read) / editor(read+query+write) / "
+        "admin. Without this flag the API is open (or bearer-gated).",
+    )
+    web_p.add_argument(
+        "--auth-groups-header",
+        default="x-forwarded-groups",
+        metavar="HEADER",
+        help="header carrying the user's groups (default x-forwarded-groups), "
+        "mapped to roles via --auth-group-role.",
+    )
+    web_p.add_argument(
+        "--auth-group-role",
+        action="append",
+        default=None,
+        metavar="GROUP=ROLE",
+        help="map a proxy group to a role, e.g. --auth-group-role analysts=editor. "
+        "Repeatable. Highest role wins.",
+    )
+    web_p.add_argument(
+        "--auth-admin",
+        action="append",
+        default=None,
+        metavar="IDENTITY",
+        help="identity (e.g. email) always treated as admin. Repeatable.",
+    )
+    web_p.add_argument(
+        "--auth-default-role",
+        default="viewer",
+        choices=["viewer", "editor", "admin"],
+        help="role for an authenticated user not matched by group/admin rules "
+        "(default viewer).",
+    )
     web_p.set_defaults(func=_cmd_web)
 
     args = parser.parse_args(argv)
@@ -1400,12 +1440,37 @@ def _cmd_web(args) -> int:
                 file=sys.stderr,
             )
 
+    # RBAC (reverse-proxy / SSO trust), enabled when --auth-header is set.
+    rbac = None
+    if getattr(args, "auth_header", None):
+        from ematix_flow.web.auth import RBACConfig
+
+        group_roles: dict[str, str] = {}
+        for spec in getattr(args, "auth_group_role", None) or []:
+            group, sep, role = spec.partition("=")
+            group, role = group.strip(), role.strip()
+            if not sep or not group or role not in ("viewer", "editor", "admin"):
+                print(
+                    f"warning: --auth-group-role {spec!r} is not GROUP=viewer|editor|admin; ignoring",
+                    file=sys.stderr,
+                )
+                continue
+            group_roles[group] = role
+        rbac = RBACConfig(
+            identity_header=args.auth_header.lower(),
+            groups_header=(args.auth_groups_header or "").lower() or None,
+            group_roles=group_roles,
+            admin_identities=frozenset(getattr(args, "auth_admin", None) or []),
+            default_role=args.auth_default_role,
+        )
+
     run_server(
         host=args.bind, port=args.port, log_level=args.log_level,
         bearer_token=token,
         history=history,
         datasources=datasources or None,
         analytics_store=analytics_store,
+        rbac=rbac,
     )
     return 0
 

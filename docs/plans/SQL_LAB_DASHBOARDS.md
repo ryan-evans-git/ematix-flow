@@ -169,11 +169,20 @@ lazily and don't bloat the existing workflows UI (the memory notes the bundle is
     GROUP BY SQL) behind a SQL/Build toggle in the Chart Builder. Verified: generates + runs.
   - **Drill-down.** Click a dashboard chart → modal of the underlying rows for that category + a
     "Filter dashboard by this" button.
-  - **Ownership.** `owner` set from the bearer-token identity (`_identity`) on create across
-    saved-queries/charts/dashboards/alerts. Verified.
-  - **Deferred (needs a decision):** *full auth* — real login / SSO / per-user tokens + RBAC. The
-    ownership plumbing is in and single-tenant identity works; the identity model is the operator's
-    call. Also: per-query memory ceiling; true mid-query cancellation.
+  - **Ownership.** `owner` set from the caller identity (`_identity`) on create across
+    saved-queries/charts/dashboards/alerts.
+  - **Auth (RBAC, reverse-proxy / SSO trust). ✅ SHIPPED.** `auth.py`: trusts an upstream identity
+    header (default `X-Forwarded-Email`) + optional groups header → role. Roles gate *actions*
+    (viewer=read / editor=read+query+write / admin) via a middleware + `required_permission(method,
+    path)` table; org-wide sharing (owner = attribution only). `GET /api/me` drives the UI (nav
+    user/role badge + hidden/disabled controls per permission). `flow web --auth-header` /
+    `--auth-group-role g=role` / `--auth-admin` / `--auth-default-role`. 23 tests; RBAC enforcement
+    verified live (anon 401, viewer read-only, editor query+write, admin all). Chosen model:
+    proxy-trust + full RBAC + org-wide sharing.
+  - **Still deferred:** per-query memory ceiling; true mid-query cancellation (sqlite interrupt / PG
+    statement_timeout). *Note: the SPA can't set the proxy header on its own fetches, so the
+    viewer/editor UI-gating visuals aren't harness-drivable — logic-verified; open deployment
+    (RBAC off) confirmed no-regression.*
   - *Note: ECharts data-clicks (cross-filter + drill trigger) can't be synthetically driven in the
     preview harness — those paths are code-verified + share verified downstream pipelines.*
 

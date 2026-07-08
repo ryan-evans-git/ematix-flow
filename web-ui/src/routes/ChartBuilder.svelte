@@ -3,6 +3,7 @@
   import SqlEditor from "../lib/SqlEditor.svelte";
   import EChart from "../lib/EChart.svelte";
   import VisualQueryBuilder from "../lib/VisualQueryBuilder.svelte";
+  import { me, can } from "../lib/session.js";
   import {
     VIZ_TYPES,
     isNumericType,
@@ -187,7 +188,7 @@
 
   <section class="main">
     <div class="toolbar">
-      <button class="run" on:click={run} disabled={running || !datasourceId}>
+      <button class="run" on:click={run} disabled={running || !datasourceId || !can($me, "query")} title={can($me, "query") ? "" : "Requires the query permission"}>
         {running ? "Running…" : "▶ Run"} <kbd>⌘⏎</kbd>
       </button>
       <div class="mode">
@@ -195,7 +196,7 @@
         <button class:on={mode === "build"} on:click={() => (mode = "build")}>Build</button>
       </div>
       <input class="chart-name" placeholder="Untitled chart" bind:value={currentName} />
-      <button class="secondary" on:click={save} disabled={!result}>{currentId ? "Update" : "Save"}</button>
+      <button class="secondary" on:click={save} disabled={!result || !can($me, "write")} title={can($me, "write") ? "" : "Requires the write permission"}>{currentId ? "Update" : "Save"}</button>
       <span class="spacer"></span>
       <label class="rows">Limit <input type="number" min="1" max="100000" bind:value={maxRows} /></label>
     </div>
