@@ -56,11 +56,7 @@ pub fn configured_fraction() -> Option<f64> {
 /// `tri_state_of` convention in [`crate::flags`]).
 fn fraction_of(val: Option<&str>) -> Option<f64> {
     match val {
-        Some(v)
-            if v == "0"
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("off") =>
-        {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") => {
             None
         }
         Some(v) => match v.parse::<f64>() {
@@ -124,24 +120,200 @@ pub fn effective_limit_bytes() -> Option<usize> {
     Some((ram as f64 * frac) as usize)
 }
 
-/// Attach the bounded default pool to `builder` unless the caller
-/// already installed a `RuntimeEnv` (theirs wins) or the pool is
-/// disabled/unresolvable (unbounded legacy behaviour).
+/// Attach the default memory policy to `builder`. Precedence:
+/// 1. a caller-installed `RuntimeEnv` always wins (no-op);
+/// 2. `EMAT_MEM_POOL_FRACTION` opt-in → hard Greedy cap at f × RAM;
+/// 3. otherwise the Σ.AI.6c **elastic floor guard** (default ON where
+///    MemAvailable is sensable, i.e. Linux) — unbounded until the
+///    MACHINE is nearly out of memory, then per-query refusal instead
+///    of a kernel OOM-kill. `EMAT_MEM_FLOOR_BYTES=0` disables;
+/// 4. unknown platform / disabled → unbounded legacy.
 pub fn apply_default_memory_pool(mut builder: SessionStateBuilder) -> SessionStateBuilder {
     if builder.runtime_env().is_some() {
         return builder;
     }
-    let Some(limit) = effective_limit_bytes() else {
-        return builder;
-    };
-    match RuntimeEnvBuilder::new()
-        .with_memory_limit(limit, 1.0)
-        .build_arc()
-    {
-        Ok(renv) => builder.with_runtime_env(renv),
-        // Construction can't realistically fail, but never let the
-        // guard break session construction.
-        Err(_) => builder,
+    // Opt-in hard cap (see module docs for why it is NOT the default).
+    if let Some(limit) = effective_limit_bytes() {
+        return match RuntimeEnvBuilder::new()
+            .with_memory_limit(limit, 1.0)
+            .build_arc()
+        {
+            Ok(renv) => builder.with_runtime_env(renv),
+            // Construction can't realistically fail, but never let the
+            // guard break session construction.
+            Err(_) => builder,
+        };
+    }
+    // Elastic floor guard: only where the sensor works (Linux) and the
+    // floor resolves (RAM known, not disabled).
+    if sensed_available_bytes().is_some() {
+        if let Some(floor) = configured_floor(system_ram_bytes()) {
+            let pool = std::sync::Arc::new(ElasticFloorPool::new(
+                floor,
+                Box::new(sensed_available_bytes),
+            ));
+            return match RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc() {
+                Ok(renv) => builder.with_runtime_env(renv),
+                Err(_) => builder,
+            };
+        }
+    }
+    builder
+}
+
+// ---------------------------------------------------------------------------
+// Σ.AI.6c — ElasticFloorPool: the OOM-guard that the refuted blanket cap
+// could not be. Unbounded while the MACHINE is healthy (zero tax on every
+// banked benchmark number), refusing allocations only when system
+// MemAvailable would sink below a floor — so a runaway query gets a
+// recoverable per-query `ResourcesExhausted` instead of the kernel
+// OOM-killing the process (the parted-SF100 failure mode). Unlike the hard
+// fraction cap there is no artificial mid-plenty ceiling: spillable
+// consumers that DO spill free real RAM, MemAvailable recovers, and
+// progress resumes — the cap's in-suite spill-tax/livelock shape can't
+// form because the floor only binds when the machine is genuinely full.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::{MemoryPool, MemoryReservation};
+
+/// Sensor for "bytes the OS could still hand out without reclaim pain".
+/// Injected so tests are deterministic; production uses
+/// [`sensed_available_bytes`]. `None` = unknown → the pool never refuses.
+pub type AvailableSensor = dyn Fn() -> Option<usize> + Send + Sync;
+
+/// System MemAvailable in bytes. Linux: `/proc/meminfo` `MemAvailable`
+/// (the kernel's own reclaim-aware estimate — the number the OOM killer
+/// effectively works against). Other platforms: `None` (the floor guard
+/// is a server-side feature; macOS dev boxes run unguarded, as before).
+///
+/// `try_grow` sits on the per-batch hot path, so the read is cached for
+/// ~25 ms (a runaway allocation burns MemAvailable over hundreds of ms —
+/// the guard still fires long before the OOM killer; the cache just
+/// keeps the syscall+parse off every reservation).
+pub fn sensed_available_bytes() -> Option<usize> {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    const TTL_MS: u64 = 25;
+    const UNKNOWN: usize = usize::MAX;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX); // MAX = never read
+    static CACHED: AtomicUsize = AtomicUsize::new(UNKNOWN);
+
+    let now_ms = EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if last != u64::MAX && now_ms.saturating_sub(last) < TTL_MS {
+        let c = CACHED.load(Ordering::Relaxed);
+        return if c == UNKNOWN { None } else { Some(c) };
+    }
+    let fresh: Option<usize> = (|| {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: usize = meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix("MemAvailable:"))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        Some(kb * 1024)
+    })();
+    CACHED.store(fresh.unwrap_or(UNKNOWN), Ordering::Relaxed);
+    LAST_MS.store(now_ms, Ordering::Relaxed);
+    fresh
+}
+
+/// Default floor: max(1 GiB, 3% of RAM). Big enough that the kernel +
+/// page cache keep breathing room; small enough that it never binds on a
+/// healthy run (the SF100 suite peaked with ~2 GB reclaimable when it
+/// thrashed — the floor fires *before* the OOM killer would).
+pub fn default_floor_bytes(ram: usize) -> usize {
+    (1usize << 30).max(ram / 33)
+}
+
+/// Resolved `EMAT_MEM_FLOOR_BYTES`: `None` = guard disabled, `Some(b)` =
+/// refuse allocations that would leave less than `b` bytes available.
+/// Unset = AUTO (default floor from RAM). `=0` disables.
+pub fn configured_floor(ram: Option<usize>) -> Option<usize> {
+    floor_of(std::env::var("EMAT_MEM_FLOOR_BYTES").ok().as_deref(), ram)
+}
+
+/// Pure parse core (env-race-free tests, `fraction_of` convention).
+fn floor_of(val: Option<&str>, ram: Option<usize>) -> Option<usize> {
+    match val {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
+        Some(v) => match v.parse::<usize>() {
+            Ok(b) if b > 0 => Some(b),
+            _ => ram.map(default_floor_bytes),
+        },
+        None => ram.map(default_floor_bytes),
+    }
+}
+
+/// A [`MemoryPool`] that tracks reservations but only *refuses* growth
+/// when the sensed system MemAvailable, minus the requested bytes, would
+/// drop below `floor_bytes`. Unknown availability never refuses.
+pub struct ElasticFloorPool {
+    reserved: AtomicUsize,
+    floor_bytes: usize,
+    sensor: Box<AvailableSensor>,
+}
+
+impl std::fmt::Debug for ElasticFloorPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElasticFloorPool")
+            .field("reserved", &self.reserved.load(Ordering::Relaxed))
+            .field("floor_bytes", &self.floor_bytes)
+            .finish()
+    }
+}
+
+impl ElasticFloorPool {
+    pub fn new(floor_bytes: usize, sensor: Box<AvailableSensor>) -> Self {
+        Self {
+            reserved: AtomicUsize::new(0),
+            floor_bytes,
+            sensor,
+        }
+    }
+}
+
+impl MemoryPool for ElasticFloorPool {
+    fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
+        self.reserved.fetch_add(additional, Ordering::Relaxed);
+    }
+
+    fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
+        self.reserved.fetch_sub(shrink, Ordering::Relaxed);
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        if let Some(avail) = (self.sensor)() {
+            if avail.saturating_sub(additional) < self.floor_bytes {
+                return Err(DataFusionError::ResourcesExhausted(format!(
+                    "ElasticFloorPool: refusing {additional} B for {} — system \
+                     MemAvailable {avail} B would sink below the {} B floor \
+                     (EMAT_MEM_FLOOR_BYTES; =0 disables). The machine is out of \
+                     memory; failing this query instead of risking a kernel \
+                     OOM-kill.",
+                    reservation.consumer().name(),
+                    self.floor_bytes,
+                )));
+            }
+        }
+        self.grow(reservation, additional);
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.reserved.load(Ordering::Relaxed)
     }
 }
 
@@ -149,6 +321,72 @@ pub fn apply_default_memory_pool(mut builder: SessionStateBuilder) -> SessionSta
 mod tests {
     use super::*;
     use datafusion::execution::memory_pool::MemoryConsumer;
+
+    /// Floor parse table (pure, no env): unset/garbage = AUTO default
+    /// from RAM; `=0`/`off` disables; explicit bytes win.
+    #[test]
+    fn floor_parse_table() {
+        let ram = Some(32usize << 30);
+        let auto = Some(default_floor_bytes(32 << 30));
+        assert_eq!(floor_of(None, ram), auto, "unset = AUTO floor");
+        assert_eq!(floor_of(Some("0"), ram), None, "=0 disables");
+        assert_eq!(floor_of(Some("off"), ram), None);
+        assert_eq!(floor_of(Some("2147483648"), ram), Some(2 << 30));
+        assert_eq!(floor_of(Some("banana"), ram), auto, "garbage = AUTO");
+        assert_eq!(floor_of(None, None), None, "unknown RAM = no guard");
+        // Default floor: max(1 GiB, ~3% RAM). 32 GiB box → 3% ≈ 0.97 GiB,
+        // so the 1 GiB minimum rules; 128 GiB box → 3% ≈ 3.9 GiB wins.
+        assert_eq!(default_floor_bytes(32 << 30), 1 << 30);
+        assert_eq!(default_floor_bytes(128 << 30), (128usize << 30) / 33);
+    }
+
+    /// The elastic pool refuses growth only when sensed availability
+    /// minus the request would sink below the floor; unknown
+    /// availability never refuses; reserved() tracks grow/shrink.
+    #[test]
+    fn elastic_floor_refuses_only_under_real_pressure() {
+        let gib = 1usize << 30;
+        // Healthy machine: 8 GiB available, 1 GiB floor → grow fine.
+        let pool: std::sync::Arc<dyn MemoryPool> = std::sync::Arc::new(ElasticFloorPool::new(
+            gib,
+            Box::new(move || Some(8 * (1 << 30))),
+        ));
+        let mut r = MemoryConsumer::new("healthy").register(&pool);
+        assert!(r.try_grow(2 * gib).is_ok(), "plenty available → grow");
+        assert_eq!(pool.reserved(), 2 * gib, "reserved tracks grow");
+        r.free();
+        assert_eq!(pool.reserved(), 0, "reserved tracks free");
+
+        // Pressured machine: 1.5 GiB available, 1 GiB floor → a 1 GiB
+        // request would leave 0.5 GiB < floor → REFUSED; a small request
+        // that keeps us above the floor is fine.
+        let pool: std::sync::Arc<dyn MemoryPool> = std::sync::Arc::new(ElasticFloorPool::new(
+            gib,
+            Box::new(move || Some(gib + gib / 2)),
+        ));
+        let mut r = MemoryConsumer::new("pressured").register(&pool);
+        let err = r.try_grow(gib).unwrap_err().to_string();
+        assert!(
+            err.contains("ElasticFloorPool") && err.contains("OOM"),
+            "refusal must be self-diagnosing, got: {err}"
+        );
+        assert_eq!(pool.reserved(), 0, "failed grow must not reserve");
+        assert!(
+            r.try_grow(gib / 4).is_ok(),
+            "small request stays above floor"
+        );
+        r.free();
+
+        // Unknown availability (sensor None, e.g. macOS): never refuses.
+        let pool: std::sync::Arc<dyn MemoryPool> =
+            std::sync::Arc::new(ElasticFloorPool::new(gib, Box::new(|| None)));
+        let mut r = MemoryConsumer::new("unknown").register(&pool);
+        assert!(
+            r.try_grow(1 << 40).is_ok(),
+            "unknown availability → unguarded"
+        );
+        r.free();
+    }
 
     /// Parse table for `EMAT_MEM_POOL_FRACTION` (pure, no env). The
     /// pool is OPT-IN: only a valid fraction in (0,1] bounds it.
@@ -188,10 +426,8 @@ mod tests {
         // module docs).
         // SAFETY: single-threaded within this test; restored before exit.
         unsafe { std::env::remove_var("EMAT_MEM_POOL_FRACTION") };
-        let state = apply_default_memory_pool(
-            SessionStateBuilder::new().with_default_features(),
-        )
-        .build();
+        let state =
+            apply_default_memory_pool(SessionStateBuilder::new().with_default_features()).build();
         let pool = state.runtime_env().memory_pool.clone();
         let r = MemoryConsumer::new("test-default-unbounded").register(&pool);
         assert!(
@@ -203,10 +439,8 @@ mod tests {
         // Arm 2: explicit opt-in bounds the pool.
         unsafe { std::env::set_var("EMAT_MEM_POOL_FRACTION", "0.7") };
         let limit = effective_limit_bytes().expect("RAM known per test above");
-        let state = apply_default_memory_pool(
-            SessionStateBuilder::new().with_default_features(),
-        )
-        .build();
+        let state =
+            apply_default_memory_pool(SessionStateBuilder::new().with_default_features()).build();
         let pool = state.runtime_env().memory_pool.clone();
         let r = MemoryConsumer::new("test-over-cap").register(&pool);
         assert!(
