@@ -71,7 +71,12 @@ use std::time::Instant;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::DataFusionError;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::JoinType;
+use datafusion::config::ConfigOptions;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_distributed::{CompressionType, DistributedExt, WorkerResolver};
@@ -340,21 +345,154 @@ fn explicit_partitions() -> Option<usize> {
 /// gate decision itself replays per query at plan-optimization time
 /// (the rule runs on every plan), reported per query as
 /// `QueryStats::plan_mode`.
+/// EXPERIMENTAL (env-gated `EMAT_EXP_BUILD_SUBTREE=<min_rows>`, does NOT ship):
+/// for a Partitioned Inner hash join whose BUILD (left) side is a bare base-
+/// table scan of >= `min_base_rows` and whose PROBE (right) side is a join
+/// subtree, swap the inputs so the (usually smaller, filtered) join result
+/// builds instead of the large base table. Targets Q09 SF100 — DataFusion
+/// builds 80M partsupp against the ~32M part⋈lineitem⋈supplier intermediate
+/// because it over-estimates the 3-way join output; on a 32GB box that 80M
+/// build thrashes the page cache. No cardinality guess: a bare large base
+/// scan is a worse build side than a filtered join result by construction.
+#[derive(Debug)]
+struct ExpBuildSubtreeRule {
+    min_base_rows: usize,
+}
+
+/// True iff any `HashJoinExec` appears in `p`'s subtree (including `p`).
+fn subtree_contains_join(p: &Arc<dyn ExecutionPlan>) -> bool {
+    if p.as_any().is::<HashJoinExec>() {
+        return true;
+    }
+    p.children().iter().any(subtree_contains_join)
+}
+
+/// Rows if `p` is a bare scan chain (no join beneath it); else `None`.
+fn bare_scan_rows(p: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    if subtree_contains_join(p) {
+        return None;
+    }
+    p.partition_statistics(None)
+        .ok()?
+        .num_rows
+        .get_value()
+        .copied()
+}
+
+impl PhysicalOptimizerRule for ExpBuildSubtreeRule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let out = plan.transform_up(|node| {
+            let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            if !matches!(hj.join_type(), JoinType::Inner)
+                || !matches!(hj.partition_mode(), PartitionMode::Partitioned)
+            {
+                return Ok(Transformed::no(node));
+            }
+            match bare_scan_rows(hj.left()) {
+                Some(lr) if lr >= self.min_base_rows && subtree_contains_join(hj.right()) => {
+                    eprintln!(
+                        "[exp_build_subtree] swap: left bare scan {lr} rows would build; \
+                         building the join subtree instead; on={:?}",
+                        hj.on()
+                    );
+                    Ok(Transformed::yes(hj.swap_inputs(PartitionMode::Partitioned)?))
+                }
+                _ => Ok(Transformed::no(node)),
+            }
+        })?;
+        Ok(out.data)
+    }
+    fn name(&self) -> &str {
+        "ExpBuildSubtreeRule"
+    }
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// Total physical RAM in bytes, from Linux `/proc/meminfo` `MemTotal`.
+/// `None` off Linux or on a read/parse failure — callers treat that as
+/// "unknown" and skip the memory-pool bound. Bench boxes are Linux.
+fn system_ram_bytes() -> Option<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: usize = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kb * 1024)
+}
+
 fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState {
     let explicit = explicit_partitions();
     let mut cfg = SessionConfig::new().with_collect_statistics(true);
     if let Some(n) = explicit {
         cfg = cfg.with_target_partitions(n);
     }
+    // EXPERIMENTAL (env-gated, does NOT ship): prefer SortMergeJoin over
+    // HashJoin. DF 53's HashJoinExec cannot spill (it try_grow()?s and
+    // errors); SortMergeJoin + its input SortExec DO spill under a bounded
+    // pool. Q09 SF100 A/B lever — is the 40s a build-side/footprint problem
+    // that graceful spill fixes?
+    if std::env::var_os("EMAT_PREFER_SORT_MERGE").is_some() {
+        cfg.options_mut().optimizer.prefer_hash_join = false;
+    }
     let overrides = HarnessOverrides {
         auto_target_partitions: explicit.is_none(),
         ..HarnessOverrides::default()
     };
 
-    let base = SessionStateBuilder::new()
+    let mut base = SessionStateBuilder::new()
         .with_config(cfg)
         .with_default_features();
-    let (builder, _handles) = preset::with_optimizer_rules_overridden(base, &overrides);
+    // EXPERIMENTAL (env-gated, does NOT ship): bound the DataFusion memory
+    // pool to a fraction of system RAM. On its own it converts a process-wide
+    // OOM-kill into a per-query ResourcesExhausted (an OOM *guard*); paired
+    // with EMAT_PREFER_SORT_MERGE it forces the join to spill instead of
+    // thrashing the OS page cache. Q09 SF100 A/B lever.
+    if let Ok(raw) = std::env::var("EMAT_MEM_POOL_FRACTION") {
+        match (raw.parse::<f64>(), system_ram_bytes()) {
+            (Ok(frac), Some(total)) if frac > 0.0 && frac <= 1.0 => {
+                let limit = (total as f64 * frac) as usize;
+                match datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                    .with_memory_limit(limit, 1.0)
+                    .build_arc()
+                {
+                    Ok(renv) => {
+                        base = base.with_runtime_env(renv);
+                        eprintln!(
+                            "[mempool] limit={limit} bytes ({:.0}% of {}GiB system RAM)",
+                            frac * 100.0,
+                            total >> 30
+                        );
+                    }
+                    Err(e) => eprintln!("[mempool] build failed: {e}"),
+                }
+            }
+            _ => eprintln!("[mempool] ignored EMAT_MEM_POOL_FRACTION={raw:?} (need 0<f<=1 and readable /proc/meminfo)"),
+        }
+    }
+    let (mut builder, _handles) = preset::with_optimizer_rules_overridden(base, &overrides);
+    // EXPERIMENTAL (env-gated, does NOT ship): append the build-subtree swap
+    // rule LAST (Partitioned-mode swap keeps each side's hash repartition
+    // valid, so no EnforceDistribution re-run is needed). Q09 SF100 A/B lever.
+    if let Ok(min_rows) = std::env::var("EMAT_EXP_BUILD_SUBTREE").map(|s| s.parse::<usize>()) {
+        match min_rows {
+            Ok(n) => {
+                builder =
+                    builder.with_physical_optimizer_rule(Arc::new(ExpBuildSubtreeRule { min_base_rows: n }));
+            }
+            Err(_) => eprintln!("[exp_build_subtree] ignored EMAT_EXP_BUILD_SUBTREE (not a usize)"),
+        }
+    }
 
     if distributed {
         let builder = builder
