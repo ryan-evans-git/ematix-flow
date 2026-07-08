@@ -97,6 +97,8 @@ pub mod ematix_parquet_bridge;
 // of parquet-rs. Supports primitive columns only; non-primitive
 // callers continue using `FastParquetTableProvider`.
 pub mod ematix_fast_parquet;
+// feat/sidecar-indexes Phase 1: read-side sidecar (`.parquet.idx`) lookups.
+pub mod sidecar_index;
 // Σ.E5.1: streaming Arrow `RecordBatch` reader over ematix-parquet.
 // Emits 65 536-row batches sliced from a per-row-group dict-aware
 // decode. Replaces the whole-RG emission of `ematix_parquet_bridge`

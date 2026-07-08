@@ -100,18 +100,19 @@ crate + an async `ParquetIndex` opener that ematix-parquet still has as
 - Add `ematix-iceberg` behind `--features iceberg`; manifest-summary pruning
   before opening sidecars; write-side manifest stamping.
 
-## Open questions (need a decision before Phase 2)
+## Decisions (owner, 2026-07-07)
 
-1. **Index declaration surface.** How does a user say "index `customer_id`"?
-   Options: (a) a column marker on `@ematix.table` (`Annotated[BigInt, index()]`,
-   parallels `pk()`); (b) a `Target(..., index_columns=[...])` write option;
-   (c) a table dunder `__indexes__`. Leaning (a)+(b): marker for the declarative
-   table path, `index_columns=` for the object-store target path.
-2. **Which index type per column** — infer from the column type + a marker arg
+- **Index creation = BOTH write-time config AND a `flow index build` CLI
+  backfill.** The CLI backfilling sidecars onto already-written Parquet is the
+  headline "index without rewriting the file" story and the primary thing the
+  site docs will show; write-time emission covers flow-owned ingest.
+- **Start with Phase 1 (read-side pushdown) now** — it needs no API decision and
+  is the half that makes indexes pay off.
+
+## Still-open (revisit at each phase)
+
+1. **Which index type per column** — infer from the column type + a marker arg
    (`index(kind="bloom")`), or always sorted with opt-in bloom/inverted?
-3. **Build trigger** — only at write time (Phase 2), or also a `flow index build`
-   CLI to backfill sidecars for existing files? The 26–40× payoff is strongest
-   for backfilling already-written data, so a CLI is attractive.
-4. **Predicate coverage in Phase 1** — eq only first, or eq+range together?
-5. **Bench target** — reuse the TPC-H harness (which columns?) or a dedicated
+2. **Predicate coverage in Phase 1** — eq first, then range. (Start eq.)
+3. **Bench target** — reuse the TPC-H harness (which columns?) or a dedicated
    point-lookup dataset that better shows the index's selective-predicate win?
