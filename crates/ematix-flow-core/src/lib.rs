@@ -97,6 +97,10 @@ pub mod ematix_parquet_bridge;
 // of parquet-rs. Supports primitive columns only; non-primitive
 // callers continue using `FastParquetTableProvider`.
 pub mod ematix_fast_parquet;
+// feat/sidecar-indexes: single-node multi-file provider — read a directory of
+// Parquet parts as one table through the ematix codec (closes the gap where
+// single-node could only read multi-file via arrow-rs or distribution).
+pub mod ematix_fast_parquet_multi;
 // feat/sidecar-indexes Phase 1: read-side sidecar (`.parquet.idx`) lookups.
 pub mod sidecar_index;
 // feat/sidecar-indexes Phase 2: write-side sidecar creation (backfill a
