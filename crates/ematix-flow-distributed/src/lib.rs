@@ -44,6 +44,12 @@
 // the long-running `DistributedBackend` tonic-worker model below; see
 // docs/DISTRIBUTED_TPCH_BENCHMARK_PLAN.md.
 pub mod work_unit;
+// Σ.SC I.3 — coordinator-side lowering of a manifest-pruned Iceberg scan
+// into per-file WorkUnits. Off by default; `--features iceberg` pulls
+// iceberg-rust (coordinator processes only — the worker decodes the
+// iceberg-free wire form in `work_unit` without this feature).
+#[cfg(feature = "iceberg")]
+pub mod iceberg_lower;
 // Phase 3 of "What's not shipped": peer auto-discovery. Recognises
 // `dns://` and `k8s://` schemes inside the `peers` config and resolves
 // them to concrete A-record URLs at backend-open time. Plain `http(s)://`

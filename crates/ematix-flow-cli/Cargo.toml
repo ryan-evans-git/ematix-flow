@@ -60,6 +60,10 @@ datafusion = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Σ.SC I.3: the worker-decode oracle tests write (id, val) parquet fixtures
+# through the ematix codec — same fixture style as flow-core's sidecar tests.
+ematix-parquet-codec = "0.17"
+ematix-parquet-format = "0.17"
 # Allocator-parity guard (test global_allocator_is_mimalloc in main.rs):
 # mi_is_in_heap_region is behind the `extended` feature.
 libmimalloc-sys = { version = "0.1", features = ["extended"] }

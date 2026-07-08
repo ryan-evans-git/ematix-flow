@@ -157,6 +157,48 @@ pub fn plan_scan_range(
     split_survivors(&survivors, index_name)
 }
 
+/// [`plan_scan_eq`] for an `INT64` key — the shape the distributed
+/// coordinator lowers from (`IcebergPredicate` is i64-only on the v1 wire, so
+/// keeping the `Key` type out of the caller keeps ematix-parquet-codec out of
+/// the distributed crate's API surface).
+pub fn plan_scan_eq_i64(
+    files: &[DataFile],
+    index_name: &str,
+    key: i64,
+) -> DfResult<IcebergScanPlan> {
+    plan_scan_eq(files, index_name, &Key::I64(key))
+}
+
+/// [`plan_scan_range`] for `INT64` bounds (either open). See
+/// [`plan_scan_eq_i64`] for why this exists.
+pub fn plan_scan_range_i64(
+    files: &[DataFile],
+    index_name: &str,
+    low: Option<i64>,
+    high: Option<i64>,
+) -> DfResult<IcebergScanPlan> {
+    plan_scan_range(
+        files,
+        index_name,
+        low.map(Key::I64).as_ref(),
+        high.map(Key::I64).as_ref(),
+    )
+}
+
+/// Plan a fan-out with **no prunable predicate**: every file survives, and
+/// every file is a [`ScanTarget::FullScan`] — with nothing to look up, a
+/// covering sidecar buys nothing, so none is resolved.
+pub fn plan_scan_all(files: &[DataFile]) -> IcebergScanPlan {
+    IcebergScanPlan {
+        targets: files
+            .iter()
+            .map(|df| ScanTarget::FullScan {
+                data_uri: df.file_path().to_string(),
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +301,43 @@ mod tests {
 
         assert_eq!(plan.full_scan_count(), 1);
         assert_eq!(plan.indexed_count(), 0);
+    }
+
+    /// Σ.SC I.3: the i64 convenience wrappers (what the distributed
+    /// coordinator lowers from — its wire predicate is i64-only) agree with
+    /// the `Key`-typed planners.
+    #[test]
+    fn i64_wrappers_match_key_planners() {
+        let files = vec![
+            data_file("s3://t/data/a.parquet", Some(&ext_covering(0, 99))),
+            data_file("s3://t/data/b.parquet", Some(&ext_covering(100, 199))),
+            data_file("s3://t/data/c.parquet", Some(&ext_covering(200, 299))),
+        ];
+        assert_eq!(
+            plan_scan_eq_i64(&files, IDX, 150).unwrap(),
+            plan_scan_eq(&files, IDX, &Key::I64(150)).unwrap()
+        );
+        assert_eq!(
+            plan_scan_range_i64(&files, IDX, Some(100), None).unwrap(),
+            plan_scan_range(&files, IDX, Some(&Key::I64(100)), None).unwrap()
+        );
+    }
+
+    /// Σ.SC I.3: with no prunable predicate every file survives and must be
+    /// full-scanned — there is no index lookup to run, so nothing is tagged
+    /// `Indexed` even when a covering sidecar exists.
+    #[test]
+    fn plan_scan_all_keeps_every_file_as_full_scan() {
+        let files = vec![
+            data_file("s3://t/data/a.parquet", Some(&ext_covering(0, 99))),
+            data_file("s3://t/data/b.parquet", None),
+            data_file("s3://t/data/c.parquet", Some(&ext_covering(200, 299))),
+        ];
+        let plan = plan_scan_all(&files);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan.full_scan_count(), 3);
+        assert_eq!(plan.indexed_count(), 0);
+        assert_eq!(plan.targets[1].data_uri(), "s3://t/data/b.parquet");
     }
 
     #[test]

@@ -75,7 +75,25 @@ impl WorkUnit {
 pub enum Query {
     /// One of the 22 TPC-H queries. `id` is canonical "Q01".."Q22".
     Tpch { id: String },
-    // Future: Sql { sql: String }, Udf { ... }, etc.
+    /// Arbitrary SQL, executed verbatim by the worker against the tables its
+    /// `Input` registers. Added for Σ.SC I.3: an [`Input::IcebergScan`] is not
+    /// bound to the TPC-H catalog, so its units carry their own SQL. Additive
+    /// to v1 — old JSON (`kind: "tpch"`) decodes unchanged.
+    Sql { sql: String },
+    // Future: Udf { ... }, etc.
+}
+
+impl Query {
+    /// Short label echoed in [`WorkUnitMetrics::query`] — the TPC-H id
+    /// (`"Q14"`) or the literal `"sql"`. Deliberately NOT the SQL text:
+    /// metrics lines are parsed/grepped by coordinators and dashboards, and a
+    /// multi-line query would mangle them.
+    pub fn label(&self) -> &str {
+        match self {
+            Query::Tpch { id } => id,
+            Query::Sql { .. } => "sql",
+        }
+    }
 }
 
 /// Where the input data lives.
@@ -111,8 +129,12 @@ pub enum Input {
         /// files.
         index_name: String,
         /// The predicate that was pruned on, replayed by the worker as the
-        /// sidecar lookup (and re-applied on the full-scan files).
-        predicate: IcebergPredicate,
+        /// sidecar lookup (and re-applied on the full-scan files). `None` for
+        /// a pure enumeration fan-out (no prunable predicate — every file
+        /// survives and is full-scanned). `#[serde(default)]` keeps v1 JSON
+        /// with a predicate object decoding unchanged.
+        #[serde(default)]
+        predicate: Option<IcebergPredicate>,
         /// Surviving files, post manifest-prune, each tagged index-readable
         /// vs must-full-scan. Mirrors
         /// `ematix_flow_core::iceberg_scan::IcebergScanPlan`.
@@ -153,6 +175,18 @@ pub enum IcebergScanTarget {
     /// full-scan `data_uri` and re-apply the predicate (the manifest prune is
     /// conservative, not exact — dropping this would lose rows).
     FullScan { data_uri: String },
+}
+
+impl IcebergScanTarget {
+    /// The source Parquet URI, regardless of read strategy — what the worker
+    /// opens through the ematix codec either way. Mirrors
+    /// `ematix_flow_core::iceberg_scan::ScanTarget::data_uri`.
+    pub fn data_uri(&self) -> &str {
+        match self {
+            IcebergScanTarget::Indexed { data_uri, .. }
+            | IcebergScanTarget::FullScan { data_uri } => data_uri,
+        }
+    }
 }
 
 /// Where the worker writes its partial result.
@@ -270,6 +304,7 @@ mod tests {
         assert_eq!(wu.id, "wu-7a3f");
         match &wu.query {
             Query::Tpch { id } => assert_eq!(id, "Q14"),
+            other => panic!("expected Tpch, got {other:?}"),
         }
         // Re-serialise + re-parse must yield identical.
         let s = serde_json::to_string(&wu).unwrap();
@@ -345,10 +380,10 @@ mod tests {
                 assert_eq!(index_name, "idx_l_shipdate");
                 assert_eq!(
                     *predicate,
-                    IcebergPredicate::Range {
+                    Some(IcebergPredicate::Range {
                         low: Some(8766),
                         high: Some(9131),
-                    }
+                    })
                 );
                 assert_eq!(targets.len(), 2);
                 assert_eq!(
@@ -370,6 +405,106 @@ mod tests {
         // Full serialize → deserialize identity.
         let s = serde_json::to_string(&wu).unwrap();
         let wu2: WorkUnit = serde_json::from_str(&s).unwrap();
+        assert_eq!(wu, wu2);
+    }
+
+    /// Σ.SC I.3: an `iceberg_scan` may omit `predicate` entirely — a pure
+    /// enumeration fan-out (the coordinator listed the snapshot's files but
+    /// had no prunable predicate). Parses to `None` via `#[serde(default)]`,
+    /// which is also the v1 additive-compat proof: pre-existing JSON with a
+    /// predicate object still decodes (see `iceberg_scan_input_round_trip`).
+    #[test]
+    fn iceberg_scan_without_predicate_parses_none() {
+        let json = r#"{
+            "id": "wu-ice-nopred",
+            "query": {"kind": "tpch", "id": "Q01"},
+            "input": {
+                "kind": "iceberg_scan",
+                "table": "lineitem",
+                "index_name": "idx_id",
+                "targets": [
+                    {"read": "full_scan", "data_uri": "file:///t/p0.parquet"}
+                ]
+            },
+            "output": {"kind": "arrow_ipc", "uri": "file:///out.arrow"}
+        }"#;
+        let wu: WorkUnit = serde_json::from_str(json).expect("parse no-predicate scan");
+        match &wu.input {
+            Input::IcebergScan { predicate, .. } => assert!(predicate.is_none()),
+            other => panic!("expected IcebergScan, got {other:?}"),
+        }
+    }
+
+    /// Σ.SC I.3: the `sql` query variant the enum was designed to grow — the
+    /// worker executes the carried SQL verbatim. Iceberg scans are not bound
+    /// to the TPC-H catalog, so the oracle tests (and real users) need it.
+    #[test]
+    fn sql_query_round_trips_and_labels() {
+        let json = r#"{
+            "id": "wu-sql-1",
+            "query": {"kind": "sql", "sql": "SELECT id, val FROM t WHERE id = 5"},
+            "input": {
+                "kind": "iceberg_scan",
+                "table": "t",
+                "index_name": "idx_id",
+                "predicate": {"op": "eq", "key": 5},
+                "targets": [
+                    {"read": "full_scan", "data_uri": "file:///t/p0.parquet"}
+                ]
+            },
+            "output": {"kind": "arrow_ipc", "uri": "file:///out.arrow"}
+        }"#;
+        let wu: WorkUnit = serde_json::from_str(json).expect("parse sql query");
+        match &wu.query {
+            Query::Sql { sql } => assert_eq!(sql, "SELECT id, val FROM t WHERE id = 5"),
+            other => panic!("expected Sql, got {other:?}"),
+        }
+        // Metrics echo label: TPC-H units echo their id; SQL units echo "sql".
+        assert_eq!(wu.query.label(), "sql");
+        assert_eq!(Query::Tpch { id: "Q14".into() }.label(), "Q14");
+        let s = serde_json::to_string(&wu).unwrap();
+        let wu2: WorkUnit = serde_json::from_str(&s).unwrap();
+        assert_eq!(wu, wu2);
+    }
+
+    /// Σ.SC I.3: serialize → deserialize → serialize is BYTE-identical for an
+    /// IcebergScan unit. Coordinators may hash/dedupe serialized WorkUnits
+    /// (retry idempotency), so re-encoding must not reorder or reshape fields.
+    #[test]
+    fn iceberg_scan_serialization_is_byte_stable() {
+        let wu = WorkUnit {
+            schema: WorkUnit::default_schema(),
+            id: "wu-ice-stable".into(),
+            query: Query::Tpch { id: "Q06".into() },
+            input: Input::IcebergScan {
+                table: "lineitem".into(),
+                index_name: "idx_id".into(),
+                predicate: Some(IcebergPredicate::Range {
+                    low: Some(8766),
+                    high: None,
+                }),
+                targets: vec![
+                    IcebergScanTarget::Indexed {
+                        data_uri: "s3://b/p0.parquet".into(),
+                        sidecar_uri: "s3://b/p0.parquet.idx".into(),
+                    },
+                    IcebergScanTarget::FullScan {
+                        data_uri: "s3://b/p1.parquet".into(),
+                    },
+                ],
+            },
+            output: Output::ArrowIpc {
+                uri: "file:///out.arrow".into(),
+            },
+            execution: Execution::default(),
+        };
+        let s1 = serde_json::to_string(&wu).unwrap();
+        let wu2: WorkUnit = serde_json::from_str(&s1).unwrap();
+        let s2 = serde_json::to_string(&wu2).unwrap();
+        assert_eq!(
+            s1, s2,
+            "re-encoding an IcebergScan unit must be byte-stable"
+        );
         assert_eq!(wu, wu2);
     }
 

@@ -40,6 +40,21 @@ tonic = { workspace = true, features = ["tls-ring"] }
 # via datafusion-distributed; declared here so the module compiles
 # without leaning on indirect re-exports.
 http = "1"
+# Σ.SC I.3 — coordinator lowering (`iceberg_lower`): the coordinator names
+# `iceberg::spec::DataFile` to run the manifest prune once and fan the
+# survivors out as WorkUnits. Same 0.6 pin as ematix-flow-core. Optional;
+# only the `iceberg` feature (off by default) pulls it, keeping the default
+# build and the flow-worker image iceberg-free.
+iceberg = { version = "0.6", optional = true }
+# Σ.SC I.3 — tests stamp fixture DataFiles with ematix extensions
+# (`encode_key_metadata`); gated with the same feature.
+ematix-iceberg = { version = "0.17", optional = true }
+
+[features]
+# Iceberg manifest-prune lowering for the coordinator. Off by default —
+# forwards to ematix-flow-core's `iceberg` feature (which owns the prune
+# planner this module lowers from).
+iceberg = ["ematix-flow-core/iceberg", "dep:iceberg", "dep:ematix-iceberg"]
 
 [[bin]]
 name = "flow-worker"
