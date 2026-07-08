@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-07
+
+### Fixed
+
+- **Distributed mesh now actually fans out.** The distributed planner
+  sized each stage's task count as `ceil(scan_file_splits / files_per_task)`
+  with `files_per_task` defaulting to the local core count, so a
+  single-file-per-table dataset collapsed every scan to one task and the
+  mesh silently never engaged. `build_context` now pins
+  `files_per_task = 1`; with a multi-file (parted) layout the scan fans
+  out across peers (verified: 18/22 TPC-H queries distribute under
+  `EMAT_MESH=1`).
+
 ### Added
 
 - **Adaptive mesh gate (`EMAT_MESH` / `EMAT_MESH_MIN_BYTES`).** A
