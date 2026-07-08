@@ -72,9 +72,10 @@ class RunRecord:
     - ``failed_watermark`` (streaming) — the last committed
       watermark when the run failed, or None.
     - ``error_summary`` — single-line error message, or None.
-    - ``kind`` ∈ {``"batch"``, ``"streaming"``} — drives the
-      "Resume from watermark" vs "Restart from failed step" UI
-      action label.
+    - ``kind`` ∈ {``"batch"``, ``"streaming"``, ``"replay"``} —
+      drives the "Resume from watermark" vs "Restart from failed
+      step" UI action label; ``"replay"`` (DLQ Phase 4) marks a
+      bounded DLQ redrive run registered by the HTTP API.
     - ``extras`` — open-ended metadata. Backends are free to use
       this for store-specific fields without schema changes
       (e.g. K8s job id, Lambda request id).
@@ -98,9 +99,10 @@ class RunRecord:
                 f"RunRecord.status must be one of {sorted(_VALID_STATUS)}, "
                 f"got {self.status!r}"
             )
-        if self.kind not in {"batch", "streaming"}:
+        if self.kind not in {"batch", "streaming", "replay"}:
             raise ValueError(
-                f"RunRecord.kind must be 'batch' or 'streaming', got {self.kind!r}"
+                "RunRecord.kind must be 'batch', 'streaming', or 'replay', "
+                f"got {self.kind!r}"
             )
         if self.attempt < 1:
             raise ValueError(f"RunRecord.attempt must be >= 1, got {self.attempt}")

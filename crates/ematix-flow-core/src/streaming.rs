@@ -40,8 +40,8 @@ use tokio::sync::watch;
 
 use crate::backend::{ArrowBatchStream, Backend, BackendError, TargetTable, WriteMode};
 use crate::dlq::{
-    DeadLetterStore, DlqError, DlqMeta, DlqRecord, DlqRecordId, DlqSelection, DlqStage,
-    KafkaTopicDlq, ReplayOptions, ReplayReport, TableDlq, truncate_error,
+    DEFAULT_MAX_ATTEMPTS, DeadLetterStore, DlqError, DlqMeta, DlqRecord, DlqRecordId, DlqSelection,
+    DlqStage, DlqStoreMode, KafkaTopicDlq, ReplayOptions, ReplayReport, TableDlq, truncate_error,
 };
 use crate::kafka_backend::KafkaBackend;
 use crate::state_store::{RecoveredState, StateStore};
@@ -434,6 +434,15 @@ pub struct StreamingPipelineConfig {
     /// `@ematix.table(primary_key=...)` decorator, or
     /// `StreamingPipelineConfig::with_target_primary_keys`.
     pub target_primary_keys: Vec<Vec<String>>,
+    /// DLQ Phase 4: operator-selected dead-letter store family.
+    /// `Auto` (default) keeps the Phase 1 resolution order; `Topic`
+    /// / `Table` demand one family and hard-error when the pipeline
+    /// can't satisfy it. See [`DlqStoreMode`].
+    pub dlq_store: DlqStoreMode,
+    /// DLQ Phase 4: default replay attempt budget for this
+    /// pipeline. Seeds [`ReplayOptions::max_attempts`] when the
+    /// operator surface (HTTP API / CLI) doesn't override per run.
+    pub dlq_max_attempts: u32,
 }
 
 /// Phase 39.5a P2.15: per-batch transform-error handling.
@@ -493,6 +502,8 @@ impl StreamingPipelineConfig {
             transform_on_error: TransformErrorPolicy::Fail,
             cdc: None,
             target_primary_keys: Vec::new(),
+            dlq_store: DlqStoreMode::default(),
+            dlq_max_attempts: DEFAULT_MAX_ATTEMPTS,
         }
     }
 
@@ -551,6 +562,20 @@ impl StreamingPipelineConfig {
     /// (Kafka topic / state-store family / in-memory fallback).
     pub fn with_dead_letter_store(mut self, store: Arc<dyn DeadLetterStore>) -> Self {
         self.dead_letter_store = Some(store);
+        self
+    }
+
+    /// Builder-style (DLQ Phase 4): select the dead-letter store
+    /// family. See [`DlqStoreMode`] for the resolution semantics.
+    pub fn with_dlq_store(mut self, mode: DlqStoreMode) -> Self {
+        self.dlq_store = mode;
+        self
+    }
+
+    /// Builder-style (DLQ Phase 4): per-pipeline default replay
+    /// attempt budget (poison records park past it).
+    pub fn with_dlq_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.dlq_max_attempts = max_attempts;
         self
     }
 
@@ -1477,15 +1502,51 @@ impl StreamingPipeline {
     pub async fn resolve_dlq_store(&self) -> Result<&Arc<dyn DeadLetterStore>, BackendError> {
         self.dlq_store
             .get_or_try_init(|| async {
-                // 1. Explicit store wins.
+                // 1. Explicit store wins (programmatic override —
+                //    the `dlq_store` mode knob below is the
+                //    config-file surface and never outranks a
+                //    handed-in store).
                 if let Some(store) = &self.config.dead_letter_store {
                     return Ok(Arc::clone(store));
                 }
-                // 2. Historical: explicit topic + Kafka source. Uses
-                //    the primary (first) source — multi-source DLQ
-                //    routing would need per-source policy and isn't
-                //    built (same limitation as before Phase 1).
-                if let Some(topic) = &self.config.dead_letter_topic
+                // DLQ Phase 4: `dlq_store = "topic"` is a demand,
+                // not a preference — an unsatisfiable demand is a
+                // hard error, never a silent fallback.
+                if self.config.dlq_store == DlqStoreMode::Topic {
+                    let Some(topic) = &self.config.dead_letter_topic else {
+                        return Err(BackendError::Other(format!(
+                            "pipeline `{}`: dlq_store = \"topic\" requires a \
+                             dead_letter_topic to be configured",
+                            self.config.pipeline_name
+                        )));
+                    };
+                    let Some((backend, _query)) = self.sources.first() else {
+                        return Err(BackendError::Other(
+                            "DLQ requested but no sources configured".into(),
+                        ));
+                    };
+                    if backend.as_kafka().is_none() {
+                        return Err(BackendError::Other(format!(
+                            "pipeline `{}`: dlq_store = \"topic\" requires a Kafka \
+                             primary source (topic DLQs ride the source's producer)",
+                            self.config.pipeline_name
+                        )));
+                    }
+                    let store = KafkaTopicDlq::new(
+                        Arc::clone(backend),
+                        topic.clone(),
+                        self.config.pipeline_name.clone(),
+                    )?;
+                    return Ok(Arc::new(store) as Arc<dyn DeadLetterStore>);
+                }
+                // 2. Historical (Auto only — `dlq_store = "table"`
+                //    skips straight to the table family): explicit
+                //    topic + Kafka source. Uses the primary (first)
+                //    source — multi-source DLQ routing would need
+                //    per-source policy and isn't built (same
+                //    limitation as before Phase 1).
+                if self.config.dlq_store == DlqStoreMode::Auto
+                    && let Some(topic) = &self.config.dead_letter_topic
                     && let Some((backend, _query)) = self.sources.first()
                     && backend.as_kafka().is_some()
                 {
@@ -4141,6 +4202,114 @@ mod tests {
             );
             let store = pipeline.resolve_dlq_store().await.unwrap();
             assert_eq!(store.depth("fb").await.unwrap().pending, 1);
+        }
+
+        // --- DLQ Phase 4: dlq_store mode (auto | topic | table) ------------
+        //
+        // TDD note: written FIRST, red, before `DlqStoreMode` had any
+        // effect on `resolve_dlq_store` — same discipline as the
+        // earlier phases.
+
+        /// `dlq_store = "table"` skips rule 2 even when a Kafka
+        /// source + dead_letter_topic are configured — the operator
+        /// asked for the browsable/leasable table family.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn dlq_store_mode_table_overrides_topic_resolution() {
+            let kafka: Arc<dyn Backend> =
+                Arc::new(KafkaBackend::open("localhost:9092", Some("g")).unwrap());
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "mode-table")
+                .with_dead_letter_topic("dlq-topic")
+                .with_dlq_store(crate::dlq::DlqStoreMode::Table);
+            let pipeline =
+                StreamingPipeline::new(kafka, vec![(target as Arc<dyn Backend>, table)], cfg);
+            let store = pipeline.resolve_dlq_store().await.unwrap();
+            let debug = format!("{store:?}");
+            assert!(
+                !debug.contains("KafkaTopicDlq"),
+                "table mode must not resolve the topic store: {debug}"
+            );
+            assert!(debug.contains("TableDlq"), "resolved: {debug}");
+        }
+
+        /// `dlq_store = "topic"` is an explicit demand — a non-Kafka
+        /// source can't satisfy it, so resolution hard-errors
+        /// instead of silently falling back to the table family.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn dlq_store_mode_topic_requires_kafka_source() {
+            let source = Arc::new(TestBackend::new("src"));
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("q", table.clone(), "mode-topic")
+                .with_dead_letter_topic("dlq-topic")
+                .with_dlq_store(crate::dlq::DlqStoreMode::Topic);
+            let pipeline = StreamingPipeline::new(
+                source as Arc<dyn Backend>,
+                vec![(target as Arc<dyn Backend>, table)],
+                cfg,
+            );
+            let err = pipeline.resolve_dlq_store().await.unwrap_err();
+            assert!(
+                err.to_string().contains("Kafka"),
+                "typed error names the Kafka requirement: {err}"
+            );
+        }
+
+        /// `dlq_store = "topic"` without a `dead_letter_topic` is a
+        /// config contradiction — hard error, not a fallback.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn dlq_store_mode_topic_requires_topic_config() {
+            let kafka: Arc<dyn Backend> =
+                Arc::new(KafkaBackend::open("localhost:9092", Some("g")).unwrap());
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "mode-topic-2")
+                .with_dlq_store(crate::dlq::DlqStoreMode::Topic);
+            let pipeline =
+                StreamingPipeline::new(kafka, vec![(target as Arc<dyn Backend>, table)], cfg);
+            let err = pipeline.resolve_dlq_store().await.unwrap_err();
+            assert!(
+                err.to_string().contains("dead_letter_topic"),
+                "typed error names the missing topic: {err}"
+            );
+        }
+
+        /// Config defaults pin: mode = Auto (historical resolution),
+        /// max attempts = the Phase 2 replay default.
+        #[test]
+        fn dlq_config_defaults() {
+            let cfg = StreamingPipelineConfig::new(
+                "q",
+                TargetTable {
+                    schema: "".into(),
+                    name: "events".into(),
+                },
+                "p",
+            );
+            assert_eq!(cfg.dlq_store, crate::dlq::DlqStoreMode::Auto);
+            assert_eq!(cfg.dlq_max_attempts, crate::dlq::DEFAULT_MAX_ATTEMPTS);
+            let cfg = cfg.with_dlq_max_attempts(5);
+            assert_eq!(cfg.dlq_max_attempts, 5);
+        }
+
+        /// Mode string round-trip for the TOML/Python plumbing.
+        #[test]
+        fn dlq_store_mode_round_trips() {
+            use crate::dlq::DlqStoreMode;
+            for m in [DlqStoreMode::Auto, DlqStoreMode::Topic, DlqStoreMode::Table] {
+                assert_eq!(DlqStoreMode::parse(m.as_str()), Some(m));
+            }
+            assert_eq!(DlqStoreMode::parse("bogus"), None);
         }
 
         // --- DLQ Phase 2: replay engine (redrive through the pipeline) ----

@@ -53,6 +53,104 @@ def run_pipeline_from_path(
     """
     ...
 
+class DlqArrivals(TypedDict):
+    """Trailing-window arrival counts (records whose ``failed_at``
+    falls inside the window ending at the caller's ``now_ms``)."""
+
+    last_1m: int
+    last_5m: int
+    last_15m: int
+    last_60m: int
+
+class DlqStats(TypedDict):
+    """DLQ depth + stage breakdown + arrival buckets."""
+
+    pending: int
+    parked: int
+    by_stage: dict[str, int]
+    arrivals: DlqArrivals
+    scanned: int
+    truncated: bool
+
+class DlqRecordDict(TypedDict):
+    """One dead-lettered record (payload as raw ``bytes``)."""
+
+    id: str
+    stage: str
+    error: str
+    source_id: str
+    offset_bytes: bytes | None
+    event_ts: int | None
+    failed_at: int
+    attempt: int
+    payload_format: str
+    payload: bytes
+
+class ReplayReport(TypedDict):
+    """Outcome counts for one bounded DLQ replay pass."""
+
+    taken: int
+    succeeded: int
+    redeadlettered: int
+    parked: int
+    started_at_ms: int
+    finished_at_ms: int
+
+class RewindReport(TypedDict):
+    """What a completed rewind did."""
+
+    sources: list[tuple[str, bytes]]
+    state_cleared: bool
+
+def dlq_stats(toml_str: str, now_ms: int) -> DlqStats:
+    """DLQ depth/stage/arrival stats for the pipeline in ``toml_str``.
+
+    ``now_ms`` is the caller's clock (milliseconds since the Unix
+    epoch) — timestamps are always passed in, never read inside the
+    Rust layers.
+    """
+    ...
+
+def dlq_records(
+    toml_str: str,
+    status: str | None = None,
+    page: int = 0,
+    page_size: int = 50,
+) -> list[DlqRecordDict]:
+    """One page of DLQ records, oldest-first. ``status`` filters to
+    ``"pending"`` / ``"leased"`` / ``"parked"``."""
+    ...
+
+def dlq_record_by_id(toml_str: str, record_id: str) -> DlqRecordDict | None:
+    """Find one DLQ record by id (bounded scan), or ``None``."""
+    ...
+
+def dlq_replay(
+    toml_str: str, selection_json: str, max_attempts: int | None = None
+) -> ReplayReport:
+    """Run one bounded replay pass over the JSON selection
+    (``{"kind":"all"}`` / ``{"kind":"first_n","n":N}`` /
+    ``{"kind":"ids","ids":[…]}``)."""
+    ...
+
+def dlq_park(toml_str: str, selection_json: str) -> int:
+    """Park the selected records; returns how many were parked."""
+    ...
+
+def dlq_purge(toml_str: str, selection_json: str) -> int:
+    """Purge the selected records; returns the deleted count."""
+    ...
+
+def stream_rewind(
+    toml_str: str, target_json: str, confirm_state_reset: bool
+) -> RewindReport:
+    """Rewind the pipeline's sources to a timestamp
+    (``{"kind":"timestamp","ms":N}``) or opaque offset bytes
+    (``{"kind":"offset","bytes":[…]}``). Stateful pipelines require
+    ``confirm_state_reset=True`` (hard ``ValueError`` otherwise).
+    The consume loop must be stopped first."""
+    ...
+
 class KafkaBackend:
     """Streaming Kafka backend with Arrow IO + manual offset commits.
 
