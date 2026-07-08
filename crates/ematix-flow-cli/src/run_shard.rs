@@ -25,6 +25,7 @@ use arrow_ipc::writer::FileWriter as ArrowIpcWriter;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
+use ematix_flow_core::ematix_fast_parquet_multi::EmatixFastParquetMultiTableProvider;
 use ematix_flow_core::preset;
 use ematix_flow_distributed::work_unit::{Input, Output, Query, WorkUnit, WorkUnitMetrics};
 
@@ -61,29 +62,17 @@ impl RunShardError {
 pub async fn execute_work_unit(wu: &WorkUnit) -> Result<WorkUnitMetrics, RunShardError> {
     let started = Instant::now();
 
-    // ---- 1. Resolve input prefix to a local path ----
-    let (prefix, tables) = match &wu.input {
-        Input::ParquetPartition {
-            uri_prefix, tables, ..
-        } => (uri_prefix.as_str(), tables.as_slice()),
-    };
-    let prefix_path = uri_to_local_path(prefix)
-        .map_err(|e| RunShardError::Config(format!("input.uri_prefix: {e}")))?;
-    if !prefix_path.is_dir() {
-        return Err(RunShardError::Config(format!(
-            "input.uri_prefix {prefix:?} does not resolve to an existing directory ({:?})",
-            prefix_path
-        )));
-    }
-
-    // ---- 2. Resolve query SQL ----
-    let sql = match &wu.query {
+    // ---- 1. Resolve query SQL ----
+    let sql: &str = match &wu.query {
         Query::Tpch { id } => {
             tpch_sql(id).map_err(|e| RunShardError::Config(format!("query.id: {e}")))?
         }
+        // Σ.SC I.3: iceberg_scan units are not bound to the TPC-H catalog;
+        // they carry their SQL verbatim.
+        Query::Sql { sql } => sql.as_str(),
     };
 
-    // ---- 3. Build session + register tables ----
+    // ---- 2. Build session ----
     //
     // Σ.V (2026-05-26): install the ematix preset rule chain so a
     // CLI shard produces the same plan shape as the bench. Before
@@ -97,17 +86,63 @@ pub async fn execute_work_unit(wu: &WorkUnit) -> Result<WorkUnitMetrics, RunShar
     )
     .build();
     let ctx = SessionContext::new_with_state(state);
+
+    // ---- 3. Register input tables ----
     let decode_start = Instant::now();
-    for table in tables {
-        let parquet_path = parquet_path_for_table(&prefix_path, table)
-            .map_err(|e| RunShardError::Config(format!("table {table:?}: {e}")))?;
-        let mut provider =
-            EmatixFastParquetTableProvider::try_new(parquet_path.to_string_lossy().to_string())
+    match &wu.input {
+        Input::ParquetPartition {
+            uri_prefix, tables, ..
+        } => {
+            let prefix_path = uri_to_local_path(uri_prefix)
+                .map_err(|e| RunShardError::Config(format!("input.uri_prefix: {e}")))?;
+            if !prefix_path.is_dir() {
+                return Err(RunShardError::Config(format!(
+                    "input.uri_prefix {uri_prefix:?} does not resolve to an existing directory \
+                     ({prefix_path:?})"
+                )));
+            }
+            for table in tables {
+                let parquet_path = parquet_path_for_table(&prefix_path, table)
+                    .map_err(|e| RunShardError::Config(format!("table {table:?}: {e}")))?;
+                let mut provider = EmatixFastParquetTableProvider::try_new(
+                    parquet_path.to_string_lossy().to_string(),
+                )
                 .map_err(|e| RunShardError::Config(format!("open {table:?}: {e}")))?;
-        provider = provider.with_dict_preservation(wu.execution.with_dict_preservation);
-        provider = provider.with_late_mat(wu.execution.with_late_mat);
-        ctx.register_table(table.as_str(), Arc::new(provider))
-            .map_err(|e| RunShardError::Config(format!("register {table:?}: {e}")))?;
+                provider = provider.with_dict_preservation(wu.execution.with_dict_preservation);
+                provider = provider.with_late_mat(wu.execution.with_late_mat);
+                ctx.register_table(table.as_str(), Arc::new(provider))
+                    .map_err(|e| RunShardError::Config(format!("register {table:?}: {e}")))?;
+            }
+        }
+        // Σ.SC I.3: a pre-pruned Iceberg scan — the coordinator already ran
+        // the manifest prune, so the targets ARE the table. Register them as
+        // one multi-file table through the ematix codec; the SQL's WHERE
+        // clause re-applies the pruned predicate at row level via the
+        // provider's BridgeFilter pushdown (required for correctness on
+        // `full_scan` targets — the manifest prune is conservative, not
+        // exact). `indexed` targets scan identically for now: their
+        // sidecar_uri is carried but unopened until the Phase 3 provider
+        // wiring lands the row-level sidecar lookup. Execution knobs
+        // (dict-preservation/late-mat) run the provider defaults here — the
+        // multi provider doesn't thread per-file builders yet.
+        Input::IcebergScan { table, targets, .. } => {
+            let mut paths = Vec::with_capacity(targets.len());
+            for target in targets {
+                let p = uri_to_local_path(target.data_uri())
+                    .map_err(|e| RunShardError::Config(format!("iceberg_scan target: {e}")))?;
+                if !p.is_file() {
+                    return Err(RunShardError::Config(format!(
+                        "iceberg_scan target {:?} does not resolve to an existing file ({p:?})",
+                        target.data_uri()
+                    )));
+                }
+                paths.push(p.to_string_lossy().into_owned());
+            }
+            let provider = EmatixFastParquetMultiTableProvider::try_new_files(paths)
+                .map_err(|e| RunShardError::Config(format!("open iceberg_scan targets: {e}")))?;
+            ctx.register_table(table.as_str(), Arc::new(provider))
+                .map_err(|e| RunShardError::Config(format!("register {table:?}: {e}")))?;
+        }
     }
     let decode_ms = decode_start.elapsed().as_millis() as u64;
 
@@ -182,9 +217,7 @@ pub async fn execute_work_unit(wu: &WorkUnit) -> Result<WorkUnitMetrics, RunShar
     }
     Ok(WorkUnitMetrics {
         work_unit_id: wu.id.clone(),
-        query: match &wu.query {
-            Query::Tpch { id } => id.clone(),
-        },
+        query: wu.query.label().to_string(),
         wall_ms,
         decode_ms: Some(decode_ms),
         exec_ms: Some(exec_ms),
@@ -267,7 +300,7 @@ fn tpch_sql(id: &str) -> Result<&'static str, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ematix_flow_distributed::work_unit::Execution;
+    use ematix_flow_distributed::work_unit::{Execution, IcebergPredicate, IcebergScanTarget};
     use std::collections::BTreeMap;
 
     #[test]
@@ -306,6 +339,168 @@ mod tests {
         let upper = tpch_sql("Q14").unwrap();
         let lower = tpch_sql("q14").unwrap();
         assert_eq!(upper, lower);
+    }
+
+    /// Write an `(id: i64, val: i64)` parquet part through the ematix codec.
+    /// (`id`, not `key` — names ending in `key` hit the scale-gated
+    /// EMAT_DOWNCAST_KEYS narrowing and make fixtures env-race-flaky.)
+    fn write_part(path: &Path, ids: &[i64], vals: &[i64]) {
+        ematix_parquet_codec::write::write_table_to_path(
+            path,
+            &[
+                ("id", ematix_parquet_codec::write::ColumnData::I64(ids)),
+                ("val", ematix_parquet_codec::write::ColumnData::I64(vals)),
+            ],
+            ematix_parquet_format::types::CompressionCodec::Uncompressed,
+        )
+        .expect("write fixture parquet");
+    }
+
+    /// Read the worker's Arrow IPC output back as pretty-printed batches.
+    fn read_ipc_pretty(path: &Path) -> String {
+        let file = std::fs::File::open(path).expect("open ipc output");
+        let reader = arrow_ipc::reader::FileReader::try_new(file, None).expect("ipc reader");
+        let batches: Vec<_> = reader.map(|b| b.expect("ipc batch")).collect();
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("pretty")
+            .to_string()
+    }
+
+    /// Direct-scan oracle: run `sql` over `paths` via the same multi-file
+    /// provider the worker uses, on a plain SessionContext.
+    async fn direct_scan(paths: Vec<String>, table: &str, sql: &str) -> String {
+        use ematix_flow_core::ematix_fast_parquet_multi::EmatixFastParquetMultiTableProvider;
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table(
+            table,
+            Arc::new(EmatixFastParquetMultiTableProvider::try_new_files(paths).unwrap()),
+        )
+        .unwrap();
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+            .unwrap()
+            .to_string()
+    }
+
+    /// Σ.SC I.3 worker decode — THE oracle: an `iceberg_scan` WorkUnit over
+    /// three pre-pruned parquet parts returns exactly what a direct scan over
+    /// the same files returns. Targets mix `indexed` and `full_scan`: the
+    /// worker must scan both kinds (the sidecar URI is advisory until the
+    /// Phase 3 provider wiring) and re-apply the predicate via the SQL it
+    /// carries — a mid-range filter proves rows are neither lost at part
+    /// boundaries nor duplicated.
+    #[tokio::test]
+    async fn iceberg_scan_unit_matches_direct_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for (i, base) in [0i64, 100, 200].iter().enumerate() {
+            let ids: Vec<i64> = (*base..*base + 100).collect();
+            let vals: Vec<i64> = ids.iter().map(|k| k * 2).collect();
+            let p = dir.path().join(format!("part-{i:04}.parquet"));
+            write_part(&p, &ids, &vals);
+            paths.push(p.to_string_lossy().into_owned());
+        }
+        let sql = "SELECT id, val FROM t WHERE id >= 150 AND id < 250 ORDER BY id";
+        let out_path = dir.path().join("out.arrow");
+
+        let wu = WorkUnit {
+            schema: WorkUnit::default_schema(),
+            id: "test-wu-ice".into(),
+            query: Query::Sql { sql: sql.into() },
+            input: Input::IcebergScan {
+                table: "t".into(),
+                index_name: "idx_id".into(),
+                predicate: Some(IcebergPredicate::Range {
+                    low: Some(150),
+                    high: Some(249),
+                }),
+                targets: vec![
+                    // Indexed target with a sidecar URI that doesn't exist on
+                    // disk — the worker must still scan the data file.
+                    IcebergScanTarget::Indexed {
+                        data_uri: format!("file://{}", paths[1]),
+                        sidecar_uri: format!("file://{}.idx", paths[1]),
+                    },
+                    IcebergScanTarget::FullScan {
+                        data_uri: format!("file://{}", paths[2]),
+                    },
+                ],
+            },
+            output: Output::ArrowIpc {
+                uri: format!("file://{}", out_path.display()),
+            },
+            execution: Execution::default(),
+        };
+        let metrics = execute_work_unit(&wu).await.expect("iceberg_scan execute");
+        assert_eq!(metrics.query, "sql");
+        assert_eq!(metrics.rows_out, Some(100), "ids 150..=249 = 100 rows");
+
+        // Oracle: the same SQL over the same two surviving files, directly.
+        let want = direct_scan(vec![paths[1].clone(), paths[2].clone()], "t", sql).await;
+        assert_eq!(read_ipc_pretty(&out_path), want);
+    }
+
+    /// A single-target eq unit — the smallest lowering output — decodes and
+    /// answers correctly.
+    #[tokio::test]
+    async fn iceberg_scan_single_target_eq() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids: Vec<i64> = (0..600).map(|i| i % 100).collect();
+        let vals: Vec<i64> = (0..600).collect();
+        let p = dir.path().join("data.parquet");
+        write_part(&p, &ids, &vals);
+        let out_path = dir.path().join("out.arrow");
+
+        let sql = "SELECT val FROM t WHERE id = 42 ORDER BY val";
+        let wu = WorkUnit {
+            schema: WorkUnit::default_schema(),
+            id: "test-wu-ice-eq".into(),
+            query: Query::Sql { sql: sql.into() },
+            input: Input::IcebergScan {
+                table: "t".into(),
+                index_name: "idx_id".into(),
+                predicate: Some(IcebergPredicate::Eq { key: 42 }),
+                targets: vec![IcebergScanTarget::FullScan {
+                    data_uri: format!("file://{}", p.display()),
+                }],
+            },
+            output: Output::ArrowIpc {
+                uri: format!("file://{}", out_path.display()),
+            },
+            execution: Execution::default(),
+        };
+        let metrics = execute_work_unit(&wu).await.expect("eq execute");
+        assert_eq!(metrics.rows_out, Some(6), "id 42 appears 600/100 = 6 times");
+        let want = direct_scan(vec![p.to_string_lossy().into_owned()], "t", sql).await;
+        assert_eq!(read_ipc_pretty(&out_path), want);
+    }
+
+    /// A missing data file is a Config error (exit 2), not a panic or a
+    /// silent empty scan.
+    #[tokio::test]
+    async fn iceberg_scan_missing_file_is_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let wu = WorkUnit {
+            schema: WorkUnit::default_schema(),
+            id: "test-wu-ice-missing".into(),
+            query: Query::Sql {
+                sql: "SELECT 1".into(),
+            },
+            input: Input::IcebergScan {
+                table: "t".into(),
+                index_name: "idx_id".into(),
+                predicate: None,
+                targets: vec![IcebergScanTarget::FullScan {
+                    data_uri: format!("file://{}/nope.parquet", dir.path().display()),
+                }],
+            },
+            output: Output::ArrowIpc {
+                uri: format!("file://{}/out.arrow", dir.path().display()),
+            },
+            execution: Execution::default(),
+        };
+        let err = execute_work_unit(&wu).await.unwrap_err();
+        assert_eq!(err.exit_code(), 2, "missing input is a Config error: {err}");
     }
 
     /// End-to-end execute on a tiny in-tree fixture if SF=1 lineitem

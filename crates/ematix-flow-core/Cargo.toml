@@ -82,6 +82,16 @@ object_store = { workspace = true }
 ematix-parquet-codec = "0.17"
 ematix-parquet-format = "0.17"
 ematix-parquet-io = "0.17"
+# Iceberg manifest-level file pruning, combined with per-file sidecar
+# indexes (the SF1000 pruning stack). Optional + off by default so the
+# default build / PyPI wheel does not pull iceberg-rust. The `iceberg`
+# feature below forwards to ematix-iceberg's own `iceberg` feature,
+# which activates its iceberg-rust integration module (`iceberg_rs`).
+ematix-iceberg = { version = "0.17", optional = true }
+# iceberg-rust — the coordinator names `DataFile` / `Table` from here to hold
+# the manifest walk. Pinned to the same 0.6 ematix-iceberg wraps. Optional;
+# only pulled in by the `iceberg` feature below.
+iceberg = { version = "0.6", optional = true }
 deltalake = { workspace = true }
 datafusion = { workspace = true }
 cranelift = { workspace = true }
@@ -132,6 +142,10 @@ polars = { version = "0.52", optional = true, default-features = false, features
 #   cargo run --release -p ematix-flow-core \
 #     --example tpch_triangulation_bench --features triangulation
 triangulation = ["dep:polars"]
+# Iceberg manifest-level file pruning (see the ematix-iceberg dep above).
+# Off by default. Forwards to ematix-iceberg's own `iceberg` feature so its
+# iceberg-rust integration module compiles in.
+iceberg = ["dep:ematix-iceberg", "ematix-iceberg/iceberg", "dep:iceberg"]
 
 [dev-dependencies]
 arrow-array.workspace = true

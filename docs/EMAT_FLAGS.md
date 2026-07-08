@@ -240,6 +240,7 @@ Read in `src/` via `.parse()...unwrap_or(N)`. Default value is in the **Default*
 | `EMAT_RH_SUM_F64_MIN_GROUPS` | `131_072` | `128*1024` | [robin_hood_sum_f64_exec.rs:381](../crates/ematix-flow-core/src/robin_hood_sum_f64_exec.rs) | Lower group-count gate for the RH SUM(f64) rule. |
 | `EMAT_RT_BLOOM_SELECTIVITY` | `64` | ratio | [runtime_bloom_sideband_rule.rs:130](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | Probe/build selectivity ratio gate for the runtime-bloom sideband. |
 | `EMAT_SCALAR_AGG_MULT` | (none; falls through to shape default) | usize (≥1) | [auto_target_partitions.rs:196](../crates/ematix-flow-core/src/auto_target_partitions.rs) | Forced scalar-agg partition multiplier (overrides the join/no-join default). |
+| `EMAT_SIDECAR_MAX_SELECTIVITY` | `0.05` | f64 in [0,1]; `f64_or` | [sidecar_index.rs](../crates/ematix-flow-core/src/sidecar_index.rs) | Σ.SC P3 index-vs-scan gate: max estimated selectivity (uniform model over the indexed column's footer `[min,max]`) for which an eq lookup still takes the sidecar-index path; above it the plain vectorized scan runs instead. Default sits far below the codec's measured ~60% crossover because the estimate is crude and a wrong "use index" call (masked per-row decode of most of the file) costs much more than a wrong "use scan" call. |
 | `EMAT_SPR_MIN_GROUPS` | `1_000_000` | groups | [single_pass_radix_sum_exec.rs:392](../crates/ematix-flow-core/src/single_pass_radix_sum_exec.rs) | Min group count to enable the single-pass radix SUM rule. |
 | `EMAT_SPR_RADIX_BITS` | `10` | capped at 12 | [single_pass_radix_sum_exec.rs:119](../crates/ematix-flow-core/src/single_pass_radix_sum_exec.rs) | Radix bit-count (bins = 1<<bits) for the single-pass radix SUM. |
 
@@ -344,11 +345,11 @@ production rule, the harness toggles it before constructing rules manually.
 | --- | --- |
 | Production gate (default-ON) | 20 |
 | Production gate (opt-in) | 29 |
-| Numeric tunable | 43 |
+| Numeric tunable | 44 |
 | Diagnostic / trace | 21 |
 | Bench-harness only | 48 |
 | Comment-only (possibly dead) | 1 |
-| **Grand total (distinct flags)** | **162** |
+| **Grand total (distinct flags)** | **163** |
 
 > `EMAT_FAST_SNAPPY` is counted once, under Comment-only.
 > `EMAT_MI_COLLECT` is placed under Diagnostic/trace (allocator-operational,
