@@ -111,6 +111,10 @@ pub mod sidecar_build;
 // iceberg-rust). Combines with `sidecar_index` for the SF1000 pruning stack.
 #[cfg(feature = "iceberg")]
 pub mod iceberg_scan;
+// Σ.SC I.4: write-side manifest stamping — the producer half of the
+// `iceberg_scan` prune contract. Same feature gate.
+#[cfg(feature = "iceberg")]
+pub mod iceberg_stamp;
 // Σ.E5.1: streaming Arrow `RecordBatch` reader over ematix-parquet.
 // Emits 65 536-row batches sliced from a per-row-group dict-aware
 // decode. Replaces the whole-RG emission of `ematix_parquet_bridge`
