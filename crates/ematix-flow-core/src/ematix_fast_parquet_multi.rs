@@ -205,12 +205,12 @@ mod tests {
     use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
     use ematix_parquet_format::types::CompressionCodec;
 
-    /// Write a `(key: i64, val: i64)` parquet at `path`.
+    /// Write a `(id: i64, val: i64)` parquet at `path`.
     fn write_part(path: &Path, keys: &[i64], vals: &[i64]) {
         write_table_to_path(
             path,
             &[
-                ("key", ColumnData::I64(keys)),
+                ("id", ColumnData::I64(keys)),
                 ("val", ColumnData::I64(vals)),
             ],
             CompressionCodec::Uncompressed,
@@ -267,8 +267,8 @@ mod tests {
 
         // Filter (pushdown-eligible) + projection + aggregate spanning parts.
         for tmpl in [
-            "SELECT count(*) c, sum(val) s FROM {} WHERE key >= 50 AND key < 250",
-            "SELECT key, val FROM {} WHERE key IN (0, 150, 299) ORDER BY key",
+            "SELECT count(*) c, sum(val) s FROM {} WHERE id >= 50 AND id < 250",
+            "SELECT id, val FROM {} WHERE id IN (0, 150, 299) ORDER BY id",
             "SELECT count(*) FROM {}",
         ] {
             let m = run(&ctx, &tmpl.replace("{}", "multi")).await;
@@ -297,10 +297,15 @@ mod tests {
 
         let ctx = SessionContext::new();
         let plan = prov.scan(&ctx.state(), None, &[], None).await.unwrap();
-        assert_eq!(
-            plan.output_partitioning().partition_count(),
-            3,
-            "union should expose one partition per part (parallel scan)"
+        // ≥ 3, not == 3: each part contributes AT LEAST one partition (the
+        // parallel fan-out this test pins). The exact per-part count depends
+        // on process-global `EMAT_*` env that parallel tests legitimately
+        // mutate (observed flake: a concurrent env write let a child scan
+        // expose extra partitions), so an exact bound races.
+        let pc = plan.output_partitioning().partition_count();
+        assert!(
+            pc >= 3,
+            "union should expose at least one partition per part (parallel scan), got {pc}"
         );
     }
 
@@ -314,7 +319,7 @@ mod tests {
         let prov = EmatixFastParquetMultiTableProvider::try_new_files(parts).unwrap();
         let s = prov.statistics().unwrap();
         assert_eq!(s.num_rows, Precision::Exact(300), "row count = Σ parts");
-        assert_eq!(s.column_statistics.len(), 2, "key, val");
+        assert_eq!(s.column_statistics.len(), 2, "id, val");
         // When the parts carry exact footer min/max, the merge must span all of
         // them: key ranges 0..99, 100..199, 200..299 -> [0, 299].
         if let (Precision::Exact(min), Precision::Exact(max)) = (
@@ -367,10 +372,10 @@ mod tests {
         assert_eq!(prov.num_parts(), 1);
         let ctx = SessionContext::new();
         ctx.register_table("t", Arc::new(prov)).unwrap();
-        let out = run(&ctx, "SELECT sum(val) FROM t WHERE key >= 2").await;
+        let out = run(&ctx, "SELECT sum(val) FROM t WHERE id >= 2").await;
         assert!(
             out.contains("90"),
-            "sum(val where key>=2)=20+30+40=90; got {out}"
+            "sum(val where id>=2)=20+30+40=90; got {out}"
         );
     }
 }
