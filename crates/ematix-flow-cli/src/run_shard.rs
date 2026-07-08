@@ -66,6 +66,16 @@ pub async fn execute_work_unit(wu: &WorkUnit) -> Result<WorkUnitMetrics, RunShar
         Input::ParquetPartition {
             uri_prefix, tables, ..
         } => (uri_prefix.as_str(), tables.as_slice()),
+        // The coordinator-side manifest prune (feat/sidecar-indexes I.3) already
+        // lowers to an explicit file list, but the worker-side execution of a
+        // pre-pruned Iceberg scan (per-file sidecar lookup + masked decode) is
+        // not wired yet — reject clearly rather than silently mis-scan.
+        Input::IcebergScan { table, .. } => {
+            return Err(RunShardError::Config(format!(
+                "input.kind=iceberg_scan (table {table:?}) is not yet executable by the worker; \
+                 coordinator lowering exists but worker-side sidecar decode is pending"
+            )));
+        }
     };
     let prefix_path = uri_to_local_path(prefix)
         .map_err(|e| RunShardError::Config(format!("input.uri_prefix: {e}")))?;

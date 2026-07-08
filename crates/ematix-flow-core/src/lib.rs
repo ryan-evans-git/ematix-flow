@@ -99,6 +99,9 @@ pub mod ematix_parquet_bridge;
 pub mod ematix_fast_parquet;
 // feat/sidecar-indexes Phase 1: read-side sidecar (`.parquet.idx`) lookups.
 pub mod sidecar_index;
+// feat/sidecar-indexes Phase 2: write-side sidecar creation (backfill a
+// `.parquet.idx` onto existing Parquet). Backs the `flow index build` CLI.
+pub mod sidecar_build;
 // feat/sidecar-indexes Phase I.3: Iceberg manifest-level file pruning for the
 // mesh coordinator. Off by default; needs `--features iceberg` (pulls
 // iceberg-rust). Combines with `sidecar_index` for the SF1000 pruning stack.
