@@ -1,6 +1,6 @@
 <script>
   import { onMount } from "svelte";
-  import { listPipelines, runJobNow } from "../lib/api.js";
+  import { getStreamDlq, listPipelines, runJobNow } from "../lib/api.js";
 
   // Run-now modal state — per-job Run now with optional cascade.
   let runNowFor = null;
@@ -46,12 +46,36 @@
   let sortKey = "name";           // name | kind | status | next | median
   let sortDir = "asc";            // asc | desc
 
+  // DLQ Phase 5: per-stream DLQ depth, fetched per streaming
+  // pipeline after the list loads. `undefined` = not fetched /
+  // unavailable (badge hidden); a depth object shows the badge.
+  let dlqDepths = {};
+
+  async function loadDlqDepths(list) {
+    const entries = await Promise.all(
+      list
+        .filter((p) => p.kind === "streaming")
+        .map(async (p) => {
+          try {
+            const s = await getStreamDlq(p.name);
+            return [p.name, s.depth];
+          } catch (_) {
+            // Stream not registered with the API process (or DLQ
+            // endpoints unavailable) — hide the badge.
+            return null;
+          }
+        }),
+    );
+    dlqDepths = Object.fromEntries(entries.filter(Boolean));
+  }
+
   async function load() {
     loading = true;
     error = null;
     try {
       const body = await listPipelines();
       pipelines = body.pipelines;
+      loadDlqDepths(pipelines);
     } catch (e) {
       error = e.message;
     } finally {
@@ -255,6 +279,16 @@
         <span class="pipeline-meta">
           {#if p.kind === "streaming"}
             <span class="streaming-pill">Streaming</span>
+            {#if dlqDepths[p.name]}
+              {@const d = dlqDepths[p.name]}
+              <a
+                class="dlq-badge {d.pending + d.parked > 0 ? 'dlq-badge--hot' : ''}"
+                href={`#/streams/${encodeURIComponent(p.name)}/dlq`}
+                title={`dead-letter queue: ${d.pending} pending / ${d.parked} parked`}
+              >
+                DLQ {d.pending + d.parked}
+              </a>
+            {/if}
           {:else if p.next_run_at}
             <span class="next-run">Next: <span class="mono">{fmtNextRun(p.next_run_at, p.timezone)}</span></span>
           {:else}
@@ -362,6 +396,21 @@
 {/if}
 
 <style>
+  .dlq-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border, #444);
+    color: var(--fg-muted, #888);
+    font-size: 0.75em;
+    text-decoration: none;
+  }
+  .dlq-badge--hot {
+    color: var(--danger, #b85040);
+    border-color: var(--danger, #b85040);
+  }
+
   .modal-bg {
     position: fixed; inset: 0;
     background: rgba(0, 0, 0, 0.65);

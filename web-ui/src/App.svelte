@@ -8,6 +8,7 @@
   import SqlLab from "./routes/SqlLab.svelte";
   import ChartBuilder from "./routes/ChartBuilder.svelte";
   import Dashboards from "./routes/Dashboards.svelte";
+  import StreamDlq from "./routes/StreamDlq.svelte";
   import { me, loadMe } from "./lib/session.js";
 
   // Hash-based router. v0.5.1 nav model:
@@ -35,6 +36,9 @@
       return { name: "dag", focus: decodeURIComponent(m.slice("/dag/".length)) };
     }
     if (m === "/dag") return { name: "dag", focus: null };
+    // DLQ Phase 5: per-stream dead-letter queue screen.
+    const dlq = m.match(/^\/streams\/(.+)\/dlq$/);
+    if (dlq) return { name: "stream_dlq", stream: decodeURIComponent(dlq[1]) };
     if (m === "/jobs" || m === "/pipelines" || m.startsWith("/jobs?") || m.startsWith("/pipelines?")) {
       return { name: "jobs" };
     }
@@ -119,6 +123,8 @@
     <ChartBuilder />
   {:else if route.name === "dashboards"}
     <Dashboards />
+  {:else if route.name === "stream_dlq"}
+    <StreamDlq name={route.stream} />
   {/if}
 </div>
 
