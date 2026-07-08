@@ -5,6 +5,10 @@
   import Jobs from "./routes/Pipelines.svelte";
   import Workflows from "./routes/Workflows.svelte";
   import Dag from "./routes/Dag.svelte";
+  import SqlLab from "./routes/SqlLab.svelte";
+  import ChartBuilder from "./routes/ChartBuilder.svelte";
+  import Dashboards from "./routes/Dashboards.svelte";
+  import { me, loadMe } from "./lib/session.js";
 
   // Hash-based router. v0.5.1 nav model:
   //   #/workflows      → top-level grouping of jobs (default)
@@ -34,6 +38,9 @@
     if (m === "/jobs" || m === "/pipelines" || m.startsWith("/jobs?") || m.startsWith("/pipelines?")) {
       return { name: "jobs" };
     }
+    if (m === "/sql" || m.startsWith("/sql?")) return { name: "sql" };
+    if (m === "/charts" || m.startsWith("/charts")) return { name: "charts" };
+    if (m === "/dashboards" || m.startsWith("/dashboards")) return { name: "dashboards" };
     return { name: "workflows" };
   }
 
@@ -50,6 +57,7 @@
 
   onMount(() => {
     theme = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+    loadMe();
     window.addEventListener("hashchange", () => {
       route = parseHash(window.location.hash);
     });
@@ -63,6 +71,9 @@
   $: jobsActive = route.name === "jobs";
   $: runsActive = route.name === "runs" || route.name === "run_detail";
   $: dagActive = route.name === "dag";
+  $: sqlActive = route.name === "sql";
+  $: chartsActive = route.name === "charts";
+  $: dashboardsActive = route.name === "dashboards";
 </script>
 
 <div class="app">
@@ -72,7 +83,15 @@
     <a href="#/jobs" class:active={jobsActive}>Jobs</a>
     <a href="#/runs" class:active={runsActive}>Runs</a>
     <a href="#/dag" class:active={dagActive}>DAG</a>
+    <a href="#/sql" class:active={sqlActive}>SQL Lab</a>
+    <a href="#/charts" class:active={chartsActive}>Charts</a>
+    <a href="#/dashboards" class:active={dashboardsActive}>Dashboards</a>
     <span style="flex: 1"></span>
+    {#if $me.rbac_enabled && $me.identity}
+      <span class="user-badge" title="Signed in via SSO">
+        {$me.identity}<span class="role role-{$me.role}">{$me.role}</span>
+      </span>
+    {/if}
     <a href="/api/docs" target="_blank" rel="noopener">API Docs ↗</a>
     <button
       class="theme-toggle"
@@ -94,5 +113,34 @@
     <Runs />
   {:else if route.name === "dag"}
     <Dag focus={route.focus} />
+  {:else if route.name === "sql"}
+    <SqlLab />
+  {:else if route.name === "charts"}
+    <ChartBuilder />
+  {:else if route.name === "dashboards"}
+    <Dashboards />
   {/if}
 </div>
+
+<style>
+  .user-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--fg-muted);
+    margin-right: 10px;
+  }
+  .role {
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .role-admin { color: var(--danger); border-color: var(--danger); }
+  .role-editor { color: var(--accent); border-color: var(--accent); }
+  .role-viewer { color: var(--fg-muted); }
+</style>
