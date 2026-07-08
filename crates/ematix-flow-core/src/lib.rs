@@ -97,6 +97,10 @@ pub mod ematix_parquet_bridge;
 // of parquet-rs. Supports primitive columns only; non-primitive
 // callers continue using `FastParquetTableProvider`.
 pub mod ematix_fast_parquet;
+// Single-node multi-file provider — read a directory of Parquet parts as one
+// table through the ematix codec (closes the gap where single-node could only
+// read multi-file via arrow-rs or distribution).
+pub mod ematix_fast_parquet_multi;
 // Σ.E5.1: streaming Arrow `RecordBatch` reader over ematix-parquet.
 // Emits 65 536-row batches sliced from a per-row-group dict-aware
 // decode. Replaces the whole-RG emission of `ematix_parquet_bridge`
