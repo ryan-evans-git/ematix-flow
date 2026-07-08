@@ -1,7 +1,8 @@
 # Plan — DLQ management + stream replayability
 
 **PRD:** [docs/prds/2026-07-04-dlq-replay.md](../prds/2026-07-04-dlq-replay.md)
-**Status:** Phases 1–2 landed (2026-07-04; Phase 2 on `feat/dlq-replay-phase2`); Phase 3 next
+**Status:** COMPLETE — Phases 1–2 landed 2026-07-04; Phases 3–6 landed
+2026-07-08 (`feat/dlq-replay-phases-3-6`)
 **Discipline:** TDD per phase (contract tests written first, shared across
 store impls); every phase independently green + shippable; strict CI gates
 unchanged. Rust core in `ematix-flow-core`, orchestration/API in
@@ -98,6 +99,39 @@ unchanged. Rust core in `ematix-flow-core`, orchestration/API in
   required for stateful pipelines, hard error without it.
 - Exit: rewind-equivalence integration test (rewind-to-T output ≡
   fresh-start-at-T output, windowed pipeline); stateless rewind test.
+- **Landed 2026-07-08**: `StreamingPipeline::rewind(RewindTarget, confirm_state_reset)`
+  = gate → resolve → durable reset → in-memory clear → seek. New
+  hooks: `Backend::offsets_for_timestamp` (Kafka via broker
+  `offsets_for_times` on an ephemeral probe consumer; past-tail →
+  high watermark; typed default error elsewhere — the Kinesis
+  typed-Unsupported precedent), `StateStore::reset` (clear ALL
+  blobs + REPLACE offsets in one transaction; InMemory + Postgres;
+  contract-tested on both), `BatchTransform::{is_stateful,
+  clear_state}` (windowed transforms wipe `WindowState` wholesale;
+  the pipeline also zeroes watermark bookkeeping). Exit tests:
+  `rewind_equivalence_windowed` (run cut mid-stream so an open
+  window would double-count if state survived) +
+  `stateless_rewind_replays_from_offset`. Deviations/notes:
+  (a) **pause/resume is the caller's job** — `rewind` requires the
+  consume loop stopped; the Phase 4 API layer enforces it by
+  refusing (409) while the stream's latest run is `running`
+  (in-core pause machinery wasn't needed for the exit criteria);
+  (b) offset-bytes rewinds are **single-source only** (one opaque
+  blob can't honestly address N sources) — multi-source pipelines
+  rewind by timestamp, resolved per source;
+  (c) `RewindTarget::Timestamp` is caller-supplied ms (house
+  timestamps-passed-in rule; no clock reads in the path);
+  (d) **Kafka rebalance rework** (pre-req): `seek_to`-recovered
+  offsets now apply by mutating the assignment TPL before `assign`
+  instead of `seek()` from `post_rebalance`, which raced the
+  fetcher ("Erroneous state" — the #539 flake). All 24
+  broker-gated Kafka tests pass with the rework;
+  (e) rewound offsets are durable via `StateStore::reset` when a
+  store is configured; a **no-state-store Kafka pipeline rewound
+  from another process** (the HTTP API) only updates the API
+  process's in-memory backend — committing the rewound offsets to
+  the consumer group is a noted follow-up (single-process rewind +
+  state-store pipelines are fully covered).
 
 ## Phase 4 — Python surface + HTTP API
 
@@ -113,6 +147,36 @@ unchanged. Rust core in `ematix-flow-core`, orchestration/API in
   unchanged.
 - Exit: API tests (fixtures + live store), replay run appears in
   `/api/runs` with `kind=replay`.
+- **Landed 2026-07-08**: `dlq_store`/`dlq_max_attempts` kwargs +
+  TOML (validated both in Python and at Rust config-load,
+  mirroring `transform_on_error`); `DlqStoreMode` on the core
+  config — `"topic"`/`"table"` are demands that hard-error when
+  unsatisfiable, `"table"` skips the topic rule. New
+  `ematix_flow_cli::dlq_ops` layer (operations-only pipeline built
+  with the SAME resolution as `run_consume_with`; stats scans are
+  capped at 10k records and report `truncated`) exposed through
+  pyo3 (`_core.dlq_stats/records/record_by_id/replay/park/purge/
+  stream_rewind`, with a per-TOML pipeline cache so in-process
+  fallback stores stay coherent across HTTP calls) and consumed by
+  `web/dlq.py` + the FastAPI endpoints exactly as specced. Replay
+  runs (including failed ones) register as `kind="replay"` with the
+  ReplayReport in extras. Deviations/notes:
+  (a) **stats scan bound** — stage breakdown + arrival buckets page
+  through `browse` (oldest-first) up to 10k records; a deeper DLQ
+  reports `truncated = true` rather than stalling the API;
+  (b) `dlq_record_by_id` is a bounded browse scan (the trait has no
+  point lookup) — fine at DLQ scale, revisit if DLQs grow;
+  (c) **park by selection** resolves All/FirstN against the PENDING
+  set (leased records are in a replay's custody);
+  (d) purge requires an EXPLICIT selection at the HTTP layer — no
+  implicit whole-DLQ default on a destructive op;
+  (e) the "live store" exit criterion is covered by the CLI crate's
+  `dlq_ops` suite (sqlite family, incl. a real redrive into a
+  sqlite target) + a pyo3 empty-store smoke; the HTTP layer is
+  pinned with fixtures (21 tests: paging, 4 KB preview truncation,
+  download, gating, RunHistory registration, bearer rules);
+  (f) `run_dlq_replay`'s options now default `max_attempts` from
+  the pipeline's configured `dlq_max_attempts` at the ops layer.
 
 ## Phase 5 — Web UI
 
@@ -125,6 +189,29 @@ unchanged. Rust core in `ematix-flow-core`, orchestration/API in
 - Runs tab: `replay` badge + link back to the source DLQ screen.
 - mock-api.mjs fixtures for all new endpoints (dev parity).
 - Exit: `npm run build` clean; manual QA script in docs/qa/.
+- **Landed 2026-07-08**: `#/streams/{name}/dlq` screen
+  (StreamDlq.svelte) with depth card, per-interval arrival
+  sparkline, stage chips, paged record table + payload drawer
+  (≤4 KB preview + raw download), Replay all/selected/first-N,
+  Park, Purge behind confirm modals reusing the Pipelines modal
+  pattern (purge-all requires typing `purge`); Rewind control with
+  timestamp/offset picker. mock-api.mjs fixtures for every
+  endpoint; `npm run build` clean; QA script at
+  `docs/qa/DLQ_REPLAY_UI_QA.md` (first file in docs/qa/).
+  Deviations/notes:
+  (a) the repo has **no stream-detail screen** — the DLQ depth
+  badge lives on the streaming job card (Jobs tab; fetched
+  per-stream after the list loads, hidden when the stream isn't
+  registered with the API process) and the Rewind control lives on
+  the DLQ screen;
+  (b) the stateful typed confirmation is **progressive**: the UI
+  first submits without `confirm_state_reset`; the server's typed
+  400 triggers the type-the-stream-name step, then the retry
+  carries the flag (statefulness isn't known client-side up
+  front). The mock API emulates the 400 so the flow is
+  exercisable offline;
+  (c) Runs-tab `replay` badge links back to the stream's DLQ
+  screen (RunRecord summaries already carry `kind`).
 
 ## Phase 6 — Docs, changelog, gate sweep
 
@@ -132,6 +219,15 @@ unchanged. Rust core in `ematix-flow-core`, orchestration/API in
   CHANGELOG entry, `docs/EMAT_FLAGS.md` if any env knobs were added.
 - Full gates: fmt/clippy(±features)/workspace tests/parity suites/
   tpch_validate; streaming happy-path perf pin; coverage on new modules.
+- **Landed 2026-07-08**: `docs/DLQ_REPLAY_GUIDE.md` (lifecycle
+  guide, in the mkdocs nav), README DLQ bullet + streaming example
+  updated, CHANGELOG Unreleased entry (feature + the #539 seek
+  fix). No env knobs were added, so `docs/EMAT_FLAGS.md` is
+  untouched. Gate sweep results are recorded in the phase commits;
+  the pandas/pyarrow × `_core` interpreter-shutdown segfault that
+  blocks a single-process local pytest run on macOS is
+  PRE-EXISTING (reproduced on an untouched main checkout) and
+  tracked separately.
 
 ## Risks / watch-outs
 
