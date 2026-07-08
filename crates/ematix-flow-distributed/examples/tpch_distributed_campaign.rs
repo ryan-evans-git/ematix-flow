@@ -598,9 +598,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let p = table_source(&data_dir, table)
             .unwrap_or_else(|| panic!("pre-flight passed but {table} source vanished"));
         if use_fast {
-            let prov = ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider::try_new(
-                p.to_string_lossy().to_string(),
-            )?;
+            let prov =
+                ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider::try_new(
+                    p.to_string_lossy().to_string(),
+                )?;
             ctx.register_table(*table, Arc::new(prov))?;
         } else {
             ctx.register_parquet(*table, p.to_str().unwrap(), Default::default())
