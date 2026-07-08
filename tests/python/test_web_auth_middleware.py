@@ -6,11 +6,11 @@ import sqlite3
 import pytest
 
 pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
 
-from ematix_flow.web.analytics_store import AnalyticsStore  # noqa: E402
-from ematix_flow.web.auth import RBACConfig  # noqa: E402
-from ematix_flow.web.server import create_app  # noqa: E402
+from ematix_flow.web.analytics_store import AnalyticsStore
+from ematix_flow.web.auth import RBACConfig
+from ematix_flow.web.server import create_app
 
 
 @pytest.fixture

@@ -1451,7 +1451,8 @@ def _cmd_web(args) -> int:
             group, role = group.strip(), role.strip()
             if not sep or not group or role not in ("viewer", "editor", "admin"):
                 print(
-                    f"warning: --auth-group-role {spec!r} is not GROUP=viewer|editor|admin; ignoring",
+                    f"warning: --auth-group-role {spec!r} is not "
+                    "GROUP=viewer|editor|admin; ignoring",
                     file=sys.stderr,
                 )
                 continue

@@ -11,7 +11,8 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 # Jobs older than this (since completion) are pruned on access.
 _JOB_TTL_S = 600.0
@@ -31,7 +32,7 @@ class QueryJobRegistry:
             try:
                 result = fn()
                 self._set(job_id, status="done", result=result)
-            except Exception as exc:  # noqa: BLE001 - surfaced to the poller
+            except Exception as exc:
                 self._set(job_id, status="error", error=str(exc))
 
         threading.Thread(target=run, name=f"query-job-{job_id[:8]}", daemon=True).start()

@@ -15,9 +15,9 @@ from ematix_flow.web.analytics import (
 )
 
 pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
 
-from ematix_flow.web.server import create_app  # noqa: E402
+from ematix_flow.web.server import create_app
 
 
 class TestDenylist:

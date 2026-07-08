@@ -288,7 +288,7 @@ def _run_with_timeout(fn, timeout_s: float):
     def target() -> None:
         try:
             box["ok"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - relayed to caller
+        except BaseException as exc:
             box["err"] = exc
 
     thread = threading.Thread(target=target, name="ematix-query", daemon=True)

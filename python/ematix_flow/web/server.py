@@ -310,7 +310,9 @@ def create_app(
                 # Still resolve identity for /api/me + ownership.
                 ident = _auth.resolve_identity(request.headers, rbac)
                 request.state.identity = ident
-                request.state.role = _auth.resolve_role(ident, request.headers, rbac) if ident else None
+                request.state.role = (
+                    _auth.resolve_role(ident, request.headers, rbac) if ident else None
+                )
                 return await call_next(request)
             from fastapi.responses import JSONResponse
 
@@ -382,9 +384,11 @@ def create_app(
         try:
             return fn(datasource_registry, *args)
         except DatasourceNotFound as exc:
-            raise HTTPException(status_code=404, detail=f"datasource {exc.args[0]!r} not found")
+            raise HTTPException(
+                status_code=404, detail=f"datasource {exc.args[0]!r} not found"
+            ) from exc
         except QueryError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/health")
     def health() -> dict[str, str]:  # type: ignore[unused-function]
@@ -567,7 +571,9 @@ def create_app(
         return {"deleted": True}
 
     @app.post("/api/dashboards/{dashboard_id}/query")
-    def query_dashboard(dashboard_id: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:  # type: ignore[unused-function]
+    def query_dashboard(  # type: ignore[unused-function]
+        dashboard_id: str, payload: dict[str, Any] = Body(default={})
+    ) -> dict[str, Any]:
         """Run every tile's chart query and return results keyed by
         chart_id, each self-contained ({name, viz_type, encoding,
         columns, rows, truncated} or {error}).
@@ -620,8 +626,8 @@ def create_app(
             )
         try:
             threshold = float(payload.get("threshold"))
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="threshold must be a number")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="threshold must be a number") from exc
         if analytics_store.get_chart(chart_id) is None:
             raise HTTPException(status_code=404, detail="chart not found")
         return analytics_store.create_alert(
@@ -661,10 +667,10 @@ def create_app(
             outcome = evaluate_alert(
                 datasource_registry, chart, alert["column"], alert["op"], alert["threshold"]
             )
-        except DatasourceNotFound:
-            raise HTTPException(status_code=404, detail="datasource not found")
+        except DatasourceNotFound as exc:
+            raise HTTPException(status_code=404, detail="datasource not found") from exc
         except QueryError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"alert_id": alert_id, **outcome}
 
     @app.post("/api/query")
@@ -679,15 +685,15 @@ def create_app(
                 sql=payload.get("sql", ""),
                 max_rows=payload.get("max_rows"),
             )
-        except DatasourceNotFound:
+        except DatasourceNotFound as exc:
             raise HTTPException(
                 status_code=404,
                 detail=f"datasource {datasource_id!r} not found",
-            )
+            ) from exc
         except QueryTimeout as exc:
-            raise HTTPException(status_code=504, detail=str(exc))
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         except QueryError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/query/async")
     def run_query_async(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # type: ignore[unused-function]
@@ -703,10 +709,12 @@ def create_app(
         try:
             datasource = datasource_registry.get(datasource_id)
             cleaned = guard_readonly(payload.get("sql", ""))
-        except DatasourceNotFound:
-            raise HTTPException(status_code=404, detail=f"datasource {datasource_id!r} not found")
+        except DatasourceNotFound as exc:
+            raise HTTPException(
+                status_code=404, detail=f"datasource {datasource_id!r} not found"
+            ) from exc
         except QueryError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         max_rows = payload.get("max_rows")
         job_id = query_jobs.submit(lambda: run_query(datasource.url, cleaned, max_rows))
         return {"job_id": job_id, "status": "pending"}
@@ -1276,7 +1284,7 @@ def create_app(
     @app.post("/api/runs/{run_id}/restart")
     def post_restart(
         run_id: str,
-        body: dict[str, Any] = Body(default_factory=dict),  # noqa: B008
+        body: dict[str, Any] = Body(default_factory=dict),
     ) -> dict[str, Any]:  # type: ignore[unused-function]
         _require_history()
         assert history is not None  # narrowed by _require_history
@@ -1335,7 +1343,7 @@ def create_app(
     @app.post("/api/workflows/{name}/run-now")
     def post_workflow_run_now(  # type: ignore[unused-function]
         name: str,
-        body: dict[str, Any] = Body(default_factory=dict),  # noqa: B008
+        body: dict[str, Any] = Body(default_factory=dict),
     ) -> dict[str, Any]:
         """Enqueue an immediate run of the named workflow. Ignores
         trigger gates (cron not yet reached, upstream events not
@@ -1401,7 +1409,7 @@ def create_app(
     @app.post("/api/jobs/{name}/run-now")
     def post_job_run_now(  # type: ignore[unused-function]
         name: str,
-        body: dict[str, Any] = Body(default_factory=dict),  # noqa: B008
+        body: dict[str, Any] = Body(default_factory=dict),
     ) -> dict[str, Any]:
         """Enqueue an immediate run of the named job.
 
