@@ -118,4 +118,31 @@ pub trait StateStore: Send + Sync + std::fmt::Debug {
     async fn dead_letter_store(&self) -> Result<Option<Arc<dyn DeadLetterStore>>, BackendError> {
         Ok(None)
     }
+
+    /// DLQ Phase 3: atomically clear EVERY state blob for
+    /// `pipeline` and replace its committed offsets with `offsets`
+    /// — the rewind primitive. Both mutations happen in ONE
+    /// transaction: a crash in between must never leave cleared
+    /// state paired with the OLD offsets (double-count) or old
+    /// state paired with the NEW offsets (stale windows absorb the
+    /// re-consumed rows).
+    ///
+    /// Unlike [`commit`], `offsets` REPLACES the stored set —
+    /// source ids absent from the map are deleted, so a rewound
+    /// pipeline can't resume a stale sibling source cursor.
+    ///
+    /// Default is a typed error so stores that haven't opted in
+    /// fail a stateful rewind loudly instead of half-applying it.
+    ///
+    /// [`commit`]: StateStore::commit
+    async fn reset(
+        &self,
+        pipeline: &str,
+        _offsets: HashMap<SourceId, Vec<u8>>,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Other(format!(
+            "this StateStore does not support reset (rewind) — pipeline `{pipeline}` \
+             cannot atomically clear state + rewrite offsets on this store"
+        )))
+    }
 }

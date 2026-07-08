@@ -225,6 +225,7 @@ const WORKFLOWS = [
 // ----- Fixture: runs -----
 
 const RUNS = [
+  { run_id: "replay-live_orders-a1b2c3", pipeline: "live_orders.stream_orders_to_olap", status: "succeeded", started_at: ago(m(9)), duration_ms: 1_842, attempt: 1, triggered_by: "manual", kind: "replay" },
   { run_id: "r-9af3", pipeline: "warehouse_etl.ingest_orders",                  status: "succeeded", started_at: ago(m(34)),   duration_ms: 12_410, attempt: 1, triggered_by: "schedule" },
   { run_id: "r-9ad9", pipeline: "warehouse_etl.build_sales_mart",               status: "succeeded", started_at: ago(m(48)),   duration_ms: 48_911, attempt: 1, triggered_by: "schedule" },
   { run_id: "r-9ada", pipeline: "live_orders.stream_orders_to_olap",        status: "running",   started_at: ago(h(2)),    duration_ms: null,   attempt: 1, triggered_by: "manual" },
@@ -314,6 +315,82 @@ const DAG = {
   ],
 };
 
+// ----- Fixture: per-stream DLQ (DLQ Phase 5) -----
+//
+// Shapes mirror the FastAPI endpoints in
+// python/ematix_flow/web/server.py:
+//   GET  /streams/:name/dlq                       → depth/stages/arrivals
+//   GET  /streams/:name/dlq/records               → paged record summaries
+//   GET  /streams/:name/dlq/records/:id/payload   → raw payload bytes
+//   POST /streams/:name/dlq/{replay,park,purge}   → report / counts
+//   POST /streams/:name/rewind                    → rewind report
+
+const DLQ_STREAM = "live_orders.stream_orders_to_olap";
+
+const DLQ_PAYLOADS = {};
+
+function dlqRecord(i) {
+  const stages = ["write", "write", "transform", "write", "late_data"];
+  const stage = stages[i % stages.length];
+  const errors = {
+    write: "olap_orders: connection reset by peer during INSERT batch",
+    transform: 'CAST(order_total AS DECIMAL): invalid utf-8 sequence in field "order_total"',
+    late_data: 'late data evicted past its lateness deadline (late_data = "dlq")',
+  };
+  const payload = JSON.stringify({
+    order_id: 41_000 + i,
+    customer_id: 7_000 + (i % 40),
+    order_total: stage === "transform" ? "£—corrupt—" : (19.99 + i).toFixed(2),
+    ts: ago(m(3 * i + 2)),
+  });
+  const id = `dlq-${(4096 + i).toString(16)}`;
+  DLQ_PAYLOADS[id] = payload;
+  return {
+    id,
+    stage,
+    error: errors[stage],
+    source_id: "orders",
+    offset_base64: btoa(JSON.stringify({ v: 1, partitions: { 0: 15_000 + i } })),
+    event_ts: (now - m(3 * i + 2)) * 1000,
+    failed_at: now - m(3 * i + 2),
+    attempt: 1 + (i % 3),
+    payload_format: "json",
+    payload_preview: payload,
+    payload_size: payload.length,
+    payload_truncated: false,
+    download: `/api/streams/${encodeURIComponent(DLQ_STREAM)}/dlq/records/${id}/payload`,
+  };
+}
+
+const DLQ_RECORDS = Array.from({ length: 63 }, (_, i) => dlqRecord(i));
+// Statuses: a handful parked, one leased, rest pending.
+const DLQ_STATUS = (i) => (i % 17 === 3 ? "parked" : i === 5 ? "leased" : "pending");
+
+function dlqSummary() {
+  const byStage = {};
+  let pending = 0;
+  let parked = 0;
+  DLQ_RECORDS.forEach((r, i) => {
+    byStage[r.stage] = (byStage[r.stage] || 0) + 1;
+    if (DLQ_STATUS(i) === "parked") parked += 1;
+    else pending += 1;
+  });
+  const within = (ms) => DLQ_RECORDS.filter((r) => now - r.failed_at <= ms).length;
+  return {
+    pipeline: DLQ_STREAM,
+    depth: { pending, parked },
+    by_stage: byStage,
+    arrivals: {
+      last_1m: within(m(1)),
+      last_5m: within(m(5)),
+      last_15m: within(m(15)),
+      last_60m: within(m(60)),
+    },
+    scanned: DLQ_RECORDS.length,
+    truncated: false,
+  };
+}
+
 // ----- Dispatch -----
 
 function json(res, payload, status = 200) {
@@ -363,6 +440,102 @@ export function mockApiPlugin() {
         const jobRunMatch = path.match(/^\/jobs\/([^/]+)\/run-now$/);
         if (method === "POST" && jobRunMatch) {
           return json(res, { ok: true, new_run_id: "r-MOCK02" });
+        }
+
+        // ---- Streams: DLQ + rewind (DLQ Phase 5) ----
+        const dlqSummaryMatch = path.match(/^\/streams\/([^/]+)\/dlq$/);
+        if (method === "GET" && dlqSummaryMatch) {
+          const name = decodeURIComponent(dlqSummaryMatch[1]);
+          if (name !== DLQ_STREAM) {
+            return json(res, { detail: `unknown stream '${name}'` }, 404);
+          }
+          return json(res, dlqSummary());
+        }
+
+        const dlqRecordsMatch = path.match(/^\/streams\/([^/]+)\/dlq\/records$/);
+        if (method === "GET" && dlqRecordsMatch) {
+          const name = decodeURIComponent(dlqRecordsMatch[1]);
+          if (name !== DLQ_STREAM) {
+            return json(res, { detail: `unknown stream '${name}'` }, 404);
+          }
+          const status = url.searchParams.get("status");
+          const page = parseInt(url.searchParams.get("page") || "0", 10);
+          const pageSize = parseInt(url.searchParams.get("page_size") || "50", 10);
+          let filtered = DLQ_RECORDS.filter(
+            (_, i) => !status || DLQ_STATUS(i) === status,
+          );
+          return json(res, {
+            pipeline: name,
+            page,
+            page_size: pageSize,
+            records: filtered.slice(page * pageSize, (page + 1) * pageSize),
+          });
+        }
+
+        const dlqPayloadMatch = path.match(
+          /^\/streams\/([^/]+)\/dlq\/records\/([^/]+)\/payload$/,
+        );
+        if (method === "GET" && dlqPayloadMatch) {
+          const body = DLQ_PAYLOADS[decodeURIComponent(dlqPayloadMatch[2])];
+          if (body == null) {
+            return json(res, { detail: "DLQ record not found" }, 404);
+          }
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/octet-stream");
+          return res.end(body);
+        }
+
+        const dlqActionMatch = path.match(
+          /^\/streams\/([^/]+)\/dlq\/(replay|park|purge)$/,
+        );
+        if (method === "POST" && dlqActionMatch) {
+          const action = dlqActionMatch[2];
+          if (action === "replay") {
+            return json(res, {
+              run_id: "replay-MOCK01",
+              report: {
+                taken: 12,
+                succeeded: 9,
+                redeadlettered: 2,
+                parked: 1,
+                started_at_ms: now - 2_000,
+                finished_at_ms: now,
+              },
+            });
+          }
+          if (action === "park") return json(res, { parked: 3 });
+          return json(res, { purged: 7 });
+        }
+
+        const rewindMatch = path.match(/^\/streams\/([^/]+)\/rewind$/);
+        if (method === "POST" && rewindMatch) {
+          // Emulate the stateful gate: first call without
+          // confirm_state_reset gets the typed 400 so the UI's
+          // typed-confirmation flow is exercisable in dev.
+          let bodyStr = "";
+          req.on("data", (c) => (bodyStr += c));
+          req.on("end", () => {
+            let parsed = {};
+            try { parsed = JSON.parse(bodyStr || "{}"); } catch (_) {}
+            if (!parsed.to || !parsed.to.kind) {
+              return json(res, { detail: "to is required" }, 400);
+            }
+            if (!parsed.confirm_state_reset) {
+              return json(res, {
+                detail:
+                  "pipeline has a stateful (windowed/session) transform — " +
+                  "pass confirm_state_reset = true to proceed.",
+              }, 400);
+            }
+            return json(res, {
+              pipeline: DLQ_STREAM,
+              state_cleared: true,
+              sources: [
+                { source: "orders", offset_base64: btoa('{"v":1,"partitions":{"0":14000}}') },
+              ],
+            });
+          });
+          return;
         }
 
         // Anything else: pass through (Vite will 404).

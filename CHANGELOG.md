@@ -7,7 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **DLQ management + stream replayability (Phases 3–6 of the DLQ
+  plan; Phases 1–2 shipped the store + replay engine).**
+  - **Rewind** (`StreamingPipeline::rewind`, `POST
+    /api/streams/{name}/rewind`): move a stream's read position to
+    a timestamp (Kafka `offsets_for_times`; typed error on backends
+    without a timestamp index) or opaque offset bytes. Stateful
+    (windowed/session) pipelines require `confirm_state_reset` and
+    get their durable state cleared + offsets rewritten in ONE
+    state-store transaction (`StateStore::reset`), plus in-memory
+    accumulator + watermark resets — rewind-to-T output is
+    equivalent to a fresh start at T.
+  - **`dlq_store = "auto" | "topic" | "table"`** and
+    **`dlq_max_attempts`** on `run_streaming_pipeline` + TOML;
+    `"topic"`/`"table"` are hard demands, never silent fallbacks.
+  - **HTTP API**: `GET /api/streams/{name}/dlq` (depth, arrival
+    buckets, stage breakdown), `GET …/dlq/records` (paged, ≤4 KB
+    payload preview + raw download), `POST …/dlq/replay` /
+    `…/dlq/park` / `…/dlq/purge` (selection: all / first N / ids),
+    and the rewind endpoint (409 while the stream runs). Replay
+    runs register in RunHistory as `kind="replay"` and appear in
+    `/api/runs`.
+  - **Web UI**: `#/streams/{name}/dlq` screen (depth card, arrival
+    sparkline, stage chips, paged record table with payload drawer,
+    Replay/Park/Purge behind confirm modals, Rewind control with a
+    typed state-reset confirmation), DLQ depth badges on streaming
+    job cards, and `replay` badges on the Runs tab. Mock-API
+    fixtures for offline dev; manual QA script at
+    `docs/qa/DLQ_REPLAY_UI_QA.md`.
+  - Docs: `docs/DLQ_REPLAY_GUIDE.md` covers the error-policy → DLQ
+    → replay → rewind lifecycle.
+
 ### Fixed
+
+- **Kafka `seek_to` recovery no longer races the fetcher.**
+  Recovered offsets are now applied by mutating the rebalance
+  assignment TPL before `assign` instead of calling `seek()` from
+  `post_rebalance` (which intermittently hit "Local: Erroneous
+  state" — the #539 flake). Restart/rewind seeks are deterministic.
+
 
 - **macOS: segfault when `_core` and pyarrow share a process.** The
   Python extension set mimalloc (v3) as the Rust `#[global_allocator]`;

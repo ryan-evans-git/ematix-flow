@@ -605,6 +605,31 @@ pub trait Backend: Send + Sync + 'static {
     async fn offset_snapshot(&self) -> Result<Option<Vec<u8>>, BackendError> {
         Ok(None)
     }
+
+    /// DLQ Phase 3: resolve a wall-clock timestamp (milliseconds
+    /// since the Unix epoch, passed in by the caller — never read
+    /// from a clock here) to this backend's opaque offset bytes,
+    /// suitable for [`seek_to`]. Rewind-to-timestamp resolves each
+    /// source through this before seeking.
+    ///
+    /// Kafka implements it via the broker's `offsets_for_times`.
+    /// Backends without native timestamp indexes (Kinesis until its
+    /// durable offsets land; SQL backends) keep this default typed
+    /// error — operators rewind them by offset bytes instead (the
+    /// generic StateStore-recorded offset path).
+    ///
+    /// [`seek_to`]: Backend::seek_to
+    async fn offsets_for_timestamp(
+        &self,
+        _query: &str,
+        _ts_ms: i64,
+    ) -> Result<Vec<u8>, BackendError> {
+        Err(BackendError::Other(format!(
+            "backend dialect {:?} does not support timestamp→offset resolution — \
+             rewind this source by offset bytes instead",
+            self.dialect()
+        )))
+    }
 }
 
 /// Re-export for trait method signatures.

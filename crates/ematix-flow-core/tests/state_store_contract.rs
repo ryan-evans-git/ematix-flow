@@ -62,3 +62,23 @@ async fn empty_commit_is_noop() {
     let store = InMemoryStateStore::new();
     h::run_empty_commit_is_noop(&store, "p").await;
 }
+
+// ----- DLQ Phase 3: reset (rewind primitive) --------------------------
+
+#[tokio::test]
+async fn reset_clears_state_and_replaces_offsets() {
+    let store = InMemoryStateStore::new();
+    h::run_reset_clears_state_and_replaces_offsets(&store, "p").await;
+}
+
+#[tokio::test]
+async fn reset_leaves_other_pipelines_alone() {
+    let store = InMemoryStateStore::new();
+    h::run_reset_leaves_other_pipelines_alone(&store, "p1", "p2").await;
+}
+
+#[tokio::test]
+async fn reset_of_unknown_pipeline_writes_offsets() {
+    let store = InMemoryStateStore::new();
+    h::run_reset_of_unknown_pipeline_writes_offsets(&store, "p").await;
+}

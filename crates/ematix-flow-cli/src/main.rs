@@ -119,6 +119,40 @@ enum Commands {
         #[arg(long, conflicts_with = "work_unit_file")]
         work_unit_stdin: bool,
     },
+    /// Create and manage sidecar indexes (`.parquet.idx`) on existing
+    /// Parquet files — Postgres-style indexing without rewriting the source.
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IndexAction {
+    /// Build a sorted sidecar index on a column of an existing Parquet file,
+    /// writing `<source>.parquet.idx` beside it (or `--out`). The source
+    /// Parquet is never modified — the sidecar is a separate file that a
+    /// reader consults to skip whole row groups and masked-decode only the
+    /// matching rows.
+    ///
+    /// The column's physical type selects the writer: INT64 / INT32 /
+    /// BYTE_ARRAY are supported (eq + range). Exit code 2 on a bad
+    /// column/type, 3 on a write failure.
+    Build {
+        /// Path to the source `.parquet` file.
+        #[arg(value_name = "PARQUET")]
+        parquet: PathBuf,
+        /// Column to index: a leaf name (e.g. `l_orderkey`) or a numeric
+        /// ordinal (e.g. `0`).
+        #[arg(long, value_name = "COL")]
+        column: String,
+        /// Logical index name the reader addresses (e.g. `idx_orderkey`).
+        #[arg(long, value_name = "NAME")]
+        name: String,
+        /// Sidecar output path. Defaults to `<source>.parquet.idx`.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -155,6 +189,57 @@ async fn main() -> ExitCode {
             work_unit_file,
             work_unit_stdin,
         } => run_shard_cmd(work_unit_file.as_deref(), work_unit_stdin).await,
+        Commands::Index { action } => match action {
+            IndexAction::Build {
+                parquet,
+                column,
+                name,
+                out,
+            } => index_build_cmd(&parquet, &column, &name, out),
+        },
+    }
+}
+
+/// `flow index build` — backfill a sorted sidecar index onto an existing
+/// Parquet file. Thin shell over
+/// [`ematix_flow_core::sidecar_build::build_sorted_sidecar`]; the source is
+/// never modified. Exit codes: 2 = bad column / unsupported type / unreadable
+/// source, 3 = sidecar write failed.
+fn index_build_cmd(
+    parquet: &std::path::Path,
+    column: &str,
+    name: &str,
+    out: Option<PathBuf>,
+) -> ExitCode {
+    use ematix_flow_core::sidecar_build::build_sorted_sidecar;
+
+    match build_sorted_sidecar(parquet, name, column, out) {
+        Ok(path) => {
+            info!(
+                sidecar = %path.display(),
+                source = %parquet.display(),
+                index = name,
+                column,
+                "sidecar index built"
+            );
+            // The written path on stdout so scripts can capture it.
+            println!("{}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            // Classify by message: a bad column reference / unsupported type /
+            // unreadable source is a user error (2); anything else is treated
+            // as a write failure (3).
+            let msg = format!("{e}");
+            let is_user_error = msg.contains("no leaf column named")
+                || msg.contains("out of range")
+                || msg.contains("physical type") // unsupported-type NotImplemented
+                || msg.contains("index build: open ")
+                || msg.contains("read metadata");
+            let code = if is_user_error { 2 } else { 3 };
+            error!(error = %e, exit_code = code, "flow index build failed");
+            ExitCode::from(code)
+        }
     }
 }
 
@@ -315,8 +400,12 @@ fn init_tracing() {
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,ematix_flow=info"));
+    // Logs go to STDERR so stdout stays clean for machine-readable output:
+    // `run-shard`'s WorkUnitMetrics JSON and `index build`'s written sidecar
+    // path. (`run-shard`'s doc already specifies "Stderr: tracing logs".)
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .try_init();
 }

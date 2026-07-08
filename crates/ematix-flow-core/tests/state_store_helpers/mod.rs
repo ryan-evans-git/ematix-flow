@@ -296,3 +296,102 @@ pub async fn run_empty_commit_is_noop<S: StateStore>(store: &S, pipeline: &str) 
         Some(&b"v"[..])
     );
 }
+
+// ----- DLQ Phase 3: reset (rewind primitive) --------------------------
+
+/// `reset` clears every state blob and REPLACES the offset set —
+/// source ids absent from the new map are deleted (unlike
+/// `commit`'s per-source merge).
+pub async fn run_reset_clears_state_and_replaces_offsets<S: StateStore>(store: &S, pipeline: &str) {
+    store
+        .commit(
+            pipeline,
+            CommitSnapshot {
+                state_upserts: vec![
+                    (k("user-1"), b"blob-1".to_vec()),
+                    (k("user-2"), b"blob-2".to_vec()),
+                ],
+                offsets: map([
+                    ("kafka-a", b"old-a".to_vec()),
+                    ("kafka-b", b"old-b".to_vec()),
+                ]),
+                state_version: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    store
+        .reset(pipeline, map([("kafka-a", b"rewound-a".to_vec())]))
+        .await
+        .unwrap();
+
+    let r = store.load(pipeline).await.unwrap();
+    assert!(
+        r.state_by_key.is_empty(),
+        "reset must clear EVERY state blob for the pipeline"
+    );
+    assert_eq!(
+        r.offsets.get("kafka-a").map(|v| v.as_slice()),
+        Some(&b"rewound-a"[..]),
+        "reset writes the rewound offset"
+    );
+    assert!(
+        !r.offsets.contains_key("kafka-b"),
+        "reset REPLACES offsets — absent source ids are deleted, \
+         not merged like commit"
+    );
+}
+
+/// `reset` scopes to one pipeline — a sibling's state and offsets
+/// survive untouched.
+pub async fn run_reset_leaves_other_pipelines_alone<S: StateStore>(
+    store: &S,
+    pipeline_a: &str,
+    pipeline_b: &str,
+) {
+    for p in [pipeline_a, pipeline_b] {
+        store
+            .commit(
+                p,
+                CommitSnapshot {
+                    state_upserts: vec![(k("u"), b"blob".to_vec())],
+                    offsets: map([("s", b"1".to_vec())]),
+                    state_version: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    store
+        .reset(pipeline_a, map([("s", b"0".to_vec())]))
+        .await
+        .unwrap();
+
+    let rb = store.load(pipeline_b).await.unwrap();
+    assert_eq!(
+        rb.state_by_key.get(&k("u")).map(|v| v.as_slice()),
+        Some(&b"blob"[..]),
+        "sibling pipeline's state survives a reset"
+    );
+    assert_eq!(rb.offsets.get("s").map(|v| v.as_slice()), Some(&b"1"[..]));
+}
+
+/// Resetting a pipeline the store has never seen is a no-op that
+/// still records the offsets (idempotent bootstrap — rewind before
+/// first checkpoint).
+pub async fn run_reset_of_unknown_pipeline_writes_offsets<S: StateStore>(
+    store: &S,
+    pipeline: &str,
+) {
+    store
+        .reset(pipeline, map([("src", b"42".to_vec())]))
+        .await
+        .unwrap();
+    let r = store.load(pipeline).await.unwrap();
+    assert!(r.state_by_key.is_empty());
+    assert_eq!(r.offsets.get("src").map(|v| v.as_slice()), Some(&b"42"[..]));
+}

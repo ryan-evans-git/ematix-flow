@@ -9469,3 +9469,75 @@ async fn kafka_dlq_replay_poison_parks_into_fallback_table() {
         .value(0);
     assert_eq!(n, 0);
 }
+
+// ----- DLQ Phase 3: rewind timestamp→offset resolution (Kafka) --------
+
+/// `offsets_for_timestamp` resolves through the broker's
+/// `offsets_for_times` and the resulting blob round-trips through
+/// `seek_to`: a consumer seeked to T sees exactly the messages at
+/// or after T.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_offsets_for_timestamp_resolves_and_seeks() {
+    let (_container, bootstrap) = start_kafka().await;
+    let topic = "rewind-ts-events";
+
+    // Three messages with explicit, well-separated broker timestamps.
+    let producer: FutureProducer = KafkaClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("kafka producer create");
+    for (ts_ms, payload) in [
+        (1_600_000_000_000_i64, r#"{"id": 1}"#),
+        (1_600_000_100_000_i64, r#"{"id": 2}"#),
+        (1_600_000_200_000_i64, r#"{"id": 3}"#),
+    ] {
+        producer
+            .send(
+                FutureRecord::<(), str>::to(topic)
+                    .payload(payload)
+                    .timestamp(ts_ms),
+                StdDuration::from_secs(5),
+            )
+            .await
+            .expect("kafka produce");
+    }
+
+    let backend = KafkaBackend::open(&bootstrap, Some("rewind-ts-group")).unwrap();
+
+    // Resolve T between message 1 and message 2.
+    let bytes = backend
+        .offsets_for_timestamp(topic, 1_600_000_050_000)
+        .await
+        .expect("offsets_for_timestamp");
+
+    // Seek + read: only messages 2 and 3 come back.
+    backend.seek_to(&bytes).await.expect("seek_to");
+    let stream = backend.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let mut ids: Vec<i64> = Vec::new();
+    for b in &batches {
+        let id = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        ids.extend((0..id.len()).map(|i| id.value(i)));
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![2, 3], "seeked past message 1");
+
+    // A timestamp beyond the tail resolves to the high watermark —
+    // seeking there replays nothing.
+    let end_bytes = backend
+        .offsets_for_timestamp(topic, 1_700_000_000_000)
+        .await
+        .expect("offsets_for_timestamp past tail");
+    backend.seek_to(&end_bytes).await.expect("seek_to end");
+    let stream = backend.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 0, "past-tail rewind must not replay old rows");
+}

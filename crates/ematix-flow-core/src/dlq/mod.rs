@@ -67,6 +67,45 @@ pub fn truncate_error(error: &str) -> String {
     error[..end].to_string()
 }
 
+/// DLQ Phase 4: operator-facing store selection
+/// (`dlq_store = "auto" | "topic" | "table"` in TOML / Python).
+///
+/// - `Auto` — the historical Phase 1 resolution order (explicit
+///   store → topic+Kafka → state-store family → loud in-memory
+///   fallback).
+/// - `Topic` — demand the Kafka topic store; resolution hard-errors
+///   when the pipeline has no Kafka source or no
+///   `dead_letter_topic` instead of silently falling back.
+/// - `Table` — demand the table family; the topic rule is skipped
+///   even when a `dead_letter_topic` is configured (the operator
+///   wants browse/lease/park semantics a topic can't express).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DlqStoreMode {
+    #[default]
+    Auto,
+    Topic,
+    Table,
+}
+
+impl DlqStoreMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DlqStoreMode::Auto => "auto",
+            DlqStoreMode::Topic => "topic",
+            DlqStoreMode::Table => "table",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(DlqStoreMode::Auto),
+            "topic" => Some(DlqStoreMode::Topic),
+            "table" => Some(DlqStoreMode::Table),
+            _ => None,
+        }
+    }
+}
+
 /// Which pipeline stage dead-lettered the record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DlqStage {

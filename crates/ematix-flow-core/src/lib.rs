@@ -10,6 +10,12 @@ pub mod delta_backend;
 pub mod flags;
 /// Σ.AI.6 bounded-by-default DataFusion memory pool (`EMAT_MEM_POOL_FRACTION`).
 pub mod mem_pool;
+// Σ.AI.6d (2026-07-08): decode-pressure shedding — the scan-side
+// MemAvailable hook for the UNTRACKED decode memory the DataFusion
+// pool floor cannot see (MEMORY_BUDGET.md option 3). Opt-in
+// `EMAT_DECODE_SHED=1`; the 32 GB-box full-suite A/B decides the
+// default.
+pub mod mem_pressure;
 // Σ.A2 PR 1: SQL dialect translator. Namespaced (`ematix_flow_core::
 // dialect::Dialect`) so it doesn't collide with `backend::Dialect`,
 // which names backend kinds (Postgres / MySQL / Kafka / …) rather
@@ -103,6 +109,20 @@ pub mod ematix_fast_parquet;
 // table through the ematix codec (closes the gap where single-node could only
 // read multi-file via arrow-rs or distribution).
 pub mod ematix_fast_parquet_multi;
+// feat/sidecar-indexes Phase 1: read-side sidecar (`.parquet.idx`) lookups.
+pub mod sidecar_index;
+// feat/sidecar-indexes Phase 2: write-side sidecar creation (backfill a
+// `.parquet.idx` onto existing Parquet). Backs the `flow index build` CLI.
+pub mod sidecar_build;
+// feat/sidecar-indexes Phase I.3: Iceberg manifest-level file pruning for the
+// mesh coordinator. Off by default; needs `--features iceberg` (pulls
+// iceberg-rust). Combines with `sidecar_index` for the SF1000 pruning stack.
+#[cfg(feature = "iceberg")]
+pub mod iceberg_scan;
+// Σ.SC I.4: write-side manifest stamping — the producer half of the
+// `iceberg_scan` prune contract. Same feature gate.
+#[cfg(feature = "iceberg")]
+pub mod iceberg_stamp;
 // Σ.E5.1: streaming Arrow `RecordBatch` reader over ematix-parquet.
 // Emits 65 536-row batches sliced from a per-row-group dict-aware
 // decode. Replaces the whole-RG emission of `ematix_parquet_bridge`

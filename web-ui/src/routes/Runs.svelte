@@ -147,7 +147,17 @@
     <tbody>
       {#each sorted as r (r.run_id)}
         <tr on:click={() => (window.location.hash = `#/runs/${encodeURIComponent(r.run_id)}`)}>
-          <td>{r.pipeline}</td>
+          <td>
+            {r.pipeline}
+            {#if r.kind === "replay"}
+              <a
+                class="replay-badge"
+                href={`#/streams/${encodeURIComponent(r.pipeline)}/dlq`}
+                on:click|stopPropagation
+                title="DLQ replay run — open this stream's DLQ"
+              >replay</a>
+            {/if}
+          </td>
           <td><span class="status status--{r.status}">{r.status}</span></td>
           <td>{fmtTime(r.started_at)}</td>
           <td>{fmtDuration(r.duration_ms)}</td>
@@ -158,3 +168,19 @@
     </tbody>
   </table>
 {/if}
+
+
+<style>
+  .replay-badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 0 7px;
+    border-radius: 999px;
+    border: 1px solid var(--info, #4090b8);
+    color: var(--info, #4090b8);
+    font-size: 0.72em;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    text-decoration: none;
+  }
+</style>

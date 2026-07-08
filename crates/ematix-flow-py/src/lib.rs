@@ -1022,6 +1022,237 @@ fn connect(py: Python<'_>, url: &str) -> PyResult<Connection> {
     Ok(Connection { backend, dsn })
 }
 
+// =====================================================================
+// DLQ Phase 4: DLQ + rewind operations for the FastAPI layer.
+//
+// Each function takes the pipeline's TOML (rendered by the Python
+// registry) and drives `ematix_flow_cli::dlq_ops` against a cached
+// operations-only pipeline. The cache (keyed by the TOML itself) is
+// what makes the in-process fallback stores coherent: depth /
+// records / replay within one server process hit the SAME resolved
+// store handle. Durable stores (Postgres family, Kafka topics)
+// would be coherent anyway; the cache is just an optimization
+// there.
+// =====================================================================
+
+static OPS_PIPELINES: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, Arc<ematix_flow_core::streaming::StreamingPipeline>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+fn ops_pipeline_for(
+    py: Python<'_>,
+    toml_str: &str,
+) -> PyResult<Arc<ematix_flow_core::streaming::StreamingPipeline>> {
+    if let Some(p) = OPS_PIPELINES
+        .lock()
+        .expect("ops pipeline cache mutex poisoned")
+        .get(toml_str)
+    {
+        return Ok(Arc::clone(p));
+    }
+    let cfg = ematix_flow_cli::PipelineCliConfig::from_toml_str(toml_str)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let pipeline = py
+        .detach(|| {
+            rt().block_on(async move { ematix_flow_cli::dlq_ops::build_ops_pipeline(&cfg).await })
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let pipeline = Arc::new(pipeline);
+    OPS_PIPELINES
+        .lock()
+        .expect("ops pipeline cache mutex poisoned")
+        .insert(toml_str.to_string(), Arc::clone(&pipeline));
+    Ok(pipeline)
+}
+
+fn dlq_record_to_dict<'py>(
+    py: Python<'py>,
+    r: &ematix_flow_core::dlq::DlqRecord,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("id", r.id.0.as_str())?;
+    d.set_item("stage", r.meta.stage.as_str())?;
+    d.set_item("error", r.meta.error.as_str())?;
+    d.set_item("source_id", r.meta.source_id.as_str())?;
+    d.set_item("offset_bytes", r.meta.offset_bytes.as_deref())?;
+    d.set_item("event_ts", r.meta.event_ts)?;
+    d.set_item("failed_at", r.meta.failed_at)?;
+    d.set_item("attempt", r.meta.attempt)?;
+    d.set_item("payload_format", r.meta.payload_format.as_str())?;
+    d.set_item("payload", r.payload.as_slice())?;
+    Ok(d)
+}
+
+/// DLQ depth + stage breakdown + arrival buckets for the pipeline
+/// described by `toml_str`. `now_ms` is the caller's clock
+/// (milliseconds since the Unix epoch) — passed in per the house
+/// timestamps convention.
+#[pyfunction]
+fn dlq_stats<'py>(py: Python<'py>, toml_str: &str, now_ms: i64) -> PyResult<Bound<'py, PyDict>> {
+    let pipeline = ops_pipeline_for(py, toml_str)?;
+    let stats = py
+        .detach(|| {
+            rt().block_on(
+                async move { ematix_flow_cli::dlq_ops::dlq_stats(&pipeline, now_ms).await },
+            )
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let d = PyDict::new(py);
+    d.set_item("pending", stats.pending)?;
+    d.set_item("parked", stats.parked)?;
+    let stages = PyDict::new(py);
+    for (stage, count) in &stats.by_stage {
+        stages.set_item(stage, count)?;
+    }
+    d.set_item("by_stage", stages)?;
+    let arrivals = PyDict::new(py);
+    arrivals.set_item("last_1m", stats.arrivals_1m)?;
+    arrivals.set_item("last_5m", stats.arrivals_5m)?;
+    arrivals.set_item("last_15m", stats.arrivals_15m)?;
+    arrivals.set_item("last_60m", stats.arrivals_60m)?;
+    d.set_item("arrivals", arrivals)?;
+    d.set_item("scanned", stats.scanned)?;
+    d.set_item("truncated", stats.truncated)?;
+    Ok(d)
+}
+
+/// One page of DLQ records, oldest-first, as dicts (payload as raw
+/// `bytes`; preview truncation is the HTTP layer's concern).
+#[pyfunction]
+#[pyo3(signature = (toml_str, status=None, page=0, page_size=50))]
+fn dlq_records<'py>(
+    py: Python<'py>,
+    toml_str: &str,
+    status: Option<&str>,
+    page: u64,
+    page_size: u64,
+) -> PyResult<Vec<Bound<'py, PyDict>>> {
+    let pipeline = ops_pipeline_for(py, toml_str)?;
+    let status_owned = status.map(str::to_string);
+    let records = py
+        .detach(|| {
+            rt().block_on(async move {
+                ematix_flow_cli::dlq_ops::dlq_records(
+                    &pipeline,
+                    status_owned.as_deref(),
+                    page,
+                    page_size,
+                )
+                .await
+            })
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    records.iter().map(|r| dlq_record_to_dict(py, r)).collect()
+}
+
+/// Find one DLQ record by id (`None` when absent) — the payload
+/// download endpoint's lookup.
+#[pyfunction]
+fn dlq_record_by_id<'py>(
+    py: Python<'py>,
+    toml_str: &str,
+    record_id: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let pipeline = ops_pipeline_for(py, toml_str)?;
+    let record_id_owned = record_id.to_string();
+    let record = py
+        .detach(|| {
+            rt().block_on(async move {
+                ematix_flow_cli::dlq_ops::dlq_record_by_id(&pipeline, &record_id_owned).await
+            })
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    record.map(|r| dlq_record_to_dict(py, &r)).transpose()
+}
+
+/// Run one bounded replay pass. `selection_json` is
+/// `{"kind":"all"}` / `{"kind":"first_n","n":N}` /
+/// `{"kind":"ids","ids":[…]}`; `max_attempts = None` takes the
+/// pipeline's configured `dlq_max_attempts`.
+#[pyfunction]
+#[pyo3(signature = (toml_str, selection_json, max_attempts=None))]
+fn dlq_replay<'py>(
+    py: Python<'py>,
+    toml_str: &str,
+    selection_json: &str,
+    max_attempts: Option<u32>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let selection = ematix_flow_cli::dlq_ops::parse_selection(selection_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let pipeline = ops_pipeline_for(py, toml_str)?;
+    let report = py
+        .detach(|| {
+            rt().block_on(async move {
+                ematix_flow_cli::dlq_ops::dlq_replay(&pipeline, selection, max_attempts).await
+            })
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let d = PyDict::new(py);
+    d.set_item("taken", report.taken)?;
+    d.set_item("succeeded", report.succeeded)?;
+    d.set_item("redeadlettered", report.redeadlettered)?;
+    d.set_item("parked", report.parked)?;
+    d.set_item("started_at_ms", report.started_at_ms)?;
+    d.set_item("finished_at_ms", report.finished_at_ms)?;
+    Ok(d)
+}
+
+/// Park the selected records; returns how many were parked.
+#[pyfunction]
+fn dlq_park(py: Python<'_>, toml_str: &str, selection_json: &str) -> PyResult<u64> {
+    let selection = ematix_flow_cli::dlq_ops::parse_selection(selection_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let pipeline = ops_pipeline_for(py, toml_str)?;
+    py.detach(|| {
+        rt().block_on(async move { ematix_flow_cli::dlq_ops::dlq_park(&pipeline, selection).await })
+    })
+    .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// Purge the selected records; returns the deleted count.
+#[pyfunction]
+fn dlq_purge(py: Python<'_>, toml_str: &str, selection_json: &str) -> PyResult<u64> {
+    let selection = ematix_flow_cli::dlq_ops::parse_selection(selection_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let pipeline = ops_pipeline_for(py, toml_str)?;
+    py.detach(|| {
+        rt().block_on(
+            async move { ematix_flow_cli::dlq_ops::dlq_purge(&pipeline, selection).await },
+        )
+    })
+    .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// Rewind the pipeline's sources. `target_json` is
+/// `{"kind":"timestamp","ms":N}` or `{"kind":"offset","bytes":[…]}`.
+/// The pipeline's consume loop must be stopped first — the HTTP
+/// layer gates on run status before calling this.
+#[pyfunction]
+fn stream_rewind<'py>(
+    py: Python<'py>,
+    toml_str: &str,
+    target_json: &str,
+    confirm_state_reset: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let to = ematix_flow_cli::dlq_ops::parse_rewind_target(target_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let pipeline = ops_pipeline_for(py, toml_str)?;
+    let report = py
+        .detach(|| {
+            rt().block_on(async move {
+                ematix_flow_cli::dlq_ops::rewind(&pipeline, to, confirm_state_reset).await
+            })
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let d = PyDict::new(py);
+    let sources: Vec<(String, Vec<u8>)> = report.sources;
+    d.set_item("sources", sources)?;
+    d.set_item("state_cleared", report.state_cleared)?;
+    Ok(d)
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(core_version, m)?)?;
@@ -1039,6 +1270,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cross_backend_arrow_sync, m)?)?;
     m.add_function(wrap_pyfunction!(run_pipeline_from_toml_str, m)?)?;
     m.add_function(wrap_pyfunction!(run_pipeline_from_path, m)?)?;
+    m.add_function(wrap_pyfunction!(dlq_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(dlq_records, m)?)?;
+    m.add_function(wrap_pyfunction!(dlq_record_by_id, m)?)?;
+    m.add_function(wrap_pyfunction!(dlq_replay, m)?)?;
+    m.add_function(wrap_pyfunction!(dlq_park, m)?)?;
+    m.add_function(wrap_pyfunction!(dlq_purge, m)?)?;
+    m.add_function(wrap_pyfunction!(stream_rewind, m)?)?;
     m.add_function(wrap_pyfunction!(udf::make_python_udf, m)?)?;
     m.add_function(wrap_pyfunction!(udf::_apply_python_udf_to_batch, m)?)?;
     m.add_function(wrap_pyfunction!(udaf::make_python_udaf, m)?)?;

@@ -149,6 +149,28 @@ pub trait BatchTransform: Send + Sync + std::fmt::Debug {
     async fn take_dlq_rows(&self) -> Result<Vec<RecordBatch>, BackendError> {
         Ok(Vec::new())
     }
+
+    /// DLQ Phase 3: does this transform accumulate cross-batch
+    /// state (windows / sessions / join buffers)? Drives the
+    /// rewind orchestration's `confirm_state_reset` gate — a
+    /// stateful pipeline's rewind is destructive (accumulated
+    /// state must be cleared to avoid double-counting the
+    /// re-consumed rows) and therefore requires explicit operator
+    /// confirmation. Default `false` — filter / project / cast
+    /// transforms hold nothing.
+    fn is_stateful(&self) -> bool {
+        false
+    }
+
+    /// DLQ Phase 3: discard ALL accumulated cross-batch state, as
+    /// if the transform had just been constructed. Called by the
+    /// rewind orchestration after the durable state store has been
+    /// reset — the in-memory accumulators must match (empty), or
+    /// re-consumed rows would double-count into stale windows.
+    /// Default no-op for stateless transforms.
+    async fn clear_state(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 /// Π.4b-3: a static lookup table registered alongside `source`

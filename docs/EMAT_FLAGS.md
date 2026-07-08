@@ -153,6 +153,7 @@ Read in `src/`, default-OFF. Enable with `=1` (or, where noted, presence).
 | --- | --- | --- | --- | --- |
 | `EMAT_AGG_PARTITION_BOOST` | off (set =1) | `== "1"/"true"`, else off | [agg_partition_boost.rs:110](../crates/ematix-flow-core/src/agg_partition_boost.rs) | Oversubscribe partitions under a FinalPartitioned agg layer. |
 | `EMAT_COMBINE_AGG` | off (set =1) | `== Ok("1"/"true"/"TRUE")` | [combine_agg_exec.rs:404](../crates/ematix-flow-core/src/combine_agg_exec.rs) | Swap `Partial→Repartition→Final` for `CombineAggExec` (single-i64-key SUM(f64)). |
+| `EMAT_DECODE_SHED` | off (set =1) | `flags::opt_in` | [mem_pressure.rs](../crates/ematix-flow-core/src/mem_pressure.rs) | Σ.AI.6d decode-pressure shedding: when sensed `MemAvailable` < `EMAT_SHED_AVAILABLE_FRACTION` × RAM, (1) a semaphore of `max(1, cores/4)` permits bounds concurrent row-group decodes at every RG-decode entry point (eager `load_row_group`, both streaming readers' `open_row_group`, the legacy whole-RG bridge loop), and (2) the Normal→Shed transition clears the RG decode cache once. This is the hook for the UNTRACKED decode-buffer/rayon-fan-out pressure the `EMAT_MEM_FLOOR_BYTES` pool guard cannot see (run6: parted SF100 tar-pit with zero `try_grow` refusals). Normal pressure bypasses the semaphore entirely (cached sensor read + one relaxed load); disabled = one `OnceLock` load. Default OFF until the 32 GB-box FULL-SUITE A/B decides it — isolated memory-lever A/Bs do not transfer (proven twice). Probes: `mem_pressure_metrics()` (`shed_gate_entries`, `shed_cache_drops`). |
 | `EMAT_DICT_DISTINCT` | off (set =1) | `== "1"/"true"`, else off | [ematix_fast_parquet.rs:2158](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Header-only dict-distinct (NDV) walk during scan planning. |
 | `EMAT_DISABLE_FILTER_MULTI_AGG` | off (set to disable) | `.is_some()` | [fused_aggregate_filter_multi_agg_rule.rs:176](../crates/ematix-flow-core/src/fused_aggregate_filter_multi_agg_rule.rs) | **Kill-switch:** presence disables the fused filter→multi-agg rule. |
 | `EMAT_DROP_REDUNDANT_FILTER` | off (set to enable) | `.is_some()` | [drop_redundant_filter_rule.rs:135](../crates/ematix-flow-core/src/drop_redundant_filter_rule.rs) | Drop a filter made redundant by a fused scan predicate. |
@@ -240,6 +241,8 @@ Read in `src/` via `.parse()...unwrap_or(N)`. Default value is in the **Default*
 | `EMAT_RH_SUM_F64_MIN_GROUPS` | `131_072` | `128*1024` | [robin_hood_sum_f64_exec.rs:381](../crates/ematix-flow-core/src/robin_hood_sum_f64_exec.rs) | Lower group-count gate for the RH SUM(f64) rule. |
 | `EMAT_RT_BLOOM_SELECTIVITY` | `64` | ratio | [runtime_bloom_sideband_rule.rs:130](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | Probe/build selectivity ratio gate for the runtime-bloom sideband. |
 | `EMAT_SCALAR_AGG_MULT` | (none; falls through to shape default) | usize (≥1) | [auto_target_partitions.rs:196](../crates/ematix-flow-core/src/auto_target_partitions.rs) | Forced scalar-agg partition multiplier (overrides the join/no-join default). |
+| `EMAT_SHED_AVAILABLE_FRACTION` | `0.10` | f64; `f64_or` | [mem_pressure.rs](../crates/ematix-flow-core/src/mem_pressure.rs) | Σ.AI.6d shed threshold (only consulted under `EMAT_DECODE_SHED=1`): enter Shed when sensed `MemAvailable` < this fraction × physical RAM. Default 0.10 (~3.2 GB on the 32 GB campaign box — above the 1 GiB `EMAT_MEM_FLOOR_BYTES` auto-floor, so decode backs off BEFORE the tracked-consumer guard starts refusing queries). Unknown sensors (macOS) never shed. |
+| `EMAT_SIDECAR_MAX_SELECTIVITY` | `0.05` | f64 in [0,1]; `f64_or` | [sidecar_index.rs](../crates/ematix-flow-core/src/sidecar_index.rs) | Σ.SC P3 index-vs-scan gate: max estimated selectivity (uniform model over the indexed column's footer `[min,max]`) for which an eq lookup still takes the sidecar-index path; above it the plain vectorized scan runs instead. Default sits far below the codec's measured ~60% crossover because the estimate is crude and a wrong "use index" call (masked per-row decode of most of the file) costs much more than a wrong "use scan" call. |
 | `EMAT_SPR_MIN_GROUPS` | `1_000_000` | groups | [single_pass_radix_sum_exec.rs:392](../crates/ematix-flow-core/src/single_pass_radix_sum_exec.rs) | Min group count to enable the single-pass radix SUM rule. |
 | `EMAT_SPR_RADIX_BITS` | `10` | capped at 12 | [single_pass_radix_sum_exec.rs:119](../crates/ematix-flow-core/src/single_pass_radix_sum_exec.rs) | Radix bit-count (bins = 1<<bits) for the single-pass radix SUM. |
 
@@ -343,12 +346,12 @@ production rule, the harness toggles it before constructing rules manually.
 | Bucket | Count |
 | --- | --- |
 | Production gate (default-ON) | 20 |
-| Production gate (opt-in) | 29 |
-| Numeric tunable | 43 |
+| Production gate (opt-in) | 30 |
+| Numeric tunable | 45 |
 | Diagnostic / trace | 21 |
 | Bench-harness only | 48 |
 | Comment-only (possibly dead) | 1 |
-| **Grand total (distinct flags)** | **162** |
+| **Grand total (distinct flags)** | **165** |
 
 > `EMAT_FAST_SNAPPY` is counted once, under Comment-only.
 > `EMAT_MI_COLLECT` is placed under Diagnostic/trace (allocator-operational,
