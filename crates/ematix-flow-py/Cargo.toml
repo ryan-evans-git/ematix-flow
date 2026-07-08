@@ -14,15 +14,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3.workspace = true
-# Production-allocator parity: the PyPI extension module (_core) sets mimalloc
-# as the process global_allocator (see src/lib.rs) so the Rust-side query engine
-# allocations match the benchmark harness. Mirrors how polars ships its wheel.
-# `local_dynamic_tls` is REQUIRED here: the cdylib is dlopen'd by CPython, and
-# mimalloc's default initial-exec TLS model doesn't fit glibc's static-TLS
-# surplus -> `import ematix_flow` fails with "cannot allocate memory in static
-# TLS block" on Linux. local-dynamic TLS resolves it on demand. (The CLI/worker
-# binaries are loaded at startup, not dlopen'd, so they keep the faster default.)
-mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
 ematix-flow-core.workspace = true
 ematix-flow-cli.workspace = true
 tokio.workspace = true
@@ -32,3 +23,24 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 datafusion.workspace = true
 futures-util.workspace = true
+
+# Production-allocator parity: the PyPI extension module (_core) sets mimalloc
+# as the process global_allocator (see src/lib.rs) so the Rust-side query engine
+# allocations match the benchmark harness. Mirrors how polars ships its wheel.
+# `local_dynamic_tls` is REQUIRED here: the cdylib is dlopen'd by CPython, and
+# mimalloc's default initial-exec TLS model doesn't fit glibc's static-TLS
+# surplus -> `import ematix_flow` fails with "cannot allocate memory in static
+# TLS block" on Linux. local-dynamic TLS resolves it on demand. (The CLI/worker
+# binaries are loaded at startup, not dlopen'd, so they keep the faster default.)
+#
+# NOT on macOS: pyarrow's libarrow statically bundles its own mimalloc (v2.x);
+# this crate's mimalloc is v3.x (libmimalloc-sys default). Two mimalloc
+# instances in one process corrupt each other's thread-local heap metadata on
+# macOS — importing `_core` after pandas/pyarrow segfaulted either mid-call or
+# at interpreter shutdown inside libarrow's `mi_process_done ->
+# _mi_theap_collect_retired` (via `__cxa_finalize_ranges`). Linux wheels are
+# unaffected and keep allocator parity. See
+# tests/python/test_pyarrow_coexistence.py for the regression pin and
+# docs/MACOS_PYARROW_MIMALLOC.md for the full investigation.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
