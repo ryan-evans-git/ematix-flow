@@ -133,6 +133,26 @@ pub(crate) struct RgCacheKey {
 ///   takes probation-LRU victims first and touches protected only
 ///   when probation is dry — a sequential one-pass flood dies in
 ///   probation and cannot displace the re-touched working set.
+///
+/// Σ.AI.6f — ghost-assisted adaptive demotion (ARC-lite), retention
+/// mode only. Field counters (AWS TPC-H SF=100) proved Σ.AI.6e
+/// deadlocks once the cache fills: protected only demotes on
+/// promotion overflow, promotion needs a probation second touch, and
+/// effective probation (capacity − protected ≈ 1/5) is smaller than a
+/// later query's re-touch distance — so no second touches, no
+/// promotions, no demotions: `retention(admit+0 … prot_evict+0)` on
+/// every subsequent query while rejects count tens of thousands.
+/// Whoever filled protected first owns it forever (order-lucky
+/// poisoning). Fix: keys evicted from probation WITHOUT promotion go
+/// to a bounded keys-only *ghost* list; a miss on a ghosted key is
+/// proof a live working set re-touches at a distance probation can't
+/// hold, so it demotes *stale* protected-LRU entries (untouched since
+/// the ghost key was evicted) to probation-MRU, making room for the
+/// live set to earn promotion. One-touch floods never re-request
+/// their keys → no ghost hits → protected untouched (scan resistance
+/// preserved); a still-hitting protected set has fresh stamps → the
+/// staleness check refuses to demote it (loop-over-capacity streams
+/// cannot cannibalise a live seed).
 pub struct RowGroupDecodeCache {
     inner: std::sync::Mutex<RgInner>,
     capacity_bytes: usize,
@@ -153,6 +173,20 @@ enum RgSegment {
 /// set larger than the cap demotes LRU-first back to probation.
 const RG_PROTECTED_NUM: usize = 4;
 const RG_PROTECTED_DEN: usize = 5;
+
+/// Σ.AI.6f — ghost-list floor (live-key count). The cap is
+/// `max(entries.len(), RG_GHOST_MIN_ENTRIES)` — ARC sizes its ghost
+/// lists to the cache's entry count so a re-touch distance up to ~2×
+/// capacity is still observable; the floor keeps tiny/near-empty
+/// caches from truncating ghost history to nothing.
+const RG_GHOST_MIN_ENTRIES: usize = 64;
+
+/// Σ.AI.6f — bytes of stale protected demoted per ghost hit, as a
+/// multiple of the incoming entry: admit the entry itself plus equal
+/// headroom so probation grows a little faster than the ghost-hitting
+/// working set streams in (convergence in a bounded number of passes
+/// instead of asymptotically).
+const RG_GHOST_DEMOTE_HEADROOM: usize = 2;
 
 struct RgInner {
     entries: std::collections::HashMap<RgCacheKey, RgEntry>,
@@ -187,6 +221,23 @@ struct RgInner {
     retention_rejects: u64,
     /// … and protected-segment evictions (probation ran dry).
     protected_evictions: u64,
+    /// Σ.AI.6f — ghost list: keys (no payloads) recently evicted from
+    /// probation WITHOUT promotion, mapped to their eviction stamp.
+    /// A later miss on one of these keys ("ghost hit") is proof that
+    /// probation is too small for a live, re-touching working set —
+    /// the trigger for stale-protected demotion. Bounded: live-key
+    /// cap = `max(entries.len(), RG_GHOST_MIN_ENTRIES)`.
+    ghost: std::collections::HashMap<RgCacheKey, u64>,
+    /// Σ.AI.6f — FIFO order for ghost trimming. Same lazy scheme as
+    /// the segment queues: a pair is live iff `ghost[key] == stamp`
+    /// (consumed ghost hits leave stale pairs, swept when the queue
+    /// outgrows the live set 2:1).
+    ghost_q: std::collections::VecDeque<(u64, RgCacheKey)>,
+    /// Σ.AI.6f probe counters (survive `clear()`, like hits/misses):
+    /// inserts whose key was found in the ghost list …
+    ghost_hits: u64,
+    /// … and stale protected→probation demotions those hits forced.
+    ghost_demotions: u64,
 }
 
 struct RgEntry {
@@ -229,6 +280,10 @@ impl RowGroupDecodeCache {
                 retention_admits: 0,
                 retention_rejects: 0,
                 protected_evictions: 0,
+                ghost: std::collections::HashMap::new(),
+                ghost_q: std::collections::VecDeque::new(),
+                ghost_hits: 0,
+                ghost_demotions: 0,
             }),
             capacity_bytes,
             retention,
@@ -274,6 +329,16 @@ impl RowGroupDecodeCache {
         let mut guard = self.inner.lock().unwrap();
         let inner = &mut *guard;
         if self.retention {
+            // Σ.AI.6f — ghost hit: this key was recently evicted from
+            // probation un-promoted and is being re-requested — its
+            // re-touch distance exceeds what probation can hold. Demote
+            // stale protected-LRU entries (untouched since this key was
+            // evicted) so the live working set can earn promotion.
+            // Consumes the ghost entry (a key proves the point once).
+            if let Some(ghost_stamp) = inner.ghost.remove(&key) {
+                inner.ghost_hits += 1;
+                demote_stale_protected_on_ghost_hit(inner, ghost_stamp, bytes);
+            }
             // Σ.AI.6e — probation-first eviction: one-touch flood
             // traffic evicts itself; the protected working set pays
             // only when probation runs dry.
@@ -340,9 +405,29 @@ impl RowGroupDecodeCache {
         )
     }
 
+    /// Σ.AI.6f probe — `(ghost_hits, ghost_demotions)`: inserts whose
+    /// key was found in the ghost list (a live working set re-touching
+    /// beyond probation's reach), and the stale protected→probation
+    /// demotions those hits forced. Both zero in legacy-FIFO mode, and
+    /// both zero under pure one-touch floods (flood keys are never
+    /// re-requested). Additive probe — `retention_stats()` unchanged.
+    pub fn retention_ghost_stats(&self) -> (u64, u64) {
+        let inner = self.inner.lock().unwrap();
+        (inner.ghost_hits, inner.ghost_demotions)
+    }
+
     /// Σ.AI.6e — which policy this cache instance runs.
     pub fn retention_enabled(&self) -> bool {
         self.retention
+    }
+
+    /// Σ.AI.6f — test probe: `(live ghost keys, ghost queue pairs)`.
+    /// Both must stay bounded (cap + lazy-pair slack) under any
+    /// traffic; see `rg_cache_retention_ghost_list_is_bounded`.
+    #[cfg(test)]
+    fn ghost_len(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        (inner.ghost.len(), inner.ghost_q.len())
     }
 
     /// Σ.AI.6d — drop every cached column and return the bytes to the
@@ -355,6 +440,11 @@ impl RowGroupDecodeCache {
         inner.entries.clear();
         inner.q_probation.clear();
         inner.q_protected.clear();
+        // Σ.AI.6f — ghost history describes evicted *contents*; after a
+        // shed it would demote a protected set that no longer exists
+        // (harmless) or, worse, one rebuilt from scratch — drop it.
+        inner.ghost.clear();
+        inner.ghost_q.clear();
         inner.bytes_used = 0;
         inner.protected_bytes = 0;
     }
@@ -412,8 +502,94 @@ fn evict_retention(inner: &mut RgInner, needed: usize, capacity: usize) {
                 inner.protected_evictions += 1;
             } else {
                 inner.retention_rejects += 1;
+                // Σ.AI.6f — evicted from probation without ever earning
+                // promotion: remember the key so a re-request can prove
+                // probation was too small (ghost hit → stale-protected
+                // demotion). Protected evictions are NOT ghosted — they
+                // already had their tenure.
+                rg_ghost_push(inner, k);
             }
         }
+    }
+}
+
+/// Σ.AI.6f — record a promotion-less probation eviction in the ghost
+/// list and trim to cap. Keys only (a `RgCacheKey` is a path + two
+/// indices — no decoded payload is retained), FIFO trim, lazy stale
+/// pairs swept 2:1 — O(1) amortised, bounded by construction.
+fn rg_ghost_push(inner: &mut RgInner, key: RgCacheKey) {
+    inner.next_stamp += 1;
+    let stamp = inner.next_stamp;
+    // A key enters the ghost only when evicted live, and re-insertion
+    // consumes its ghost entry — so this insert never truly collides;
+    // if it ever did, the map keeps the newer stamp and the older
+    // queue pair goes stale (skipped by the `== Some(&s)` checks).
+    inner.ghost.insert(key.clone(), stamp);
+    inner.ghost_q.push_back((stamp, key));
+    let cap = inner.entries.len().max(RG_GHOST_MIN_ENTRIES);
+    while inner.ghost.len() > cap {
+        let Some((s, k)) = inner.ghost_q.pop_front() else {
+            break; // unreachable: map is populated only via the queue
+        };
+        if inner.ghost.get(&k) == Some(&s) {
+            inner.ghost.remove(&k);
+        }
+    }
+    // Consumed ghost hits leave stale queue pairs behind (the map entry
+    // is removed, the pair is not) — sweep once they outgrow the live
+    // set 2:1, same policy as `maybe_compact`.
+    if inner.ghost_q.len() > 2 * inner.ghost.len() + 64 {
+        let ghost = &inner.ghost;
+        inner.ghost_q.retain(|(s, k)| ghost.get(k) == Some(s));
+    }
+}
+
+/// Σ.AI.6f — the freeze breaker: on a ghost hit, demote protected-LRU
+/// entries back to probation-MRU until the incoming entry has
+/// [`RG_GHOST_DEMOTE_HEADROOM`]× its bytes of reclaimed room — but
+/// ONLY entries whose last touch predates the ghost key's eviction
+/// (`stamp < ghost_stamp`). That staleness gate is what preserves the
+/// Σ.AI.6e guarantees: a protected set that is still being hit carries
+/// stamps newer than any concurrent probation eviction, so a
+/// loop-over-capacity stream (whose ghost hits are legitimate) cannot
+/// cannibalise a live seed; only a set that stopped being touched
+/// before the ghost key's whole probation lifetime is demotable.
+/// Demotion keeps bytes cached (probation-MRU, fresh stamp) — a
+/// demoted entry that is in fact still wanted earns its way back with
+/// one touch. Amortised O(1): live pops are byte-bounded, stale pops
+/// are paid for by the push that created them.
+fn demote_stale_protected_on_ghost_hit(inner: &mut RgInner, ghost_stamp: u64, needed: usize) {
+    let target = needed.saturating_mul(RG_GHOST_DEMOTE_HEADROOM);
+    let mut freed = 0usize;
+    while freed < target {
+        let Some((stamp, k)) = inner.q_protected.pop_front() else {
+            break; // protected empty — nothing left to reclaim
+        };
+        let live = inner
+            .entries
+            .get(&k)
+            .is_some_and(|e| e.stamp == stamp && e.seg == RgSegment::Protected);
+        if !live {
+            continue; // stale pair, skip (lazy-queue invariant)
+        }
+        if stamp >= ghost_stamp {
+            // Protected-LRU was touched after the ghost key fell out of
+            // probation → the entire protected set is fresher still.
+            // Put the pair back and refuse: this ghost hit is capacity
+            // pressure between two LIVE sets, not a stale freeze.
+            inner.q_protected.push_front((stamp, k));
+            break;
+        }
+        inner.next_stamp += 1;
+        let fresh = inner.next_stamp;
+        let e = inner.entries.get_mut(&k).expect("liveness checked above");
+        let bytes = e.bytes;
+        e.stamp = fresh;
+        e.seg = RgSegment::Probation;
+        inner.protected_bytes -= bytes;
+        inner.q_probation.push_back((fresh, k));
+        inner.ghost_demotions += 1;
+        freed += bytes;
     }
 }
 
@@ -4865,6 +5041,132 @@ mod tests {
         assert!(admits >= W as u64, "W promoted on trial-1 re-touch");
         assert!(rejects > 0, "noise rejected in probation");
         assert_eq!(prot, 0, "noise never evicts protected entries");
+    }
+
+    /// Σ.AI.6f RED repro — the AWS SF=100 field freeze
+    /// (`retention(admit+0 … prot_evict+0)` + tens of thousands of
+    /// rejects on every query after the cache fills): whoever fills
+    /// protected FIRST owns it forever. Mechanism: protected only
+    /// demotes on promotion overflow; promotion needs a probation
+    /// second touch; effective probation (capacity − protected ≈ 1/5)
+    /// is smaller than a later query's re-touch distance → no second
+    /// touches → no promotions → no demotions → freeze.
+    ///
+    /// Junk set: 48 entries second-touched into protected (48 KiB of
+    /// the 52 KiB protected cap — no overflow demotion, order-lucky).
+    /// New live working set: 32 entries looped — re-touch distance 32
+    /// exceeds the 16-entry effective probation, so under the frozen policy
+    /// it NEVER achieves residency (0 hits on every pass, forever).
+    /// The fix (ghost-assisted demotion) must let it reach ≥80% hits
+    /// within 8 passes while the never-again-touched junk drains.
+    /// Pre-fix per-pass hits: [0,0,0,0,0,0,0,0]; post-fix:
+    /// [0, 0, 25, 32, 32, 32, 32, 32].
+    #[test]
+    fn rg_cache_retention_ghost_breaks_order_lucky_protected_freeze() {
+        let cache = rg_policy_cache(true);
+        for id in 0..48 {
+            rg_touch(&cache, id); // junk touch 1: insert (probation)
+        }
+        for id in 0..48 {
+            assert!(rg_touch(&cache, id), "junk touch 2: promote"); // → protected
+        }
+        let (admits, _, _) = cache.retention_stats();
+        assert_eq!(admits, 48, "junk owns protected before the new set arrives");
+
+        // New working set (ids 100..132) — the only traffic from here
+        // on; the junk set is NEVER touched again (it is stale).
+        let mut per_pass = Vec::new();
+        for _pass in 0..8 {
+            let mut hits = 0usize;
+            for id in 100..132 {
+                if rg_touch(&cache, id) {
+                    hits += 1;
+                }
+            }
+            per_pass.push(hits);
+        }
+        let last = *per_pass.last().unwrap();
+        assert!(
+            last * 10 >= 32 * 8,
+            "a re-touching working set must reclaim protected from a stale \
+             one: want ≥80% hits/pass at steady state, got {per_pass:?} \
+             (all-zero = the field freeze: no promotions, no demotions, \
+             junk owns protected forever)"
+        );
+        // Drain proof: every junk entry left protected via ghost-forced
+        // demotion (48 = the whole stale set), and the new set then
+        // earned promotion the normal way (second touch).
+        let (ghost_hits, ghost_demotions) = cache.retention_ghost_stats();
+        assert!(ghost_hits > 0, "the freeze breaker fired");
+        assert!(
+            ghost_demotions >= 48,
+            "the stale protected set fully drained: {ghost_demotions}"
+        );
+        let (admits_after, _, _) = cache.retention_stats();
+        assert!(
+            admits_after >= 48 + 32,
+            "the new working set achieved protected residency: {admits_after}"
+        );
+    }
+
+    /// Σ.AI.6f — scan resistance survives the ghost mechanism: a pure
+    /// one-touch flood (every key seen exactly ONCE) can fill the
+    /// ghost list but can never *hit* it — no ghost hits, no forced
+    /// demotions, and the twice-touched hot set keeps 100% residency.
+    /// This is the guard that the freeze breaker only responds to
+    /// PROOF of a live re-touching working set, not to volume.
+    #[test]
+    fn rg_cache_retention_ghost_ignores_one_touch_flood() {
+        let cache = rg_policy_cache(true);
+        for id in 0..16 {
+            rg_touch(&cache, id); // hot touch 1: insert
+        }
+        for id in 0..16 {
+            assert!(rg_touch(&cache, id), "hot touch 2: promote");
+        }
+        for id in 1_000..1_400 {
+            rg_touch(&cache, id); // 6×-capacity one-touch flood
+        }
+        let survivors = (0..16).filter(|&id| rg_touch(&cache, id)).count();
+        assert_eq!(
+            survivors, 16,
+            "flood must not displace the protected hot set"
+        );
+        let (ghost_hits, ghost_demotions) = cache.retention_ghost_stats();
+        assert_eq!(ghost_hits, 0, "flood keys are never re-requested");
+        assert_eq!(ghost_demotions, 0, "no ghost hit → no demotion");
+        let (_, _, prot) = cache.retention_stats();
+        assert_eq!(prot, 0, "the flood never reaches the protected segment");
+    }
+
+    /// Σ.AI.6f — the ghost list stays bounded under (a) an unbounded
+    /// stream of distinct keys (pure growth pressure) and (b) a
+    /// loop-over-capacity pattern (every pass consumes ghost entries
+    /// and refills them — maximal stale-pair churn). Keys only, cap =
+    /// max(live entries, 64); queue pairs swept at 2:1.
+    #[test]
+    fn rg_cache_retention_ghost_list_is_bounded() {
+        let cache = rg_policy_cache(true);
+        for id in 0..10_000 {
+            rg_touch(&cache, id); // 10 000 distinct one-touch keys
+        }
+        let (live, pairs) = cache.ghost_len();
+        assert!(live <= 64, "ghost live keys ≤ cap after flood: {live}");
+        assert!(pairs <= 2 * 64 + 64, "ghost queue swept 2:1: {pairs}");
+        for _pass in 0..50 {
+            for id in 20_000..20_100 {
+                rg_touch(&cache, id); // 100-key loop > 64-entry capacity
+            }
+        }
+        let (live, pairs) = cache.ghost_len();
+        assert!(live <= 64, "ghost live keys ≤ cap after loop churn: {live}");
+        assert!(
+            pairs <= 2 * 64 + 64,
+            "ghost queue bounded after churn: {pairs}"
+        );
+        cache.clear();
+        let (live, pairs) = cache.ghost_len();
+        assert_eq!((live, pairs), (0, 0), "clear() drops ghost history");
     }
 
     /// Σ.AI.6e — correctness oracle: retention forced ON (injectable
