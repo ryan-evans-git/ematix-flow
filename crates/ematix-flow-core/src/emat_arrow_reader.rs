@@ -117,10 +117,42 @@ pub(crate) struct RgCacheKey {
 /// Σ.O.c.1 — process-shared cache of decoded row-group columns.
 /// Thread-safe; share an `Arc<RowGroupDecodeCache>` across reader
 /// instances to amortise decode across queries.
+///
+/// Σ.AI.6e — two eviction policies, selected at construction:
+///
+/// - **retention = false** (legacy): pure FIFO on insertion order.
+///   `get` never reorders, so a scan whose insert traffic exceeds
+///   capacity evicts the seeded working set in insertion order even
+///   while it is being hit — the Q09 SF=100 trial-3 collapse (6.5 s
+///   cache-served → 16–50 s decode-bound once eviction starts).
+/// - **retention = true** (`EMAT_RG_CACHE_RETENTION`, AUTO = ON):
+///   segmented LRU with admission-on-second-touch. New entries land
+///   in a *probationary* segment; only a second touch promotes to the
+///   *protected* segment (capped at [`RG_PROTECTED_NUM`]/[`RG_PROTECTED_DEN`]
+///   of capacity, LRU overflow demotes back to probation). Eviction
+///   takes probation-LRU victims first and touches protected only
+///   when probation is dry — a sequential one-pass flood dies in
+///   probation and cannot displace the re-touched working set.
 pub struct RowGroupDecodeCache {
     inner: std::sync::Mutex<RgInner>,
     capacity_bytes: usize,
+    retention: bool,
 }
+
+/// Σ.AI.6e — which segment an entry lives in (retention mode only;
+/// legacy FIFO keeps every entry in `Probation` and never promotes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RgSegment {
+    Probation,
+    Protected,
+}
+
+/// Σ.AI.6e — protected-segment cap as a fraction of `capacity_bytes`
+/// (4/5). Leaves ≥1/5 of the budget as probation flow-through so
+/// fresh entries can always demonstrate a second touch; a protected
+/// set larger than the cap demotes LRU-first back to probation.
+const RG_PROTECTED_NUM: usize = 4;
+const RG_PROTECTED_DEN: usize = 5;
 
 struct RgInner {
     entries: std::collections::HashMap<RgCacheKey, RgEntry>,
@@ -129,45 +161,109 @@ struct RgInner {
     /// grows 5-10× vs the old per-projection cache, so the linear-
     /// scan eviction became visible on SF=1 single-scan queries
     /// (Q06 +37%).
-    insertion_order: std::collections::VecDeque<RgCacheKey>,
+    ///
+    /// Σ.AI.6e — legacy mode: FIFO insertion order (exact pre-Σ.AI.6e
+    /// behaviour). Retention mode: probationary LRU queue with lazy
+    /// (stamp-validated) entries — see `RgEntry::stamp`.
+    q_probation: std::collections::VecDeque<(u64, RgCacheKey)>,
+    /// Σ.AI.6e — protected LRU queue (retention mode only; stays
+    /// empty in legacy mode). Same lazy-stamp scheme as probation.
+    q_protected: std::collections::VecDeque<(u64, RgCacheKey)>,
     bytes_used: usize,
+    /// Σ.AI.6e — bytes currently in the protected segment.
+    protected_bytes: usize,
+    /// Σ.AI.6e — monotone stamp for lazy queue entries: a queued
+    /// `(stamp, key)` is live iff `entries[key].stamp == stamp` and
+    /// the segment matches the queue. Re-touch pushes a fresh pair
+    /// instead of an O(n) mid-queue removal; stale pairs are skipped
+    /// on pop and swept by `maybe_compact` — O(1) amortised per op.
+    next_stamp: u64,
     hits: u64,
     misses: u64,
+    /// Σ.AI.6e probe counters (survive `clear()`, like hits/misses):
+    /// probation→protected promotions (second touch) …
+    retention_admits: u64,
+    /// … probation evictions (one-touch entries denied admission) …
+    retention_rejects: u64,
+    /// … and protected-segment evictions (probation ran dry).
+    protected_evictions: u64,
 }
 
 struct RgEntry {
     column: std::sync::Arc<DecodedColumn>,
     bytes: usize,
+    /// Σ.AI.6e — validity stamp; see `RgInner::next_stamp`.
+    stamp: u64,
+    seg: RgSegment,
 }
 
 impl RowGroupDecodeCache {
-    /// Default cap 1 GiB.
+    /// Default cap 1 GiB; retention policy per `EMAT_RG_CACHE_RETENTION`
+    /// (AUTO = ON, Σ.AI.6e).
     pub fn new() -> Self {
         Self::with_capacity_bytes(1024 * 1024 * 1024)
     }
 
+    /// Retention policy resolved from the environment
+    /// ([`rg_cache_retention_resolved`]); use
+    /// [`Self::with_capacity_bytes_and_retention`] for an explicit,
+    /// env-independent policy (tests / A/B harnesses).
     pub fn with_capacity_bytes(capacity_bytes: usize) -> Self {
+        Self::with_capacity_bytes_and_retention(capacity_bytes, rg_cache_retention_resolved())
+    }
+
+    /// Σ.AI.6e — explicit-policy constructor: `retention = false` is
+    /// the exact pre-Σ.AI.6e FIFO; `true` is segmented LRU with
+    /// admission-on-second-touch.
+    pub fn with_capacity_bytes_and_retention(capacity_bytes: usize, retention: bool) -> Self {
         Self {
             inner: std::sync::Mutex::new(RgInner {
                 entries: std::collections::HashMap::new(),
-                insertion_order: std::collections::VecDeque::new(),
+                q_probation: std::collections::VecDeque::new(),
+                q_protected: std::collections::VecDeque::new(),
                 bytes_used: 0,
+                protected_bytes: 0,
+                next_stamp: 0,
                 hits: 0,
                 misses: 0,
+                retention_admits: 0,
+                retention_rejects: 0,
+                protected_evictions: 0,
             }),
             capacity_bytes,
+            retention,
         }
     }
 
+    /// Σ.AI.6e — protected-segment byte cap (4/5 of capacity).
+    fn protected_cap(&self) -> usize {
+        self.capacity_bytes / RG_PROTECTED_DEN * RG_PROTECTED_NUM
+    }
+
     pub(crate) fn get(&self, key: &RgCacheKey) -> Option<std::sync::Arc<DecodedColumn>> {
-        let mut inner = self.inner.lock().unwrap();
-        let cloned = inner.entries.get(key).map(|e| e.column.clone());
-        if cloned.is_some() {
-            inner.hits += 1;
-        } else {
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        let Some(e) = inner.entries.get_mut(key) else {
             inner.misses += 1;
+            return None;
+        };
+        inner.hits += 1;
+        let column = e.column.clone();
+        if self.retention {
+            // Σ.AI.6e — touch: probation hit is the second touch →
+            // promote to protected; protected hit refreshes recency.
+            inner.next_stamp += 1;
+            e.stamp = inner.next_stamp;
+            if e.seg == RgSegment::Probation {
+                e.seg = RgSegment::Protected;
+                inner.protected_bytes += e.bytes;
+                inner.retention_admits += 1;
+            }
+            inner.q_protected.push_back((e.stamp, key.clone()));
+            demote_protected_overflow(inner, self.protected_cap());
+            maybe_compact(inner);
         }
-        cloned
+        Some(column)
     }
 
     pub(crate) fn insert(&self, key: RgCacheKey, column: DecodedColumn) {
@@ -175,32 +271,78 @@ impl RowGroupDecodeCache {
         if bytes > self.capacity_bytes {
             return; // entry alone exceeds cap; skip
         }
-        let mut inner = self.inner.lock().unwrap();
-        while inner.bytes_used + bytes > self.capacity_bytes && !inner.insertion_order.is_empty() {
-            // O(1) FIFO eviction — was O(n) when using Vec::remove(0)
-            // and the per-column cache has 5-10× more entries than
-            // the old per-projection one.
-            let oldest = inner.insertion_order.pop_front().unwrap();
-            if let Some(e) = inner.entries.remove(&oldest) {
-                inner.bytes_used -= e.bytes;
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        if self.retention {
+            // Σ.AI.6e — probation-first eviction: one-touch flood
+            // traffic evicts itself; the protected working set pays
+            // only when probation runs dry.
+            evict_retention(inner, bytes, self.capacity_bytes);
+        } else {
+            while inner.bytes_used + bytes > self.capacity_bytes && !inner.q_probation.is_empty() {
+                // O(1) FIFO eviction — was O(n) when using Vec::remove(0)
+                // and the per-column cache has 5-10× more entries than
+                // the old per-projection one.
+                let (_, oldest) = inner.q_probation.pop_front().unwrap();
+                if let Some(e) = inner.entries.remove(&oldest) {
+                    inner.bytes_used -= e.bytes;
+                }
             }
         }
         let arc = std::sync::Arc::new(column);
-        if let Some(old) = inner
-            .entries
-            .insert(key.clone(), RgEntry { column: arc, bytes })
-        {
+        inner.next_stamp += 1;
+        let stamp = inner.next_stamp;
+        if let Some(old) = inner.entries.insert(
+            key.clone(),
+            RgEntry {
+                column: arc,
+                bytes,
+                stamp,
+                seg: RgSegment::Probation,
+            },
+        ) {
             inner.bytes_used -= old.bytes;
-            // already in insertion_order, no need to re-add
+            if old.seg == RgSegment::Protected {
+                // Σ.AI.6e — replacement (racing decoders) restarts the
+                // entry in probation; the stale protected queue pair is
+                // skipped on pop via its stamp.
+                inner.protected_bytes -= old.bytes;
+            }
+            if self.retention {
+                inner.q_probation.push_back((stamp, key));
+            }
+            // legacy FIFO: already in q_probation, no need to re-add
+            // (eviction removes by key, stamps are not checked).
         } else {
-            inner.insertion_order.push_back(key);
+            inner.q_probation.push_back((stamp, key));
         }
         inner.bytes_used += bytes;
+        if self.retention {
+            maybe_compact(inner);
+        }
     }
 
     pub fn stats(&self) -> (u64, u64, usize) {
         let inner = self.inner.lock().unwrap();
         (inner.hits, inner.misses, inner.bytes_used)
+    }
+
+    /// Σ.AI.6e probe — `(retention_admits, retention_rejects,
+    /// protected_evictions)`: probation→protected promotions, probation
+    /// evictions (one-touch entries denied admission), and protected
+    /// evictions (probation ran dry). All zero in legacy-FIFO mode.
+    pub fn retention_stats(&self) -> (u64, u64, u64) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.retention_admits,
+            inner.retention_rejects,
+            inner.protected_evictions,
+        )
+    }
+
+    /// Σ.AI.6e — which policy this cache instance runs.
+    pub fn retention_enabled(&self) -> bool {
+        self.retention
     }
 
     /// Σ.AI.6d — drop every cached column and return the bytes to the
@@ -211,8 +353,10 @@ impl RowGroupDecodeCache {
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.entries.clear();
-        inner.insertion_order.clear();
+        inner.q_probation.clear();
+        inner.q_protected.clear();
         inner.bytes_used = 0;
+        inner.protected_bytes = 0;
     }
 
     pub fn len(&self) -> usize {
@@ -222,6 +366,102 @@ impl RowGroupDecodeCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Σ.AI.6e — retention-mode eviction: pop probation-LRU victims
+/// (skipping stale stamp pairs) until `needed` fits; fall back to
+/// protected-LRU only when probation is dry. Amortised O(1): every
+/// queue pair is popped at most once.
+fn evict_retention(inner: &mut RgInner, needed: usize, capacity: usize) {
+    while inner.bytes_used + needed > capacity {
+        let victim = loop {
+            match inner.q_probation.pop_front() {
+                Some((stamp, k)) => {
+                    let live = inner
+                        .entries
+                        .get(&k)
+                        .is_some_and(|e| e.stamp == stamp && e.seg == RgSegment::Probation);
+                    if live {
+                        break Some((k, RgSegment::Probation));
+                    }
+                }
+                None => {
+                    break loop {
+                        match inner.q_protected.pop_front() {
+                            Some((stamp, k)) => {
+                                let live = inner.entries.get(&k).is_some_and(|e| {
+                                    e.stamp == stamp && e.seg == RgSegment::Protected
+                                });
+                                if live {
+                                    break Some((k, RgSegment::Protected));
+                                }
+                            }
+                            None => break None,
+                        }
+                    };
+                }
+            }
+        };
+        let Some((k, seg)) = victim else {
+            break; // cache empty; caller's entry fits by the cap pre-check
+        };
+        if let Some(e) = inner.entries.remove(&k) {
+            inner.bytes_used -= e.bytes;
+            if seg == RgSegment::Protected {
+                inner.protected_bytes -= e.bytes;
+                inner.protected_evictions += 1;
+            } else {
+                inner.retention_rejects += 1;
+            }
+        }
+    }
+}
+
+/// Σ.AI.6e — demote protected-LRU entries back to probation while the
+/// protected segment exceeds its cap. Demotion keeps the bytes cached
+/// (total budget unchanged) but exposes them to probation eviction —
+/// a demoted entry earns its way back with another touch.
+fn demote_protected_overflow(inner: &mut RgInner, protected_cap: usize) {
+    while inner.protected_bytes > protected_cap {
+        let Some((stamp, k)) = inner.q_protected.pop_front() else {
+            break;
+        };
+        let live = inner
+            .entries
+            .get(&k)
+            .is_some_and(|e| e.stamp == stamp && e.seg == RgSegment::Protected);
+        if !live {
+            continue;
+        }
+        inner.next_stamp += 1;
+        let fresh = inner.next_stamp;
+        let e = inner.entries.get_mut(&k).expect("liveness checked above");
+        e.stamp = fresh;
+        e.seg = RgSegment::Probation;
+        inner.protected_bytes -= e.bytes;
+        inner.q_probation.push_back((fresh, k));
+    }
+}
+
+/// Σ.AI.6e — sweep stale (stamp-superseded) queue pairs once the
+/// queues outgrow the live entry set 2:1. `VecDeque::retain` keeps
+/// order and allocates nothing; amortised O(1) per cache op.
+fn maybe_compact(inner: &mut RgInner) {
+    let live = inner.entries.len();
+    if inner.q_probation.len() + inner.q_protected.len() <= 2 * live + 64 {
+        return;
+    }
+    let entries = &inner.entries;
+    inner.q_probation.retain(|(s, k)| {
+        entries
+            .get(k)
+            .is_some_and(|e| e.stamp == *s && e.seg == RgSegment::Probation)
+    });
+    inner.q_protected.retain(|(s, k)| {
+        entries
+            .get(k)
+            .is_some_and(|e| e.stamp == *s && e.seg == RgSegment::Protected)
+    });
 }
 
 impl Default for RowGroupDecodeCache {
@@ -279,6 +519,23 @@ pub fn process_rg_decode_cache() -> Option<std::sync::Arc<RowGroupDecodeCache>> 
 /// rep-progression with cache off vs on without re-execing.
 pub fn set_process_rg_decode_cache(cache: Option<std::sync::Arc<RowGroupDecodeCache>>) {
     *process_rg_decode_cache_slot().write().unwrap() = cache;
+}
+
+/// Σ.AI.6e — AUTO arm of `EMAT_RG_CACHE_RETENTION`: **ON**. The unit
+/// benches (`rg_cache_retention_*` below) show segmented-LRU retention
+/// never loses to the legacy FIFO on any measured pattern (one-pass
+/// flood, LRU-friendly loop, Q09-shaped seed+re-stream) — parity where
+/// FIFO is fine, 0% → 100% where FIFO thrashes. Final call = the AWS
+/// 32 GB-box FULL-SUITE A/B (isolated memory-lever A/Bs don't
+/// transfer — proven twice, docs/plans/MEMORY_BUDGET.md).
+const RG_CACHE_RETENTION_AUTO_ON: bool = true;
+
+/// Σ.AI.6e — resolve `EMAT_RG_CACHE_RETENTION` (tri-state): `=1`
+/// force retention, `=0` force legacy FIFO, unset/unrecognized =
+/// AUTO = ON. Read at cache construction (`with_capacity_bytes` /
+/// the process-slot init), not per lookup.
+pub fn rg_cache_retention_resolved() -> bool {
+    crate::flags::tri_state("EMAT_RG_CACHE_RETENTION").unwrap_or(RG_CACHE_RETENTION_AUTO_ON)
 }
 
 fn estimate_column_bytes(c: &DecodedColumn) -> usize {
@@ -4396,6 +4653,285 @@ mod tests {
             format!("{after:?}"),
             "cleared-and-repopulated rows are identical"
         );
+    }
+
+    // ----- Σ.AI.6e — RG cache retention (segmented LRU, second-touch
+    // admission). Deterministic unit benches: synthetic keys/columns,
+    // no wall clock — the asserts are HIT RATES, not times. -----
+
+    /// One synthetic entry = 1 KiB Int64 column (Arc'd Buffer, same
+    /// shape `estimate_column_bytes` sees in production).
+    const RG_SYNTH_ENTRY_BYTES: usize = 1024;
+
+    fn rg_synth_col() -> DecodedColumn {
+        DecodedColumn::Int64 {
+            data: Buffer::from(vec![0u8; RG_SYNTH_ENTRY_BYTES]),
+            n_rows: RG_SYNTH_ENTRY_BYTES / 8,
+        }
+    }
+
+    fn rg_synth_id(id: usize) -> RgCacheKey {
+        RgCacheKey {
+            file_path: std::path::PathBuf::from("/synthetic/rg-retention-bench"),
+            row_group_idx: id,
+            leaf_idx: 0,
+        }
+    }
+
+    /// Touch entry `id`: `true` = hit, `false` = miss (then insert —
+    /// exactly what `load_row_group_dense` does per projected leaf).
+    fn rg_touch(cache: &RowGroupDecodeCache, id: usize) -> bool {
+        let key = rg_synth_id(id);
+        if cache.get(&key).is_some() {
+            true
+        } else {
+            cache.insert(key, rg_synth_col());
+            false
+        }
+    }
+
+    /// 64-entry policy cache (64 × 1 KiB), explicit env-independent policy.
+    fn rg_policy_cache(retention: bool) -> RowGroupDecodeCache {
+        RowGroupDecodeCache::with_capacity_bytes_and_retention(64 * RG_SYNTH_ENTRY_BYTES, retention)
+    }
+
+    /// Σ.AI.6e step-2 reproduction — the settled Q09 SF=100 mechanism:
+    /// seed K ≤ capacity, then stream 2×capacity sequential entries
+    /// repeatedly. Legacy FIFO: every repeat pass yields ZERO hits (a
+    /// scan whose insert traffic exceeds capacity evicts the seeded
+    /// set in insertion order even while it is being hit). Retention:
+    /// the twice-touched seed is protected and keeps hitting.
+    #[test]
+    fn rg_cache_sequential_overcap_stream_fifo_thrash_vs_retention() {
+        // Legacy FIFO — pins the pathology.
+        let fifo = rg_policy_cache(false);
+        for id in 0..32 {
+            rg_touch(&fifo, id); // seed K=32 ≤ capacity 64
+        }
+        let mut pass_hits = [0usize; 3];
+        for hits in &mut pass_hits {
+            for id in 0..128 {
+                // 2× capacity, sequential
+                if rg_touch(&fifo, id) {
+                    *hits += 1;
+                }
+            }
+        }
+        assert_eq!(
+            pass_hits[2], 0,
+            "FIFO repeat pass must yield zero hits (thrash): {pass_hits:?}"
+        );
+        let (admits, rejects, prot) = fifo.retention_stats();
+        assert_eq!(
+            (admits, rejects, prot),
+            (0, 0, 0),
+            "legacy mode: retention probes stay zero"
+        );
+
+        // Retention — pass 1 re-touches the seed (second touch →
+        // protected); the flood churns probation only. Steady state:
+        // the full seed keeps hitting every pass.
+        let ret = rg_policy_cache(true);
+        for id in 0..32 {
+            rg_touch(&ret, id);
+        }
+        let mut final_seed_hits = 0usize;
+        for pass in 0..3 {
+            for id in 0..128 {
+                let hit = rg_touch(&ret, id);
+                if pass == 2 && id < 32 && hit {
+                    final_seed_hits += 1;
+                }
+            }
+        }
+        assert!(
+            final_seed_hits * 10 >= 32 * 9,
+            "retention must keep ≥90% of the seeded set hitting: {final_seed_hits}/32"
+        );
+    }
+
+    /// Unit bench (a) — one-pass sequential flood over 2× capacity
+    /// with a hot set touched twice beforehand: the hot set must
+    /// survive with ≥90% hits on re-touch (FIFO: 0%).
+    #[test]
+    fn rg_cache_retention_hot_set_survives_one_pass_flood() {
+        let run = |cache: &RowGroupDecodeCache| -> usize {
+            for id in 0..16 {
+                rg_touch(cache, id); // touch 1: insert
+            }
+            for id in 0..16 {
+                assert!(rg_touch(cache, id), "hot set fits: touch 2 hits");
+            }
+            for id in 1_000..1_128 {
+                rg_touch(cache, id); // one-pass flood, 2× capacity
+            }
+            (0..16).filter(|&id| rg_touch(cache, id)).count()
+        };
+        let fifo_hits = run(&rg_policy_cache(false));
+        assert_eq!(fifo_hits, 0, "FIFO: flood evicts the twice-touched hot set");
+        let ret = rg_policy_cache(true);
+        let ret_hits = run(&ret);
+        assert!(
+            ret_hits * 10 >= 16 * 9,
+            "retention: hot set survives the flood ≥90%: {ret_hits}/16"
+        );
+        let (admits, rejects, prot) = ret.retention_stats();
+        assert!(admits >= 16, "hot set promoted on second touch");
+        assert!(rejects > 0, "flood one-touch entries die in probation");
+        assert_eq!(prot, 0, "the flood never reaches the protected segment");
+    }
+
+    /// Unit bench (b) — LRU-friendly pattern (repeated small loop <
+    /// capacity): retention must MATCH the legacy policy's hit count
+    /// exactly (no regression where FIFO was already fine).
+    #[test]
+    fn rg_cache_retention_matches_legacy_on_lru_friendly_loop() {
+        let run = |cache: &RowGroupDecodeCache| -> usize {
+            let mut hits = 0;
+            for _pass in 0..5 {
+                for id in 0..32 {
+                    if rg_touch(cache, id) {
+                        hits += 1;
+                    }
+                }
+            }
+            hits
+        };
+        let fifo_hits = run(&rg_policy_cache(false));
+        let ret_hits = run(&rg_policy_cache(true));
+        assert_eq!(
+            fifo_hits,
+            4 * 32,
+            "loop < capacity: all passes after the first hit"
+        );
+        assert_eq!(
+            ret_hits, fifo_hits,
+            "retention must not regress the LRU-friendly loop"
+        );
+    }
+
+    /// Unit bench (c) — Q09-shaped: seed W (the warmup), re-stream W
+    /// repeatedly with distinct one-touch noise interleaved — light in
+    /// trials 1–2 (the seeding window), heavier once cross-trial
+    /// traffic accumulates. Reproduces the observed SF=100 curve:
+    /// FIFO's trials 1–2 are fast (warmup-seeded hits), trial 3+
+    /// collapse once eviction starts. Retention must hold W at ≥90%
+    /// steady-state.
+    #[test]
+    fn rg_cache_q09_shaped_fifo_collapses_retention_holds() {
+        const W: usize = 40;
+        // Returns per-trial hit counts on W across 6 trials.
+        let run = |cache: &RowGroupDecodeCache| -> Vec<usize> {
+            for id in 0..W {
+                rg_touch(cache, id); // warmup seed
+            }
+            let mut noise_id = 10_000;
+            let mut trials = Vec::new();
+            for trial in 0..6 {
+                let per_group = if trial < 2 { 2 } else { 4 };
+                let mut hits = 0;
+                for id in 0..W {
+                    if rg_touch(cache, id) {
+                        hits += 1;
+                    }
+                    if id % 5 == 4 {
+                        for _ in 0..per_group {
+                            rg_touch(cache, noise_id); // distinct one-touch noise
+                            noise_id += 1;
+                        }
+                    }
+                }
+                trials.push(hits);
+            }
+            trials
+        };
+        let fifo = run(&rg_policy_cache(false));
+        let ret_cache = rg_policy_cache(true);
+        let ret = run(&ret_cache);
+        // FIFO reproduces the observed fast-fast-collapse: trials 1–2
+        // ride the seed, steady state goes near-zero.
+        assert_eq!(fifo[0], W, "trial 1 rides the warmup seed");
+        assert_eq!(fifo[1], W, "trial 2 still rides the seed (pre-eviction)");
+        assert!(
+            fifo[5] * 10 < W,
+            "FIFO steady state must collapse (<10% of W): {fifo:?}"
+        );
+        // Retention: W stays protected across every trial.
+        assert!(
+            ret[5] * 10 >= W * 9,
+            "retention steady state must hold ≥90% of W: {ret:?}"
+        );
+        let (admits, rejects, prot) = ret_cache.retention_stats();
+        assert!(admits >= W as u64, "W promoted on trial-1 re-touch");
+        assert!(rejects > 0, "noise rejected in probation");
+        assert_eq!(prot, 0, "noise never evicts protected entries");
+    }
+
+    /// Σ.AI.6e — correctness oracle: retention forced ON (injectable
+    /// policy — no env mutation, no parallel-runner race), scans return
+    /// byte-identical rows on hit, and clear() + repopulate is identical.
+    #[test]
+    fn rg_decode_cache_retention_forced_on_identical_rows_and_clear() {
+        let path = tmp_parquet("rg_cache_retention_identity");
+        write_three_primitives(&path, 4096);
+        let cache = std::sync::Arc::new(RowGroupDecodeCache::with_capacity_bytes_and_retention(
+            1 << 30,
+            true,
+        ));
+        assert!(cache.retention_enabled());
+
+        let first = read_all_with_rg_cache(&path, schema_three_primitives(), cache.clone());
+        let second = read_all_with_rg_cache(&path, schema_three_primitives(), cache.clone());
+        let (h, m, _) = cache.stats();
+        assert!(m >= 1, "first read misses + inserts");
+        assert!(h >= 1, "second read hits");
+        let (admits, _, _) = cache.retention_stats();
+        assert!(admits >= 1, "second read promotes to protected");
+        assert_eq!(
+            format!("{first:?}"),
+            format!("{second:?}"),
+            "cache-served rows are identical (it's a cache — wrong results disqualify)"
+        );
+
+        cache.clear();
+        assert!(cache.is_empty(), "clear() empties both segments");
+        let (_, _, bytes) = cache.stats();
+        assert_eq!(bytes, 0, "clear() returns every byte incl. protected");
+        let third = read_all_with_rg_cache(&path, schema_three_primitives(), cache.clone());
+        assert_eq!(format!("{first:?}"), format!("{third:?}"));
+    }
+
+    /// Σ.AI.6e — `EMAT_RG_CACHE_RETENTION` tri-state resolution: `=0`
+    /// forces legacy FIFO, `=1` forces retention, unset = AUTO = ON.
+    /// One combined test; mutates a production `EMAT_*` var → takes
+    /// `EMAT_ENV_TEST_LOCK` (repo convention) and restores on exit.
+    #[test]
+    fn rg_cache_retention_env_tri_state_resolution() {
+        let _guard = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
+        let k = "EMAT_RG_CACHE_RETENTION";
+        let prev = std::env::var(k).ok();
+
+        unsafe { std::env::remove_var(k) };
+        assert!(rg_cache_retention_resolved(), "unset = AUTO = ON");
+        unsafe { std::env::set_var(k, "0") };
+        assert!(!rg_cache_retention_resolved(), "=0 forces legacy FIFO");
+        assert!(
+            !RowGroupDecodeCache::new().retention_enabled(),
+            "env-resolved constructor honours the force-OFF"
+        );
+        unsafe { std::env::set_var(k, "1") };
+        assert!(rg_cache_retention_resolved(), "=1 forces retention");
+        assert!(RowGroupDecodeCache::new().retention_enabled());
+        unsafe { std::env::set_var(k, "auto") };
+        assert!(
+            rg_cache_retention_resolved(),
+            "unrecognized value = AUTO = ON (tri_state convention)"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(k, v) },
+            None => unsafe { std::env::remove_var(k) },
+        }
     }
 
     /// L9.ADAPT LATE-ARM — a tight-rescued wrap's sideband published
