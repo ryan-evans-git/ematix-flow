@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RG decode-cache retention (Σ.AI.6e, `EMAT_RG_CACHE_RETENTION`
+  tri-state, AUTO = ON).** The `RowGroupDecodeCache` eviction policy is
+  now segmented LRU with admission-on-second-touch (probationary +
+  protected segments, probation-first eviction) instead of pure FIFO.
+  Fixes the Q09 SF=100 steady-state collapse where a scan whose insert
+  traffic exceeds cache capacity evicted the warmup-seeded working set
+  while it was being hit (trials 1–2 ~6.5 s cache-served, trial 3+
+  16–50 s decode-bound). One-touch sequential floods now die in
+  probation and cannot displace the re-touched working set; unit
+  benches show exact hit-rate parity with the old policy on
+  LRU-friendly patterns. `=0` restores the legacy FIFO bit-exact;
+  probe via `RowGroupDecodeCache::retention_stats()`. Final default
+  confirmation rides the 32 GB-box full-suite A/B
+  (`docs/plans/MEMORY_BUDGET.md`, option 4).
 - **DLQ management + stream replayability (Phases 3–6 of the DLQ
   plan; Phases 1–2 shipped the store + replay engine).**
   - **Rewind** (`StreamingPipeline::rewind`, `POST

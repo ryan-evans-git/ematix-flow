@@ -2,7 +2,9 @@
 
 Status: **ElasticFloorPool landed (Σ.AI.6c, 2026-07-08)**;
 **decode-pressure shedding prototype landed (Σ.AI.6d, 2026-07-08 —
-opt-in `EMAT_DECODE_SHED=1`, box A/B pending)**; per-query paging
+opt-in `EMAT_DECODE_SHED=1`, box A/B pending)**; **decode-cache
+retention landed (Σ.AI.6e, 2026-07-08 — `EMAT_RG_CACHE_RETENTION`
+AUTO = ON, box A/B pending, option 4 below)**; per-query paging
 = designed, not started. Owner ask: make SF100-class workloads safe and
 eventually fast on memory-tight boxes, with **bench == release** (no
 bench-only settings).
@@ -89,6 +91,39 @@ Candidate designs, in rough order of leverage:
    send (no cross-scan wait cycles). Counters `shed_gate_entries` /
    `shed_cache_drops` via `mem_pressure_metrics()`. Default stays OFF
    until the FULL 22q suite A/B on the 32 GB box decides it.
+
+4. **Decode-cache retention.** Status: **landed (Σ.AI.6e, 2026-07-08,
+   `EMAT_RG_CACHE_RETENTION` tri-state, AUTO = ON), box A/B pending.**
+   The settled Q09 SF=100 mechanism (2026-07-09 diagnostics — replaced
+   two earlier wrong theories): on the 32 GB box Q09 runs **6.5 s when
+   the RG decode cache serves its working set** and 16–50 s
+   (IO/decode-bound) when it doesn't — DuckDB's steady state is 6.4 s,
+   so cache retention IS the whole gap. Observed pattern (fresh
+   process, warmup + 6 trials, page cache dropped first): trials 1–2
+   fast (~6.5 s, warmup-seeded hits), trial 3+ collapse (eviction),
+   then oscillation; with `EMAT_RG_DECODE_CACHE=0` no fast trials at
+   all ([26, 16, 49, …] s) — proving the fast trials were the cache.
+   Root cause confirmed in code: the eviction was pure FIFO (`get`
+   never reordered), so a scan whose insert traffic exceeds capacity
+   evicts the seeded working set in insertion order *even while it is
+   being hit* — steady-state hit rate collapses to ~0 although the
+   set fits with room to spare right after seeding.
+   Design: segmented LRU with **admission-on-second-touch** — new
+   entries land in a probationary segment; only a second touch
+   promotes to the protected segment (≤ 4/5 of capacity, LRU overflow
+   demotes back to probation); eviction takes probation-LRU victims
+   first and touches protected only when probation is dry. Sequential
+   one-pass floods die in probation and cannot displace the re-touched
+   working set. O(1) amortised per op (lazy stamp-validated queues,
+   no per-op allocation); legacy FIFO preserved bit-exact behind
+   `EMAT_RG_CACHE_RETENTION=0`. Deterministic unit benches (hit
+   rates): 2×-capacity flood hot-set survival 0/16 → 16/16; Q09-shaped
+   seed+re-stream steady state 0/40 → 40/40 (FIFO reproduces the
+   fast-fast-collapse curve [40, 40, 0, 0, 0, 0]); LRU-friendly loop
+   exact parity (no regression). Probes: `retention_stats()` =
+   (admits, rejects, protected_evictions). AUTO ships ON on the unit
+   evidence; the FULL 22q suite A/B on the 32 GB box makes the final
+   call, same rule as (3).
 
 Decision gate: reassess after the next DataFusion upgrade (spillable
 hash join is on their roadmap); if not landed, prototype (3) then (2),
