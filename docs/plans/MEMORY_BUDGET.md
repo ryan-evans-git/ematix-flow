@@ -4,7 +4,8 @@ Status: **ElasticFloorPool landed (Σ.AI.6c, 2026-07-08)**;
 **decode-pressure shedding prototype landed (Σ.AI.6d, 2026-07-08 —
 opt-in `EMAT_DECODE_SHED=1`, box A/B pending)**; **decode-cache
 retention landed (Σ.AI.6e, 2026-07-08 — `EMAT_RG_CACHE_RETENTION`
-AUTO = ON, box A/B pending, option 4 below)**; per-query paging
+AUTO = ON, box A/B pending, option 4 below; Σ.AI.6f, 2026-07-09 —
+policy-freeze fix, ghost-assisted demotion, see option 4)**; per-query paging
 = designed, not started. Owner ask: make SF100-class workloads safe and
 eventually fast on memory-tight boxes, with **bench == release** (no
 bench-only settings).
@@ -124,6 +125,43 @@ Candidate designs, in rough order of leverage:
    (admits, rejects, protected_evictions). AUTO ships ON on the unit
    evidence; the FULL 22q suite A/B on the 32 GB box makes the final
    call, same rule as (3).
+
+   **Σ.AI.6f (2026-07-09) — policy freeze found and fixed.** Per-query
+   field counters on the AWS SF=100 box (logs banked) showed that once
+   the cache fills (~1 GiB), the Σ.AI.6e layout FREEZES for the rest
+   of the process: `retention(admit+0 … prot_evict+0)` on virtually
+   every subsequent query while rejects count tens of thousands.
+   Mechanism (a policy deadlock, not a code bug): protected only
+   demotes on promotion overflow; promotion requires a probation
+   second touch; effective probation (capacity − protected ≈ 1/5) is
+   smaller than later queries' re-touch distance, so no second touches
+   ever happen → no promotions → no demotions — whoever filled
+   protected first owns it forever (order-lucky poisoning). Fix:
+   ghost-assisted adaptive demotion (ARC-lite). Keys evicted from
+   probation WITHOUT promotion go to a bounded keys-only ghost list
+   (cap = max(live entries, 64)); a miss on a ghosted key is proof a
+   live working set re-touches beyond probation's reach and demotes
+   protected-LRU entries that are *stale* (untouched since that key's
+   eviction) to probation-MRU. The staleness gate preserves every
+   Σ.AI.6e guarantee: one-touch floods never re-request their keys
+   (no ghost hits → protected untouched), and a still-hitting
+   protected set carries fresh stamps (never demoted). Unit evidence:
+   poisoning repro (48-entry stale protected set vs a 32-entry live
+   set with re-touch distance > probation) goes from
+   [0,0,0,0,0,0,0,0] hits/pass (frozen, forever) to
+   [0, 0, 25, 32, 32, 32, 32, 32] — full residency by pass 4 while
+   the stale set fully drains (48/48 ghost demotions); flood
+   hot-set survival, Q09-shaped, and LRU-parity benches unchanged.
+   New probe: `retention_ghost_stats()` = (ghost_hits,
+   ghost_demotions); `EMAT_RG_CACHE_RETENTION=0` legacy FIFO stays
+   bit-exact.
+
+   **Honest scope note:** the ghost fix removes the *policy* deadlock —
+   cross-query cache utility no longer depends on arrival order. It
+   does NOT make SF100 big-query caching win: the big queries' decoded
+   working sets are structurally capacity-bound (they exceed the 1 GiB
+   cap regardless of layout), and the remaining Q09 gap belongs to the
+   spillable-join arc (decision gate below), not to retention tuning.
 
 Decision gate: reassess after the next DataFusion upgrade (spillable
 hash join is on their roadmap); if not landed, prototype (3) then (2),
