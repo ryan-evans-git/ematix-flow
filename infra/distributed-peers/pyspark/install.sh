@@ -246,6 +246,13 @@ spark.worker.cleanup.enabled                   true
 spark.worker.cleanup.interval                  120
 spark.worker.cleanup.appDataTtl                300
 
+# THE actual SF=100 disk fix (2026-07-10, round 3): AL2023 mounts /tmp as
+# tmpfs (RAM-backed, ~16GB) and spark.local.dir defaults to /tmp — every
+# shuffle wrote to a 16GB RAM-disk no matter how big the EBS volume was.
+# Light queries fit; the heavy five (Q05/Q08/Q09/Q17/Q21) exceed it and
+# die with "No space left on device" on their first executions.
+spark.local.dir                                /opt/spark-scratch
+
 # s3a access via the EC2 instance profile (no static creds on disk).
 # hadoop-aws 3.4.x runs on AWS SDK **v2**: the provider below is the
 # v2-native IAM/instance-profile provider (the old v1
@@ -261,6 +268,10 @@ spark.hadoop.fs.s3a.fast.upload                true
 EOF
 
 chown -R "$SPARK_USER:$SPARK_USER" "$SPARK_HOME/conf"
+
+# EBS-backed shuffle scratch (see spark.local.dir note above).
+mkdir -p /opt/spark-scratch
+chown "$SPARK_USER:$SPARK_USER" /opt/spark-scratch
 
 # -----------------------------------------------------------------------------
 # systemd units
