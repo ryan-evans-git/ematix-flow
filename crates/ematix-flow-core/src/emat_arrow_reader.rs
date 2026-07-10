@@ -2904,6 +2904,38 @@ pub fn decode_one_column_for_bench(
     Ok((rows, bytes))
 }
 
+/// Σ.JS.1 (2026-07-09) plan-time sampling entry point: decode the
+/// FIRST row group of one column and return it as an `ArrayRef` of
+/// `target` type, so `join_side_rule` can evaluate a string-pattern
+/// predicate against REAL data and measure its true selectivity
+/// (instead of DataFusion's flat 20% default). One RG decode is tens
+/// of ms and the caller caches the measured rate process-wide per
+/// (file, predicate), so this is a one-shot plan-time cost. The
+/// sample size is bounded by the writer's row-group size (even a
+/// 131072+-row first RG is fine at plan time).
+pub(crate) fn decode_first_rg_column_for_sampling(
+    path: &str,
+    leaf: usize,
+    target: &DataType,
+) -> DfResult<ArrayRef> {
+    let file = ParquetFile::open(path)
+        .map_err(|e| ext(format!("sampling open {path}: {e}")))?;
+    let cached_md = CachedFileMetadata::from_file(&file)?;
+    let Some(rg0) = cached_md.row_groups.first() else {
+        return Err(ext(format!("sampling {path}: file has no row groups")));
+    };
+    if leaf >= rg0.columns.len() {
+        return Err(ext(format!(
+            "sampling {path}: leaf {leaf} out of range ({} columns)",
+            rg0.columns.len()
+        )));
+    }
+    let mut chunk_buf: Vec<u8> = Vec::new();
+    let dc = decode_one_column(&file, &cached_md, &mut chunk_buf, 0, leaf, target)?;
+    let n = dc.len();
+    Ok(slice_decoded(&dc, 0, n, target))
+}
+
 /// For the rare PLAIN-only (no dict) case — extremely unusual in
 /// real parquet — we fall back to the previous row-by-row path so we
 /// still produce a correct result.

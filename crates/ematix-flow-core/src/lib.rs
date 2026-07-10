@@ -186,6 +186,12 @@ pub mod swap_semi_join_build_rule;
 // that JoinSelection picks because the build's stats are Absent. See
 // module docs.
 pub mod force_collect_left_semi_build_rule;
+// Σ.JS.1: sampled join-side correction — honest bottom-up row
+// estimates (first-RG sampling of string-pattern filter selectivity +
+// dense-unique-key containment multiplicity) swap Inner Partitioned
+// hash-join build sides that JoinSelection inverted off inflated
+// estimates (Q09 SF=100 page-cache cliff). See module docs.
+pub mod join_side_rule;
 // Σ.Q.L10: logical-plan rewrite — push a LeftSemi join down past
 // Inner joins so it filters its target table directly, eliminating
 // the giant intermediate that gets semi-filtered at the top of the

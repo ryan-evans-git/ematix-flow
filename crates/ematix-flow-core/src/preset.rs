@@ -177,6 +177,10 @@ pub struct HarnessOverrides {
     /// `ForceCollectLeftForSemiBoundedBuildRule` (bench/validate:
     /// `EMAT_FORCE_COLLECT_LEFT`).
     pub force_collect_left: bool,
+    /// `SampledJoinSideRule` (Σ.JS.1). Note the rule ALSO self-gates
+    /// on `EMAT_JOIN_SIDE_FIX` (default ON, snapshotted at session
+    /// build), so harnesses keep this `true` and A/B via the env var.
+    pub sampled_join_side: bool,
     /// `ClusteredSinglePhaseAggRule` (RANGE.AGG). Note the rule ALSO
     /// self-gates on `EMAT_RANGE_AGG` (default ON), so harnesses keep
     /// this `true` and A/B via the env var.
@@ -256,6 +260,7 @@ impl Default for HarnessOverrides {
             inject_fused_rules: true,
             swap_semi_join_build: true,
             force_collect_left: true,
+            sampled_join_side: true,
             clustered_single_phase_agg: true,
             push_down_left_semi: true,
             robin_hood_sum_f64: true,
@@ -357,6 +362,26 @@ pub fn with_optimizer_rules_overridden(
     if o.force_collect_left {
         builder = builder.with_physical_optimizer_rule(Arc::new(
             crate::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule::default(),
+        ));
+    }
+    // SampledJoinSideRule (Σ.JS.1, 2026-07-09): honest bottom-up row
+    // estimates — first-RG SAMPLING of string-pattern filter
+    // selectivity (LIKE '%green%' is truly 5.4%, not DF's flat 20%) +
+    // dense-unique-key containment multiplicity for Inner joins (a
+    // row-preserving FK join does NOT fan 120M → 480M) — then swap an
+    // Inner Partitioned hash join's build side when the honest
+    // estimate says the current probe is ≥2× smaller. Evidence: Q09
+    // SF=100 on a 32 GB box — JoinSelection's inflated estimates keep
+    // orders (150M) + partsupp (80M) as BUILD sides, a ~12 GB operator
+    // peak that evicts the 13.4 GB parquet page-cache working set and
+    // collapses Q09 from 6.5 s to 16–75 s; swapping onto the filtered
+    // ~32M-row intermediates keeps the build peak ~1 GB. Runs right
+    // after ForceCollectLeft so it only sees the joins that stayed
+    // Partitioned. Default ON (bench == release); kill-switch
+    // EMAT_JOIN_SIDE_FIX=0.
+    if o.sampled_join_side {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            crate::join_side_rule::SampledJoinSideRule::default(),
         ));
     }
     // RANGE.AGG (2026-06-10): collapse Partial→hash-shuffle→Final
@@ -613,6 +638,7 @@ pub const PRODUCTION_PHYSICAL_RULE_NAMES: &[&str] = &[
     "ematix_flow_inject_filter_sum",
     "swap_semi_join_build_side",
     "ematix_flow_force_collect_left_semi_bounded_build",
+    "ematix_flow_sampled_join_side",
     "ematix_flow_clustered_single_phase_agg",
     "ematix_flow_enable_robin_hood_sum_f64",
     "ematix_flow_enable_runtime_bloom_sideband",
