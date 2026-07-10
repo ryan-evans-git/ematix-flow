@@ -211,6 +211,11 @@ export SPARK_WORKER_WEBUI_PORT=8081
 export SPARK_WORKER_MEMORY="$WORKER_MEMORY"
 export SPARK_WORKER_CORES=$WORKER_CORES
 export PYSPARK_PYTHON=/usr/bin/python3.12
+# Executor shuffle scratch on EBS: in STANDALONE mode executors take
+# their local dirs from this env var (spark.local.dir in the conf only
+# covers the driver — Spark warns about exactly this). AL2023 /tmp is a
+# 16GB tmpfs; see the spark.local.dir note in spark-defaults.conf.
+export SPARK_LOCAL_DIRS=/opt/spark-scratch
 EOF
 chmod 0755 "$SPARK_HOME/conf/spark-env.sh"
 
@@ -269,9 +274,11 @@ EOF
 
 chown -R "$SPARK_USER:$SPARK_USER" "$SPARK_HOME/conf"
 
-# EBS-backed shuffle scratch (see spark.local.dir note above).
+# EBS-backed shuffle scratch (see spark.local.dir note above). /tmp-style
+# 1777: the spark user's executors AND the ec2-user driver both create
+# blockmgr dirs here.
 mkdir -p /opt/spark-scratch
-chown "$SPARK_USER:$SPARK_USER" /opt/spark-scratch
+chmod 1777 /opt/spark-scratch
 
 # -----------------------------------------------------------------------------
 # systemd units
