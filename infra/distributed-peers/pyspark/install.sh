@@ -233,6 +233,19 @@ spark.sql.adaptive.coalescePartitions.enabled  true
 # small stages, so 400 is safe across SF10/SF100.
 spark.sql.shuffle.partitions                   400
 
+# SF=100 disk-exhaustion fix (2026-07-10, run 20260707T211533Z): shuffle
+# files accumulated across the long-lived bench session until Q05 hit
+# "No space left on device" on 1TB workers, killing all later queries.
+# Three-part fix: (1) periodicGC drops the running app's collected
+# shuffles every 90s (default 30min is far too lazy for SF=100);
+# (2)+(3) the standalone worker reaps FINISHED apps' dirs — bench.py now
+# recycles its session per query, so each query's shuffle becomes
+# reapable minutes after the query ends.
+spark.cleaner.periodicGC.interval              90s
+spark.worker.cleanup.enabled                   true
+spark.worker.cleanup.interval                  120
+spark.worker.cleanup.appDataTtl                300
+
 # s3a access via the EC2 instance profile (no static creds on disk).
 # hadoop-aws 3.4.x runs on AWS SDK **v2**: the provider below is the
 # v2-native IAM/instance-profile provider (the old v1

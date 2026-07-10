@@ -144,6 +144,12 @@ def build_spark(app_name: str):
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
         .config("spark.sql.autoBroadcastJoinThreshold", str(64 * 1024 * 1024))
+        # SF=100 disk-exhaustion fix (2026-07-10): the ContextCleaner only
+        # drops shuffle files when driver GC collects the RDD refs; the
+        # 30min default let ~1TB of shuffle accumulate by Q05 ("No space
+        # left on device", run 20260707T211533Z). 90s bounds within-app
+        # accumulation to roughly one trial's shuffle.
+        .config("spark.cleaner.periodicGC.interval", "90s")
     )
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
@@ -202,8 +208,23 @@ def benchmark_all(
     trials: int,
     warmups: int,
     sf: int,
+    session_factory=None,
 ) -> Dict[str, dict]:
-    """Run all 22 TPC-H queries, returning the per-query result dict."""
+    """Run all 22 TPC-H queries, returning the per-query result dict.
+
+    When `session_factory` is given, the SparkSession is stopped and
+    rebuilt AFTER EVERY QUERY. Two reasons (both learned from the
+    20260707T211533Z SF=100 run, where Q05 filled the workers' disks and
+    every later query failed on the dead session):
+      1. a finished app's shuffle dirs become reapable by the standalone
+         worker cleaner (spark.worker.cleanup.*), bounding disk to about
+         one query's shuffle instead of the whole suite's;
+      2. a query that wrecks the cluster (disk-full, lost executors) no
+         longer poisons the remaining queries — the next query gets a
+         fresh app on recovered workers.
+    """
+    import shutil as _shutil
+
     out: Dict[str, dict] = {}
     for n in range(1, 23):
         qid = f"Q{n:02d}"
@@ -214,7 +235,9 @@ def benchmark_all(
 
         sql = apply_tpch_query_params(n, adapt_sql_for_spark(path.read_text()), sf)
 
-        print(f"== {qid} (warmups={warmups}, trials={trials})", flush=True)
+        du = _shutil.disk_usage("/")
+        print(f"== {qid} (warmups={warmups}, trials={trials}) "
+              f"[driver disk free: {du.free / 1e9:.0f}GB]", flush=True)
         # Warmups — JVM optimization, Catalyst codegen cache priming.
         for w in range(warmups):
             try:
@@ -225,6 +248,13 @@ def benchmark_all(
                 out[qid] = {"error": f"warmup failed: {e}"}
                 break
         if qid in out and "error" in out[qid]:
+            if session_factory is not None:
+                try:
+                    spark.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(15)
+                spark = session_factory()
             continue
 
         # Measured trials.
@@ -243,6 +273,13 @@ def benchmark_all(
 
         if failed:
             out[qid] = {"error": failed, "trials_ms": trials_ms}
+            if session_factory is not None:
+                try:
+                    spark.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(15)
+                spark = session_factory()
             continue
 
         # Steady-state slice = trials 3..5 (1-indexed), i.e. indices [2:5].
@@ -255,6 +292,14 @@ def benchmark_all(
             "median_trials_3_5_ms": round(statistics.median(steady), 3),
             "rows_returned": rows,
         }
+
+        if session_factory is not None:
+            try:
+                spark.stop()
+            except Exception as e:  # noqa: BLE001
+                print(f"   (session stop after {qid}: {e})", flush=True)
+            time.sleep(5)
+            spark = session_factory()
     return out
 
 
@@ -319,15 +364,17 @@ def main(argv: List[str]) -> int:
     print(f"==> PySpark TPC-H bench: sf={args.sf} bucket={args.bucket} "
           f"trials={args.trials} warmups={args.warmups}", flush=True)
 
-    spark = build_spark(app_name=f"tpch-sf{args.sf}-bench")
+    def session_factory():
+        s = build_spark(app_name=f"tpch-sf{args.sf}-bench")
+        register_tables(s, args.bucket, args.sf)
+        return s
+
+    spark = session_factory()
     cluster_size = 4
     try:
         # Version comes from the LIVE session — never hardcode it, or a
         # version bump in install.sh silently mislabels results.
         spark_version = spark.version
-
-        print("==> registering tables", flush=True)
-        register_tables(spark, args.bucket, args.sf)
 
         # Snap a cluster-size reading once executors have registered. We
         # take it before the run so a query-time hiccup doesn't influence
@@ -335,7 +382,10 @@ def main(argv: List[str]) -> int:
         cluster_size = cluster_size_from_spark(spark)
 
         print("==> running queries", flush=True)
-        results = benchmark_all(spark, args.queries_dir, args.trials, args.warmups, args.sf)
+        results = benchmark_all(
+            spark, args.queries_dir, args.trials, args.warmups, args.sf,
+            session_factory=session_factory,
+        )
     finally:
         spark.stop()
 
