@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Σ.JS.1 sampled join-side correction (`SampledJoinSideRule`,
+  default ON, kill-switch `EMAT_JOIN_SIDE_FIX=0`).** New physical
+  optimizer rule (production preset, registered after
+  ForceCollectLeft): for every Inner `Partitioned` `HashJoinExec` it
+  computes HONEST bottom-up row estimates — string-pattern filter
+  selectivity (LIKE/ILIKE/contains) is MEASURED by decoding the first
+  row group of the filtered parquet column and evaluating the actual
+  predicate against it (cached per (file, predicate); `p_name LIKE
+  '%green%'` prices at its true 5.4%, not DataFusion's flat 20%), and
+  Inner-join cardinality uses containment multiplicity when the build
+  key is provably dense-unique from scan stats (a row-preserving FK
+  join no longer fans 120M → 480M). When the honest estimate says the
+  current probe side is ≥2× smaller (`EMAT_JOIN_SIDE_MARGIN`), the
+  build side is swapped (`swap_inputs`, Partitioned preserved) and the
+  plan is repaired with the stock `OutputRequirements` →
+  `EnforceDistribution` → `EnforceSorting` bracket. Fixes the Q09
+  SF=100 32 GB-box page-cache cliff: JoinSelection kept orders (150M)
+  + partsupp (80M) as builds off ~15×-inflated probe estimates — a
+  ~12 GB operator peak that evicted the 13.4 GB parquet page-cache
+  working set and collapsed Q09 from 6.5 s to 16–75 s; the swap keeps
+  builds on the ~32M-row filtered intermediates. Unknown estimates
+  (aggregates, other join types) make NO decision; CollectLeft joins
+  are never touched. Trace: `EMAT_JOIN_SIDE_TRACE=1`.
 - **RG decode-cache retention (Σ.AI.6e, `EMAT_RG_CACHE_RETENTION`
   tri-state, AUTO = ON).** The `RowGroupDecodeCache` eviction policy is
   now segmented LRU with admission-on-second-touch (probationary +

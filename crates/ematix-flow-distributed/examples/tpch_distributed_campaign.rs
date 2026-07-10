@@ -346,6 +346,13 @@ fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState
     if let Some(n) = explicit {
         cfg = cfg.with_target_partitions(n);
     }
+    // EMAT_EXPLAIN_STATS=1: render per-node Statistics in EXPLAIN output.
+    // Diagnostic for join-build-side selection — this probe exposed the
+    // 15x cardinality inflation (LIKE default 0.2 + composite-key join
+    // fanout) behind the Q09 SF100 page-cache cliff (Σ.JS.1).
+    if std::env::var_os("EMAT_EXPLAIN_STATS").is_some() {
+        cfg.options_mut().explain.show_statistics = true;
+    }
     let overrides = HarnessOverrides {
         auto_target_partitions: explicit.is_none(),
         ..HarnessOverrides::default()
@@ -650,6 +657,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut queries = BTreeMap::new();
+    // EMAT_CACHE_STATS: cumulative counter snapshot carried across the query
+    // loop so each query prints its own delta.
+    let mut cache_prev: (u64, u64, u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0, 0, 0);
     for n in query_subset {
         // #315: scale Q11's HAVING fraction (0.0001 / SF) so it isn't
         // degenerate (0 rows) at SF>=10. No-op for q!=11 / SF<=1.
@@ -739,6 +749,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  median={med:.2}ms p95={p95v:.2}ms first={first:.2}ms med(3-5)={med35:.2}ms rows={rows_returned}"
         );
+
+        // EMAT_CACHE_STATS=1 diagnostic: per-query DELTA of the process-global
+        // RG decode-cache counters (hits/misses/entries + Σ.AI.6e retention
+        // admits/rejects/protected-evictions + Σ.AI.6f ghost hits/demotions).
+        // Answers "where did this query's cache hits go" without a profiler —
+        // cumulative counters are read before/after each query via the public
+        // probes.
+        if std::env::var_os("EMAT_CACHE_STATS").is_some() {
+            if let Some(c) = ematix_flow_core::emat_arrow_reader::process_rg_decode_cache() {
+                let (h, m, entries) = c.stats();
+                let (ad, rj, pe) = c.retention_stats();
+                let (gh, gd) = c.retention_ghost_stats();
+                let (ph, pm, pad, prj, ppe, pgh, pgd) = cache_prev;
+                eprintln!(
+                    "  cache: hits+{} misses+{} entries={} | retention(admit+{} reject+{} prot_evict+{} ghost_hit+{} demote+{}) enabled={}",
+                    h - ph,
+                    m - pm,
+                    entries,
+                    ad - pad,
+                    rj - prj,
+                    pe - ppe,
+                    gh - pgh,
+                    gd - pgd,
+                    c.retention_enabled()
+                );
+                cache_prev = (h, m, ad, rj, pe, gh, gd);
+            }
+        }
 
         queries.insert(
             label,

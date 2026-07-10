@@ -587,10 +587,10 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
             return None;
         }
         match current {
-            Value::Object(map) => match map.get(segment) {
-                Some(v) => current = v,
-                None => return None,
-            },
+            Value::Object(map) => {
+                let v = map.get(segment)?;
+                current = v
+            }
             // Indexing into a non-object (or null) — path doesn't
             // resolve. The executor reports this as a parse error
             // for required fields.

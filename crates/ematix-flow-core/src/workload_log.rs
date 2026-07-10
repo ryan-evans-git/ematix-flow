@@ -358,13 +358,7 @@ impl WorkloadLog {
             )
             .optional()
             .map_err(WorkloadLogError::Db)?;
-        Ok(row.and_then(|o| {
-            if o.n_observations >= min_observations {
-                Some(o)
-            } else {
-                None
-            }
-        }))
+        Ok(row.filter(|&o| o.n_observations >= min_observations))
     }
 }
 
@@ -475,13 +469,7 @@ impl WorkloadLog {
             )
             .optional()
             .map_err(WorkloadLogError::Db)?;
-        Ok(row.and_then(|o| {
-            if o.n_observations >= min_observations {
-                Some(o)
-            } else {
-                None
-            }
-        }))
+        Ok(row.filter(|&o| o.n_observations >= min_observations))
     }
 }
 
@@ -631,13 +619,7 @@ impl WorkloadLog {
             )
             .optional()
             .map_err(WorkloadLogError::Db)?;
-        Ok(row.and_then(|o| {
-            if o.n_observations >= min_observations {
-                Some(o)
-            } else {
-                None
-            }
-        }))
+        Ok(row.filter(|&o| o.n_observations >= min_observations))
     }
 }
 

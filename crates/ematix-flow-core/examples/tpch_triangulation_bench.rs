@@ -1412,6 +1412,9 @@ async fn build_ematix_ctx(
             .ok()
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
             .unwrap_or(true),
+        // Σ.JS.1 stays installed; the rule self-gates on
+        // EMAT_JOIN_SIDE_FIX (default ON), so A/B via the env var.
+        sampled_join_side: true,
         // RANGE.AGG stays installed; A/B via its own EMAT_RANGE_AGG gate.
         clustered_single_phase_agg: true,
         // Σ.Q.L10: EMAT_PUSH_SEMI=0 to disable for A/B benching.

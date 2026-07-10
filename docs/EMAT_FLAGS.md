@@ -51,6 +51,7 @@ These are read in `src/` and default to enabled. Disable with `=0`.
 | `EMAT_CSE_FILTER_FUSION` | ON (set =0 to disable) | `.unwrap_or(true)` | [dedupe_aggregate_rule.rs:311](../crates/ematix-flow-core/src/dedupe_aggregate_rule.rs) | CSE filter-fusion across deduped aggregate subtrees. |
 | `EMAT_CSE_PARALLEL` | ON (set =0 to disable) | `.unwrap_or(true)` | [shared_subtree_exec.rs:296](../crates/ematix-flow-core/src/shared_subtree_exec.rs) | Concurrent (vs serial) drain of SharedSubtree CSE consumers; Q15 −13%. |
 | `EMAT_DIM_PUSH` | ON (set =0 to disable) | `enabled()` | [flow_query_planner.rs:73](../crates/ematix-flow-core/src/flow_query_planner.rs) | Dim-join pushdown into the fact join chain (`push_dim_join_into_chain`); Q10. |
+| `EMAT_JOIN_SIDE_FIX` | ON (set =0 to disable) | `enabled()` | [join_side_rule.rs](../crates/ematix-flow-core/src/join_side_rule.rs) | Σ.JS.1 sampled join-side correction: honest bottom-up estimates (first-RG sampling of string-pattern filter selectivity + dense-unique-key containment multiplicity) swap Inner Partitioned hash-join builds when the current probe is ≥2× smaller (`EMAT_JOIN_SIDE_MARGIN`). Q09 SF=100 32 GB-box page-cache cliff fix: orders(150M)+partsupp(80M) builds ≈12 GB peak evicted the 13.4 GB parquet working set; swap → ~32M-row builds. Snapshotted at session build. |
 | `EMAT_L9_FUSED_PROBE` | ON (set =0 to disable) | `.unwrap_or(true)` | [emat_arrow_reader.rs:1126](../crates/ematix-flow-core/src/emat_arrow_reader.rs) | L9 fused membership-probe arm in the scan (set/bloom + static preds). |
 | `EMAT_L9_REQUIRE_FILTERED_BUILD` | ON (set =0 to disable) | `.unwrap_or(true)` | [runtime_bloom_sideband_rule.rs:142](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | L9.SelectiveBuild: only emit a runtime bloom when the build side is pre-filtered. |
 | `EMAT_L9_TIGHT_CARDINALITY` | ON (set =0 to disable) | `!= Ok("0")` | [runtime_bloom_sideband_rule.rs:806](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | L9 deep-semi cap / tight-cardinality rescue (right-sizes the probe wrap). |
@@ -193,6 +194,7 @@ Read in `src/` via `.parse()...unwrap_or(N)`. Default value is in the **Default*
 | `EMAT_COLLECT_LEFT_BROADCAST_RATIO` | `16.0` | f64 | [force_collect_left_semi_build_rule.rs:150](../crates/ematix-flow-core/src/force_collect_left_semi_build_rule.rs) | Probe/build ratio break-even for CollectLeft broadcast (`=0` disables). |
 | `EMAT_COLLECT_LEFT_MIN_RATIO` | `0.0` | f64 (0 = disabled) | [force_collect_left_semi_build_rule.rs:142](../crates/ematix-flow-core/src/force_collect_left_semi_build_rule.rs) | REV.17.1 cardinality-ratio guard (min probe/build). |
 | `EMAT_DATE_BUILD_SIDE_RATIO` | `2.0` | f64 (clamped ≥ 1.0) | [force_collect_left_semi_build_rule.rs:174](../crates/ematix-flow-core/src/force_collect_left_semi_build_rule.rs) | Σ.AH.3 swap margin: only swap when corrected build ≥ ratio × corrected probe (flap guard). |
+| `EMAT_JOIN_SIDE_MARGIN` | `2.0` | f64 (clamped ≥ 1.0) | [join_side_rule.rs](../crates/ematix-flow-core/src/join_side_rule.rs) | Σ.JS.1 swap margin: only swap when honest est(build) ≥ margin × est(probe); absorbs the composite-key multiplicity-1.0 assumption being wrong. |
 | `EMAT_COMBINE_AGG_HINT` | `131_072` | `1<<17` | [combine_agg_exec.rs:413](../crates/ematix-flow-core/src/combine_agg_exec.rs) | Per-partition group-table pre-size hint for CombineAggExec. |
 | `EMAT_DECODE_PARALLEL_THRESHOLD` | `4` | pages | [emat_arrow_reader.rs:2556](../crates/ematix-flow-core/src/emat_arrow_reader.rs) | Min pending pages before page-decode goes parallel. |
 | `EMAT_LATE_MAT_BATCH` | `1_048_576` | `usize_or` (`=0` disables) | [flow_query_planner.rs](../crates/ematix-flow-core/src/flow_query_planner.rs) | Query-scoped execution batch size the late-mat plan runs under (`BatchSizeOverrideExec`); few large batches make the Utf8View reattach a near-free buffer-sharing gather. |
@@ -266,6 +268,7 @@ presence- or `=1`-activated; none affect query results.
 | `EMAT_L9_TRACE` | off (set to enable) | `.is_some()` | [runtime_bloom_sideband_rule.rs:185](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | Trace the L9 sideband / fused-probe path. |
 | `EMAT_MI_COLLECT` | auto (RSS-gated) | `0`/`1`/auto | [heap_pressure.rs:125](../crates/ematix-flow-core/src/heap_pressure.rs) | MI.GATE.3: `mi_collect` control — `0` off, `1` on, else RSS-gated. (Operational, not a result-affecting gate; kept here as it tunes allocator behavior.) |
 | `EMAT_PUSH_PIPELINE_TRACE` | off (set to enable) | `.is_some()` | [fuse_push_pipeline_rule.rs:199](../crates/ematix-flow-core/src/fuse_push_pipeline_rule.rs) | Trace the push-pipeline fusion rule. |
+| `EMAT_JOIN_SIDE_TRACE` | off (set to enable) | `present()` | [join_side_rule.rs](../crates/ematix-flow-core/src/join_side_rule.rs) | Trace Σ.JS.1 swap decisions (honest build/probe estimates per fired join). |
 | `EMAT_RANGE_AGG_TRACE` | off (set to enable) | `.is_some()` | [clustered_agg_rule.rs:211](../crates/ematix-flow-core/src/clustered_agg_rule.rs) | Trace RANGE.AGG chunk planning. |
 | `EMAT_REORDER_COST` | off (set to enable) | `.is_ok()` | [join_reorder.rs:1145](../crates/ematix-flow-core/src/join_reorder.rs) | Print join-reorder cost model output. |
 | `EMAT_REORDER_DEBUG` | off (set to enable) | `.is_ok()` | [join_reorder.rs:346](../crates/ematix-flow-core/src/join_reorder.rs) | Debug-print join reorder decisions. |
@@ -346,13 +349,13 @@ production rule, the harness toggles it before constructing rules manually.
 
 | Bucket | Count |
 | --- | --- |
-| Production gate (default-ON) | 20 |
+| Production gate (default-ON) | 21 |
 | Production gate (opt-in) | 30 |
-| Numeric tunable | 45 |
-| Diagnostic / trace | 21 |
+| Numeric tunable | 46 |
+| Diagnostic / trace | 22 |
 | Bench-harness only | 48 |
 | Comment-only (possibly dead) | 1 |
-| **Grand total (distinct flags)** | **165** |
+| **Grand total (distinct flags)** | **168** |
 
 > `EMAT_FAST_SNAPPY` is counted once, under Comment-only.
 > `EMAT_MI_COLLECT` is placed under Diagnostic/trace (allocator-operational,

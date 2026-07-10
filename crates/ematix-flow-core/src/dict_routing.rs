@@ -227,7 +227,7 @@ pub fn analyse_plan(plan: &LogicalPlan, row_counts: &HashMap<String, u64>) -> Di
         match node {
             LogicalPlan::Aggregate(agg) => {
                 let n_aggs = agg.aggr_expr.len();
-                for (_, info) in state.tables.iter_mut() {
+                for info in state.tables.values_mut() {
                     let mut keys_from_table = 0usize;
                     for ge in &agg.group_expr {
                         if expr_references_any(ge, &info.string_cols) {
@@ -242,7 +242,7 @@ pub fn analyse_plan(plan: &LogicalPlan, row_counts: &HashMap<String, u64>) -> Di
                 }
             }
             LogicalPlan::Filter(f) => {
-                for (_, info) in state.tables.iter_mut() {
+                for info in state.tables.values_mut() {
                     if filter_uses_like_or_substr(&f.predicate, &info.string_cols) {
                         info.in_like_or_substr = true;
                     }
