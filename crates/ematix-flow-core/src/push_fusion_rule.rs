@@ -583,10 +583,9 @@ pub fn reconstruct(plan: &LogicalPlan) -> Option<LogicalPlan> {
         };
         if let Some((price, disc)) = match_revenue(inner) {
             emit.push(EmitSpec::ProbeRevenue { price, disc });
-        } else if let Some(name) = bare_column_name(inner) {
-            emit.push(EmitSpec::ProbeColumn(name));
         } else {
-            return None; // unsupported fact-only emit expr
+            let name = bare_column_name(inner)?;
+            emit.push(EmitSpec::ProbeColumn(name));
         }
         fields.push(Field::new(
             emit_proj.schema.field(i).name().clone(),

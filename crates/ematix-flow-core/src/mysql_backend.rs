@@ -1141,10 +1141,9 @@ fn mysql_to_timestamp_us(v: &mysql_async::Value) -> Result<i64, BackendError> {
 /// MySQL-shaped timestamps here.
 fn parse_naive_iso8601_us(s: &str) -> Option<i64> {
     let s = s.trim();
-    let (date, time) = if let Some(t) = s.find(['T', ' ']) {
+    let (date, time) = {
+        let t = s.find(['T', ' '])?;
         (&s[..t], &s[t + 1..])
-    } else {
-        return None;
     };
     let mut date_parts = date.split('-');
     let y: i32 = date_parts.next()?.parse().ok()?;

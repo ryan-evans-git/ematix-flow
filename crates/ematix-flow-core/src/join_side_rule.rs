@@ -513,13 +513,12 @@ fn string_pattern_column<'a>(
                 return None;
             }
             (bin.left().as_any().downcast_ref::<Column>()?, bin.right())
-        } else if let Some(f) = any.downcast_ref::<ScalarFunctionExpr>() {
+        } else {
+            let f = any.downcast_ref::<ScalarFunctionExpr>()?;
             if f.name() != "contains" || f.args().len() != 2 {
                 return None;
             }
             (f.args()[0].as_any().downcast_ref::<Column>()?, &f.args()[1])
-        } else {
-            return None;
         };
     // Pattern must be a literal — a per-row pattern can't be priced.
     pattern.as_any().downcast_ref::<Literal>()?;

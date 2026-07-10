@@ -324,9 +324,9 @@ impl BridgeFilter {
         if !self.is_runtime_i64_only() {
             return None;
         }
-        let first_col = match self.predicates.first() {
-            Some(p) => p.col_idx(),
-            None => return None,
+        let first_col = {
+            let p = self.predicates.first()?;
+            p.col_idx()
         };
         if !self.predicates.iter().all(|p| p.col_idx() == first_col) {
             return None;
