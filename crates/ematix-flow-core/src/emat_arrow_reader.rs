@@ -2918,8 +2918,7 @@ pub(crate) fn decode_first_rg_column_for_sampling(
     leaf: usize,
     target: &DataType,
 ) -> DfResult<ArrayRef> {
-    let file = ParquetFile::open(path)
-        .map_err(|e| ext(format!("sampling open {path}: {e}")))?;
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("sampling open {path}: {e}")))?;
     let cached_md = CachedFileMetadata::from_file(&file)?;
     let Some(rg0) = cached_md.row_groups.first() else {
         return Err(ext(format!("sampling {path}: file has no row groups")));

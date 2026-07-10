@@ -764,8 +764,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (ph, pm, pad, prj, ppe, pgh, pgd) = cache_prev;
                 eprintln!(
                     "  cache: hits+{} misses+{} entries={} | retention(admit+{} reject+{} prot_evict+{} ghost_hit+{} demote+{}) enabled={}",
-                    h - ph, m - pm, entries, ad - pad, rj - prj, pe - ppe,
-                    gh - pgh, gd - pgd,
+                    h - ph,
+                    m - pm,
+                    entries,
+                    ad - pad,
+                    rj - prj,
+                    pe - ppe,
+                    gh - pgh,
+                    gd - pgd,
                     c.retention_enabled()
                 );
                 cache_prev = (h, m, ad, rj, pe, gh, gd);

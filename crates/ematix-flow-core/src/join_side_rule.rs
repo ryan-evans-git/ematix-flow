@@ -113,10 +113,10 @@ use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::Result;
 use datafusion::logical_expr::Operator;
-use datafusion::physical_expr::{PhysicalExpr, PhysicalExprRef};
 use datafusion::physical_expr::ScalarFunctionExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, LikeExpr, Literal};
 use datafusion::physical_expr::utils::split_conjunction;
+use datafusion::physical_expr::{PhysicalExpr, PhysicalExprRef};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
 use datafusion::physical_plan::ExecutionPlan;
@@ -498,7 +498,10 @@ fn string_pattern_column<'a>(
     let any = conj.as_any();
     let (col, pattern): (&Column, &Arc<dyn PhysicalExpr>) =
         if let Some(like) = any.downcast_ref::<LikeExpr>() {
-            (like.expr().as_any().downcast_ref::<Column>()?, like.pattern())
+            (
+                like.expr().as_any().downcast_ref::<Column>()?,
+                like.pattern(),
+            )
         } else if let Some(bin) = any.downcast_ref::<BinaryExpr>() {
             if !matches!(
                 bin.op(),
@@ -548,12 +551,7 @@ fn sampled_pass_rate(
     conj: &Arc<dyn PhysicalExpr>,
 ) -> Option<f64> {
     let key = (scan.path().to_string(), format!("{conj}"));
-    if let Some(rate) = SAMPLED_SELECTIVITY_CACHE
-        .lock()
-        .ok()?
-        .get(&key)
-        .copied()
-    {
+    if let Some(rate) = SAMPLED_SELECTIVITY_CACHE.lock().ok()?.get(&key).copied() {
         return Some(rate);
     }
     let field = scan.schema().field(idx).clone();
@@ -754,10 +752,8 @@ mod tests {
         }
         let ctx = SessionContext::new_with_config(config);
         for (name, path) in tables {
-            let prov = EmatixFastParquetTableProvider::try_new(
-                path.to_str().unwrap().to_string(),
-            )
-            .unwrap();
+            let prov = EmatixFastParquetTableProvider::try_new(path.to_str().unwrap().to_string())
+                .unwrap();
             ctx.register_table(*name, Arc::new(prov)).unwrap();
         }
         ctx
@@ -828,14 +824,10 @@ mod tests {
         let dim = tmp_parquet("est_like");
         write_dim(&dim, 100, 20); // 5 of 100 contain "xyz"
         let ctx = ctx_with(&[("dim", &dim)]);
-        let plan =
-            physical_plan(&ctx, "SELECT ident FROM dim WHERE pname LIKE '%xyz%'").await;
+        let plan = physical_plan(&ctx, "SELECT ident FROM dim WHERE pname LIKE '%xyz%'").await;
         let filter_node =
             find_first::<FilterExec>(&plan).expect("FilterExec retained for string LIKE");
-        let filter = filter_node
-            .as_any()
-            .downcast_ref::<FilterExec>()
-            .unwrap();
+        let filter = filter_node.as_any().downcast_ref::<FilterExec>().unwrap();
         let sel = filter_selectivity(filter);
         assert!(
             (sel - 0.05).abs() < 1e-9,
@@ -866,9 +858,7 @@ mod tests {
              WHERE d.pname LIKE '%xyz%'",
         )
         .await;
-        let out = rule()
-            .optimize(plan, &config_opts())
-            .unwrap();
+        let out = rule().optimize(plan, &config_opts()).unwrap();
         let hj_node = find_first::<HashJoinExec>(&out).expect("hash join in plan");
         let est = estimate_rows(&hj_node).expect("join estimate known");
         // build = filtered dim (est 100_000 × 0.01 = 1000), key domain
@@ -916,9 +906,7 @@ mod tests {
             enabled: false,
             swap_margin: 2.0,
         };
-        let untouched = off
-            .optimize(Arc::clone(&plan), &config_opts())
-            .unwrap();
+        let untouched = off.optimize(Arc::clone(&plan), &config_opts()).unwrap();
         assert_eq!(
             plan_text(&plan),
             plan_text(&untouched),
@@ -926,9 +914,7 @@ mod tests {
         );
 
         // Rule ON: build side becomes the filtered dim intermediate.
-        let out = rule()
-            .optimize(plan, &config_opts())
-            .unwrap();
+        let out = rule().optimize(plan, &config_opts()).unwrap();
         let hj1 = find_first::<HashJoinExec>(&out).expect("hash join after rule");
         let hj1 = hj1.as_any().downcast_ref::<HashJoinExec>().unwrap();
         assert!(
@@ -960,9 +946,7 @@ mod tests {
                    WHERE d.pname LIKE '%xyz%' \
                    GROUP BY f.ref_a ORDER BY k";
         let plan = physical_plan(&ctx, sql).await;
-        let swapped = rule()
-            .optimize(Arc::clone(&plan), &config_opts())
-            .unwrap();
+        let swapped = rule().optimize(Arc::clone(&plan), &config_opts()).unwrap();
         assert_ne!(
             plan_text(&plan),
             plan_text(&swapped),
@@ -995,9 +979,7 @@ mod tests {
             "SELECT ta.ref_a FROM ta JOIN tb ON ta.ref_a = tb.ref_a",
         )
         .await;
-        let out = rule()
-            .optimize(Arc::clone(&plan), &config_opts())
-            .unwrap();
+        let out = rule().optimize(Arc::clone(&plan), &config_opts()).unwrap();
         assert_eq!(
             plan_text(&plan),
             plan_text(&out),
@@ -1022,9 +1004,7 @@ mod tests {
              ON f.ref_a = g.ident",
         )
         .await;
-        let out = rule()
-            .optimize(Arc::clone(&plan), &config_opts())
-            .unwrap();
+        let out = rule().optimize(Arc::clone(&plan), &config_opts()).unwrap();
         assert_eq!(
             plan_text(&plan),
             plan_text(&out),
@@ -1043,10 +1023,7 @@ mod tests {
             "unset => rule ON (production default)"
         );
         unsafe { std::env::set_var("EMAT_JOIN_SIDE_FIX", "0") };
-        assert!(
-            !SampledJoinSideRule::default().enabled,
-            "=0 => rule OFF"
-        );
+        assert!(!SampledJoinSideRule::default().enabled, "=0 => rule OFF");
         unsafe { std::env::remove_var("EMAT_JOIN_SIDE_FIX") };
         // Margin default + clamp.
         assert!((SampledJoinSideRule::default().swap_margin - 2.0).abs() < 1e-9);
