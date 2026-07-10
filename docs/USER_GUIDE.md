@@ -378,6 +378,57 @@ skip event in the RunLog so `flow status` shows *waiting on
 upstream*. Attempt state survives process restarts when a durable
 [RunLog](#durable-run-history-runlog) is configured.
 
+### Data quality + freshness SLOs
+
+Install the extra (`pip install "ematix-flow[quality]"`) and a pipeline
+can assert things about the data it just wrote, and declare a freshness
+SLO. Both are **opt-in** — a pipeline with neither kwarg is unchanged.
+Checks run through [ematix-probe](https://pypi.org/project/ematix-probe/)
+as a SQL-pushdown stage (no data movement) right after the write.
+
+```python
+@ematix.pipeline(
+    target=DimCustomer,                 # PK → unique, NOT NULL → not_null
+    mode="scd2",                        #   are auto-derived from the table
+    expectations=lambda t: (
+        t.column("email").not_null().regex(r".+@.+\..+"),
+        t.column("status").is_in(["active", "churned", "trial"]),
+        t.row_count(at_least=1_000),
+    ),
+    on_quality_failure="fail",          # "warn" (default) | "fail"
+    freshness_sla="6h",                 # SLO: fresh within 6 hours
+    freshness_column="updated_at",      # checked at run; else run-completion time
+)
+def dim_customer(conn):
+    return "SELECT id, email, status, updated_at FROM staging.customers"
+```
+
+- **`on_quality_failure="warn"`** (default) records the result and alerts
+  but the run still succeeds; **`"fail"`** marks the run failed and skips
+  any `transforms_post`.
+- Assertion types (from ematix-probe): `not_null`, `unique`, `between`,
+  `regex`, `is_in`, `row_count`, `freshness`, plus percentile /
+  cardinality / schema checks. Targets on **Postgres** and **DuckDB** run
+  in-database; other connection kinds are skipped with a warning.
+- Set `EMATIX_SKIP_QUALITY=1` to bypass the stage globally.
+
+**Freshness is also evaluated on a schedule** — the point of an SLO is to
+catch a pipeline that has *stopped running*, which no failure alert would
+report. Run this on a cron (it reads last-success from the RunLog):
+
+```sh
+flow freshness-check --module pipelines \
+  --run-log-url postgres://user:pw@host/db \
+  --analytics-db /var/lib/ematix/analytics.db \
+  --alerter slack://hooks.slack.com/services/T/B/XYZ
+```
+
+It exits non-zero if anything is breached, alerts on the
+healthy→breached edge (de-duped via the persisted state), and writes
+freshness + expectation results to the analytics DB — where the web UI's
+**Quality** view surfaces them (verdict pills, per-assertion detail, and
+per-pipeline freshness cards).
+
 ### SCD2 with event-time
 
 ```python

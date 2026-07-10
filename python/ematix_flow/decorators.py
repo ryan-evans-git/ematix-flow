@@ -1208,6 +1208,17 @@ class _EmatixNamespace:
         # in (e.g. "America/New_York"). The Web UI also picks this up
         # to localise the "Next run" rendering.
         timezone: str | None = None,
+        # Data-quality (opt-in; see ematix_flow.quality). `expectations`
+        # is a Callable[[Tester], None] using ematix-probe's fluent
+        # builder; the ManagedTable target also contributes auto-derived
+        # not_null/unique. `on_quality_failure` is "warn" (default) or
+        # "fail". `freshness_sla` (e.g. "6h") declares a freshness SLO;
+        # `freshness_column` names the event-time column checked at run.
+        expectations: Callable[[Any], None] | None = None,
+        on_quality_failure: str = "warn",
+        freshness_sla: str | int | float | None = None,
+        freshness_column: str | None = None,
+        alert_on_quality_warn: bool = False,
     ):
         """Function decorator. Wraps `pipeline.sync` and registers via the
         Phase 12 scheduling registry.
@@ -1373,6 +1384,26 @@ class _EmatixNamespace:
                         except Exception:
                             pass
 
+                    # Data-quality stage: run expectations against the
+                    # freshly-written target BEFORE post-transforms, so a
+                    # failed expectation (policy="fail") short-circuits
+                    # downstream SQL. Opt-in — no-ops when neither
+                    # expectations= nor freshness_sla= was declared.
+                    if expectations is not None or freshness_sla is not None:
+                        from ematix_flow import quality as _quality
+
+                        _quality.run_quality_stage(
+                            target_connection=tgt_conn,
+                            pipeline_name=name or fn.__name__,
+                            target_cls=target,
+                            expectations=expectations,
+                            on_quality_failure=on_quality_failure,
+                            freshness_column=freshness_column,
+                            freshness_sla=freshness_sla,
+                            sync_result=sync_result,
+                            alert_on_warn=alert_on_quality_warn,
+                        )
+
                     # Phase 27a/b: post-load transforms.
                     if transforms_post:
                         _run_transforms_post(
@@ -1462,6 +1493,14 @@ class _EmatixNamespace:
             wrapped._preview = _preview  # type: ignore[attr-defined]
             wrapped.preview = lambda: _preview(dry_run=False)  # type: ignore[attr-defined]
             wrapped.dry_run = lambda: _preview(dry_run=True)  # type: ignore[attr-defined]
+
+            # Register the freshness SLA (if any) so the scheduled
+            # FreshnessEvaluator can watch this pipeline even when it
+            # stops running.
+            if freshness_sla is not None:
+                from ematix_flow import quality as _quality
+
+                _quality.register_freshness_sla(name or fn.__name__, freshness_sla)
 
             # Register with the Phase 12 scheduling registry.
             from ematix_flow import pipeline as _p

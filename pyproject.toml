@@ -172,6 +172,16 @@ web = [
     "uvicorn[standard]>=0.27",
 ]
 
+# ---- Data-quality extra (expectations + freshness SLOs) -----------
+# Wires the published `ematix-probe` library into the pipeline
+# lifecycle and the web UI: declare `expectations=` / `freshness_sla=`
+# on `@ematix.pipeline` and get post-write assertions + freshness
+# monitoring. Opt-in — a pipeline with neither kwarg is unaffected,
+# and the base install doesn't pull the probe.
+quality = [
+    "ematix-probe>=0.1.1,<0.2",
+]
+
 # ---- AWS Glue Schema Registry (task #556)
 # boto3 — Glue's GetSchemaVersion / RegisterSchemaVersion / CreateSchema
 # calls. Only the schema fetch+register lives in Python; the Kafka
@@ -227,6 +237,7 @@ all = [
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-otlp>=1.20",
     "kubernetes>=29",
+    "ematix-probe>=0.1.1,<0.2",
 ]
 
 dev = [
@@ -252,6 +263,8 @@ dev = [
     "prometheus_client>=0.19",
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-otlp>=1.20",
+    # Data-quality: exercise the expectations + freshness surface end-to-end.
+    "ematix-probe>=0.1.1,<0.2",
 ]
 
 [tool.maturin]

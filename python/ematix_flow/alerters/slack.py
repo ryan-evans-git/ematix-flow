@@ -58,6 +58,8 @@ class SlackAlerter:
             "failed": ":warning:",
             "gave_up": ":x:",
             "recovered": ":white_check_mark:",
+            "quality_failed": ":mag:",
+            "sla_breached": ":hourglass_flowing_sand:",
         }.get(event.kind, ":bell:")
 
         if event.kind == "gave_up":
@@ -79,4 +81,16 @@ class SlackAlerter:
                 f"{emoji} *{event.pipeline}* recovered "
                 f"(after {event.attempt_count} attempts) _{ts}_"
             )
+        if event.kind == "quality_failed":
+            return (
+                f"{emoji} *{event.pipeline}* data-quality check failed: "
+                f"`{event.error_message}` _{ts}_"
+            )
+        if event.kind == "sla_breached":
+            return (
+                f"{emoji} *{event.pipeline}* freshness SLO breached: "
+                f"`{event.error_message}` _{ts}_"
+            )
+        if event.error_message:
+            return f"{emoji} *{event.pipeline}* {event.kind}: `{event.error_message}` _{ts}_"
         return f"{emoji} *{event.pipeline}* {event.kind} _{ts}_"

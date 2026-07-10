@@ -918,6 +918,82 @@ def _cmd_connections_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_freshness_check(args: argparse.Namespace) -> int:
+    """Evaluate freshness SLOs once and alert on breaches.
+
+    Intended to be invoked on a cron (or from the scheduler tick): imports
+    the pipelines module so freshness SLAs register, reads each pipeline's
+    last successful run from the run-log, and compares against its SLA.
+    Alerts fire only on the healthy→breached edge (de-duped via the
+    persisted freshness state), so a standing breach doesn't re-page.
+    """
+    _import_user_module(args.module)
+    from ematix_flow import quality as _q
+
+    run_log_url = getattr(args, "run_log_url", None) or os.environ.get(
+        "EMATIX_FLOW_RUN_LOG_URL"
+    )
+    if not run_log_url:
+        print(
+            "error: freshness-check needs a run-log; pass --run-log-url or set "
+            "$EMATIX_FLOW_RUN_LOG_URL",
+            file=sys.stderr,
+        )
+        return 2
+    from ematix_flow.run_log import from_url as _runlog_from_url
+
+    history = _runlog_from_url(run_log_url)
+    if not hasattr(history, "list_runs"):
+        print(
+            f"error: run-log {run_log_url!r} does not support history queries",
+            file=sys.stderr,
+        )
+        return 2
+
+    analytics_store = None
+    analytics_db = getattr(args, "analytics_db", None) or os.environ.get(
+        "EMATIX_FLOW_ANALYTICS_DB"
+    )
+    if analytics_db:
+        try:
+            from ematix_flow.web.analytics_store import AnalyticsStore
+
+            analytics_store = AnalyticsStore(analytics_db)
+        except Exception as exc:  # pragma: no cover
+            print(
+                f"warning: --analytics-db {analytics_db!r} could not be opened "
+                f"({exc!r}); freshness state will not be persisted",
+                file=sys.stderr,
+            )
+
+    alerters = _open_alerters(args)
+
+    def _last_success(pipeline: str):
+        runs = history.list_runs(pipeline=pipeline, status="succeeded", limit=1)
+        if not runs:
+            return None
+        return runs[0].finished_at
+
+    states = _q.evaluate_freshness_once(
+        last_success_fn=_last_success,
+        analytics_store=analytics_store,
+        alerters=alerters,
+    )
+    if analytics_store is not None:
+        analytics_store.close()
+
+    if args.format == "json":
+        print(json.dumps([s.to_dict() for s in states]))
+    else:
+        if not states:
+            print("no freshness SLOs registered")
+        for s in states:
+            lag = "never" if s.lag_seconds is None else f"{s.lag_seconds}s"
+            print(f"{s.pipeline:<32}  {s.state:<9}  lag={lag}  sla={s.sla_seconds}s")
+    # Exit 1 if anything is breached, so cron/CI can react.
+    return 1 if any(s.state == "breached" for s in states) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="flow", description="ematix-flow CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1088,6 +1164,25 @@ def main(argv: list[str] | None = None) -> int:
     _add_run_log_args(due_p)
     _add_observability_args(due_p)
     due_p.set_defaults(func=_cmd_run_due)
+
+    # `flow freshness-check` — evaluate freshness SLOs once (cron entry).
+    fresh_p = sub.add_parser(
+        "freshness-check",
+        help="evaluate pipeline freshness SLOs once; alert on breaches. "
+        "Run on a cron so stalled pipelines are caught even when they "
+        "aren't firing.",
+    )
+    fresh_p.add_argument("--module", required=True)
+    fresh_p.add_argument(
+        "--analytics-db",
+        default=None,
+        help="SQLite path for persisting freshness state (the web UI reads "
+        "it). Defaults to $EMATIX_FLOW_ANALYTICS_DB.",
+    )
+    fresh_p.add_argument("--format", choices=["text", "json"], default="text")
+    _add_run_log_args(fresh_p)
+    _add_observability_args(fresh_p)
+    fresh_p.set_defaults(func=_cmd_freshness_check)
 
     # `flow preview / dry-run` subcommands (Phase 25).
     preview_p = sub.add_parser(

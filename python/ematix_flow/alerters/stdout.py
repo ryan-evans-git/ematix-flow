@@ -37,6 +37,11 @@ class StdoutAlerter:
                 f"[ALERT] {ts} recovered: {event.pipeline} "
                 f"(after {event.attempt_count} attempts)"
             )
+        elif event.kind in ("quality_failed", "sla_breached") or event.error_message:
+            msg = (
+                f"[ALERT] {ts} {event.kind}: {event.pipeline}: "
+                f"{event.error_message}"
+            )
         else:
             msg = f"[ALERT] {ts} {event.kind}: {event.pipeline}"
         print(msg, file=self._stream, flush=True)

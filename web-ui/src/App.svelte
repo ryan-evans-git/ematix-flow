@@ -8,6 +8,7 @@
   import SqlLab from "./routes/SqlLab.svelte";
   import ChartBuilder from "./routes/ChartBuilder.svelte";
   import Dashboards from "./routes/Dashboards.svelte";
+  import Quality from "./routes/Quality.svelte";
   import StreamDlq from "./routes/StreamDlq.svelte";
   import { me, loadMe } from "./lib/session.js";
 
@@ -45,6 +46,7 @@
     if (m === "/sql" || m.startsWith("/sql?")) return { name: "sql" };
     if (m === "/charts" || m.startsWith("/charts")) return { name: "charts" };
     if (m === "/dashboards" || m.startsWith("/dashboards")) return { name: "dashboards" };
+    if (m === "/quality" || m.startsWith("/quality")) return { name: "quality" };
     return { name: "workflows" };
   }
 
@@ -78,6 +80,7 @@
   $: sqlActive = route.name === "sql";
   $: chartsActive = route.name === "charts";
   $: dashboardsActive = route.name === "dashboards";
+  $: qualityActive = route.name === "quality";
 </script>
 
 <div class="app">
@@ -90,6 +93,7 @@
     <a href="#/sql" class:active={sqlActive}>SQL Lab</a>
     <a href="#/charts" class:active={chartsActive}>Charts</a>
     <a href="#/dashboards" class:active={dashboardsActive}>Dashboards</a>
+    <a href="#/quality" class:active={qualityActive}>Quality</a>
     <span style="flex: 1"></span>
     {#if $me.rbac_enabled && $me.identity}
       <span class="user-badge" title="Signed in via SSO">
@@ -123,6 +127,8 @@
     <ChartBuilder />
   {:else if route.name === "dashboards"}
     <Dashboards />
+  {:else if route.name === "quality"}
+    <Quality />
   {:else if route.name === "stream_dlq"}
     <StreamDlq name={route.stream} />
   {/if}
