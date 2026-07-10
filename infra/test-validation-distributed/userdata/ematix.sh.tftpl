@@ -145,11 +145,19 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable flow-worker.service
-systemctl start flow-worker.service
+# Workers only (2026-07-10): the coordinator's flow-worker was never in
+# EMATIX_PEERS — it sat idle while the cross-process partition registry
+# sensed a second live process and halved the bench orchestrator's core
+# share. Every pre-fix cluster bench (mesh AND single-on-coordinator
+# modes) paid this ~1.4x tax. The unit file is still written on the
+# coordinator for manual experiments; it just doesn't run by default.
+if [ "${role}" != "coordinator" ]; then
+  systemctl enable flow-worker.service
+  systemctl start flow-worker.service
 
-# Quick health check
-sleep 10
-systemctl is-active flow-worker.service || journalctl -u flow-worker.service --no-pager | tail -50
+  # Quick health check
+  sleep 10
+  systemctl is-active flow-worker.service || journalctl -u flow-worker.service --no-pager | tail -50
+fi
 
 echo "=== ematix bootstrap: done ==="
