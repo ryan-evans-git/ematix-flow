@@ -267,7 +267,12 @@ def benchmark_all(
                     spark.stop()
                 except Exception:  # noqa: BLE001
                     pass
-                time.sleep(15)
+                # A crashed app can strand hundreds of GB of shuffle on the
+                # workers; the standalone cleaner reaps FINISHED apps only
+                # every spark.worker.cleanup.interval with appDataTtl grace.
+                # Wait out one full reap cycle before the next query.
+                print("   (cooldown 420s — letting worker cleanup reap the failed app)", flush=True)
+                time.sleep(420)
                 spark = session_factory()
             continue
 
@@ -292,7 +297,8 @@ def benchmark_all(
                     spark.stop()
                 except Exception:  # noqa: BLE001
                     pass
-                time.sleep(15)
+                print("   (cooldown 420s — letting worker cleanup reap the failed app)", flush=True)
+                time.sleep(420)
                 spark = session_factory()
             continue
 

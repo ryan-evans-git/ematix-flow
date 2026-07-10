@@ -49,7 +49,12 @@ locals {
   # at SF100 on 250 GB with "No space left on device"; 1 TB gives the full
   # 22-query suite (154 warmup+trial iters) headroom. Trino survived on 250 GB
   # but shares this sizing harmlessly.
-  ebs_size_gb   = var.scale_factor == 100 ? 1000 : 100
+  ebs_size_gb = var.scale_factor == 100 ? 2500 : 100
+  # 2500 (was 1000, 2026-07-10): PySpark SF=100's shuffle-heavy queries
+  # (Q05/Q08/Q09/Q17/Q21) need headroom for one crashed app's stranded
+  # shuffle (~0.5TB) PLUS the running app's, until the standalone worker
+  # cleaner reaps on its 120s/300s cycle. ematix/duckdb/trino legs are
+  # unaffected (they never approached 1TB).
 
   # Bench bucket name (input) — referenced in IAM policies + userdata.
   # Validate caller provided it.
