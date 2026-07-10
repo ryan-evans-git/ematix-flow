@@ -346,6 +346,13 @@ fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState
     if let Some(n) = explicit {
         cfg = cfg.with_target_partitions(n);
     }
+    // EMAT_EXPLAIN_STATS=1: render per-node Statistics in EXPLAIN output.
+    // Diagnostic for join-build-side selection — this probe exposed the
+    // 15x cardinality inflation (LIKE default 0.2 + composite-key join
+    // fanout) behind the Q09 SF100 page-cache cliff (Σ.JS.1).
+    if std::env::var_os("EMAT_EXPLAIN_STATS").is_some() {
+        cfg.options_mut().explain.show_statistics = true;
+    }
     let overrides = HarnessOverrides {
         auto_target_partitions: explicit.is_none(),
         ..HarnessOverrides::default()
