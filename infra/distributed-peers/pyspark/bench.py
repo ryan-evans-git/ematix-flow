@@ -181,10 +181,21 @@ def run_query_timed(spark, sql: str) -> tuple[float, int]:
     We pull rows with .collect() so the timer includes the full physical
     execution, not just the query plan. For TPC-H the result sets are tiny
     (max ~100 rows) so collect cost is negligible.
+
+    After the timed collect we force a DRIVER JVM GC (outside the timer):
+    Spark's ContextCleaner only deletes a trial's shuffle files once GC
+    collects the RDD refs, and the shuffle-heavy SF=100 queries (Q05/Q08/
+    Q09/Q17/Q18/Q21, run 20260710T104329Z) wrote through their workers'
+    1TB disks in under 7 executions while the 90s periodic GC lagged.
     """
     t0 = time.perf_counter()
     rows = spark.sql(sql).collect()
     elapsed = (time.perf_counter() - t0) * 1000.0
+    try:
+        spark.sparkContext._jvm.System.gc()  # noqa: SLF001
+        time.sleep(2)
+    except Exception:  # noqa: BLE001
+        pass
     return elapsed, len(rows)
 
 
@@ -209,6 +220,7 @@ def benchmark_all(
     warmups: int,
     sf: int,
     session_factory=None,
+    only: set | None = None,
 ) -> Dict[str, dict]:
     """Run all 22 TPC-H queries, returning the per-query result dict.
 
@@ -228,6 +240,8 @@ def benchmark_all(
     out: Dict[str, dict] = {}
     for n in range(1, 23):
         qid = f"Q{n:02d}"
+        if only is not None and qid not in only:
+            continue
         path = queries_dir / f"q{n:02d}.sql"
         if not path.is_file():
             print(f"!! missing {path}, skipping", flush=True)
@@ -348,6 +362,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="local JSON output path (default: ./pyspark-sf{N}.json)")
     p.add_argument("--no-upload", action="store_true",
                    help="skip S3 upload (write local file only)")
+    p.add_argument("--queries", default=None,
+                   help="comma-separated subset, e.g. Q05,Q09 (default: all 22)")
     return p.parse_args(argv)
 
 
@@ -382,9 +398,12 @@ def main(argv: List[str]) -> int:
         cluster_size = cluster_size_from_spark(spark)
 
         print("==> running queries", flush=True)
+        only = None
+        if args.queries:
+            only = {q.strip().upper() for q in args.queries.split(",") if q.strip()}
         results = benchmark_all(
             spark, args.queries_dir, args.trials, args.warmups, args.sf,
-            session_factory=session_factory,
+            session_factory=session_factory, only=only,
         )
     finally:
         spark.stop()
