@@ -44,7 +44,12 @@ locals {
   # Instance sizing per scale factor. SF=10 lineitem is ~7.5 GB and
   # joins fit in 16 GB; SF=100 lineitem is ~75 GB and the Q18/Q21
   # build sides won't fit on 16 GB workers.
-  instance_type = var.scale_factor == 100 ? "c7i.4xlarge" : "c7i.2xlarge"
+  # Always c7i.4xlarge (2026-07-10): the old SF<100 => 2xlarge downsizing
+  # silently produced cluster numbers on HALF the per-node hardware of the
+  # single-node runs and of what the site claimed — SF=1/10 mesh results
+  # from July were 4x c7i.2xlarge published as 4xlarge. Benchmark
+  # comparability beats the cost saving on these short-lived stacks.
+  instance_type = "c7i.4xlarge"
   # SF100: 1 TB. Spark spills shuffle to local disk aggressively and DNF'd Q5
   # at SF100 on 250 GB with "No space left on device"; 1 TB gives the full
   # 22-query suite (154 warmup+trial iters) headroom. Trino survived on 250 GB
