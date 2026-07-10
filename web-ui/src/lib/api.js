@@ -37,6 +37,21 @@ export async function listPipelines() {
   return _request("/pipelines");
 }
 
+export async function listQuality({ pipeline, limit = 50, offset = 0 } = {}) {
+  const params = new URLSearchParams();
+  if (pipeline) params.set("pipeline", pipeline);
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
+  return _request(`/quality?${params.toString()}`);
+}
+
+export async function listFreshness({ pipeline } = {}) {
+  const params = new URLSearchParams();
+  if (pipeline) params.set("pipeline", pipeline);
+  const qs = params.toString();
+  return _request(`/freshness${qs ? `?${qs}` : ""}`);
+}
+
 export async function listWorkflows() {
   return _request("/workflows");
 }

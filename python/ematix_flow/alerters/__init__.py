@@ -41,13 +41,17 @@ class AlertEvent:
     pushes to alerters.
 
     `kind` is one of:
-      - "failed"      — pipeline raised; retry cycle still has attempts
-                        left
-      - "gave_up"     — attempt_count == max_attempts; orchestrator is
-                        done retrying until the next scheduled tick
-                        clears the state
-      - "recovered"   — a pipeline that was previously failing has now
-                        succeeded; safe to stop watching
+      - "failed"        — pipeline raised; retry cycle still has attempts
+                          left
+      - "gave_up"       — attempt_count == max_attempts; orchestrator is
+                          done retrying until the next scheduled tick
+                          clears the state
+      - "recovered"     — a pipeline that was previously failing has now
+                          succeeded; safe to stop watching
+      - "quality_failed" — a data-quality expectation failed (or could
+                          not be evaluated). See :mod:`ematix_flow.quality`.
+      - "sla_breached"  — a pipeline's freshness SLO was breached (it has
+                          not produced fresh data within its window).
 
     Fields are flat (no nested dicts) so alerter implementations can
     template them into JSON / plaintext / a markdown table without
@@ -118,6 +122,33 @@ def from_url(url: str) -> Alerter:
     )
 
 
+# ---- Process-wide alerter registry --------------------------------------
+#
+# The orchestrator loop passes an explicit ``alerters=[...]`` list, but
+# some events fire from deeper in a single pipeline run (e.g. the
+# data-quality stage in :mod:`ematix_flow.quality`) where that list isn't
+# threaded through. Those call sites read this registry instead. The CLI /
+# scheduler registers configured alerters at startup; tests register fakes.
+
+_ACTIVE_ALERTERS: list[Alerter] = []
+
+
+def register_alerter(alerter: Alerter) -> None:
+    """Add an alerter to the process-wide registry (idempotent)."""
+    if alerter not in _ACTIVE_ALERTERS:
+        _ACTIVE_ALERTERS.append(alerter)
+
+
+def active_alerters() -> list[Alerter]:
+    """Return the registered alerters (a copy)."""
+    return list(_ACTIVE_ALERTERS)
+
+
+def clear_alerters() -> None:
+    """Drop all registered alerters (used by tests + between runs)."""
+    _ACTIVE_ALERTERS.clear()
+
+
 __all__ = [
     "AlertEvent",
     "Alerter",
@@ -125,7 +156,10 @@ __all__ = [
     "PagerDutyAlerter",
     "SlackAlerter",
     "StdoutAlerter",
+    "active_alerters",
+    "clear_alerters",
     "from_url",
+    "register_alerter",
 ]
 
 

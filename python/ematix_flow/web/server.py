@@ -478,6 +478,26 @@ def create_app(
 
     # ---- Charts ----------------------------------------------------
 
+    # ---- data-quality + freshness (read-only) ----------------------
+
+    @app.get("/api/quality")
+    def list_quality(  # type: ignore[unused-function]
+        pipeline: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        return {
+            "quality_runs": analytics_store.list_quality_runs(
+                pipeline=pipeline, limit=limit, offset=offset
+            )
+        }
+
+    @app.get("/api/freshness")
+    def list_freshness(  # type: ignore[unused-function]
+        pipeline: str | None = None,
+    ) -> dict[str, Any]:
+        return {"freshness": analytics_store.list_freshness(pipeline=pipeline)}
+
     @app.get("/api/charts")
     def list_charts() -> dict[str, Any]:  # type: ignore[unused-function]
         return {"charts": analytics_store.list_charts()}

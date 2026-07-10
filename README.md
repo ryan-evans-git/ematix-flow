@@ -66,6 +66,12 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
 - **Operationally honest.** Restart-safe state, watermarks, at-least-once
   delivery, credential redaction, structured run history, Prometheus +
   OpenTelemetry metrics, Slack alerts.
+- **Data quality + freshness.** Declare `expectations=` (not-null, unique,
+  range, regex, row-count…) and a `freshness_sla=` on any pipeline; checks
+  run as a SQL-pushdown stage after the write, freshness SLOs are evaluated
+  on a schedule so a *stalled* pipeline is caught even when it isn't firing,
+  and results surface in the web UI's **Quality** view. Opt-in via
+  `pip install "ematix-flow[quality]"`.
 
 Status: beta; the API is stabilizing toward 1.0. Published on PyPI as
 `ematix-flow`. All four surfaces — declarative pipelines, multi-backend,

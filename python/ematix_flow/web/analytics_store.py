@@ -18,7 +18,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 _SCHEMA = """
     CREATE TABLE IF NOT EXISTS analytics_schema_version (
@@ -73,6 +73,32 @@ _SCHEMA = """
         updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_alerts_chart ON alerts(chart_id);
+    -- v5: data-quality. `quality_runs` records one row per expectations
+    -- run (from the pipeline post-write stage); `detail_json` holds the
+    -- per-assertion list. `freshness_state` is the current freshness SLO
+    -- state per pipeline, upserted by the scheduled evaluator.
+    CREATE TABLE IF NOT EXISTS quality_runs (
+        id            TEXT PRIMARY KEY,
+        pipeline      TEXT NOT NULL,
+        run_id        TEXT,
+        table_name    TEXT NOT NULL,
+        schema_name   TEXT,
+        verdict       TEXT NOT NULL,
+        checks_total  INTEGER NOT NULL DEFAULT 0,
+        checks_failed INTEGER NOT NULL DEFAULT 0,
+        detail_json   TEXT NOT NULL DEFAULT '[]',
+        started_at    TEXT NOT NULL,
+        finished_at   TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_qr_pipeline ON quality_runs(pipeline, finished_at);
+    CREATE TABLE IF NOT EXISTS freshness_state (
+        pipeline     TEXT PRIMARY KEY,
+        sla_seconds  INTEGER NOT NULL,
+        lag_seconds  INTEGER,
+        state        TEXT NOT NULL,
+        last_success TEXT,
+        evaluated_at TEXT NOT NULL
+    );
 """
 
 
@@ -436,3 +462,122 @@ class AnalyticsStore:
         with self._lock:
             cur = self._conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
             return cur.rowcount > 0
+
+    # ---- data-quality runs (v5) ------------------------------------
+
+    @staticmethod
+    def _quality_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "pipeline": row["pipeline"],
+            "run_id": row["run_id"],
+            "table": row["table_name"],
+            "schema": row["schema_name"],
+            "verdict": row["verdict"],
+            "checks_total": row["checks_total"],
+            "checks_failed": row["checks_failed"],
+            "assertions": json.loads(row["detail_json"]),
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+        }
+
+    def record_quality_run(self, outcome: Any, *, run_id: str | None = None) -> str:
+        """Persist a quality run. ``outcome`` is a
+        :class:`ematix_flow.quality.QualityOutcome` (duck-typed here to
+        avoid a runtime→web import cycle)."""
+        now = _now_iso()
+        row_id = uuid.uuid4().hex
+        started = outcome.started_at.isoformat() if outcome.started_at else now
+        finished = outcome.finished_at.isoformat() if outcome.finished_at else now
+        detail = json.dumps([a.to_dict() for a in outcome.assertions])
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO quality_runs"
+                "(id, pipeline, run_id, table_name, schema_name, verdict, "
+                "checks_total, checks_failed, detail_json, started_at, finished_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row_id,
+                    outcome.pipeline,
+                    run_id,
+                    outcome.table,
+                    outcome.schema,
+                    outcome.verdict,
+                    outcome.checks_total,
+                    outcome.checks_failed,
+                    detail,
+                    started,
+                    finished,
+                ),
+            )
+        return row_id
+
+    def list_quality_runs(
+        self, *, pipeline: str | None = None, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        with self._lock:
+            if pipeline:
+                rows = self._conn.execute(
+                    "SELECT * FROM quality_runs WHERE pipeline = ? "
+                    "ORDER BY finished_at DESC LIMIT ? OFFSET ?",
+                    (pipeline, limit, offset),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM quality_runs ORDER BY finished_at DESC "
+                    "LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+        return [self._quality_row_to_dict(r) for r in rows]
+
+    # ---- freshness state (v5) --------------------------------------
+
+    @staticmethod
+    def _freshness_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "pipeline": row["pipeline"],
+            "sla_seconds": row["sla_seconds"],
+            "lag_seconds": row["lag_seconds"],
+            "state": row["state"],
+            "last_success": row["last_success"],
+            "evaluated_at": row["evaluated_at"],
+        }
+
+    def upsert_freshness_state(self, state: Any) -> None:
+        """Insert/replace a pipeline's current freshness state.
+        ``state`` is a :class:`ematix_flow.quality.FreshnessState`."""
+        d = state.to_dict()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO freshness_state"
+                "(pipeline, sla_seconds, lag_seconds, state, last_success, "
+                "evaluated_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(pipeline) DO UPDATE SET "
+                "sla_seconds=excluded.sla_seconds, lag_seconds=excluded.lag_seconds, "
+                "state=excluded.state, last_success=excluded.last_success, "
+                "evaluated_at=excluded.evaluated_at",
+                (
+                    d["pipeline"],
+                    d["sla_seconds"],
+                    d["lag_seconds"],
+                    d["state"],
+                    d["last_success"],
+                    d["evaluated_at"],
+                ),
+            )
+
+    def list_freshness(
+        self, *, pipeline: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            if pipeline:
+                rows = self._conn.execute(
+                    "SELECT * FROM freshness_state WHERE pipeline = ?", (pipeline,)
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM freshness_state ORDER BY pipeline"
+                ).fetchall()
+        return [self._freshness_row_to_dict(r) for r in rows]
