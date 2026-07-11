@@ -72,7 +72,7 @@ pub fn indexed_i64_eq(
     let source = ematix_parquet_io::ParquetFile::open(source_path).map_err(|e| {
         DataFusionError::Execution(format!("sidecar: open source {source_path:?}: {e:?}"))
     })?;
-    let idx = match ematix_parquet_codec::index::ParquetIndex::open(&idx_path, &source) {
+    let idx = match ematix_parquet_codec::index::LazyParquetIndex::open(&idx_path, &source) {
         Ok(idx) => idx,
         Err(e) if is_stale(&e) => {
             // Σ.SC P3: staleness is recoverable but worth watching — a
@@ -114,6 +114,7 @@ static SIDECAR_HIT: AtomicU64 = AtomicU64::new(0);
 static SIDECAR_MISS: AtomicU64 = AtomicU64::new(0);
 static SIDECAR_STALE: AtomicU64 = AtomicU64::new(0);
 static SIDECAR_SKIPPED_SELECTIVITY: AtomicU64 = AtomicU64::new(0);
+static SIDECAR_PRUNED_RANGE: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the sidecar decision counters. `hit` = index path taken and
 /// answered; `miss` = no/uncovered sidecar (full scan); `stale` = fingerprint
@@ -126,6 +127,9 @@ pub struct SidecarMetrics {
     pub miss: u64,
     pub stale: u64,
     pub skipped_selectivity: u64,
+    /// Lookups answered EMPTY without touching the sidecar body: the
+    /// part's footer bounds exclude the key (parted point lookups).
+    pub pruned_range: u64,
 }
 
 /// Read the current counter values (relaxed — probes want cheap, not fenced).
@@ -135,6 +139,7 @@ pub fn sidecar_metrics() -> SidecarMetrics {
         miss: SIDECAR_MISS.load(Ordering::Relaxed),
         stale: SIDECAR_STALE.load(Ordering::Relaxed),
         skipped_selectivity: SIDECAR_SKIPPED_SELECTIVITY.load(Ordering::Relaxed),
+        pruned_range: SIDECAR_PRUNED_RANGE.load(Ordering::Relaxed),
     }
 }
 
@@ -213,7 +218,7 @@ pub fn sidecar_i64_eq_opt(
     let source = ematix_parquet_io::ParquetFile::open(source_path).map_err(|e| {
         DataFusionError::Execution(format!("sidecar: open source {source_path:?}: {e:?}"))
     })?;
-    let idx = match ematix_parquet_codec::index::ParquetIndex::open(&idx_path, &source) {
+    let idx = match ematix_parquet_codec::index::LazyParquetIndex::open(&idx_path, &source) {
         Ok(idx) => idx,
         Err(e) if is_stale(&e) => {
             SIDECAR_STALE.fetch_add(1, Ordering::Relaxed);
@@ -242,6 +247,15 @@ pub fn sidecar_i64_eq_opt(
     // index path (pre-P3 behavior: someone built this index on purpose).
     if let ematix_parquet_codec::index::IndexKind::Sorted { source_column, .. } = &entry.kind {
         if let Some((min, max)) = footer_i64_bounds(source_path, source_column)? {
+            // Range prune: a key outside this part's footer bounds
+            // has NO rows here — the honest indexed answer is the
+            // empty set, and neither the sidecar body nor any data
+            // page gets read. On an orderkey-contiguous parted table
+            // this skips all but one part per point lookup.
+            if key < min || key > max {
+                SIDECAR_PRUNED_RANGE.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(Vec::new()));
+            }
             let est = estimate_eq_selectivity(min, max, key);
             if est > max_selectivity {
                 SIDECAR_SKIPPED_SELECTIVITY.fetch_add(1, Ordering::Relaxed);

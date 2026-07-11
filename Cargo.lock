@@ -4115,9 +4115,9 @@ dependencies = [
 
 [[package]]
 name = "ematix-iceberg"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7908cb9e3aa6288fbd3e2f01eefed0500d2729244d027f793b68dc1de35639c3"
+checksum = "cca2905b8e337ec5f983ae7b1ede6977a7bedd82e84897ea045d640485600dd7"
 dependencies = [
  "ematix-parquet-codec",
  "iceberg",
@@ -4125,9 +4125,9 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-codec"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49cd77fa354b5498082b333ea306e8d0b74e96dc307de91033168a2970a97e94"
+checksum = "e58620a8cd82a4438d8dadcf2d365ec3c9e0fff2960d1b9fc2008108a7af941d"
 dependencies = [
  "brotli",
  "ematix-parquet-format",
@@ -4140,15 +4140,15 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-format"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a9c8ccb0fb826df9574b294593c88d8d29f7e052a82090899a492a460bcf914"
+checksum = "46e4011a12dc76a4d7375914762dc4591d5a1f2512037985847926885eee58b3"
 
 [[package]]
 name = "ematix-parquet-io"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7453c51e4ca574d2982b8ba304a3a0b1e8e90b338a8de0e1510886c8b5e2eb06"
+checksum = "cf805e90aa2cfb7efa16447052b79d3ca3a3a57fc75c21b9f318d610a551b267"
 dependencies = [
  "ematix-parquet-format",
 ]
@@ -5113,7 +5113,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.4.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -5235,7 +5235,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -7995,7 +7995,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -8033,7 +8033,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
