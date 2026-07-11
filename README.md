@@ -715,6 +715,14 @@ left of their downstreams. Useful for spotting orphan pipelines,
 unintended cycles, or fan-out hotspots before they bite at scheduler
 tick time.
 
+The **Quality** view surfaces the data-quality surface (`expectations=`
++ `freshness_sla=` on `@ematix.pipeline`): freshness SLO cards with
+lag-vs-SLA status, and recent expectation runs expandable to the
+per-check verdicts — a failing `email.not_null` shows the offending
+row count right in the table:
+
+![Quality view — freshness SLO cards and per-check expectation verdicts](docs/screenshots/quality.png)
+
 More screenshots + walkthrough: [ematix.dev/specs/04-web-ui-screenshots](https://ematix.dev/specs/04-web-ui-screenshots).
 
 ### Analytics — SQL Lab, Charts, Dashboards
