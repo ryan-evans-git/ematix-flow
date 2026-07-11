@@ -61,6 +61,15 @@ use datafusion_distributed::{DistributedExec, DistributedPhysicalOptimizerRule};
 /// the pre-gate behavior.
 pub const DEFAULT_MESH_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Default for `EMAT_MESH_MAX_TABLE_SCANS`: decline to distribute at
+/// 3+ scan instances of one base table. Calibrated 2026-07-11 on the
+/// SF=100 4-node refresh: Q21 (lineitem ×3) ran 12.0 s distributed vs
+/// 6.7 s single-node — every extra instance of the dominant table is
+/// a full extra shuffle for the mesh but a page-cache re-read plus
+/// runtime-bloom prune for the single node. Q15 (lineitem ×2) meshes
+/// at parity (1.30 s vs 1.35 s), so 2 instances stay distributed.
+pub const DEFAULT_MESH_MAX_TABLE_SCANS: u32 = 3;
+
 /// Config for the adaptive mesh gate. Carried as a field of
 /// [`AdaptiveMeshGateRule`] so tests construct it explicitly via the
 /// pure constructors (no process-global env races — the
@@ -75,6 +84,19 @@ pub struct MeshGateConfig {
     /// are >= this. `EMAT_MESH_MIN_BYTES`, default
     /// [`DEFAULT_MESH_MIN_BYTES`].
     pub min_bytes: u64,
+    /// Σ.MG self-join shuffle guard: in AUTO, decline to distribute
+    /// when any single base table appears as this many (or more)
+    /// independent scan instances in the plan. Each instance of the
+    /// big table is a full extra network shuffle for the mesh, while
+    /// the single-node plan re-reads it from page cache and prunes it
+    /// with runtime blooms (which distributed arrow scans don't
+    /// carry). TPC-H Q21 (lineitem × 3: inner + semi + anti) is the
+    /// motivating shape — mesh 12.0 s vs single-node 6.7 s at SF=100
+    /// on 4× c7i.4xlarge; Q15 (lineitem × 2) meshes at parity and
+    /// deliberately stays distributed. `EMAT_MESH_MAX_TABLE_SCANS`
+    /// (decline at N or more; 0 disables the guard), default
+    /// [`DEFAULT_MESH_MAX_TABLE_SCANS`].
+    pub max_table_scans: u32,
 }
 
 impl MeshGateConfig {
@@ -99,6 +121,9 @@ impl MeshGateConfig {
         Self {
             mode: ematix_flow_core::flags::tri_state("EMAT_MESH"),
             min_bytes,
+            max_table_scans: max_table_scans_of(
+                std::env::var("EMAT_MESH_MAX_TABLE_SCANS").ok().as_deref(),
+            ),
         }
     }
 
@@ -108,6 +133,7 @@ impl MeshGateConfig {
         Self {
             mode: Some(false),
             min_bytes: DEFAULT_MESH_MIN_BYTES,
+            max_table_scans: DEFAULT_MESH_MAX_TABLE_SCANS,
         }
     }
 
@@ -117,6 +143,7 @@ impl MeshGateConfig {
         Self {
             mode: Some(true),
             min_bytes: DEFAULT_MESH_MIN_BYTES,
+            max_table_scans: DEFAULT_MESH_MAX_TABLE_SCANS,
         }
     }
 
@@ -126,8 +153,17 @@ impl MeshGateConfig {
         Self {
             mode: None,
             min_bytes,
+            max_table_scans: DEFAULT_MESH_MAX_TABLE_SCANS,
         }
     }
+}
+
+/// Pure core of the `EMAT_MESH_MAX_TABLE_SCANS` parse (same
+/// convention as [`min_bytes_of`]): unset or garbage → default;
+/// `0` → guard disabled (never decline on instance count).
+fn max_table_scans_of(val: Option<&str>) -> u32 {
+    val.and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MESH_MAX_TABLE_SCANS)
 }
 
 /// Pure core of the `EMAT_MESH_MIN_BYTES` parse so tests can pin the
@@ -150,10 +186,21 @@ fn min_bytes_of(val: Option<&str>) -> (u64, bool) {
     }
 }
 
-/// Pure AUTO decision: `leaf_bytes` carries one entry per scan leaf —
-/// `Some(bytes)` when the leaf reports a usable `total_byte_size`
-/// (`Precision::Exact` or `Inexact`), `None` when unknown (`Absent`).
-/// Returns `true` when the plan should distribute.
+/// Full AUTO decision: byte threshold AND the Σ.MG self-join veto.
+/// `repeats` = max scan instances of one base table
+/// ([`max_same_table_scan_instances`]); `max_table_scans == 0`
+/// disables the veto.
+fn auto_decision(leaf_bytes: &[Option<u64>], repeats: u32, config: &MeshGateConfig) -> bool {
+    if config.max_table_scans > 0 && repeats >= config.max_table_scans {
+        return false;
+    }
+    auto_should_distribute(leaf_bytes, config.min_bytes)
+}
+
+/// Pure byte-threshold decision: `leaf_bytes` carries one entry per
+/// scan leaf — `Some(bytes)` when the leaf reports a usable
+/// `total_byte_size` (`Precision::Exact` or `Inexact`), `None` when
+/// unknown (`Absent`). Returns `true` when the plan should distribute.
 ///
 /// - Any known bytes → distribute iff the (saturating) known sum
 ///   reaches `min_bytes`. Unknown leaves contribute nothing — the
@@ -248,7 +295,8 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
                 tracing::debug!("mesh gate: mode=on → distribute");
                 self.inner.optimize(plan, config)
             }
-            // AUTO: decide from the scan leaves' byte statistics.
+            // AUTO: decide from the scan leaves' byte statistics,
+            // vetoed by the Σ.MG self-join shuffle guard.
             None => {
                 let mut leaf_bytes = Vec::new();
                 collect_scan_leaf_bytes(&plan, &mut leaf_bytes);
@@ -256,11 +304,13 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
                     .iter()
                     .flatten()
                     .fold(0u64, |acc, b| acc.saturating_add(*b));
-                let distribute = auto_should_distribute(&leaf_bytes, self.config.min_bytes);
+                let repeats = max_same_table_scan_instances(&plan, self.config.min_bytes);
+                let distribute = auto_decision(&leaf_bytes, repeats, &self.config);
                 tracing::debug!(
                     known_scan_bytes = known_sum,
                     min_bytes = self.config.min_bytes,
                     leaves = leaf_bytes.len(),
+                    same_table_instances = repeats,
                     decision = if distribute {
                         "distribute"
                     } else {
@@ -284,6 +334,105 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Σ.MG: the largest number of independent scan INSTANCES any single
+/// base table has in this plan. A self-join like Q21 scans lineitem
+/// three times (inner + semi + anti); each instance is a full extra
+/// network shuffle when distributed, but a page-cache re-read (plus
+/// runtime-bloom pruning) on the single node.
+///
+/// Table identity is the parent directory of the scan's first file:
+/// - arrow `DataSourceExec` listings (the distributed registration):
+///   one leaf per instance; identity via `FileScanConfig.file_groups`.
+/// - `EmatixInterleaveUnionExec` (the ematix parted provider): the
+///   union IS one instance — its children are parts of one logical
+///   scan, so the walk records it once and does not descend (else a
+///   single parted table would read as 8 "instances").
+/// - `EmatixFastParquetExec`: identity via its file's parent dir.
+///
+/// Leaves with no extractable identity are ignored (never veto on
+/// unknowns), as are instances below `min_instance_bytes` — three
+/// scans of 25-row `nation` multiply nothing; the guard is about
+/// shuffle volume, so only instances that are themselves mesh-scale
+/// (the same `EMAT_MESH_MIN_BYTES` floor) count.
+pub fn max_same_table_scan_instances(
+    plan: &Arc<dyn ExecutionPlan>,
+    min_instance_bytes: u64,
+) -> u32 {
+    use std::collections::HashMap;
+    fn identity_of(plan: &Arc<dyn ExecutionPlan>) -> Option<String> {
+        if let Some(ds) = plan
+            .as_any()
+            .downcast_ref::<datafusion::datasource::source::DataSourceExec>()
+        {
+            let cfg = ds
+                .data_source()
+                .as_any()
+                .downcast_ref::<datafusion::datasource::physical_plan::FileScanConfig>()?;
+            let first = cfg.file_groups.iter().flat_map(|g| g.files()).next()?;
+            let loc = first.object_meta.location.as_ref();
+            return Some(parent_dir(loc));
+        }
+        if let Some(scan) =
+            plan.as_any()
+                .downcast_ref::<ematix_flow_core::ematix_fast_parquet::EmatixFastParquetExec>()
+        {
+            return Some(parent_dir(scan.path()));
+        }
+        None
+    }
+    fn parent_dir(path: &str) -> String {
+        match path.rsplit_once('/') {
+            Some((dir, _file)) => dir.to_string(),
+            None => path.to_string(),
+        }
+    }
+    fn known_bytes(plan: &Arc<dyn ExecutionPlan>) -> u64 {
+        plan.partition_statistics(None)
+            .ok()
+            .and_then(|s| match s.total_byte_size {
+                Precision::Exact(n) | Precision::Inexact(n) => Some(n as u64),
+                Precision::Absent => None,
+            })
+            .unwrap_or(0)
+    }
+    fn walk(plan: &Arc<dyn ExecutionPlan>, min_bytes: u64, counts: &mut HashMap<String, u32>) {
+        // A parted interleave union is ONE scan instance of one table,
+        // sized as the sum of its parts.
+        if plan
+            .as_any()
+            .is::<ematix_flow_core::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>()
+        {
+            let total: u64 = plan.children().iter().map(|c| known_bytes(c)).sum();
+            let mut node = plan.children().into_iter().next().cloned();
+            while let Some(n) = node {
+                if let Some(id) = identity_of(&n) {
+                    if total >= min_bytes {
+                        *counts.entry(id).or_insert(0) += 1;
+                    }
+                    return;
+                }
+                node = n.children().into_iter().next().cloned();
+            }
+            return;
+        }
+        let children = plan.children();
+        if children.is_empty() {
+            if known_bytes(plan) >= min_bytes {
+                if let Some(id) = identity_of(plan) {
+                    *counts.entry(id).or_insert(0) += 1;
+                }
+            }
+            return;
+        }
+        for c in children {
+            walk(c, min_bytes, counts);
+        }
+    }
+    let mut counts = HashMap::new();
+    walk(plan, min_instance_bytes, &mut counts);
+    counts.values().copied().max().unwrap_or(0)
 }
 
 /// Collect one `Option<bytes>` per scan leaf (nodes with no
@@ -568,6 +717,138 @@ mod tests {
         assert!(
             Arc::ptr_eq(&distributed, &out),
             "an already-distributed root must pass through unchanged"
+        );
+    }
+
+    // ---------------- Σ.MG self-join shuffle guard ----------------
+
+    #[test]
+    fn max_table_scans_parse_table() {
+        assert_eq!(max_table_scans_of(None), DEFAULT_MESH_MAX_TABLE_SCANS);
+        assert_eq!(max_table_scans_of(Some("5")), 5);
+        assert_eq!(max_table_scans_of(Some("0")), 0); // 0 = guard off
+        assert_eq!(
+            max_table_scans_of(Some("junk")),
+            DEFAULT_MESH_MAX_TABLE_SCANS
+        );
+    }
+
+    #[test]
+    fn auto_decision_veto_table() {
+        let big = &[Some(u64::MAX)][..]; // bytes alone say distribute
+        let auto = MeshGateConfig::auto_with_min_bytes(0);
+        // Below the instance ceiling: bytes decide.
+        assert!(auto_decision(big, 1, &auto));
+        assert!(auto_decision(big, 2, &auto));
+        // At/above the ceiling (default 3): veto regardless of bytes.
+        assert!(!auto_decision(big, 3, &auto));
+        assert!(!auto_decision(big, 7, &auto));
+        // max_table_scans = 0 disables the guard entirely.
+        let off = MeshGateConfig {
+            max_table_scans: 0,
+            ..auto
+        };
+        assert!(auto_decision(big, 9, &off));
+    }
+
+    /// The Q21 shape in miniature: THREE scan instances of one base
+    /// table (inner self-joins). The counter must see 3, and AUTO
+    /// must return the single-node plan Arc even though the byte
+    /// threshold alone says distribute.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn three_instance_self_join_declines_fanout() {
+        let (_tmp, path) = write_fixture();
+        let ctx = fixture_ctx(&path).await;
+        let plan = physical_plan(
+            &ctx,
+            "SELECT a.k FROM t a              JOIN t b ON a.k = b.k              JOIN t c ON a.k = c.k",
+        )
+        .await;
+        assert_eq!(
+            max_same_table_scan_instances(&plan, 0),
+            3,
+            "three self-join arms = three instances:\n{}",
+            displayable(plan.as_ref()).indent(true)
+        );
+        let rule = AdaptiveMeshGateRule::new(MeshGateConfig::auto_with_min_bytes(0));
+        let out = rule
+            .optimize(plan.clone(), &ConfigOptions::default())
+            .expect("optimize");
+        assert!(
+            Arc::ptr_eq(&plan, &out),
+            "3+ instances of one table must veto fan-out (single-node Arc back)"
+        );
+    }
+
+    /// Two instances (the Q15 shape) do NOT trip the veto — the
+    /// counter reports 2 and the pure decision distributes on bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_instance_self_join_does_not_veto() {
+        let (_tmp, path) = write_fixture();
+        let ctx = fixture_ctx(&path).await;
+        let plan = physical_plan(&ctx, "SELECT a.k FROM t a JOIN t b ON a.k = b.k").await;
+        assert_eq!(max_same_table_scan_instances(&plan, 2), 2);
+        // Above the per-instance byte floor, small scans don't count
+        // at all — 3 copies of a tiny table can never veto.
+        assert_eq!(max_same_table_scan_instances(&plan, u64::MAX), 0);
+        let big = &[Some(u64::MAX)][..];
+        assert!(
+            auto_decision(big, 2, &MeshGateConfig::auto_with_min_bytes(0)),
+            "2 instances stay distributed"
+        );
+    }
+
+    /// A parted ematix table (EmatixInterleaveUnionExec over N part
+    /// scans) is ONE logical scan instance — the counter must NOT
+    /// read its parts as N self-join arms (that would veto every
+    /// parted single-table query).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parted_union_counts_as_one_instance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Four part files of one table in one directory.
+        for i in 0..4 {
+            let path = tmp.path().join(format!("t-{i:04}.parquet"));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Float64, false),
+            ]));
+            let n = 100i64;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())),
+                    Arc::new(Float64Array::from(
+                        (0..n).map(|x| x as f64).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("batch");
+            let file = File::create(&path).expect("create");
+            let mut w = ArrowWriter::try_new(file, schema, None).expect("writer");
+            w.write(&batch).expect("write");
+            w.close().expect("close");
+        }
+        let cfg = SessionConfig::new()
+            .with_collect_statistics(true)
+            .with_target_partitions(4);
+        let builder = ematix_flow_core::preset::with_optimizer_rules(
+            SessionStateBuilder::new()
+                .with_config(cfg)
+                .with_default_features(),
+        );
+        let ctx = SessionContext::new_with_state(builder.build());
+        let prov =
+            ematix_flow_core::ematix_fast_parquet_multi::EmatixFastParquetMultiTableProvider::try_new_dir(
+                tmp.path(),
+            )
+            .expect("multi provider");
+        ctx.register_table("t", Arc::new(prov)).expect("register");
+        let plan = physical_plan(&ctx, "SELECT k, SUM(v) FROM t GROUP BY k").await;
+        assert_eq!(
+            max_same_table_scan_instances(&plan, 0),
+            1,
+            "a parted union is one instance:\n{}",
+            displayable(plan.as_ref()).indent(true)
         );
     }
 }

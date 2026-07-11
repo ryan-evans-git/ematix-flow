@@ -245,7 +245,11 @@ impl PhysicalOptimizerRule for SampledJoinSideRule {
 
 /// Honest row estimate for `plan`, or `None` when the subtree contains
 /// an operator we can't price (see module docs for the node table).
-pub(crate) fn estimate_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<f64> {
+///
+/// Public because the distributed mesh gate (Σ.MG) prices join build
+/// sides with the same honesty rules this rule swaps by — one
+/// estimator, one set of grounding proofs.
+pub fn estimate_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<f64> {
     let any = plan.as_any();
     if any.is::<EmatixFastParquetExec>() {
         return stats_rows(plan);
