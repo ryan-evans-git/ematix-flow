@@ -181,6 +181,11 @@ pub struct HarnessOverrides {
     /// on `EMAT_JOIN_SIDE_FIX` (default ON, snapshotted at session
     /// build), so harnesses keep this `true` and A/B via the env var.
     pub sampled_join_side: bool,
+    /// `GraceJoinDemotionRule` (Σ.SP Phase 1b). The rule ALSO
+    /// self-gates on `EMAT_GRACE_JOIN` (OPT-IN, default OFF until the
+    /// full-suite box protocol decides), so keeping this `true` merely
+    /// registers it; a default install never demotes.
+    pub grace_join: bool,
     /// `ClusteredSinglePhaseAggRule` (RANGE.AGG). Note the rule ALSO
     /// self-gates on `EMAT_RANGE_AGG` (default ON), so harnesses keep
     /// this `true` and A/B via the env var.
@@ -261,6 +266,7 @@ impl Default for HarnessOverrides {
             swap_semi_join_build: true,
             force_collect_left: true,
             sampled_join_side: true,
+            grace_join: true,
             clustered_single_phase_agg: true,
             push_down_left_semi: true,
             robin_hood_sum_f64: true,
@@ -382,6 +388,17 @@ pub fn with_optimizer_rules_overridden(
     if o.sampled_join_side {
         builder = builder.with_physical_optimizer_rule(Arc::new(
             crate::join_side_rule::SampledJoinSideRule::default(),
+        ));
+    }
+    // GraceJoinDemotionRule (Σ.SP Phase 1b, 2026-07-11): after the
+    // join-side correction so it prices the FINAL build orientation.
+    // Opt-in (EMAT_GRACE_JOIN=1): an honestly-oversized Inner build
+    // demotes to the grace-partitioned spill join instead of riding
+    // the page-cache margin into a kernel OOM (DF 53 hash joins
+    // cannot spill). docs/plans/SPILLABLE_JOIN.md.
+    if o.grace_join {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            crate::grace_join_rule::GraceJoinDemotionRule::default(),
         ));
     }
     // RANGE.AGG (2026-06-10): collapse Partial→hash-shuffle→Final
@@ -639,6 +656,7 @@ pub const PRODUCTION_PHYSICAL_RULE_NAMES: &[&str] = &[
     "swap_semi_join_build_side",
     "ematix_flow_force_collect_left_semi_bounded_build",
     "ematix_flow_sampled_join_side",
+    "ematix_flow_grace_join_demotion",
     "ematix_flow_clustered_single_phase_agg",
     "ematix_flow_enable_robin_hood_sum_f64",
     "ematix_flow_enable_runtime_bloom_sideband",
