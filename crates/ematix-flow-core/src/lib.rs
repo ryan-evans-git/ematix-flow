@@ -109,6 +109,10 @@ pub mod ematix_fast_parquet;
 // table through the ematix codec (closes the gap where single-node could only
 // read multi-file via arrow-rs or distribution).
 pub mod ematix_fast_parquet_multi;
+// Σ.SP Phase 1: grace-partitioned Inner hash join — spill-backed join
+// for builds the in-memory HashJoinExec cannot afford (DF 53 cannot
+// spill hash joins). See docs/plans/SPILLABLE_JOIN.md.
+pub mod grace_hash_join;
 // feat/sidecar-indexes Phase 1: read-side sidecar (`.parquet.idx`) lookups.
 pub mod sidecar_index;
 // feat/sidecar-indexes Phase 2: write-side sidecar creation (backfill a
