@@ -17,8 +17,10 @@
 //! explicit, else AUTO = ½ × sensed `MemAvailable` at plan time (the
 //! Σ.AI.6c sensor; platforms without it never demote).
 //!
-//! Scope (Phase 1): Inner joins with no residual filter and no
-//! embedded projection — the exact shape `GraceHashJoinExec` handles.
+//! Scope (Phase 2): Inner / LeftSemi / LeftAnti joins (the Q21 shape),
+//! residual filter forwarded verbatim; still no embedded projection.
+//! The build side under CollectLeft is the LEFT input for all three,
+//! so the demotion estimate stays left-side.
 
 use std::sync::Arc;
 
@@ -107,11 +109,13 @@ impl PhysicalOptimizerRule for GraceJoinDemotionRule {
             let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
-            // Phase 1 shape: Inner, no residual filter, no embedded
-            // projection — what GraceHashJoinExec reproduces exactly.
-            if !matches!(hj.join_type(), JoinType::Inner)
-                || hj.filter().is_some()
-                || hj.projection.is_some()
+            // Phase 2 shape: Inner/LeftSemi/LeftAnti (residual filter
+            // forwards verbatim), no embedded projection — what
+            // GraceHashJoinExec reproduces exactly.
+            if !matches!(
+                hj.join_type(),
+                JoinType::Inner | JoinType::LeftSemi | JoinType::LeftAnti
+            ) || hj.projection.is_some()
             {
                 return Ok(Transformed::no(node));
             }
@@ -126,8 +130,9 @@ impl PhysicalOptimizerRule for GraceJoinDemotionRule {
             let k = spill_partitions(est_bytes, budget);
             if trace {
                 eprintln!(
-                    "[grace_join] demote: est_build_bytes={est_bytes:.0} \
+                    "[grace_join] demote: join_type={:?} est_build_bytes={est_bytes:.0} \
                      budget={budget:.0} k={k} on={:?}",
+                    hj.join_type(),
                     hj.on()
                 );
             }
@@ -135,6 +140,8 @@ impl PhysicalOptimizerRule for GraceJoinDemotionRule {
                 Arc::clone(hj.left()),
                 Arc::clone(hj.right()),
                 hj.on().to_vec(),
+                *hj.join_type(),
+                hj.filter().cloned(),
                 k,
             )?)))
         })?;
@@ -329,5 +336,73 @@ mod tests {
         assert_eq!(spill_partitions(100.0, 1_000_000.0), 4, "floor clamp");
         assert_eq!(spill_partitions(1_000_000.0, 100_000.0), 32, "20 → pow2 32");
         assert_eq!(spill_partitions(1e12, 8.0), 256, "ceiling clamp");
+    }
+
+    // ---- Phase 2: semi / anti demotion ----
+
+    fn typed_join(
+        l: Arc<dyn ExecutionPlan>,
+        r: Arc<dyn ExecutionPlan>,
+        join_type: JoinType,
+    ) -> Arc<dyn ExecutionPlan> {
+        let on: JoinOn = vec![(
+            Arc::new(Column::new("ident", 0)) as _,
+            Arc::new(Column::new("ref_a", 0)) as _,
+        )];
+        Arc::new(
+            HashJoinExec::try_new(
+                l,
+                r,
+                on,
+                None,
+                &join_type,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Oversized LeftSemi and LeftAnti builds demote and keep parity —
+    /// the Q21 shape this arc exists for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn demotes_semi_and_anti_with_result_parity() {
+        let ctx = SessionContext::new();
+        for join_type in [JoinType::LeftSemi, JoinType::LeftAnti] {
+            let (_, l) = mem_side("ident", 10_000, 500);
+            let (_, r) = mem_side("ref_a", 2_000, 300); // matches 0..300 only
+            let plan = typed_join(l, r, join_type);
+            let expect = rows_sorted(&plan, &ctx).await;
+            assert!(expect.len() > 4, "{join_type:?} oracle non-trivial");
+
+            let out = rule(1_000)
+                .optimize(Arc::clone(&plan), &ConfigOptions::default())
+                .unwrap();
+            let text = format!("{}", displayable(out.as_ref()).indent(true));
+            assert!(
+                text.contains("GraceHashJoinExec"),
+                "oversized {join_type:?} build must demote:\n{text}"
+            );
+            let got = rows_sorted(&out, &ctx).await;
+            assert_eq!(got, expect, "demoted {join_type:?} plan must match");
+        }
+    }
+
+    /// Join types outside Inner/LeftSemi/LeftAnti are never demoted,
+    /// however oversized the build.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsupported_join_types_not_demoted() {
+        let (_, l) = mem_side("ident", 10_000, 500);
+        let (_, r) = mem_side("ref_a", 2_000, 500);
+        let plan = typed_join(l, r, JoinType::Right);
+        let out = rule(1_000)
+            .optimize(Arc::clone(&plan), &ConfigOptions::default())
+            .unwrap();
+        assert!(
+            !format!("{}", displayable(out.as_ref()).indent(true)).contains("GraceHashJoinExec"),
+            "Right join must not demote"
+        );
     }
 }
