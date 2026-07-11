@@ -15,7 +15,8 @@
 //!
 //! There was no way to read a multi-file dataset **single-node through
 //! ematix-parquet**. This provider is that missing primitive: it wraps one
-//! [`EmatixFastParquetTableProvider`] per part and [`UnionExec`]s their scans.
+//! [`EmatixFastParquetTableProvider`] per part and unions their scans via
+//! [`EmatixInterleaveUnionExec`] (width-pinned — see Σ.MW.2 on that type).
 //! Each part is decoded by the ematix codec, and the parts run as independent
 //! partitions across cores — the scan parallelism a single huge file is starved
 //! of (e.g. the SF100 Q09 penalty on one 22 GB `lineitem`).
@@ -24,6 +25,7 @@
 //! (`crate::iceberg_scan`): "these N surviving files are one table."
 
 use std::any::Any;
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -34,14 +36,167 @@ use datafusion::common::Statistics;
 use datafusion::common::stats::Precision;
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties, SendableRecordBatchStream,
+};
 
 use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
 
+/// Union-semantics N-ary node whose children are PINNED at their own
+/// partition counts (Σ.MW.2).
+///
+/// The stock [`UnionExec`](datafusion::physical_plan::union::UnionExec)
+/// reports `benefits_from_input_partitioning() == true` for every
+/// child, so `EnforceDistribution` wraps EACH part's scan in its own
+/// `RepartitionExec(RoundRobinBatch(target))` — 8 parts × target 14 =
+/// 112 concurrent decode streams on SF100 lineitem, re-introducing
+/// above the provider the exact width amplification Σ.MW.1 removed
+/// inside it (observed: parted single-node Q07 8.9×, Q18 6.1× slower
+/// than flat; setting per-part budgets can't help because the rule
+/// expands every union child to `target` regardless of the union's
+/// total). This node is the same concatenation — children stay fully
+/// visible to every downcast-driven rule (runtime blooms, clustered
+/// agg, Σ.JS grounding) — but answers `false`, so the planner takes
+/// the union's own width as final and parallelism is provided by the
+/// provider's ceil-division part sizing instead.
+#[derive(Debug)]
+pub struct EmatixInterleaveUnionExec {
+    children: Vec<Arc<dyn ExecutionPlan>>,
+    /// Prefix map: output partition `k` executes
+    /// `children[map[k].0].execute(map[k].1)`.
+    map: Vec<(usize, usize)>,
+    props: Arc<PlanProperties>,
+}
+
+impl EmatixInterleaveUnionExec {
+    /// All children must share the first child's schema. Empty input
+    /// is an error.
+    pub fn try_new(children: Vec<Arc<dyn ExecutionPlan>>) -> DfResult<Self> {
+        let Some(first) = children.first() else {
+            return Err(DataFusionError::Plan(
+                "EmatixInterleaveUnionExec: no children".into(),
+            ));
+        };
+        let schema = first.schema();
+        let mut map = Vec::new();
+        for (ci, c) in children.iter().enumerate() {
+            if c.schema().fields() != schema.fields() {
+                return Err(DataFusionError::Plan(format!(
+                    "EmatixInterleaveUnionExec: child {ci} schema mismatch"
+                )));
+            }
+            for p in 0..c.output_partitioning().partition_count() {
+                map.push((ci, p));
+            }
+        }
+        let props = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(map.len().max(1)),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Ok(Self {
+            children,
+            map,
+            props,
+        })
+    }
+}
+
+impl DisplayAs for EmatixInterleaveUnionExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "EmatixInterleaveUnionExec: parts={}, partitions={} (width-pinned)",
+            self.children.len(),
+            self.map.len()
+        )
+    }
+}
+
+impl ExecutionPlan for EmatixInterleaveUnionExec {
+    fn name(&self) -> &str {
+        "EmatixInterleaveUnionExec"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.props
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.children.iter().collect()
+    }
+    /// The whole point of this node: no child "benefits" from an
+    /// inserted round-robin — the provider already sized the parts.
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false; self.children.len()]
+    }
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::try_new(children)?))
+    }
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        let Some(&(ci, cp)) = self.map.get(partition) else {
+            return Err(DataFusionError::Internal(format!(
+                "EmatixInterleaveUnionExec: partition {partition} out of range ({})",
+                self.map.len()
+            )));
+        };
+        self.children[ci].execute(cp, context)
+    }
+    /// Merged statistics across children (rows/nulls summed, min/max
+    /// widened) — same semantics as the provider's `statistics()`, so
+    /// planner rules that consult the plan see what the table-level
+    /// stats promised.
+    fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Statistics> {
+        match partition {
+            Some(k) => {
+                let Some(&(ci, cp)) = self.map.get(k) else {
+                    return Err(DataFusionError::Internal(format!(
+                        "EmatixInterleaveUnionExec: partition {k} out of range"
+                    )));
+                };
+                self.children[ci].partition_statistics(Some(cp))
+            }
+            None => {
+                let mut merged = self.children[0].partition_statistics(None)?;
+                for c in &self.children[1..] {
+                    let s = c.partition_statistics(None)?;
+                    merged.num_rows = merged.num_rows.add(&s.num_rows);
+                    merged.total_byte_size = merged.total_byte_size.add(&s.total_byte_size);
+                    for (a, b) in merged
+                        .column_statistics
+                        .iter_mut()
+                        .zip(s.column_statistics.iter())
+                    {
+                        a.null_count = a.null_count.add(&b.null_count);
+                        a.min_value = a.min_value.min(&b.min_value);
+                        a.max_value = a.max_value.max(&b.max_value);
+                        a.sum_value = a.sum_value.add(&b.sum_value);
+                        a.distinct_count = Precision::Absent;
+                    }
+                }
+                Ok(merged)
+            }
+        }
+    }
+}
+
 /// A table backed by many Parquet part-files, each read via the ematix-parquet
-/// fast reader. Single-node; the parts scan in parallel via [`UnionExec`].
+/// fast reader. Single-node; the parts scan in parallel via
+/// [`EmatixInterleaveUnionExec`].
 ///
 /// `Debug` is required by DataFusion's `TableProvider` supertrait.
 #[derive(Debug)]
@@ -189,12 +344,18 @@ impl TableProvider for EmatixFastParquetMultiTableProvider {
         // union's width is what the operators above poll CONCURRENTLY, and
         // parts × target_partitions multiplied the query's decode working set
         // by the part count (13-part SF100 lineitem: ~182 streams, Q01 ~9 GB
-        // peak, kernel OOM on 32 GB boxes within a few executions). Floor
-        // division keeps Σ(part partitions) ≤ target_partitions once every
-        // part has its guaranteed one; a table with more parts than the budget
-        // degrades to one partition per part (width = part count).
+        // peak, kernel OOM on 32 GB boxes within a few executions).
+        //
+        // Σ.MW.2: CEIL division, so Σ(part partitions) lands in
+        // [target, target + parts) — never below target. Below-target
+        // width made `EnforceDistribution` "helpfully" wrap every part
+        // in RoundRobinBatch(target) (parts × target streams, the
+        // Σ.MW.1 bug re-introduced one level up); the width-pinned
+        // union below refuses that, so the union's own width must
+        // carry the query's parallelism. A table with more parts than
+        // the budget still degrades to one partition per part.
         let target = state.config_options().execution.target_partitions;
-        let per_part = (target / self.parts.len()).max(1);
+        let per_part = target.div_ceil(self.parts.len()).max(1);
         let mut children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(self.parts.len());
         for part in &self.parts {
             children.push(
@@ -206,8 +367,7 @@ impl TableProvider for EmatixFastParquetMultiTableProvider {
         if children.len() == 1 {
             return Ok(children.pop().expect("len checked"));
         }
-        // `try_new` returns `Arc<dyn ExecutionPlan>` already.
-        UnionExec::try_new(children)
+        Ok(Arc::new(EmatixInterleaveUnionExec::try_new(children)?))
     }
 }
 
@@ -438,15 +598,69 @@ mod tests {
         let ctx = SessionContext::new_with_config(config);
         let plan = prov.scan(&ctx.state(), None, &[], None).await.unwrap();
         let pc = plan.output_partitioning().partition_count();
+        // Σ.MW.2 ceil sizing: width ∈ [target, target + parts) — at
+        // least target (below-target used to invite per-part
+        // RoundRobin expansion), and never the parts × target blowup
+        // (3 parts × 4 RGs used to expose 3 × min(4, 8) = 12).
         assert!(
-            pc <= 8,
-            "union width must respect target_partitions=8 (3 parts × 4 RGs \
-             used to expose 3 × min(4, 8) = 12), got {pc}"
+            pc < 8 + 3,
+            "union width must stay under target+parts, got {pc}"
         );
-        assert!(pc >= 3, "each part still contributes a partition, got {pc}");
+        assert!(
+            pc >= 8,
+            "union width must reach target_partitions=8, got {pc}"
+        );
         // Correctness under the budget: full scan returns every row.
         ctx.register_table("t", Arc::new(prov)).unwrap();
         let out = run(&ctx, "SELECT count(*) c FROM t").await;
+        assert!(out.contains("1200"), "3 parts × 400 rows; got {out}");
+    }
+
+    /// Σ.MW.2 regression oracle: a GROUP BY forces a hash exchange
+    /// above the parted scan — exactly where `EnforceDistribution`
+    /// used to wrap EVERY part in `RoundRobinBatch(target)` (8 parts
+    /// × 14 = 112 decode streams on SF100 Q07). The width-pinned
+    /// union must survive physical optimization with no RoundRobin
+    /// under it and produce correct results.
+    #[tokio::test]
+    async fn interleave_union_defeats_roundrobin_expansion() {
+        use datafusion::physical_plan::displayable;
+        let dir = tempfile::tempdir().unwrap();
+        let pdir = dir.path().join("parts");
+        std::fs::create_dir(&pdir).unwrap();
+        for i in 0..3i64 {
+            write_part_multi_rg(&pdir.join(format!("part-{i:04}.parquet")), i * 400, 4, 100);
+        }
+        let prov = EmatixFastParquetMultiTableProvider::try_new_dir(&pdir).unwrap();
+        let config = datafusion::prelude::SessionConfig::new().with_target_partitions(8);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("t", Arc::new(prov)).unwrap();
+        let df = ctx
+            .sql("SELECT id % 7 AS g, count(*) AS c, sum(val) AS s FROM t GROUP BY id % 7")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let text = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(
+            text.contains("EmatixInterleaveUnionExec"),
+            "parted scan must plan through the width-pinned union:\n{text}"
+        );
+        assert!(
+            !text.contains("RoundRobinBatch"),
+            "no per-part RoundRobin expansion may survive (Σ.MW.2):\n{text}"
+        );
+        // Execution parity: the grouped totals cover every row once.
+        let out = run(
+            &ctx,
+            "SELECT count(*) FROM (SELECT id % 7 g, count(*) c FROM t GROUP BY id % 7)",
+        )
+        .await;
+        assert!(out.contains("7"), "7 groups expected; got {out}");
+        let out = run(
+            &ctx,
+            "SELECT sum(c) FROM (SELECT id % 7 g, count(*) c FROM t GROUP BY id % 7)",
+        )
+        .await;
         assert!(out.contains("1200"), "3 parts × 400 rows; got {out}");
     }
 
