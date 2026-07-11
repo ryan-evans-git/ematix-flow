@@ -1,5 +1,6 @@
-//! Σ.SP Phase 1 — `GraceHashJoinExec`: a grace-partitioned Inner hash
-//! join for builds the in-memory `HashJoinExec` cannot afford.
+//! Σ.SP — `GraceHashJoinExec`: a grace-partitioned hash join (Inner /
+//! LeftSemi / LeftAnti) for builds the in-memory `HashJoinExec` cannot
+//! afford.
 //!
 //! DF 53's `HashJoinExec` cannot spill: an oversized build either rides
 //! the page-cache margin to a kernel OOM (unbounded pool) or deadlocks
@@ -22,11 +23,18 @@
 //! against the stock operator, duplicate keys and multi-key `on`
 //! included.
 //!
-//! Scope (Phase 1): `JoinType::Inner`, no filter, no projection —
-//! exactly the shape the demotion rule targets first. Semi/anti (the
-//! Q21 shape) are Phase 2; recursion for a still-oversized pair is
-//! Phase 1.5 (until then the demotion rule sizes `k` from the grounded
-//! estimate with headroom). See docs/plans/SPILLABLE_JOIN.md.
+//! Scope (Phase 2): `Inner`, `LeftSemi`, `LeftAnti` — the Q21 shape —
+//! with optional residual `JoinFilter` (its `ColumnIndex` mapping is
+//! relative to the pair inputs, whose schemas equal the original
+//! inputs', so it forwards verbatim). Still no embedded projection.
+//! Semi/anti per-pair is sound for the same reason inner is: ALL right
+//! rows equi-matching a left row share its scatter pair, so "has a
+//! match (passing the filter)" is decidable within the pair. The one
+//! asymmetry: a LeftAnti pair with left rows but NO right rows must
+//! still run (emits every left row) where Inner/LeftSemi skip it.
+//! Recursion for a still-oversized pair is a later phase (until then
+//! the demotion rule sizes `k` from the grounded estimate with
+//! headroom). See docs/plans/SPILLABLE_JOIN.md.
 
 use std::any::Any;
 use std::fmt;
@@ -35,7 +43,7 @@ use std::sync::Arc;
 use ahash::RandomState;
 use datafusion::arrow::array::{RecordBatch, UInt32Array};
 use datafusion::arrow::compute::take_record_batch;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::FileReader as IpcFileReader;
 use datafusion::arrow::ipc::writer::FileWriter as IpcFileWriter;
 use datafusion::common::hash_utils::create_hashes;
@@ -45,7 +53,7 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::disk_manager::RefCountedTempFile;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::joins::utils::JoinOn;
+use datafusion::physical_plan::joins::utils::{JoinFilter, JoinOn, build_join_schema};
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
 use datafusion::physical_plan::{
@@ -61,11 +69,17 @@ use futures_util::StreamExt;
 /// scan. (Recursion, when it lands, bumps these per depth.)
 const SCATTER_SEEDS: (u64, u64, u64, u64) = (0x5eed_5ca7, 0x7e11_ea57, 0x9e37_79b9, 0x0dd_ba11);
 
-/// Grace-partitioned Inner equi-join. See module docs.
+/// Grace-partitioned equi-join (Inner / LeftSemi / LeftAnti). See
+/// module docs.
 pub struct GraceHashJoinExec {
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,
     on: JoinOn,
+    join_type: JoinType,
+    /// Residual non-equi predicate, forwarded verbatim to each pair
+    /// join (its `ColumnIndex` mapping is input-relative and the pair
+    /// inputs share the original inputs' schemas).
+    filter: Option<JoinFilter>,
     /// Spill fan-out per side. Chosen by the demotion rule from the
     /// grounded build estimate; ≥ 1.
     num_spill_partitions: usize,
@@ -76,18 +90,21 @@ impl fmt::Debug for GraceHashJoinExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GraceHashJoinExec")
             .field("on", &self.on)
+            .field("join_type", &self.join_type)
             .field("num_spill_partitions", &self.num_spill_partitions)
             .finish()
     }
 }
 
 impl GraceHashJoinExec {
-    /// Inner join only (Phase 1). `num_spill_partitions` is clamped to
-    /// ≥ 1; `on` must be non-empty column-pair equi-keys.
+    /// Inner / LeftSemi / LeftAnti (Phase 2). `num_spill_partitions`
+    /// is clamped to ≥ 1; `on` must be non-empty column-pair equi-keys.
     pub fn try_new(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
         on: JoinOn,
+        join_type: JoinType,
+        filter: Option<JoinFilter>,
         num_spill_partitions: usize,
     ) -> Result<Self> {
         if on.is_empty() {
@@ -95,17 +112,19 @@ impl GraceHashJoinExec {
                 "GraceHashJoinExec: empty join keys".into(),
             ));
         }
-        // Inner output schema = left fields ⊕ right fields — the stock
-        // HashJoinExec's Inner/no-projection shape, which the pair
-        // phase reproduces exactly.
-        let fields: Vec<Field> = left
-            .schema()
-            .fields()
-            .iter()
-            .chain(right.schema().fields().iter())
-            .map(|f| f.as_ref().clone())
-            .collect();
-        let schema: SchemaRef = Arc::new(Schema::new(fields));
+        if !matches!(
+            join_type,
+            JoinType::Inner | JoinType::LeftSemi | JoinType::LeftAnti
+        ) {
+            return Err(DataFusionError::Plan(format!(
+                "GraceHashJoinExec: unsupported join type {join_type:?}"
+            )));
+        }
+        // Same schema the stock no-projection HashJoinExec exposes for
+        // this join type (l ⊕ r for Inner, left-only for semi/anti) —
+        // the pair phase reproduces it exactly.
+        let (schema, _) = build_join_schema(&left.schema(), &right.schema(), &join_type);
+        let schema: SchemaRef = Arc::new(schema);
         let props = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
@@ -116,6 +135,8 @@ impl GraceHashJoinExec {
             left,
             right,
             on,
+            join_type,
+            filter,
             num_spill_partitions: num_spill_partitions.max(1),
             props,
         })
@@ -124,14 +145,25 @@ impl GraceHashJoinExec {
     pub fn num_spill_partitions(&self) -> usize {
         self.num_spill_partitions
     }
+
+    pub fn join_type(&self) -> JoinType {
+        self.join_type
+    }
 }
 
 impl DisplayAs for GraceHashJoinExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "GraceHashJoinExec: join_type=Inner, k={}, on={:?}",
-            self.num_spill_partitions, self.on
+            "GraceHashJoinExec: join_type={:?}, k={}, on={:?}{}",
+            self.join_type,
+            self.num_spill_partitions,
+            self.on,
+            if self.filter.is_some() {
+                ", filter=yes"
+            } else {
+                ""
+            }
         )
     }
 }
@@ -163,6 +195,8 @@ impl ExecutionPlan for GraceHashJoinExec {
             l,
             r,
             self.on.clone(),
+            self.join_type,
+            self.filter.clone(),
             self.num_spill_partitions,
         )?))
     }
@@ -180,6 +214,8 @@ impl ExecutionPlan for GraceHashJoinExec {
         let left = Arc::clone(&self.left);
         let right = Arc::clone(&self.right);
         let on = self.on.clone();
+        let join_type = self.join_type;
+        let filter = self.filter.clone();
         let k = self.num_spill_partitions;
         let schema = self.schema();
         let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&schema), 2);
@@ -190,20 +226,27 @@ impl ExecutionPlan for GraceHashJoinExec {
             let l_parts = scatter_side(&left, &left_keys, k, &context).await?;
             let r_parts = scatter_side(&right, &right_keys, k, &context).await?;
             for i in 0..k {
-                // Inner join: a pair with either side empty emits nothing.
-                let (Some(lf), Some(rf)) = (&l_parts[i], &r_parts[i]) else {
+                // No left rows → nothing to emit for Inner/Semi/Anti.
+                let Some(lf) = &l_parts[i] else {
                     continue;
                 };
+                let r_batches = match &r_parts[i] {
+                    Some(rf) => read_spill(rf)?,
+                    // No right rows: Inner/Semi emit nothing — but a
+                    // LeftAnti pair emits EVERY left row, so it still
+                    // runs (against an empty build probe).
+                    None if matches!(join_type, JoinType::LeftAnti) => Vec::new(),
+                    None => continue,
+                };
                 let l_batches = read_spill(lf)?;
-                let r_batches = read_spill(rf)?;
                 let l_mem = MemorySourceConfig::try_new_exec(&[l_batches], left.schema(), None)?;
                 let r_mem = MemorySourceConfig::try_new_exec(&[r_batches], right.schema(), None)?;
                 let pair = HashJoinExec::try_new(
                     l_mem,
                     r_mem,
                     on.clone(),
-                    None,
-                    &JoinType::Inner,
+                    filter.clone(),
+                    &join_type,
                     None,
                     PartitionMode::CollectLeft,
                     NullEquality::NullEqualsNothing,
@@ -310,7 +353,7 @@ fn read_spill(file: &RefCountedTempFile) -> Result<Vec<RecordBatch>> {
 mod tests {
     use super::*;
     use datafusion::arrow::array::{Int64Array, StringArray};
-    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::util::pretty::pretty_format_batches;
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_plan::common::collect;
@@ -384,18 +427,20 @@ mod tests {
         rows
     }
 
-    fn stock_join(
+    fn stock_join_typed(
         l: Arc<dyn ExecutionPlan>,
         r: Arc<dyn ExecutionPlan>,
         on: JoinOn,
+        join_type: JoinType,
+        filter: Option<JoinFilter>,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(
             HashJoinExec::try_new(
                 l,
                 r,
                 on,
-                None,
-                &JoinType::Inner,
+                filter,
+                &join_type,
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
@@ -403,6 +448,14 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn stock_join(
+        l: Arc<dyn ExecutionPlan>,
+        r: Arc<dyn ExecutionPlan>,
+        on: JoinOn,
+    ) -> Arc<dyn ExecutionPlan> {
+        stock_join_typed(l, r, on, JoinType::Inner, None)
     }
 
     fn mem_exec(schema: SchemaRef, batches: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {
@@ -430,6 +483,8 @@ mod tests {
                     mem_exec(Arc::clone(&ls), lb.clone()),
                     mem_exec(Arc::clone(&rs), rb.clone()),
                     on_ident_ref_a(),
+                    JoinType::Inner,
+                    None,
                     k,
                 )
                 .unwrap(),
@@ -483,6 +538,8 @@ mod tests {
                 mem_exec(Arc::clone(&schema), vec![mk(200, 5)]),
                 mem_exec(Arc::clone(&schema), vec![mk(300, 5)]),
                 on,
+                JoinType::Inner,
+                None,
                 4,
             )
             .unwrap(),
@@ -502,6 +559,8 @@ mod tests {
                 mem_exec(Arc::clone(&ls), vec![]),
                 mem_exec(rs, rb),
                 on_ident_ref_a(),
+                JoinType::Inner,
+                None,
                 4,
             )
             .unwrap(),
@@ -520,12 +579,188 @@ mod tests {
         let (ls, lb) = left_batches(40);
         let (rs, rb) = right_batches(200, 30);
         let grace: Arc<dyn ExecutionPlan> = Arc::new(
-            GraceHashJoinExec::try_new(mem_exec(ls, lb), mem_exec(rs, rb), on_ident_ref_a(), 3)
-                .unwrap(),
+            GraceHashJoinExec::try_new(
+                mem_exec(ls, lb),
+                mem_exec(rs, rb),
+                on_ident_ref_a(),
+                JoinType::Inner,
+                None,
+                3,
+            )
+            .unwrap(),
         );
         let a = sorted_rows(Arc::clone(&grace), &ctx).await;
         let b = sorted_rows(grace, &ctx).await;
         assert_eq!(a, b, "re-execution must reproduce the join");
         assert!(a.len() > 4);
+    }
+
+    // ---- Phase 2: semi / anti / residual filter ----
+
+    use datafusion::common::JoinSide;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::BinaryExpr;
+    use datafusion::physical_plan::joins::utils::ColumnIndex;
+
+    /// `left.ident < right.payload` as a residual `JoinFilter` — the
+    /// Q21 shape (equi-key + non-equi residual on other columns).
+    fn lt_filter() -> JoinFilter {
+        let intermediate = Arc::new(Schema::new(vec![
+            Field::new("ident", DataType::Int64, false),
+            Field::new("payload", DataType::Int64, false),
+        ]));
+        JoinFilter::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("ident", 0)),
+                Operator::Lt,
+                Arc::new(Column::new("payload", 1)),
+            )),
+            vec![
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Right,
+                },
+            ],
+            intermediate,
+        )
+    }
+
+    /// Semi/anti parity vs stock across scatter fan-outs. Right covers
+    /// only ident < 40, so LeftSemi and LeftAnti both split the 100
+    /// left rows non-trivially.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parity_left_semi_and_left_anti_across_k() {
+        let ctx = SessionContext::new();
+        let (ls, lb) = left_batches(100);
+        let (rs, rb) = right_batches(400, 40); // ref_a 0..40, dups
+        for join_type in [JoinType::LeftSemi, JoinType::LeftAnti] {
+            let stock = stock_join_typed(
+                mem_exec(Arc::clone(&ls), lb.clone()),
+                mem_exec(Arc::clone(&rs), rb.clone()),
+                on_ident_ref_a(),
+                join_type,
+                None,
+            );
+            let expect = sorted_rows(stock, &ctx).await;
+            assert!(expect.len() > 4, "{join_type:?} oracle must be non-trivial");
+            for k in [1usize, 2, 8] {
+                let grace: Arc<dyn ExecutionPlan> = Arc::new(
+                    GraceHashJoinExec::try_new(
+                        mem_exec(Arc::clone(&ls), lb.clone()),
+                        mem_exec(Arc::clone(&rs), rb.clone()),
+                        on_ident_ref_a(),
+                        join_type,
+                        None,
+                        k,
+                    )
+                    .unwrap(),
+                );
+                let got = sorted_rows(grace, &ctx).await;
+                assert_eq!(got, expect, "grace {join_type:?} (k={k}) != stock");
+            }
+        }
+    }
+
+    /// Residual filter parity for Inner AND LeftAnti (Q21's shape:
+    /// anti join deciding "no match" against equi-key ∧ filter).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parity_with_residual_filter() {
+        let ctx = SessionContext::new();
+        let (ls, lb) = left_batches(100);
+        let (rs, rb) = right_batches(400, 60);
+        for join_type in [JoinType::Inner, JoinType::LeftAnti] {
+            let stock = stock_join_typed(
+                mem_exec(Arc::clone(&ls), lb.clone()),
+                mem_exec(Arc::clone(&rs), rb.clone()),
+                on_ident_ref_a(),
+                join_type,
+                Some(lt_filter()),
+            );
+            let expect = sorted_rows(stock, &ctx).await;
+            assert!(
+                expect.len() > 4,
+                "{join_type:?}+filter oracle must be non-trivial"
+            );
+            let grace: Arc<dyn ExecutionPlan> = Arc::new(
+                GraceHashJoinExec::try_new(
+                    mem_exec(Arc::clone(&ls), lb.clone()),
+                    mem_exec(Arc::clone(&rs), rb.clone()),
+                    on_ident_ref_a(),
+                    join_type,
+                    Some(lt_filter()),
+                    8,
+                )
+                .unwrap(),
+            );
+            let got = sorted_rows(grace, &ctx).await;
+            assert_eq!(got, expect, "grace {join_type:?}+filter != stock");
+        }
+    }
+
+    /// The Phase-2 asymmetry: with a single-valued right side and k=8,
+    /// ≥7 scatter pairs have left rows but NO right spill file. A
+    /// LeftAnti join must still emit those pairs' left rows (Phase 1's
+    /// skip-empty-pair loop would silently drop them).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anti_pairs_without_right_rows_emit_left() {
+        let ctx = SessionContext::new();
+        let (ls, lb) = left_batches(64);
+        let (rs, rb) = right_batches(50, 1); // every right row: ref_a = 0
+        let stock = stock_join_typed(
+            mem_exec(Arc::clone(&ls), lb.clone()),
+            mem_exec(Arc::clone(&rs), rb.clone()),
+            on_ident_ref_a(),
+            JoinType::LeftAnti,
+            None,
+        );
+        let expect = sorted_rows(stock, &ctx).await;
+        let grace: Arc<dyn ExecutionPlan> = Arc::new(
+            GraceHashJoinExec::try_new(
+                mem_exec(Arc::clone(&ls), lb.clone()),
+                mem_exec(Arc::clone(&rs), rb.clone()),
+                on_ident_ref_a(),
+                JoinType::LeftAnti,
+                None,
+                8,
+            )
+            .unwrap(),
+        );
+        let got = sorted_rows(grace, &ctx).await;
+        assert_eq!(
+            got, expect,
+            "anti must emit left rows from right-empty pairs"
+        );
+        // 63 of 64 left rows survive the anti (only ident=0 matches):
+        // strictly more rows than the header/footer lines alone.
+        assert!(
+            got.len() > 60,
+            "anti output suspiciously small: {}",
+            got.len()
+        );
+    }
+
+    /// Unsupported join types are rejected at construction.
+    #[test]
+    fn rejects_unsupported_join_types() {
+        let (ls, lb) = left_batches(4);
+        let (rs, rb) = right_batches(4, 2);
+        for jt in [JoinType::Left, JoinType::Right, JoinType::Full] {
+            assert!(
+                GraceHashJoinExec::try_new(
+                    mem_exec(Arc::clone(&ls), lb.clone()),
+                    mem_exec(Arc::clone(&rs), rb.clone()),
+                    on_ident_ref_a(),
+                    jt,
+                    None,
+                    4,
+                )
+                .is_err(),
+                "{jt:?} must be rejected"
+            );
+        }
     }
 }
