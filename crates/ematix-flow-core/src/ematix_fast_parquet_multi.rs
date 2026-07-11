@@ -183,9 +183,24 @@ impl TableProvider for EmatixFastParquetMultiTableProvider {
         // the single-file provider's machinery: RG assignment, BridgeFilter
         // pushdown, late-mat), then union the per-part execs. Each child yields
         // its own partitions, so the union runs the parts in parallel.
+        //
+        // Σ.MW.1: split the session's partition budget across parts instead of
+        // letting every part size itself to the full `target_partitions` — the
+        // union's width is what the operators above poll CONCURRENTLY, and
+        // parts × target_partitions multiplied the query's decode working set
+        // by the part count (13-part SF100 lineitem: ~182 streams, Q01 ~9 GB
+        // peak, kernel OOM on 32 GB boxes within a few executions). Floor
+        // division keeps Σ(part partitions) ≤ target_partitions once every
+        // part has its guaranteed one; a table with more parts than the budget
+        // degrades to one partition per part (width = part count).
+        let target = state.config_options().execution.target_partitions;
+        let per_part = (target / self.parts.len()).max(1);
         let mut children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(self.parts.len());
         for part in &self.parts {
-            children.push(part.scan(state, projection, filters, limit).await?);
+            children.push(
+                part.scan_with_partition_budget(state, projection, filters, limit, Some(per_part))
+                    .await?,
+            );
         }
         // A single part needs no union wrapper.
         if children.len() == 1 {
@@ -357,6 +372,82 @@ mod tests {
         assert!(EmatixFastParquetMultiTableProvider::try_new_files(vec![]).is_err());
         let dir = tempfile::tempdir().unwrap();
         assert!(EmatixFastParquetMultiTableProvider::try_new_dir(dir.path()).is_err());
+    }
+
+    /// Write a `(id: i64, val: i64)` parquet with `num_rgs` row groups of
+    /// `rows_per_rg` rows each — the shape that exposes the union-width bug
+    /// (single-RG parts can only contribute one partition regardless).
+    fn write_part_multi_rg(path: &Path, base: i64, num_rgs: usize, rows_per_rg: usize) {
+        use datafusion::parquet::basic::{Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+        let f = |n: &str| {
+            Arc::new(
+                PType::primitive_type_builder(n, PhysicalType::INT64)
+                    .with_repetition(Repetition::REQUIRED)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let schema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![f("id"), f("val")])
+                .build()
+                .unwrap(),
+        );
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer =
+            SerializedFileWriter::new(file, schema, Arc::new(WriterProperties::builder().build()))
+                .unwrap();
+        for rg_i in 0..num_rgs {
+            let start = base + (rg_i * rows_per_rg) as i64;
+            let ids: Vec<i64> = (start..start + rows_per_rg as i64).collect();
+            let vals: Vec<i64> = ids.iter().map(|k| k * 2).collect();
+            let mut rg = writer.next_row_group().unwrap();
+            for col_vals in [&ids, &vals] {
+                let mut col = rg.next_column().unwrap().unwrap();
+                if let ColumnWriter::Int64ColumnWriter(t) = col.untyped() {
+                    t.write_batch(col_vals, None, None).unwrap();
+                }
+                col.close().unwrap();
+            }
+            rg.close().unwrap();
+        }
+        writer.close().unwrap();
+    }
+
+    /// Σ.MW.1 (parted-SF100 fast-path OOM): the union must not MULTIPLY scan
+    /// width. Before the per-part budget split, every part independently took
+    /// `min(num_rgs, target_partitions)` partitions — 13 lineitem parts on a
+    /// 14-core box exposed ~182 concurrently-polled decode streams (~13× the
+    /// intended width; Q01 peaked ~9 GB instead of ~2 GB and the 32 GB bench
+    /// boxes kernel-OOM'd within a few executions). With the split,
+    /// Σ(part partitions) stays within the session budget.
+    #[tokio::test]
+    async fn union_width_bounded_by_target_partitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let pdir = dir.path().join("parts");
+        std::fs::create_dir(&pdir).unwrap();
+        for i in 0..3i64 {
+            write_part_multi_rg(&pdir.join(format!("part-{i:04}.parquet")), i * 400, 4, 100);
+        }
+        let prov = EmatixFastParquetMultiTableProvider::try_new_dir(&pdir).unwrap();
+        let config = datafusion::prelude::SessionConfig::new().with_target_partitions(8);
+        let ctx = SessionContext::new_with_config(config);
+        let plan = prov.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let pc = plan.output_partitioning().partition_count();
+        assert!(
+            pc <= 8,
+            "union width must respect target_partitions=8 (3 parts × 4 RGs \
+             used to expose 3 × min(4, 8) = 12), got {pc}"
+        );
+        assert!(pc >= 3, "each part still contributes a partition, got {pc}");
+        // Correctness under the budget: full scan returns every row.
+        ctx.register_table("t", Arc::new(prov)).unwrap();
+        let out = run(&ctx, "SELECT count(*) c FROM t").await;
+        assert!(out.contains("1200"), "3 parts × 400 rows; got {out}");
     }
 
     /// A single part behaves like the plain single-file provider (no union).

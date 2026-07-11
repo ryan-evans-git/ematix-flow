@@ -3045,7 +3045,31 @@ impl TableProvider for EmatixFastParquetTableProvider {
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        self.scan_with_partition_budget(state, projection, filters, limit, None)
+            .await
+    }
+}
+
+impl EmatixFastParquetTableProvider {
+    /// `TableProvider::scan` with an optional per-scan partition cap.
+    ///
+    /// Σ.MW.1 (parted-SF100 fast-path OOM): the multi-file provider
+    /// unions one of these scans per part, and every part independently
+    /// sizing itself to `target_partitions` multiplies the query's
+    /// concurrently-polled decode width by the part count (13 lineitem
+    /// parts × 14 partitions ≈ 182 streams; Q01 peaked ~9 GB instead of
+    /// ~2 GB and 32 GB boxes kernel-OOM'd). The union splits the session
+    /// budget across parts via `max_partitions`; `None` preserves the
+    /// single-file behaviour exactly.
+    pub(crate) async fn scan_with_partition_budget(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
         _limit: Option<usize>,
+        max_partitions: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let projection = projection
             .cloned()
@@ -3059,7 +3083,10 @@ impl TableProvider for EmatixFastParquetTableProvider {
 
         let target_partitions = state.config_options().execution.target_partitions;
         let num_rgs = self.num_row_groups;
-        let num_partitions = num_rgs.min(target_partitions).max(1);
+        let num_partitions = num_rgs
+            .min(target_partitions)
+            .min(max_partitions.unwrap_or(usize::MAX))
+            .max(1);
         // LPT.RG — cost-balanced (LPT) row-group → partition assignment,
         // replacing round-robin (`rg % num_partitions`). Each partition's
         // producer decodes its list sequentially, so the most expensive
