@@ -122,6 +122,19 @@ The `flow` binary, `run_pipeline`, and the typed-Python streaming
 API work without any extras. To build from source, see
 [Development](#development) at the bottom.
 
+### Use with AI agents
+
+The official docs at [ematix.dev](https://ematix.dev) are exposed as
+an MCP server, so any MCP-capable agent can answer ematix-flow
+questions from the docs themselves instead of guessing:
+
+```sh
+claude mcp add --transport http ematix-docs https://9ba370ad-3936-453a-b644-ff67148f5e03.search.ai.cloudflare.com/mcp
+```
+
+Works with Claude Code out of the box; any other MCP client can use
+the same HTTP endpoint.
+
 ---
 
 <a id="connections"></a>
