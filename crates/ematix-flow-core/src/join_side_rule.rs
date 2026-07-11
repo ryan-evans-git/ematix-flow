@@ -505,16 +505,52 @@ fn stat_zero_nulls(p: &Precision<usize>) -> bool {
 /// in the scan's (projected) output schema. Descends through
 /// pass-throughs / `FilterExec` (schema-preserving) and through
 /// `ProjectionExec`s that forward the column unchanged.
+///
+/// Σ.JS.3 (Q09 parted): when the leaf is a parted union
+/// (`EmatixInterleaveUnionExec`, or a stock `UnionExec` some other
+/// plan source produced), resolve to the FIRST part's scan. All
+/// children of one parted union are row-slices of the same logical
+/// table, so a first-row-group sample of part 1 is exactly as
+/// representative as flat's first-row-group sample — while failing
+/// the downcast here meant Q09's swaps never fired on parted and the
+/// 32 GB box paid the page-cache cliff (57.5 s vs 5.8 s flat).
 fn resolve_column_to_scan(
     plan: &Arc<dyn ExecutionPlan>,
     output_index: usize,
 ) -> Option<(&EmatixFastParquetExec, usize)> {
     let (leaf, idx) = resolve_column_to_leaf(plan, output_index)?;
-    let scan = leaf.as_any().downcast_ref::<EmatixFastParquetExec>()?;
+    let scan = match leaf.as_any().downcast_ref::<EmatixFastParquetExec>() {
+        Some(scan) => scan,
+        None => first_part_scan(leaf)?,
+    };
     if idx < scan.schema().fields().len() {
         Some((scan, idx))
     } else {
         None
+    }
+}
+
+/// The first child scan of a parted union, unwrapped through
+/// single-child pass-throughs (planner wrappers like
+/// `CooperativeExec` / `CoalesceBatchesExec` — the Σ.PS.2 lesson).
+/// `None` when `plan` is not a union or its first child does not
+/// bottom out at an ematix scan.
+fn first_part_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&EmatixFastParquetExec> {
+    let any = plan.as_any();
+    if !any.is::<datafusion::physical_plan::union::UnionExec>()
+        && !any.is::<crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>()
+    {
+        return None;
+    }
+    let mut node = plan.children().into_iter().next()?;
+    loop {
+        if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
+            return Some(scan);
+        }
+        if !is_pass_through(node) {
+            return None;
+        }
+        node = node.children().into_iter().next()?;
     }
 }
 
@@ -1492,5 +1528,115 @@ mod tests {
         unsafe { std::env::remove_var("EMAT_JOIN_SIDE_FIX") };
         // Margin default + clamp.
         assert!((SampledJoinSideRule::default().swap_margin - 2.0).abs() < 1e-9);
+    }
+
+    /// Parted dim: `parts` contiguous slices of the same dense-unique
+    /// domain in one directory, registered through the multi-file
+    /// provider (the shape whose plans carry
+    /// `EmatixInterleaveUnionExec`). Returns the directory.
+    fn write_parted_dim(name: &str, rows: usize, parts: usize, match_every: usize) -> PathBuf {
+        let dir = tmp_parquet(name).parent().unwrap().to_path_buf();
+        let per = rows / parts;
+        for p in 0..parts {
+            let lo = p * per;
+            let hi = if p + 1 == parts { rows } else { lo + per };
+            write_dim_range(
+                &dir.join(format!("{name}-{:04}.parquet", p + 1)),
+                lo,
+                hi,
+                match_every,
+            );
+        }
+        dir
+    }
+
+    fn ctx_with_parted(tables: &[(&str, &Path)], parted: &[(&str, &Path)]) -> SessionContext {
+        let ctx = ctx_with(tables);
+        for (name, dir) in parted {
+            let prov =
+                crate::ematix_fast_parquet_multi::EmatixFastParquetMultiTableProvider::try_new_dir(
+                    dir,
+                )
+                .unwrap();
+            ctx.register_table(*name, Arc::new(prov)).unwrap();
+        }
+        ctx
+    }
+
+    /// Σ.JS.3 (Q09 parted, 2026-07-11): a LIKE filter above a parted
+    /// union must be priced by SAMPLING (first part's first row
+    /// group), exactly like the flat single-scan shape — not the flat
+    /// 0.2 default. Before the fix `resolve_column_to_scan` failed
+    /// its downcast on `EmatixInterleaveUnionExec`, Q09's swaps never
+    /// fired on parted, and the 32 GB box paid the page-cache cliff
+    /// (57.5 s parted vs 5.8 s flat, same binary).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parted_sampled_like_selectivity_beats_default() {
+        let dir = write_parted_dim("parted_like", 400, 4, 20); // true 5%
+        let ctx = ctx_with_parted(&[], &[("dim", &dir)]);
+        let plan = physical_plan(&ctx, "SELECT ident FROM dim WHERE pname LIKE '%xyz%'").await;
+        assert!(
+            find_first::<crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>(&plan)
+                .is_some(),
+            "fixture must plan through the parted union:\n{}",
+            plan_text(&plan)
+        );
+        let filter_node =
+            find_first::<FilterExec>(&plan).expect("FilterExec retained above the parted union");
+        let filter = filter_node.as_any().downcast_ref::<FilterExec>().unwrap();
+        let sel = filter_selectivity(filter);
+        assert!(
+            (sel - 0.05).abs() < 1e-9,
+            "parted LIKE must sample the measured 5% like flat does, got {sel}"
+        );
+        let est = estimate_rows(&filter_node).expect("parted filter estimate known");
+        assert!(
+            (est - 20.0).abs() < 1e-6,
+            "filter estimate should be 400 × 0.05 = 20, got {est}"
+        );
+    }
+
+    /// The Q09 shape on a PARTED dim: the swap that fires on flat
+    /// must also fire when the filtered dim is a parted union, and
+    /// the swapped plan must return identical results.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parted_q09_shape_swaps_build_to_filtered_side() {
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        use datafusion::physical_plan::collect;
+
+        let dir = write_parted_dim("parted_shape_dim", 100_000, 4, 100);
+        let fact = tmp_parquet("parted_shape_fact");
+        write_fact(&fact, 10_000);
+        let ctx = ctx_with_parted(&[("fact", &fact)], &[("dim", &dir)]);
+        let sql = "SELECT f.ref_a AS k, count(*) AS c, sum(f.val) AS s \
+                   FROM fact f JOIN dim d ON f.ref_a = d.ident \
+                   WHERE d.pname LIKE '%xyz%' \
+                   GROUP BY f.ref_a ORDER BY k";
+        let plan = physical_plan(&ctx, sql).await;
+        let swapped = rule().optimize(Arc::clone(&plan), &config_opts()).unwrap();
+        assert_ne!(
+            plan_text(&plan),
+            plan_text(&swapped),
+            "the rule must swap on the parted shape as it does on flat:\n{}",
+            plan_text(&plan)
+        );
+        let hj = find_first::<HashJoinExec>(&swapped).expect("hash join after rule");
+        let hj = hj.as_any().downcast_ref::<HashJoinExec>().unwrap();
+        assert!(
+            plan_text(hj.left()).contains("pname"),
+            "build (left) side must be the filtered parted dim:\n{}",
+            plan_text(&swapped)
+        );
+
+        let task_ctx = ctx.task_ctx();
+        let base = collect(plan, Arc::clone(&task_ctx)).await.unwrap();
+        let after = collect(swapped, task_ctx).await.unwrap();
+        let base_rows: usize = base.iter().map(|b| b.num_rows()).sum();
+        assert!(base_rows > 0, "fixture query returns rows");
+        assert_eq!(
+            format!("{}", pretty_format_batches(&base).unwrap()),
+            format!("{}", pretty_format_batches(&after).unwrap()),
+            "swapped parted plan must return identical results"
+        );
     }
 }
