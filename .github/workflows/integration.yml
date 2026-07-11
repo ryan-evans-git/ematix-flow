@@ -72,72 +72,12 @@ name: integration
 #   - workflow_dispatch — manual re-run.
 
 on:
+  # Release tags (`v*`) + the nightly cron below + manual dispatch.
+  # No longer gates every PR/merge: the 40-min container suite is off
+  # the per-push critical path. The nightly run keeps a daily backstop
+  # on main, and the full suite also runs when a release tag is cut.
   push:
-    branches: [main, master]
-    # Skip on changes that can't affect Rust coverage. A LICENSE-
-    # only PR or a docs/markdown tweak would otherwise spend ~30
-    # min spinning up Postgres / MinIO / Kafka / RabbitMQ
-    # containers for nothing.
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE*"
-      - "COPYING*"
-      - "NOTICE*"
-      - "AUTHORS*"
-      - "CONTRIBUTORS*"
-      - "docs/**"
-      - "examples/**/README*"
-      - "examples/**/*.sql"
-      - "examples/**/*.toml"
-      - "python/**"
-      - "scripts/**"
-      - "infra/**"
-      - ".github/workflows/release.yml"
-      - ".gitignore"
-      - ".gitattributes"
-  pull_request:
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE*"
-      - "COPYING*"
-      - "NOTICE*"
-      - "AUTHORS*"
-      - "CONTRIBUTORS*"
-      - "docs/**"
-      - "examples/**/README*"
-      - "examples/**/*.sql"
-      - "examples/**/*.toml"
-      - "python/**"
-      - "scripts/**"
-      - "infra/**"
-      - ".github/workflows/release.yml"
-      - ".gitignore"
-      - ".gitattributes"
-  # `merge_group` fires on the synthetic `gh-readonly-queue/<base>/<sha>`
-  # refs the GitHub merge queue creates when a PR is added. The
-  # integration suite is a required check, so the queue's pre-merge
-  # CI run needs this trigger — otherwise queued PRs never satisfy
-  # the required-status-check set. Same `paths-ignore` filter as
-  # `push` / `pull_request` so a docs-only queue entry doesn't spend
-  # 30 min on testcontainers.
-  merge_group:
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE*"
-      - "COPYING*"
-      - "NOTICE*"
-      - "AUTHORS*"
-      - "CONTRIBUTORS*"
-      - "docs/**"
-      - "examples/**/README*"
-      - "examples/**/*.sql"
-      - "examples/**/*.toml"
-      - "python/**"
-      - "scripts/**"
-      - "infra/**"
-      - ".github/workflows/release.yml"
-      - ".gitignore"
-      - ".gitattributes"
+    tags: ['v*']
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
