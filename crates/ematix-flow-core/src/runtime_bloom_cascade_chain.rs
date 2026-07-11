@@ -698,6 +698,37 @@ fn install_link(
                         };
                         return Ok(Transformed::yes(new));
                     }
+                    // Σ.PS.2: parted target — thread into EVERY part,
+                    // through whatever wrappers planning added.
+                    if n.as_any()
+                        .is::<crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>()
+                    {
+                        let mut kids: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+                        for c in n.children() {
+                            let rewritten = Arc::clone(c)
+                                .transform_up(|inner| {
+                                    if let Some(s) =
+                                        inner.as_any().downcast_ref::<EmatixFastParquetExec>()
+                                    {
+                                        let new: Arc<dyn ExecutionPlan> =
+                                            if s.runtime_sideband().is_some() {
+                                                s.with_extra_runtime_sideband(sb.clone())
+                                            } else {
+                                                s.with_runtime_sideband(sb.clone())
+                                            };
+                                        return Ok(Transformed::yes(new));
+                                    }
+                                    Ok(Transformed::no(inner))
+                                })
+                                .data()?;
+                            kids.push(rewritten);
+                        }
+                        let new =
+                            crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec::try_new(
+                                kids,
+                            )?;
+                        return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
+                    }
                 }
                 Ok(Transformed::no(n))
             })

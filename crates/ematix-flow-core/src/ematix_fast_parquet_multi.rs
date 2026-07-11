@@ -70,6 +70,8 @@ pub struct EmatixInterleaveUnionExec {
     /// Prefix map: output partition `k` executes
     /// `children[map[k].0].execute(map[k].1)`.
     map: Vec<(usize, usize)>,
+    /// RANGE.AGG Stage-2 claim (see `try_new_claiming_hash`).
+    hash_claim: Option<Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>>,
     props: Arc<PlanProperties>,
 }
 
@@ -77,6 +79,30 @@ impl EmatixInterleaveUnionExec {
     /// All children must share the first child's schema. Empty input
     /// is an error.
     pub fn try_new(children: Vec<Arc<dyn ExecutionPlan>>) -> DfResult<Self> {
+        Self::try_new_inner(children, None)
+    }
+
+    /// Like [`Self::try_new`], but the node CLAIMS
+    /// `Partitioning::Hash(exprs, total)` — the RANGE.AGG Stage-2
+    /// trick, lifted to parted scans. The caller must have proven that
+    /// every distinct key lands in exactly one output partition
+    /// (strict-gap chunking within each part AND strict key gaps
+    /// between parts); the claim then lets `EnforceDistribution`
+    /// accept this node as a SinglePartitioned agg's input without
+    /// re-inserting a full-input hash shuffle. Callers must cap the
+    /// claim above the agg with `PartitionClaimResetExec`, exactly as
+    /// the single-file path does.
+    pub fn try_new_claiming_hash(
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        hash_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    ) -> DfResult<Self> {
+        Self::try_new_inner(children, Some(hash_exprs))
+    }
+
+    fn try_new_inner(
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        hash_claim: Option<Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>>,
+    ) -> DfResult<Self> {
         let Some(first) = children.first() else {
             return Err(DataFusionError::Plan(
                 "EmatixInterleaveUnionExec: no children".into(),
@@ -94,15 +120,20 @@ impl EmatixInterleaveUnionExec {
                 map.push((ci, p));
             }
         }
+        let partitioning = match &hash_claim {
+            Some(exprs) => Partitioning::Hash(exprs.clone(), map.len().max(1)),
+            None => Partitioning::UnknownPartitioning(map.len().max(1)),
+        };
         let props = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
-            Partitioning::UnknownPartitioning(map.len().max(1)),
+            partitioning,
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
         Ok(Self {
             children,
             map,
+            hash_claim,
             props,
         })
     }
@@ -141,7 +172,10 @@ impl ExecutionPlan for EmatixInterleaveUnionExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::try_new(children)?))
+        Ok(Arc::new(Self::try_new_inner(
+            children,
+            self.hash_claim.clone(),
+        )?))
     }
     fn execute(
         &self,
