@@ -167,3 +167,13 @@ Decision gate: reassess after the next DataFusion upgrade (spillable
 hash join is on their roadmap); if not landed, prototype (3) then (2),
 each behind a tri-state, each validated with the FULL 22q suite on the
 32 GB box (isolated A/Bs of memory levers do not transfer — proven above).
+
+**Gate resolved 2026-07-11:** upstream spillable hash join has NOT
+landed through DataFusion 54.0.0 (June 2026; proposal epic
+apache/datafusion#17267 still design-stage). Meanwhile the landscape
+moved: Q09 was solved at the plan level (Σ.JS.1/Σ.JS.2, PRs #176/#178)
+and the parted tar pit was scan-width, not paging (Σ.MW.1, PR #179 —
+the union multiplied decode width by the part count; with the budget
+split the parted single-node suite completes). The paging arc continues
+as **grace-partitioned join demotion** driven by the Σ.JS.2 grounded
+estimates — see [SPILLABLE_JOIN.md](SPILLABLE_JOIN.md).
