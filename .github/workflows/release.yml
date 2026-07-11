@@ -85,7 +85,13 @@ jobs:
         run: |
           SHA="${{ github.sha }}"
           REPO="${{ github.repository }}"
-          DEADLINE=$((SECONDS + 1800))  # 30-min cap
+          # 100-min cap. Under tag-only CI (2026-07-11), ci.yml STARTS
+          # at the same moment as this workflow — the gate must outlast
+          # a full CI run (~45 min) plus runner queue time, not the
+          # old always-on-CI case where the SHA was usually green
+          # before the tag. The 30-min cap timed out the v0.14.1
+          # release while its CI was still mid-run.
+          DEADLINE=$((SECONDS + 6000))
           echo "Waiting for ci.yml on $SHA..."
           while [ $SECONDS -lt $DEADLINE ]; do
             run_json=$(gh api \
