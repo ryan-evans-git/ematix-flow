@@ -4115,9 +4115,9 @@ dependencies = [
 
 [[package]]
 name = "ematix-iceberg"
-version = "0.17.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b0482ec6bc9088ada7ee073e8e12f7ade79de9c1cb8602ecb9d4e8963e026ac"
+checksum = "7908cb9e3aa6288fbd3e2f01eefed0500d2729244d027f793b68dc1de35639c3"
 dependencies = [
  "ematix-parquet-codec",
  "iceberg",
@@ -4125,9 +4125,9 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-codec"
-version = "0.17.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5dd7a9cc5b3ba7cd7bf450a64662be1691b6a30171987a1c31aa7571d743b93"
+checksum = "49cd77fa354b5498082b333ea306e8d0b74e96dc307de91033168a2970a97e94"
 dependencies = [
  "brotli",
  "ematix-parquet-format",
@@ -4140,15 +4140,15 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-format"
-version = "0.17.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83389038c04c82cfd3f69e885a01c200bfaa3fc99784fd85271d12689aa4d836"
+checksum = "9a9c8ccb0fb826df9574b294593c88d8d29f7e052a82090899a492a460bcf914"
 
 [[package]]
 name = "ematix-parquet-io"
-version = "0.17.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d60dad0a80c8bbdfe430c0b4e140a370c6192ea18cfc53a7b6e072b8112aa9dc"
+checksum = "7453c51e4ca574d2982b8ba304a3a0b1e8e90b338a8de0e1510886c8b5e2eb06"
 dependencies = [
  "ematix-parquet-format",
 ]
@@ -5235,7 +5235,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -6666,7 +6666,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -7995,7 +7995,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -8033,7 +8033,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -10770,7 +10770,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
