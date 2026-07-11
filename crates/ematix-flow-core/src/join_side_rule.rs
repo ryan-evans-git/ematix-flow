@@ -364,38 +364,136 @@ fn containment_multiplicity(
 }
 
 /// If the column at `output_index` of `plan` resolves (through
-/// pass-throughs, filters and column-forwarding projections) to an
-/// `EmatixFastParquetExec` column that is provably dense-unique BEFORE
-/// filtering — Exact `null_count == 0` and Exact integer min/max with
+/// pass-throughs, filters and column-forwarding projections) to a
+/// scan-leaf column that is provably dense-unique BEFORE filtering —
+/// Exact `null_count == 0` and Exact integer min/max with
 /// `max − min + 1 == unfiltered_rows` — return the key domain size.
+///
+/// Σ.JS.2 (Q21 SF100 parted, 2026-07-11): grounding accepts BOTH scan
+/// flavors — `EmatixFastParquetExec` (the single-node fast path) and
+/// arrow parquet leaves (`register_parquet`/ListingTable, the
+/// distributed/mesh registration), the latter through DF's own
+/// statistics and ONLY where they are Exact. Before this, arrow
+/// plans could never ground a PK side, every PK-FK join fell to the
+/// ungrounded `min(l, r)` fallback (supplier ⨝ lineitem priced at
+/// |supplier|), and the enclosing join swapped its build onto a
+/// ~600M-row intermediate — a 48.6 GB peak the 32 GB bench
+/// coordinators answered with a kernel OOM.
 fn dense_unique_domain(plan: &Arc<dyn ExecutionPlan>, output_index: usize) -> Option<f64> {
-    let (scan, idx) = resolve_column_to_scan(plan, output_index)?;
-    let cs = scan.column_stats().get(idx)?;
-    if !matches!(cs.null_count, Precision::Exact(0)) {
+    let (leaf, idx) = resolve_column_to_leaf(plan, output_index)?;
+    let (cs, unfiltered_rows) = leaf_column_stats(leaf, idx)?;
+    if !stat_zero_nulls(&cs.null_count) {
         return None;
     }
-    let min = exact_int(&cs.min_value)?;
-    let max = exact_int(&cs.max_value)?;
+    let min = stat_int(&cs.min_value)?;
+    let max = stat_int(&cs.max_value)?;
     if max < min {
         return None;
     }
     let domain = max - min + 1;
-    if domain == scan.num_rows() as i128 {
+    if domain == unfiltered_rows as i128 {
         Some(domain as f64)
     } else {
         None
     }
 }
 
-/// Exact integer bound from a `ColumnStatistics` min/max.
-fn exact_int(p: &Precision<ScalarValue>) -> Option<i128> {
-    match p {
-        Precision::Exact(ScalarValue::Int64(Some(v))) => Some(*v as i128),
-        Precision::Exact(ScalarValue::Int32(Some(v))) => Some(*v as i128),
-        Precision::Exact(ScalarValue::UInt64(Some(v))) => Some(*v as i128),
-        Precision::Exact(ScalarValue::UInt32(Some(v))) => Some(*v as i128),
-        _ => None,
+/// Column statistics + unfiltered row count at a resolved scan leaf.
+/// Exact-only for arrow leaves: exactness IS the honesty criterion —
+/// an Inexact merge (pruned scan, stats-less file in a multi-file
+/// group) must fall back to ungrounded, never fake-ground.
+fn leaf_column_stats(
+    leaf: &Arc<dyn ExecutionPlan>,
+    idx: usize,
+) -> Option<(datafusion::common::ColumnStatistics, u64)> {
+    if let Some(scan) = leaf.as_any().downcast_ref::<EmatixFastParquetExec>() {
+        let cs = scan.column_stats().get(idx)?.clone();
+        return Some((cs, scan.num_rows() as u64));
     }
+    // Union of same-schema scans — the multi-file (parted) provider
+    // shape: `UnionExec[EmatixFastParquetExec × N]`. Merge the
+    // children's Exact stats: min-of-mins, max-of-maxes, summed rows
+    // and nulls. Overlapping part files are naturally rejected by
+    // the caller's `domain == rows` density check (their row sum
+    // exceeds the merged domain), so merging stays conservative.
+    if leaf
+        .as_any()
+        .is::<datafusion::physical_plan::union::UnionExec>()
+    {
+        let mut rows: u64 = 0;
+        let mut min = i128::MAX;
+        let mut max = i128::MIN;
+        for child in leaf.children() {
+            let (cleaf, cidx) = resolve_column_to_leaf(child, idx)?;
+            let (cs, r) = leaf_column_stats(cleaf, cidx)?;
+            if !stat_zero_nulls(&cs.null_count) {
+                return None;
+            }
+            min = min.min(stat_int(&cs.min_value)?);
+            max = max.max(stat_int(&cs.max_value)?);
+            rows = rows.checked_add(r)?;
+        }
+        if rows == 0 || min > max || i64::try_from(min).is_err() || i64::try_from(max).is_err() {
+            return None;
+        }
+        let cs = datafusion::common::ColumnStatistics {
+            null_count: Precision::Exact(0),
+            min_value: Precision::Exact(ScalarValue::Int64(Some(min as i64))),
+            max_value: Precision::Exact(ScalarValue::Int64(Some(max as i64))),
+            ..Default::default()
+        };
+        return Some((cs, rows));
+    }
+    // Arrow scan leaves (DataSourceExec parquet). Leaf-ness is the
+    // shape guarantee: no children means the reported statistics are
+    // the file footers', not something derived.
+    if !leaf.children().is_empty() {
+        return None;
+    }
+    let stats = leaf.partition_statistics(None).ok()?;
+    if crate::flags::present("EMAT_JOIN_SIDE_TRACE") {
+        eprintln!(
+            "[join_side] arrow leaf stats: rows={:?} col[{idx}]={:?}",
+            stats.num_rows,
+            stats.column_statistics.get(idx),
+        );
+    }
+    // Exact OR Inexact — see `stat_int`: a pushed predicate (even an
+    // empty DynamicFilter placeholder) downgrades the tag while the
+    // values stay footer-true; the caller's density identity is the
+    // actual proof and safely refuses estimated counts.
+    let rows = match stats.num_rows {
+        Precision::Exact(n) | Precision::Inexact(n) => n as u64,
+        Precision::Absent => return None,
+    };
+    let cs = stats.column_statistics.get(idx)?.clone();
+    Some((cs, rows))
+}
+
+/// Integer bound from a `ColumnStatistics` min/max, Exact OR Inexact.
+/// Σ.JS.2: DF downgrades a scan's statistics to Inexact the moment a
+/// predicate (even an empty `DynamicFilter` placeholder) is pushed
+/// into it, while the reported VALUES stay the footer truth. The
+/// density identity (`max − min + 1 == rows`) is the proof grounding
+/// leans on — a genuinely estimated count essentially never satisfies
+/// it, and a post-filter-scaled row count breaks it and safely
+/// refuses (see `dense_unique_grounds_on_inexact_footer_values`).
+fn stat_int(p: &Precision<ScalarValue>) -> Option<i128> {
+    match p {
+        Precision::Exact(v) | Precision::Inexact(v) => match v {
+            ScalarValue::Int64(Some(v)) => Some(*v as i128),
+            ScalarValue::Int32(Some(v)) => Some(*v as i128),
+            ScalarValue::UInt64(Some(v)) => Some(*v as i128),
+            ScalarValue::UInt32(Some(v)) => Some(*v as i128),
+            _ => None,
+        },
+        Precision::Absent => None,
+    }
+}
+
+/// Null-count is zero, Exact or Inexact (same Σ.JS.2 rationale).
+fn stat_zero_nulls(p: &Precision<usize>) -> bool {
+    matches!(p, Precision::Exact(0) | Precision::Inexact(0))
 }
 
 /// Trace the column at `output_index` of `plan` down to the underlying
@@ -407,18 +505,30 @@ fn resolve_column_to_scan(
     plan: &Arc<dyn ExecutionPlan>,
     output_index: usize,
 ) -> Option<(&EmatixFastParquetExec, usize)> {
-    let any = plan.as_any();
-    if let Some(scan) = any.downcast_ref::<EmatixFastParquetExec>() {
-        if output_index < scan.schema().fields().len() {
-            return Some((scan, output_index));
-        }
-        return None;
+    let (leaf, idx) = resolve_column_to_leaf(plan, output_index)?;
+    let scan = leaf.as_any().downcast_ref::<EmatixFastParquetExec>()?;
+    if idx < scan.schema().fields().len() {
+        Some((scan, idx))
+    } else {
+        None
     }
+}
+
+/// Walk `plan`'s column at `output_index` down through pass-throughs,
+/// filters and column-forwarding projections to the first
+/// non-wrapper node, returning that node and the column's index in
+/// its schema. Shared by sampling (which then requires an ematix
+/// scan) and dense-unique grounding (which accepts any honest leaf).
+fn resolve_column_to_leaf(
+    plan: &Arc<dyn ExecutionPlan>,
+    output_index: usize,
+) -> Option<(&Arc<dyn ExecutionPlan>, usize)> {
+    let any = plan.as_any();
     if let Some(proj) = any.downcast_ref::<datafusion::physical_plan::projection::ProjectionExec>()
     {
         let proj_expr = proj.expr().get(output_index)?;
         let col = proj_expr.expr.as_any().downcast_ref::<Column>()?;
-        return resolve_column_to_scan(proj.input(), col.index());
+        return resolve_column_to_leaf(proj.input(), col.index());
     }
     if let Some(filter) = any.downcast_ref::<FilterExec>() {
         // A DF 53 FilterExec may carry an embedded projection
@@ -429,12 +539,12 @@ fn resolve_column_to_scan(
             Some(proj) => *proj.get(output_index)?,
             None => output_index,
         };
-        return resolve_column_to_scan(filter.input(), input_index);
+        return resolve_column_to_leaf(filter.input(), input_index);
     }
     if is_pass_through(plan) {
-        return resolve_column_to_scan(plan.children().first()?, output_index);
+        return resolve_column_to_leaf(plan.children().first()?, output_index);
     }
-    None
+    (output_index < plan.schema().fields().len()).then_some((plan, output_index))
 }
 
 // ============================================================
@@ -650,6 +760,13 @@ mod tests {
     /// Dimension table: dense-unique `ident` 0..rows, string `pname`
     /// where one row in `match_every` contains "xyz".
     fn write_dim(path: &Path, rows: usize, match_every: usize) {
+        write_dim_range(path, 0, rows, match_every);
+    }
+
+    /// `write_dim` with an explicit `ident` range `lo..hi` — parted
+    /// PART FILES are this: contiguous, non-overlapping slices of one
+    /// dense-unique domain.
+    fn write_dim_range(path: &Path, lo: usize, hi: usize, match_every: usize) {
         let schema = Arc::new(
             PType::group_type_builder("schema")
                 .with_fields(vec![
@@ -673,13 +790,13 @@ mod tests {
         let file = File::create(path).unwrap();
         let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
         let mut rg = writer.next_row_group().unwrap();
-        let ident: Vec<i64> = (0..rows as i64).collect();
+        let ident: Vec<i64> = (lo as i64..hi as i64).collect();
         let mut col = rg.next_column().unwrap().unwrap();
         if let ColumnWriter::Int64ColumnWriter(t) = col.untyped() {
             t.write_batch(&ident, None, None).unwrap();
         }
         col.close().unwrap();
-        let names: Vec<ByteArray> = (0..rows)
+        let names: Vec<ByteArray> = (lo..hi)
             .map(|i| {
                 let s = if i % match_every == 0 {
                     format!("shiny xyz widget {i}")
@@ -1009,6 +1126,351 @@ mod tests {
             plan_text(&out),
             "a join with an unknown-side estimate must stay untouched"
         );
+    }
+
+    /// Fact table whose FK REPEATS (`ref_a = i % fk_mod`,
+    /// `ref_b = i % b_mod`) — the lineitem shape, where the FK column
+    /// is provably NOT dense-unique. `write_fact`'s sequential
+    /// `ref_a` can't model this: it is accidentally dense-unique.
+    fn write_fact_fk(path: &Path, rows: usize, fk_mod: usize, b_mod: usize) {
+        let schema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![i64_field("ref_a"), i64_field("ref_b")])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = File::create(path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        for m in [fk_mod, b_mod] {
+            let vals: Vec<i64> = (0..rows).map(|i| (i % m) as i64).collect();
+            let mut col = rg.next_column().unwrap().unwrap();
+            if let ColumnWriter::Int64ColumnWriter(t) = col.untyped() {
+                t.write_batch(&vals, None, None).unwrap();
+            }
+            col.close().unwrap();
+        }
+        rg.close().unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Arrow-path session: the same session knobs as `ctx_with`, but
+    /// tables registered through DF's own `register_parquet`
+    /// (ListingTable) — the registration the distributed/mesh
+    /// campaign path uses. Statistics collection ON so the leaves
+    /// carry the Exact footer stats the estimator must ground on.
+    async fn arrow_ctx_with(tables: &[(&str, &Path)]) -> SessionContext {
+        let mut config = SessionConfig::new().with_target_partitions(2);
+        {
+            let opts = config.options_mut();
+            opts.optimizer.hash_join_single_partition_threshold = 0;
+            opts.optimizer.hash_join_single_partition_threshold_rows = 0;
+            opts.execution.collect_statistics = true;
+        }
+        let ctx = SessionContext::new_with_config(config);
+        for (name, path) in tables {
+            ctx.register_parquet(*name, path.to_str().unwrap(), Default::default())
+                .await
+                .unwrap();
+        }
+        ctx
+    }
+
+    /// Σ.JS.2 (Q21 SF100 parted regression, 2026-07-11): a PK-FK
+    /// Inner join estimated over ARROW scans must not collapse to the
+    /// PK side's row count. supplier(1M) ⨝ lineitem(600M) is
+    /// row-preserving on LINEITEM; the ungrounded `min(l, r)`
+    /// fallback priced it at 1M, and the enclosing o_orderkey join
+    /// then swapped its build onto the ~600M-row intermediate —
+    /// 48.6 GB peak, kernel OOM on the 32 GB bench coordinators.
+    /// Arrow parquet leaves carry Exact footer stats, so the
+    /// dense-unique PK side MUST ground and the estimate MUST be the
+    /// FK side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_pk_fk_join_estimate_is_fk_side() {
+        let dim = tmp_parquet("arrow_pkfk_dim");
+        let fact = tmp_parquet("arrow_pkfk_fact");
+        write_dim(&dim, 100, 100); // dense-unique ident 0..100 (the PK side)
+        write_fact_fk(&fact, 10_000, 100, 2_000); // ref_a repeats ×100 (the FK side)
+        let ctx = arrow_ctx_with(&[("dim", &dim), ("fact", &fact)]).await;
+        let plan = physical_plan(
+            &ctx,
+            "SELECT f.ref_a FROM fact f JOIN dim d ON f.ref_a = d.ident",
+        )
+        .await;
+        let hj = find_first::<HashJoinExec>(&plan).expect("hash join in arrow plan");
+        let est = estimate_rows(&hj).expect("arrow PK-FK join estimate must be known");
+        assert!(
+            est >= 9_000.0,
+            "PK-FK join over arrow scans is row-preserving on the FK \
+             side (10 000 rows); the estimate must not collapse to the \
+             PK side's 100, got {est}\n{}",
+            plan_text(&plan)
+        );
+    }
+
+    /// Q21 in miniature on the ARROW path: filtered ord JOIN
+    /// (sup ⨝ li). The honest probe estimate is the 10 000-row li
+    /// intermediate — far bigger than the filtered ord build — so the
+    /// rule must leave the plan untouched. Under the ungrounded-min
+    /// bug the probe subtree priced at |sup| = 100 and the rule
+    /// swapped the build onto the li intermediate: Q21's 48.6 GB
+    /// blow-up in miniature.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn q21_shape_arrow_path_does_not_swap() {
+        let sup = tmp_parquet("q21_sup");
+        let li = tmp_parquet("q21_li");
+        let ord = tmp_parquet("q21_ord");
+        write_dim(&sup, 100, 100); // dense-unique ident 0..100
+        write_fact_fk(&li, 10_000, 100, 2_000); // ref_a → sup, ref_b → ord
+        write_dim(&ord, 2_000, 100); // dense-unique ident 0..2000, pname filterable
+        let ctx = arrow_ctx_with(&[("sup", &sup), ("li", &li), ("ord", &ord)]).await;
+        let plan = physical_plan(
+            &ctx,
+            "SELECT o.ident FROM ord o \
+             JOIN (SELECT li.ref_b FROM sup JOIN li ON sup.ident = li.ref_a) x \
+             ON o.ident = x.ref_b \
+             WHERE o.pname LIKE '%xyz%'",
+        )
+        .await;
+        let out = rule().optimize(Arc::clone(&plan), &config_opts()).unwrap();
+        assert_eq!(
+            plan_text(&plan),
+            plan_text(&out),
+            "no join in the Q21 shape may swap: every honest estimate \
+             says the current builds are already the small sides"
+        );
+    }
+
+    /// The literal Q21 parted PK-side shape: a parted DIRECTORY —
+    /// `UnionExec[EmatixFastParquetExec × N]` from the multi-file
+    /// provider — with contiguous per-file `ident` ranges, joined to
+    /// an arrow-registered fact (the campaign's exact mixed
+    /// registration). Grounding must merge stats across the union so
+    /// the PK-FK estimate stays the FK side. This is the shape that
+    /// mis-priced supplier ⨝ lineitem at |supplier| in production
+    /// and swapped Q21 onto a ~600M-row build.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parted_union_pk_side_grounds_estimate() {
+        let part1 = tmp_parquet("dim-0001");
+        let dir = part1.parent().unwrap().to_path_buf();
+        write_dim_range(&part1, 0, 50, 50);
+        write_dim_range(&dir.join("dim-0002.parquet"), 50, 100, 50);
+        let fact = tmp_parquet("parted_union_fact");
+        write_fact_fk(&fact, 10_000, 100, 2_000);
+
+        let mut config = SessionConfig::new().with_target_partitions(2);
+        {
+            let opts = config.options_mut();
+            opts.optimizer.hash_join_single_partition_threshold = 0;
+            opts.optimizer.hash_join_single_partition_threshold_rows = 0;
+            opts.execution.collect_statistics = true;
+        }
+        let ctx = SessionContext::new_with_config(config);
+        let prov =
+            crate::ematix_fast_parquet_multi::EmatixFastParquetMultiTableProvider::try_new_dir(
+                &dir,
+            )
+            .unwrap();
+        ctx.register_table("dim", Arc::new(prov)).unwrap();
+        ctx.register_parquet("fact", fact.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+
+        let plan = physical_plan(
+            &ctx,
+            "SELECT f.ref_a FROM fact f JOIN dim d ON f.ref_a = d.ident",
+        )
+        .await;
+        let hj = find_first::<HashJoinExec>(&plan).expect("hash join in parted plan");
+        let est = estimate_rows(&hj).expect("parted PK-FK join estimate must be known");
+        assert!(
+            est >= 9_000.0,
+            "union-of-parts PK side must ground; the estimate is the \
+             10 000-row FK side, not |dim| = 100 — got {est}\n{}",
+            plan_text(&plan)
+        );
+    }
+
+    /// The distributed/mesh registration verbatim: `register_parquet`
+    /// on the parted DIRECTORY. DF's ListingTable merges the part
+    /// files' footer stats and downgrades them to Inexact — the
+    /// VALUES are still the footer truth, and the density identity
+    /// (max − min + 1 == rows) is the proof grounding leans on.
+    /// This is the exact session shape whose ungrounded estimate
+    /// swapped Q21 onto a ~600M-row build on the live mesh.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_dir_registration_inexact_stats_still_ground() {
+        let part1 = tmp_parquet("adim-0001");
+        let dir = part1.parent().unwrap().to_path_buf();
+        write_dim_range(&part1, 0, 50, 50);
+        write_dim_range(&dir.join("adim-0002.parquet"), 50, 100, 50);
+        let fact = tmp_parquet("adir_fact");
+        write_fact_fk(&fact, 10_000, 100, 2_000);
+        // Production-faithful session: high target_partitions (files
+        // split into byte ranges) and collect_statistics LEFT AT ITS
+        // DEFAULT — the campaign session never enables it, so the
+        // parquet listing reports lazily-merged stats downgraded to
+        // Inexact. The VALUES are still the footer truth; only the
+        // Precision tag drops.
+        let mut config = SessionConfig::new().with_target_partitions(16);
+        {
+            let opts = config.options_mut();
+            opts.optimizer.hash_join_single_partition_threshold = 0;
+            opts.optimizer.hash_join_single_partition_threshold_rows = 0;
+        }
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_parquet("dim", dir.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+        ctx.register_parquet("fact", fact.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+        let plan = physical_plan(
+            &ctx,
+            "SELECT f.ref_a FROM fact f JOIN dim d ON f.ref_a = d.ident",
+        )
+        .await;
+        let hj = find_first::<HashJoinExec>(&plan).expect("hash join in dir-registered plan");
+        let est = estimate_rows(&hj).expect("dir-registered PK-FK estimate must be known");
+        assert!(
+            est >= 9_000.0,
+            "multi-file dir registration (Inexact merged stats) must \
+             still ground the dense-unique PK side — got {est}\n{}",
+            plan_text(&plan)
+        );
+    }
+
+    /// Bare leaf reporting fixed statistics — stands in for the
+    /// production mesh scans, whose stats DF downgrades to Inexact
+    /// once a DynamicFilter is pushed onto them (every probe-side
+    /// scan under a CollectLeft join). Values remain footer truth.
+    #[derive(Debug)]
+    struct MockLeafExec {
+        props: Arc<datafusion::physical_plan::PlanProperties>,
+        stats: datafusion::common::Statistics,
+    }
+
+    impl MockLeafExec {
+        fn new(rows: Precision<usize>, cs: datafusion::common::ColumnStatistics) -> Self {
+            use datafusion::arrow::datatypes::{DataType, Field, Schema};
+            use datafusion::physical_expr::EquivalenceProperties;
+            use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+            use datafusion::physical_plan::{Partitioning, PlanProperties};
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "ident",
+                DataType::Int64,
+                false,
+            )]));
+            let stats = datafusion::common::Statistics {
+                num_rows: rows,
+                total_byte_size: Precision::Absent,
+                column_statistics: vec![cs],
+            };
+            Self {
+                props: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(Arc::clone(&schema)),
+                    Partitioning::UnknownPartitioning(1),
+                    EmissionType::Incremental,
+                    Boundedness::Bounded,
+                )),
+                stats,
+            }
+        }
+    }
+
+    impl datafusion::physical_plan::DisplayAs for MockLeafExec {
+        fn fmt_as(
+            &self,
+            _t: datafusion::physical_plan::DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(f, "MockLeafExec")
+        }
+    }
+
+    impl ExecutionPlan for MockLeafExec {
+        fn name(&self) -> &str {
+            "MockLeafExec"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+            &self.props
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _c: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _p: usize,
+            _cx: Arc<datafusion::execution::TaskContext>,
+        ) -> Result<datafusion::execution::SendableRecordBatchStream> {
+            unreachable!("plan-time only")
+        }
+        fn partition_statistics(
+            &self,
+            _p: Option<usize>,
+        ) -> Result<datafusion::common::Statistics> {
+            Ok(self.stats.clone())
+        }
+    }
+
+    fn inexact_cs(min: i64, max: i64) -> datafusion::common::ColumnStatistics {
+        datafusion::common::ColumnStatistics {
+            null_count: Precision::Inexact(0),
+            min_value: Precision::Inexact(ScalarValue::Int64(Some(min))),
+            max_value: Precision::Inexact(ScalarValue::Int64(Some(max))),
+            ..Default::default()
+        }
+    }
+
+    /// Σ.JS.2: Inexact-tagged stats whose VALUES satisfy the density
+    /// identity (max − min + 1 == rows) must ground — the identity,
+    /// not the Precision tag, is the proof. The production mesh
+    /// session tags every DynamicFilter-carrying scan Inexact while
+    /// still reporting footer-true values; refusing them re-opens
+    /// the Q21 mis-swap. Values that BREAK the identity (a truly
+    /// estimated count) must keep refusing.
+    #[test]
+    fn dense_unique_grounds_on_inexact_footer_values() {
+        let dense: Arc<dyn ExecutionPlan> = Arc::new(MockLeafExec::new(
+            Precision::Inexact(1_000_000),
+            inexact_cs(1, 1_000_000),
+        ));
+        assert_eq!(
+            dense_unique_domain(&dense, 0),
+            Some(1_000_000.0),
+            "Inexact footer-true values satisfying the density identity must ground"
+        );
+        // A post-filter-scaled row estimate breaks the identity → refuse.
+        let scaled: Arc<dyn ExecutionPlan> = Arc::new(MockLeafExec::new(
+            Precision::Inexact(200_000),
+            inexact_cs(1, 1_000_000),
+        ));
+        assert_eq!(
+            dense_unique_domain(&scaled, 0),
+            None,
+            "estimated (identity-breaking) stats must NOT ground"
+        );
+        // Absent stats must refuse regardless.
+        let absent: Arc<dyn ExecutionPlan> = Arc::new(MockLeafExec::new(
+            Precision::Absent,
+            datafusion::common::ColumnStatistics::new_unknown(),
+        ));
+        assert_eq!(dense_unique_domain(&absent, 0), None);
     }
 
     /// Default construction snapshots the EMAT_JOIN_SIDE_FIX env gate
