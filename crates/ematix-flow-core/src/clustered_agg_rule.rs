@@ -199,22 +199,89 @@ pub(crate) fn plan_disjoint_chunks(
     Some(chunks)
 }
 
+/// What the agg chain bottoms out on: one ematix scan, or the parted
+/// provider's width-pinned union of them (Σ.PS.2).
+enum ClusteredSource<'a> {
+    Single(&'a EmatixFastParquetExec),
+    Parted(Vec<&'a EmatixFastParquetExec>),
+}
+
 /// Walk through batching pass-throughs (they neither reorder rows
-/// across partitions nor change partitioning) to the scan.
+/// across partitions nor change partitioning) to the scan — or to the
+/// parted union whose children are all plain scans.
 #[allow(deprecated)] // CoalesceBatchesExec still appears in DF 53 plans
-fn unwrap_to_emat_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&EmatixFastParquetExec> {
+fn unwrap_to_clustered_source(plan: &Arc<dyn ExecutionPlan>) -> Option<ClusteredSource<'_>> {
     let any = plan.as_any();
     if let Some(scan) = any.downcast_ref::<EmatixFastParquetExec>() {
-        return Some(scan);
+        return Some(ClusteredSource::Single(scan));
+    }
+    if let Some(union) =
+        any.downcast_ref::<crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>()
+    {
+        let mut parts = Vec::with_capacity(union.children().len());
+        for c in union.children() {
+            parts.push(c.as_any().downcast_ref::<EmatixFastParquetExec>()?);
+        }
+        if parts.len() < 2 {
+            return None;
+        }
+        return Some(ClusteredSource::Parted(parts));
     }
     if any.is::<datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec>() {
-        return unwrap_to_emat_scan(plan.children().first()?);
+        return unwrap_to_clustered_source(plan.children().first()?);
     }
     // CooperativeExec wraps leaf scans in DF 53 (yield points).
     if plan.name() == "CooperativeExec" {
-        return unwrap_to_emat_scan(plan.children().first()?);
+        return unwrap_to_clustered_source(plan.children().first()?);
     }
     None
+}
+
+/// Per-scan half of the union arm: validate the scan shape, sweep its
+/// RG stats for `file_col`, and plan strict-gap chunks with
+/// `target_parts`. Returns the re-chunked (hash-claiming) scan plus
+/// the file's overall key span `[min, max]`.
+fn chunk_one_part(
+    scan: &EmatixFastParquetExec,
+    file_col: usize,
+    gexpr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    target_parts: usize,
+    trace: bool,
+) -> Option<(Arc<dyn ExecutionPlan>, (i64, i64))> {
+    if scan.filter().is_some() || scan.runtime_sideband().is_some() {
+        if trace {
+            eprintln!(
+                "[range_agg] DECLINE {}: part scan carries a filter/sideband",
+                scan.path()
+            );
+        }
+        return None;
+    }
+    let path = std::path::PathBuf::from(scan.path());
+    let n_rgs: usize = scan.assignments().iter().map(|c| c.len()).sum();
+    let Ok((mut ranges, mut rg_rows)) =
+        crate::ematix_parquet_bridge::rg_i64_ranges_and_counts(&path, file_col)
+    else {
+        if trace {
+            eprintln!(
+                "[range_agg] DECLINE {}: RG stats sweep failed for col {file_col}",
+                scan.path()
+            );
+        }
+        return None;
+    };
+    if ranges.len() < n_rgs {
+        return None;
+    }
+    ranges.truncate(n_rgs);
+    rg_rows.truncate(n_rgs);
+    let span = (
+        ranges.first().copied().flatten()?.0,
+        ranges.last().copied().flatten()?.1,
+    );
+    let chunks = plan_disjoint_chunks(&ranges, &rg_rows, target_parts)?;
+    let new_scan = scan.with_assignments_claiming_hash(chunks, vec![Arc::clone(gexpr)]);
+    Some((new_scan, span))
 }
 
 /// See module docs.
@@ -258,14 +325,120 @@ impl PhysicalOptimizerRule for ClusteredSinglePhaseAggRule {
             if !matches!(partial.mode(), AggregateMode::Partial) {
                 return Ok(Transformed::no(node));
             }
-            let Some(scan) = unwrap_to_emat_scan(partial.input()) else {
+            // Group key first — both source arms need it. Partial's
+            // group expr is against the scan output schema, so a
+            // Column reference's index maps through each scan's
+            // projection().
+            let group_col = partial.group_expr().expr().first().cloned();
+            let Some((gexpr, _gname)) = group_col else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(col) = gexpr
+                .as_any()
+                .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+            else {
                 if trace {
-                    eprintln!(
-                        "[range_agg] DECLINE: Partial input is not an Emat scan (got {})",
-                        partial.input().name()
-                    );
+                    eprintln!("[range_agg] DECLINE: group key is not a bare column");
                 }
                 return Ok(Transformed::no(node));
+            };
+            let scan = match unwrap_to_clustered_source(partial.input()) {
+                None => {
+                    if trace {
+                        eprintln!(
+                            "[range_agg] DECLINE: Partial input is not an Emat scan (got {})",
+                            partial.input().name()
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
+                // ---- Σ.PS.2: the parted provider's union of scans ----
+                //
+                // Sound iff (a) every part is internally strict-gap
+                // chunkable (per-part plan_disjoint_chunks) and (b)
+                // consecutive parts have STRICT key gaps — a key
+                // spanning two parts would land in two output
+                // partitions of the 1:1 interleave union and the
+                // SinglePartitioned agg would emit it twice.
+                Some(ClusteredSource::Parted(parts)) => {
+                    let proj0 = parts[0].projection();
+                    if !parts.iter().all(|p| p.projection() == proj0) {
+                        return Ok(Transformed::no(node));
+                    }
+                    let Some(&file_col) = proj0.get(col.index()) else {
+                        return Ok(Transformed::no(node));
+                    };
+                    let target = config.execution.target_partitions.max(2);
+                    let per_part_target = target.div_ceil(parts.len()).max(2);
+                    let mut rebuilt: Vec<Arc<dyn ExecutionPlan>> =
+                        Vec::with_capacity(parts.len());
+                    let mut spans: Vec<(i64, i64)> = Vec::with_capacity(parts.len());
+                    let mut ok = true;
+                    for part in &parts {
+                        match chunk_one_part(part, file_col, &gexpr, per_part_target, trace) {
+                            Some((scan, span)) => {
+                                rebuilt.push(scan);
+                                spans.push(span);
+                            }
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        return Ok(Transformed::no(node));
+                    }
+                    for w in spans.windows(2) {
+                        if w[0].1 >= w[1].0 {
+                            if trace {
+                                eprintln!(
+                                    "[range_agg] DECLINE parted: part key spans overlap/touch \
+                                     ({:?} then {:?}) — cannot prove disjoint partitions",
+                                    w[0], w[1]
+                                );
+                            }
+                            return Ok(Transformed::no(node));
+                        }
+                    }
+                    if trace {
+                        eprintln!(
+                            "[range_agg] FIRE parted: col {file_col}, {} parts, {} total chunks",
+                            parts.len(),
+                            rebuilt
+                                .iter()
+                                .map(|c| c.properties().output_partitioning().partition_count())
+                                .sum::<usize>()
+                        );
+                    }
+                    let union =
+                        crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec::try_new_claiming_hash(
+                            rebuilt,
+                            vec![Arc::clone(&gexpr)],
+                        )?;
+                    let single = AggregateExec::try_new(
+                        AggregateMode::SinglePartitioned,
+                        partial.group_expr().clone(),
+                        partial.aggr_expr().to_vec(),
+                        partial.filter_expr().to_vec(),
+                        Arc::new(union),
+                        Arc::clone(&partial.input_schema()),
+                    )?;
+                    if single.schema() != final_agg.schema() {
+                        if trace {
+                            eprintln!(
+                                "[range_agg] DECLINE parted: SinglePartitioned schema != Final"
+                            );
+                        }
+                        return Ok(Transformed::no(node));
+                    }
+                    return Ok(Transformed::yes(Arc::new(
+                        crate::partition_claim_reset_exec::PartitionClaimResetExec::new(Arc::new(
+                            single,
+                        )),
+                    )));
+                }
+                Some(ClusteredSource::Single(s)) => s,
             };
             // The scan must be a plain dense scan: no pushed filter or
             // runtime sideband (those drop rows — still key-disjoint,
@@ -281,24 +454,6 @@ impl PhysicalOptimizerRule for ClusteredSinglePhaseAggRule {
                 return Ok(Transformed::no(node));
             }
             // Resolve the group key to the scan's FILE column index.
-            // Partial's group expr is against the scan output schema, so
-            // a Column reference's index maps through scan.projection().
-            let group_col = partial.group_expr().expr().first().cloned();
-            let Some((gexpr, _gname)) = group_col else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(col) = gexpr
-                .as_any()
-                .downcast_ref::<datafusion::physical_expr::expressions::Column>()
-            else {
-                if trace {
-                    eprintln!(
-                        "[range_agg] DECLINE {}: group key is not a bare column",
-                        scan.path()
-                    );
-                }
-                return Ok(Transformed::no(node));
-            };
             let Some(&file_col) = scan.projection().get(col.index()) else {
                 if trace {
                     eprintln!(
@@ -507,6 +662,169 @@ mod tests {
         )
         .unwrap();
         ctx
+    }
+
+    /// Σ.PS.2 fixture: N part files, each clustered on `k` with
+    /// DISJOINT key ranges across parts (part i covers
+    /// [i*key_stride, i*key_stride + n/5)), each with multiple row
+    /// groups and intra-part boundary-spanning keys. Overlap mode
+    /// makes part key ranges overlap so the rule must decline.
+    fn write_parted_clustered_fixture(
+        tag: &str,
+        parts: usize,
+        overlap: bool,
+    ) -> std::path::PathBuf {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+
+        let n = 1000i64;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let dir =
+            std::env::temp_dir().join(format!("range_agg_parted_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for part in 0..parts {
+            // Disjoint: part key bases 0, 200, 400… (each part's keys
+            // span [base, base+199]). Overlap: every part starts at 0.
+            let base = if overlap { 0 } else { part as i64 * 200 };
+            let keys: Vec<i64> = (0..n).map(|i| base + i / 5).collect();
+            let vals: Vec<i64> = (0..n).map(|_| 1).collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(Int64Array::from(vals)),
+                ],
+            )
+            .unwrap();
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(100))
+                .build();
+            let f = std::fs::File::create(dir.join(format!("part-{part:04}.parquet"))).unwrap();
+            let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        dir
+    }
+
+    fn ctx_over_parted_fixture(
+        dir: &std::path::Path,
+        config: datafusion::prelude::SessionConfig,
+    ) -> datafusion::prelude::SessionContext {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::prelude::SessionContext;
+        let state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(ClusteredSinglePhaseAggRule))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "t",
+            Arc::new(
+                crate::ematix_fast_parquet_multi::EmatixFastParquetMultiTableProvider::try_new_dir(
+                    dir,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        ctx
+    }
+
+    /// Σ.PS.2 e2e: the parted arm fires through the width-pinned union
+    /// (plan shows SinglePartitioned + PartitionClaimResetExec, no
+    /// Partial), and the grouped sums are EXACT — every key appears
+    /// once with the right count, including intra-part
+    /// boundary-spanning keys. Oracle = the same query with the rule's
+    /// env kill-switch… simpler: known closed form (each key has
+    /// exactly 5 rows of v=1 in one part; disjoint parts → sum 5).
+    #[tokio::test]
+    async fn parted_clustered_group_by_fires_and_is_exact() {
+        use datafusion::physical_plan::displayable;
+        let dir = write_parted_clustered_fixture("fire", 4, false);
+        let config = datafusion::prelude::SessionConfig::new().with_target_partitions(8);
+        let ctx = ctx_over_parted_fixture(&dir, config);
+        let df = ctx
+            .sql("SELECT k, sum(v) AS s, count(*) AS c FROM t GROUP BY k")
+            .await
+            .unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let text = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(
+            text.contains("PartitionClaimResetExec") && text.contains("SinglePartitioned"),
+            "parted arm must fire:\n{text}"
+        );
+        assert!(
+            !text.contains("mode=Partial"),
+            "no two-phase agg may remain:\n{text}"
+        );
+        let batches = df.collect().await.unwrap();
+        let mut rows = 0usize;
+        for b in &batches {
+            let s = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap();
+            let c = b
+                .column(2)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                assert_eq!(s.value(i), 5, "each key sums to exactly 5");
+                assert_eq!(c.value(i), 5, "each key counts exactly 5");
+                rows += 1;
+            }
+        }
+        // 4 parts × 200 distinct keys, all disjoint.
+        assert_eq!(rows, 800, "every group exactly once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Overlapping part key ranges → the parted arm must DECLINE (a
+    /// key in two parts would land in two \"disjoint\" partitions and
+    /// aggregate twice). Results stay exact via the stock two-phase
+    /// plan.
+    #[tokio::test]
+    async fn parted_overlapping_parts_decline_but_stay_exact() {
+        use datafusion::physical_plan::displayable;
+        let dir = write_parted_clustered_fixture("overlap", 3, true);
+        let config = datafusion::prelude::SessionConfig::new().with_target_partitions(8);
+        let ctx = ctx_over_parted_fixture(&dir, config);
+        let df = ctx
+            .sql("SELECT k, sum(v) AS s FROM t GROUP BY k")
+            .await
+            .unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let text = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(
+            !text.contains("PartitionClaimResetExec"),
+            "overlapping parts must decline the single-phase rewrite:\n{text}"
+        );
+        let batches = df.collect().await.unwrap();
+        let mut rows = 0usize;
+        for b in &batches {
+            let s = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                // 3 overlapping parts × 5 rows per key each.
+                assert_eq!(s.value(i), 15, "stock plan merges the 3 parts");
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 200);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// E2E: a multi-row-group parquet clustered on `k`, including a

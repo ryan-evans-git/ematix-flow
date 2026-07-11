@@ -798,6 +798,46 @@ pub(crate) fn find_probe_scan_for_column(
         }
         return None;
     }
+    // Σ.PS.2: the parted provider's width-pinned union — every child is
+    // a part-scan of the SAME logical table, so the UNION node is the
+    // attach target and the rewrite blooms EVERY part. Attaching to
+    // just the first part (the old first-match descent) left 7/8 of a
+    // parted table unpruned: Q07 parted shipped 161M rows through the
+    // exchanges instead of 14.6M.
+    if let Some(union) = plan
+        .as_any()
+        .downcast_ref::<crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>()
+    {
+        // Children may be wrapped (CooperativeExec / CoalesceBatches)
+        // by physical planning — unwrap single-child chains to the scan.
+        fn unwrap_scan(p: &Arc<dyn ExecutionPlan>) -> Option<&EmatixFastParquetExec> {
+            if let Some(s) = p.as_any().downcast_ref::<EmatixFastParquetExec>() {
+                return Some(s);
+            }
+            match p.children().as_slice() {
+                [only] => unwrap_scan(only),
+                _ => None,
+            }
+        }
+        if let Some(first) = union.children().first() {
+            if let Some(scan0) = unwrap_scan(first) {
+                let file_sch = scan0.file_schema();
+                if let Some((file_idx, _)) = file_sch
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| f.name() == col_name)
+                {
+                    if scan0.projection().contains(&file_idx) {
+                        if let Ok(fresh) = scan0.with_added_predicates(Vec::new()) {
+                            return Some((Arc::clone(plan), fresh, file_idx));
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+    }
     // Descend into every child. For 1-child wrappers this is a
     // straight chain; for multi-child plans (HashJoinExec, Union)
     // we try each child in turn — first match wins (see assumption
@@ -827,6 +867,32 @@ fn rewrite_probe_subtree(
                 if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
                     let new = scan.with_runtime_sideband(sideband.clone());
                     return Ok(Transformed::yes(new as Arc<dyn ExecutionPlan>));
+                }
+                // Σ.PS.2: parted target — bloom EVERY part scan,
+                // through whatever wrappers planning added per child.
+                if node
+                    .as_any()
+                    .is::<crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>()
+                {
+                    let mut kids: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+                    for c in node.children() {
+                        let rewritten = Arc::clone(c)
+                            .transform_up(|n| {
+                                if let Some(s) = n.as_any().downcast_ref::<EmatixFastParquetExec>()
+                                {
+                                    return Ok(Transformed::yes(
+                                        s.with_runtime_sideband(sideband.clone())
+                                            as Arc<dyn ExecutionPlan>,
+                                    ));
+                                }
+                                Ok(Transformed::no(n))
+                            })
+                            .data()?;
+                        kids.push(rewritten);
+                    }
+                    let new =
+                        crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec::try_new(kids)?;
+                    return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
                 }
             }
             Ok(Transformed::no(node))
@@ -1390,6 +1456,91 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
     use ematix_parquet_format::types::CompressionCodec;
+
+    /// Σ.PS.2 regression: on a parted table the probe resolves to the
+    /// width-pinned union NODE, and the rewrite attaches the sideband
+    /// to EVERY part scan. The old first-match descent attached to
+    /// only part 1 of N, leaving the rest unpruned (Q07 parted pushed
+    /// 161M rows through the exchanges instead of 14.6M).
+    #[test]
+    fn parted_probe_attaches_sideband_to_every_part() {
+        use crate::ematix_fast_parquet_multi::{
+            EmatixFastParquetMultiTableProvider, EmatixInterleaveUnionExec,
+        };
+        let dir = std::env::temp_dir().join(format!("l9_parted_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for part in 0..3i64 {
+            let ids: Vec<i64> = (0..100).map(|i| part * 100 + i).collect();
+            let vals: Vec<i64> = (0..100).collect();
+            let a: Vec<i64> = (0..100).map(|i| i % 7).collect();
+            let b: Vec<i64> = (0..100).map(|i| i % 11).collect();
+            write_table_to_path(
+                dir.join(format!("part-{part:04}.parquet")),
+                &[
+                    ("ident", ColumnData::I64(&ids)),
+                    ("val", ColumnData::I64(&vals)),
+                    ("ref_a", ColumnData::I64(&a)),
+                    ("ref_b", ColumnData::I64(&b)),
+                ],
+                CompressionCodec::Snappy,
+            )
+            .unwrap();
+        }
+        let prov = EmatixFastParquetMultiTableProvider::try_new_dir(&dir).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let plan = rt.block_on(async {
+            let ctx = SessionContext::new_with_config(SessionConfig::new());
+            ctx.register_table("t", Arc::new(prov)).unwrap();
+            ctx.sql("SELECT ident, val FROM t")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap()
+        });
+        // Resolve through whatever wrappers planning added down to the
+        // union, then run the finder + rewriter against it.
+        let (target, _scan, file_idx) =
+            find_probe_scan_for_column(&plan, "val").expect("finder must resolve parted probe");
+        assert!(
+            target.as_any().is::<EmatixInterleaveUnionExec>(),
+            "parted probe target must be the union node, got {}",
+            target.name()
+        );
+        assert_eq!(file_idx, 1, "val is file column 1");
+
+        let sideband = crate::bridge_filter_sideband::BridgeFilterSideband::new();
+        let rewritten = rewrite_probe_subtree(&plan, &target, &sideband).unwrap();
+        // Every part scan under the rewritten plan carries the sideband.
+        let mut scans = 0usize;
+        let mut with_sideband = 0usize;
+        fn walk(
+            p: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+            scans: &mut usize,
+            with_sb: &mut usize,
+        ) {
+            if let Some(s) = p.as_any().downcast_ref::<EmatixFastParquetExec>() {
+                *scans += 1;
+                if s.runtime_sideband().is_some() {
+                    *with_sb += 1;
+                }
+            }
+            for c in p.children() {
+                walk(c, scans, with_sb);
+            }
+        }
+        walk(&rewritten, &mut scans, &mut with_sideband);
+        assert_eq!(scans, 3, "three part scans expected");
+        assert_eq!(
+            with_sideband, 3,
+            "EVERY part must carry the sideband (old behavior: 1 of 3)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// L9.ADAPT lazy rescue — the pre-gate constants encode measured
     /// boundaries: the probe-rows floor keeps SF=1 (6M-row facts) and

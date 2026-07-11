@@ -317,6 +317,46 @@ fn find_probe_scan_for_column(
         }
         return None;
     }
+    // Σ.PS.2: the parted provider's width-pinned union — every child is
+    // a part-scan of the SAME logical table, so the UNION node is the
+    // attach target and the rewrite blooms EVERY part. Attaching to
+    // just the first part (the old first-match descent) left 7/8 of a
+    // parted table unpruned: Q07 parted shipped 161M rows through the
+    // exchanges instead of 14.6M.
+    if let Some(union) = plan
+        .as_any()
+        .downcast_ref::<crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>()
+    {
+        // Children may be wrapped (CooperativeExec / CoalesceBatches)
+        // by physical planning — unwrap single-child chains to the scan.
+        fn unwrap_scan(p: &Arc<dyn ExecutionPlan>) -> Option<&EmatixFastParquetExec> {
+            if let Some(s) = p.as_any().downcast_ref::<EmatixFastParquetExec>() {
+                return Some(s);
+            }
+            match p.children().as_slice() {
+                [only] => unwrap_scan(only),
+                _ => None,
+            }
+        }
+        if let Some(first) = union.children().first() {
+            if let Some(scan0) = unwrap_scan(first) {
+                let file_sch = scan0.file_schema();
+                if let Some((file_idx, _)) = file_sch
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| f.name() == col_name)
+                {
+                    if scan0.projection().contains(&file_idx) {
+                        if let Ok(fresh) = scan0.with_added_predicates(Vec::new()) {
+                            return Some((Arc::clone(plan), fresh, file_idx));
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+    }
     for child in plan.children() {
         if let Some(found) = find_probe_scan_for_column(child, col_name) {
             return Some(found);
@@ -336,6 +376,32 @@ fn rewrite_probe_subtree(
                 if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
                     let new = scan.with_runtime_sideband(sideband.clone());
                     return Ok(Transformed::yes(new as Arc<dyn ExecutionPlan>));
+                }
+                // Σ.PS.2: parted target — bloom EVERY part scan,
+                // through whatever wrappers planning added per child.
+                if node
+                    .as_any()
+                    .is::<crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>()
+                {
+                    let mut kids: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+                    for c in node.children() {
+                        let rewritten = Arc::clone(c)
+                            .transform_up(|n| {
+                                if let Some(s) = n.as_any().downcast_ref::<EmatixFastParquetExec>()
+                                {
+                                    return Ok(Transformed::yes(
+                                        s.with_runtime_sideband(sideband.clone())
+                                            as Arc<dyn ExecutionPlan>,
+                                    ));
+                                }
+                                Ok(Transformed::no(n))
+                            })
+                            .data()?;
+                        kids.push(rewritten);
+                    }
+                    let new =
+                        crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec::try_new(kids)?;
+                    return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
                 }
             }
             Ok(Transformed::no(node))
