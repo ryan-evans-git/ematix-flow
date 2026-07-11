@@ -1,0 +1,386 @@
+IDLE-DETECTED loadavg15=1.02 at Sun Jul  5 22:14:23 EDT 2026
+=== Σ.AI.1 strict bench protocol ===
+  sf:             10
+  invocations:    12 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        8,9
+  extra env:      <none>
+  output dir:     bench-results/cert-2026-07-04/ematix-sf10-q89
+
+  [env] captured -> bench-results/cert-2026-07-04/ematix-sf10-q89/env.json
+--- invocation 1 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 5 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-5.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 6 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-6.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 7 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-7.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 8 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-8.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 9 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-9.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 10 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-10.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 11 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-11.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 12 / 12 → bench-results/cert-2026-07-04/ematix-sf10-q89/run-12.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/cert-2026-07-04/ematix-sf10-q89/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — ematix
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'Battery Power'
+- Git: a02228381f61 on integration/mesh-gate-campaign (dirty: True)
+- Data: SF=10; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 11 of 12 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-10.md', 'run-11.md', 'run-12.md', 'run-2.md', 'run-3.md', 'run-4.md', 'run-5.md', 'run-6.md', 'run-7.md', 'run-8.md', 'run-9.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q08 | 141.40 | 141.82 | 2.42 | 1.71% | 141.4 / 143.0 / 140.2 / 139.8 / 144.5 / 138.9 / 139.9 / 143.9 / 144.7 / 144.8 / 138.8 |
+| Q09 | 254.94 | 256.33 | 3.69 | 1.45% | 260.8 / 264.8 / 255.3 / 254.3 / 253.7 / 254.9 / 257.1 / 253.5 / 253.3 / 258.6 / 253.4 |
+
+**Sum of medians**: 396.34 ms  (primary, robust to single-run outliers)
+**Sum of means**: 398.15 ms  (secondary)
+**Median CV**: 1.58%  (noise-floor across invocations)
+**Max CV**: 1.71%  (worst-case per-query noise — likely single-run outlier)
+=== Σ.AI.1 strict bench protocol ===
+  sf:             10
+  invocations:    12 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        8,9
+  extra env:      <none>
+  output dir:     bench-results/cert-2026-07-04/duckdb-sf10-q89
+
+  [env] captured -> bench-results/cert-2026-07-04/duckdb-sf10-q89/env.json
+--- invocation 1 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 5 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-5.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 6 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-6.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 7 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-7.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 8 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-8.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 9 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-9.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 10 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-10.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 11 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-11.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 12 / 12 → bench-results/cert-2026-07-04/duckdb-sf10-q89/run-12.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/cert-2026-07-04/duckdb-sf10-q89/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — duckdb
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'Battery Power'
+- Git: a02228381f61 on integration/mesh-gate-campaign (dirty: True)
+- Data: SF=10; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 11 of 12 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-10.md', 'run-11.md', 'run-12.md', 'run-2.md', 'run-3.md', 'run-4.md', 'run-5.md', 'run-6.md', 'run-7.md', 'run-8.md', 'run-9.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q08 | 153.76 | 153.72 | 1.12 | 0.73% | 152.9 / 155.4 / 155.6 / 153.8 / 152.3 / 153.1 / 154.0 / 154.6 / 154.0 / 153.2 / 152.2 |
+| Q09 | 271.54 | 271.62 | 2.03 | 0.75% | 269.4 / 271.5 / 271.6 / 273.9 / 271.7 / 275.2 / 269.9 / 270.4 / 270.1 / 274.5 / 269.7 |
+
+**Sum of medians**: 425.30 ms  (primary, robust to single-run outliers)
+**Sum of means**: 425.35 ms  (secondary)
+**Median CV**: 0.74%  (noise-floor across invocations)
+**Max CV**: 0.75%  (worst-case per-query noise — likely single-run outlier)
+=== Σ.AI.1 strict bench protocol ===
+  sf:             100
+  invocations:    12 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        1,16
+  extra env:      <none>
+  output dir:     bench-results/cert-2026-07-04/ematix-sf100-q116
+
+  [env] captured -> bench-results/cert-2026-07-04/ematix-sf100-q116/env.json
+--- invocation 1 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 5 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-5.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 6 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-6.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 7 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-7.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 8 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-8.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 9 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-9.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 10 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-10.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 11 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-11.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 12 / 12 → bench-results/cert-2026-07-04/ematix-sf100-q116/run-12.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/cert-2026-07-04/ematix-sf100-q116/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — ematix
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'Battery Power'
+- Git: a02228381f61 on integration/mesh-gate-campaign (dirty: True)
+- Data: SF=100; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 11 of 12 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-10.md', 'run-11.md', 'run-12.md', 'run-2.md', 'run-3.md', 'run-4.md', 'run-5.md', 'run-6.md', 'run-7.md', 'run-8.md', 'run-9.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q01 | 2319.52 | 2330.81 | 87.89 | 3.79% | 2423.6 / 2436.2 / 2463.6 / 2218.7 / 2246.1 / 2235.7 / 2278.4 / 2267.4 / 2319.5 / 2361.7 / 2388.0 |
+| Q16 | 374.97 | 374.95 | 10.41 | 2.77% | 388.1 / 388.5 / 385.3 / 361.8 / 364.4 / 363.4 / 364.5 / 371.3 / 375.0 / 382.1 / 380.0 |
+
+**Sum of medians**: 2694.49 ms  (primary, robust to single-run outliers)
+**Sum of means**: 2705.77 ms  (secondary)
+**Median CV**: 3.28%  (noise-floor across invocations)
+**Max CV**: 3.79%  (worst-case per-query noise — likely single-run outlier)
+=== Σ.AI.1 strict bench protocol ===
+  sf:             100
+  invocations:    12 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        1,16
+  extra env:      <none>
+  output dir:     bench-results/cert-2026-07-04/duckdb-sf100-q116
+
+  [env] captured -> bench-results/cert-2026-07-04/duckdb-sf100-q116/env.json
+--- invocation 1 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 5 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-5.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 6 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-6.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 7 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-7.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 8 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-8.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 9 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-9.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 10 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-10.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 11 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-11.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 12 / 12 → bench-results/cert-2026-07-04/duckdb-sf100-q116/run-12.md ---
+  [thermal] pre: nominal
+  (isolated: 2 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/cert-2026-07-04/duckdb-sf100-q116/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — duckdb
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'Battery Power'
+- Git: a02228381f61 on integration/mesh-gate-campaign (dirty: True)
+- Data: SF=100; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 11 of 12 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-10.md', 'run-11.md', 'run-12.md', 'run-2.md', 'run-3.md', 'run-4.md', 'run-5.md', 'run-6.md', 'run-7.md', 'run-8.md', 'run-9.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q01 | 2343.21 | 2339.11 | 14.98 | 0.64% | 2313.9 / 2338.8 / 2343.2 / 2359.2 / 2331.0 / 2345.6 / 2352.8 / 2356.2 / 2343.3 / 2317.3 / 2328.8 |
+| Q16 | 375.71 | 375.80 | 1.29 | 0.34% | 375.0 / 375.3 / 377.6 / 375.7 / 377.0 / 377.5 / 376.7 / 373.5 / 374.6 / 375.9 / 375.1 |
+
+**Sum of medians**: 2718.92 ms  (primary, robust to single-run outliers)
+**Sum of means**: 2714.91 ms  (secondary)
+**Median CV**: 0.49%  (noise-floor across invocations)
+**Max CV**: 0.64%  (worst-case per-query noise — likely single-run outlier)
+CERT-DONE
