@@ -204,10 +204,11 @@ async fn main() -> datafusion::common::Result<()> {
         .map(|m| m.len())
         .unwrap_or(0);
         let plan = df.create_physical_plan().await?;
-        let instances = ematix_flow_distributed::mesh_gate::max_same_table_scan_instances(
-            &plan,
-            ematix_flow_distributed::mesh_gate::DEFAULT_MESH_MIN_BYTES,
-        );
+        let (instances, _inst_bytes) =
+            ematix_flow_distributed::mesh_gate::max_same_table_scan_instances(
+                &plan,
+                ematix_flow_distributed::mesh_gate::DEFAULT_MESH_MIN_BYTES,
+            );
         let (sum_bytes, dom) = scan_leaf_stats(&plan);
         match dom {
             Some((_, dom_rows, dom_leaf)) => {

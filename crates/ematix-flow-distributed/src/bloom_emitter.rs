@@ -193,7 +193,17 @@ fn collect_join_candidates(plan: &LogicalPlan, out: &mut Vec<JoinCandidate>) {
     if let LogicalPlan::Join(join) = plan {
         if matches!(join.join_type, JoinType::Inner) {
             for (left_expr, right_expr) in &join.on {
-                if let Some(cand) = build_candidate(join, left_expr, right_expr) {
+                // Σ.MG.2 eligibility: BOTH orientations. Each side's
+                // keys can bloom the other's base scan; the build-side
+                // pre-execution is LIMIT-clamped, so trying the big
+                // side as a "build" costs one bounded read that
+                // discards at the cap.
+                if let Some(cand) = build_candidate(&join.left, &join.right, left_expr, right_expr)
+                {
+                    out.push(cand);
+                }
+                if let Some(cand) = build_candidate(&join.right, &join.left, right_expr, left_expr)
+                {
                     out.push(cand);
                 }
             }
@@ -215,26 +225,30 @@ fn collect_join_candidates(plan: &LogicalPlan, out: &mut Vec<JoinCandidate>) {
 }
 
 fn build_candidate(
-    join: &datafusion::logical_expr::Join,
-    left_expr: &Expr,
-    right_expr: &Expr,
+    probe: &LogicalPlan,
+    build: &LogicalPlan,
+    probe_expr: &Expr,
+    build_expr: &Expr,
 ) -> Option<JoinCandidate> {
-    let left_col = match left_expr {
+    let probe_col_expr = match probe_expr {
         Expr::Column(c) => c.clone(),
         _ => return None,
     };
-    let right_col = match right_expr {
+    let build_col = match build_expr {
         Expr::Column(c) => c.clone(),
         _ => return None,
     };
 
-    // Find a base TableScan on the probe (left) side that has
-    // `left_col`. Walking through Filter/Projection/Alias etc.
-    let (probe_table, probe_col_name) = find_probe_table_col(&join.left, &left_col)?;
+    // Find a base TableScan on the probe side that has the column,
+    // walking through Filter/Projection/Alias — and (Σ.MG.2) through
+    // Inner joins / LeftSemi left sides, where the key column passes
+    // through unchanged and pruning the base scan stays conservative
+    // (those joins only ever DROP probe rows).
+    let (probe_table, probe_col_name) = find_probe_table_col(probe, &probe_col_expr)?;
 
     // Type guard: the probe column must be Int64 or Int32 on the
     // probe-side schema (the schema the worker will see).
-    let probe_schema = join.left.schema();
+    let probe_schema = probe.schema();
     let probe_field = probe_schema
         .field_with_unqualified_name(&probe_col_name)
         .ok()?;
@@ -243,9 +257,9 @@ fn build_candidate(
     }
     // And on the build side too — we need to produce i64 keys to
     // insert.
-    let build_schema = join.right.schema();
+    let build_schema = build.schema();
     let build_field = build_schema
-        .field_with_unqualified_name(&right_col.name)
+        .field_with_unqualified_name(&build_col.name)
         .ok()?;
     if !matches!(build_field.data_type(), DataType::Int64 | DataType::Int32) {
         return None;
@@ -253,8 +267,8 @@ fn build_candidate(
 
     let probe_uuid_hint = format!("{probe_table}.{probe_col_name}");
     Some(JoinCandidate {
-        build_plan: (*join.right).clone(),
-        build_col: right_col,
+        build_plan: build.clone(),
+        build_col,
         probe_table,
         probe_col: probe_col_name,
         probe_uuid_hint,
@@ -319,10 +333,32 @@ fn find_probe_table_col(plan: &LogicalPlan, target_col: &Column) -> Option<(Stri
             }
             None
         }
-        // Joins, aggregates, unions — the column may exist on the
-        // output, but the scan-level mapping is ambiguous (e.g.,
-        // post-aggregate the key is post-GROUP BY semantics; for an
-        // inner join the "table" is two tables). Skip.
+        // Σ.MG.2: descend through joins that only ever DROP rows of
+        // the side we descend into — Inner (either side) and the left
+        // (preserved-then-filtered) side of LeftSemi. The join key
+        // column passes through unchanged, so a bloom on the base
+        // scan prunes only rows that could never survive the upper
+        // join: conservative. The column must resolve on exactly ONE
+        // side (same-name-on-both is ambiguous → skip).
+        LogicalPlan::Join(j) if matches!(j.join_type, JoinType::Inner | JoinType::LeftSemi) => {
+            let sides: &[&LogicalPlan] = match j.join_type {
+                JoinType::Inner => &[&j.left, &j.right],
+                _ => &[&j.left],
+            };
+            let mut found = None;
+            for side in sides {
+                if let Some(hit) = find_probe_table_col(side, target_col) {
+                    if found.is_some() {
+                        return None; // ambiguous
+                    }
+                    found = Some(hit);
+                }
+            }
+            found
+        }
+        // Aggregates, unions — the column may exist on the output,
+        // but the scan-level mapping is ambiguous (post-aggregate the
+        // key has post-GROUP BY semantics). Skip.
         _ => None,
     }
 }
@@ -568,6 +604,58 @@ mod tests {
         assert!(
             blooms.is_empty(),
             "string-keyed join should not emit blooms"
+        );
+        Ok(())
+    }
+
+    /// Σ.MG.2 eligibility: the filtered dim on the LEFT (fact right)
+    /// must still produce a bloom — both orientations are tried.
+    #[tokio::test]
+    async fn flipped_orientation_emits_bloom() -> DfResult<()> {
+        let ctx = SessionContext::new();
+        register_orders(&ctx, "orders")?;
+        register_customer(&ctx, "customer")?;
+        let df = ctx
+            .sql(
+                "SELECT o_orderkey FROM customer \
+                 INNER JOIN orders ON c_custkey = o_custkey \
+                 WHERE c_name = 'A'",
+            )
+            .await?;
+        let plan = df.into_optimized_plan()?;
+        let blooms = emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
+        assert!(
+            blooms.keys().any(|k| k.contains("orders.o_custkey")),
+            "flipped join order must still bloom the fact scan; got {:?}",
+            blooms.keys().collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// Σ.MG.2 eligibility: a MULTI-TABLE probe side (the Q07 shape —
+    /// the fact scan sits under an intermediate inner join) resolves
+    /// through the join to the base scan.
+    #[tokio::test]
+    async fn multi_table_probe_side_emits_bloom() -> DfResult<()> {
+        let ctx = SessionContext::new();
+        register_orders(&ctx, "orders")?;
+        register_customer(&ctx, "customer")?;
+        register_customer(&ctx, "supplier_like")?; // second small dim
+        let df = ctx
+            .sql(
+                "SELECT o.o_orderkey FROM orders o \
+                 INNER JOIN supplier_like s ON o.o_custkey = s.c_custkey \
+                 INNER JOIN customer c ON o.o_custkey = c.c_custkey \
+                 WHERE c.c_name = 'A'",
+            )
+            .await?;
+        let plan = df.into_optimized_plan()?;
+        let blooms = emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
+        assert!(
+            blooms.keys().any(|k| k.contains("orders.o_custkey")),
+            "probe side behind an intermediate inner join must bloom \
+             the base fact scan; got {:?}",
+            blooms.keys().collect::<Vec<_>>()
         );
         Ok(())
     }

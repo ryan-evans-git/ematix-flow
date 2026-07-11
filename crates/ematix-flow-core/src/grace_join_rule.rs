@@ -11,11 +11,18 @@
 //! decision, exactly Σ.JS.1's honesty rule, so healthy TPC-H plans are
 //! untouched and bench == release holds.
 //!
-//! Gate: `EMAT_GRACE_JOIN=1` opt-in (Phase 1 default OFF; the full-22q
-//! 32 GB box protocol decides any default flip — see
-//! docs/plans/SPILLABLE_JOIN.md). Budget: `EMAT_GRACE_BUILD_BYTES=<n>`
-//! explicit, else AUTO = ½ × sensed `MemAvailable` at plan time (the
-//! Σ.AI.6c sensor; platforms without it never demote).
+//! Gate: `EMAT_GRACE_JOIN` tri-state, **default ON** since Σ.MG
+//! (2026-07-11): the rule self-gates on an HONEST oversize estimate
+//! (est build > budget), so on healthy plans it demotes nothing —
+//! the earlier full-22q refutation (grace 108.7 s vs off 106.1 s,
+//! Q09 +3.7 s) was measured on pre-Σ.JS.3 main, whose parted Q09
+//! carried 150M-row builds that tripped demotion; post-Σ.JS.3 those
+//! builds are the small filtered sides and SF=100 demotes zero
+//! joins. The flip buys SF=1000 completion (oversized builds spill
+//! instead of kernel-OOMing a 128 GB box). `EMAT_GRACE_JOIN=0` opts
+//! out. Budget: `EMAT_GRACE_BUILD_BYTES=<n>` explicit, else AUTO =
+//! ½ × sensed `MemAvailable` at plan time (the Σ.AI.6c sensor;
+//! platforms without it never demote).
 //!
 //! Scope (Phase 2): Inner / LeftSemi / LeftAnti joins (the Q21 shape),
 //! residual filter forwarded verbatim; still no embedded projection.
@@ -62,7 +69,8 @@ fn spill_partitions(est_build_bytes: f64, budget_bytes: f64) -> usize {
 /// See module docs.
 #[derive(Debug)]
 pub struct GraceJoinDemotionRule {
-    /// Snapshot of `EMAT_GRACE_JOIN` (opt-in, default OFF).
+    /// Snapshot of `EMAT_GRACE_JOIN` (tri-state, default ON; `=0`
+    /// opts out).
     pub enabled: bool,
     /// Explicit budget (`EMAT_GRACE_BUILD_BYTES`); `None` = AUTO from
     /// the MemAvailable sensor at optimize time.
@@ -72,7 +80,7 @@ pub struct GraceJoinDemotionRule {
 impl Default for GraceJoinDemotionRule {
     fn default() -> Self {
         Self {
-            enabled: crate::flags::present("EMAT_GRACE_JOIN"),
+            enabled: crate::flags::tri_state("EMAT_GRACE_JOIN").unwrap_or(true),
             budget_bytes: std::env::var("EMAT_GRACE_BUILD_BYTES")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -288,7 +296,25 @@ mod tests {
         );
     }
 
-    /// Disabled rule (the shipped Phase-1 default) never rewrites.
+    /// The default snapshots the tri-state: unset → ON, `=0` → OFF
+    /// (the Σ.MG flip; the oversize estimate is the real gate).
+    #[test]
+    fn default_snapshots_tri_state_on() {
+        let _env = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
+        unsafe { std::env::remove_var("EMAT_GRACE_JOIN") };
+        assert!(
+            GraceJoinDemotionRule::default().enabled,
+            "unset => grace demotion armed (default ON)"
+        );
+        unsafe { std::env::set_var("EMAT_GRACE_JOIN", "0") };
+        assert!(
+            !GraceJoinDemotionRule::default().enabled,
+            "=0 => opt-out honored"
+        );
+        unsafe { std::env::remove_var("EMAT_GRACE_JOIN") };
+    }
+
+    /// Disabled rule (`EMAT_GRACE_JOIN=0`) never rewrites.
     #[tokio::test(flavor = "multi_thread")]
     async fn disabled_rule_is_inert() {
         let (_, l) = mem_side("ident", 10_000, 500);

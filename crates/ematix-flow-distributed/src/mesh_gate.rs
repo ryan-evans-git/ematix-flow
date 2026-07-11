@@ -70,6 +70,18 @@ pub const DEFAULT_MESH_MIN_BYTES: u64 = 8 * 1024 * 1024;
 /// at parity (1.30 s vs 1.35 s), so 2 instances stay distributed.
 pub const DEFAULT_MESH_MAX_TABLE_SCANS: u32 = 3;
 
+/// The self-join veto's capacity condition: veto only when ONE
+/// instance of the repeated table is at most this fraction of system
+/// RAM. The veto's whole rationale — "single-node re-reads the table
+/// from page cache" — inverts once the table exceeds memory: at
+/// SF=1000 a ~128 GB lineitem against 128 GB of RAM means every
+/// single-node re-scan is an EBS pass, while the mesh brings 4× the
+/// IO bandwidth. SF=100 calibration: Q21's per-instance ~12.8 GB on
+/// a 32 GB box (0.4× RAM) → veto correct (single 6.7 s vs mesh
+/// 12.0 s); SF=1000 ~128 GB on 128 GB (1.0× RAM) → veto must NOT
+/// fire.
+pub const VETO_INSTANCE_RAM_FRACTION: f64 = 0.5;
+
 /// Config for the adaptive mesh gate. Carried as a field of
 /// [`AdaptiveMeshGateRule`] so tests construct it explicitly via the
 /// pure constructors (no process-global env races — the
@@ -97,6 +109,11 @@ pub struct MeshGateConfig {
     /// (decline at N or more; 0 disables the guard), default
     /// [`DEFAULT_MESH_MAX_TABLE_SCANS`].
     pub max_table_scans: u32,
+    /// Detected system RAM (bytes) for the veto's capacity condition
+    /// ([`VETO_INSTANCE_RAM_FRACTION`]). `None` when undetectable
+    /// (non-Linux dev hosts) — the veto then applies unconditionally,
+    /// matching the pre-capacity behavior on small local data.
+    pub system_ram_bytes: Option<u64>,
 }
 
 impl MeshGateConfig {
@@ -124,6 +141,7 @@ impl MeshGateConfig {
             max_table_scans: max_table_scans_of(
                 std::env::var("EMAT_MESH_MAX_TABLE_SCANS").ok().as_deref(),
             ),
+            system_ram_bytes: detect_system_ram(),
         }
     }
 
@@ -134,6 +152,7 @@ impl MeshGateConfig {
             mode: Some(false),
             min_bytes: DEFAULT_MESH_MIN_BYTES,
             max_table_scans: DEFAULT_MESH_MAX_TABLE_SCANS,
+            system_ram_bytes: detect_system_ram(),
         }
     }
 
@@ -144,6 +163,7 @@ impl MeshGateConfig {
             mode: Some(true),
             min_bytes: DEFAULT_MESH_MIN_BYTES,
             max_table_scans: DEFAULT_MESH_MAX_TABLE_SCANS,
+            system_ram_bytes: detect_system_ram(),
         }
     }
 
@@ -154,8 +174,20 @@ impl MeshGateConfig {
             mode: None,
             min_bytes,
             max_table_scans: DEFAULT_MESH_MAX_TABLE_SCANS,
+            // Deterministic in tests: no host-RAM dependence; the
+            // veto applies unconditionally unless a test sets RAM.
+            system_ram_bytes: None,
         }
     }
+}
+
+/// System RAM in bytes: Linux `/proc/meminfo` `MemTotal` (the bench
+/// and production boxes); `None` elsewhere.
+fn detect_system_ram() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
 }
 
 /// Pure core of the `EMAT_MESH_MAX_TABLE_SCANS` parse (same
@@ -187,11 +219,24 @@ fn min_bytes_of(val: Option<&str>) -> (u64, bool) {
 }
 
 /// Full AUTO decision: byte threshold AND the Σ.MG self-join veto.
-/// `repeats` = max scan instances of one base table
-/// ([`max_same_table_scan_instances`]); `max_table_scans == 0`
-/// disables the veto.
-fn auto_decision(leaf_bytes: &[Option<u64>], repeats: u32, config: &MeshGateConfig) -> bool {
-    if config.max_table_scans > 0 && repeats >= config.max_table_scans {
+/// `repeats`/`instance_bytes` come from
+/// [`max_same_table_scan_instances`]; `max_table_scans == 0` disables
+/// the veto. The veto additionally requires the repeated table to FIT
+/// memory (one instance ≤ [`VETO_INSTANCE_RAM_FRACTION`] × RAM):
+/// past that, single-node re-scans are storage passes, the page-cache
+/// rationale inverts, and the mesh's aggregate IO wins even for
+/// self-joins.
+fn auto_decision(
+    leaf_bytes: &[Option<u64>],
+    repeats: u32,
+    instance_bytes: u64,
+    config: &MeshGateConfig,
+) -> bool {
+    let fits_memory = match config.system_ram_bytes {
+        Some(ram) => (instance_bytes as f64) <= (ram as f64) * VETO_INSTANCE_RAM_FRACTION,
+        None => true,
+    };
+    if config.max_table_scans > 0 && repeats >= config.max_table_scans && fits_memory {
         return false;
     }
     auto_should_distribute(leaf_bytes, config.min_bytes)
@@ -304,8 +349,9 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
                     .iter()
                     .flatten()
                     .fold(0u64, |acc, b| acc.saturating_add(*b));
-                let repeats = max_same_table_scan_instances(&plan, self.config.min_bytes);
-                let distribute = auto_decision(&leaf_bytes, repeats, &self.config);
+                let (repeats, instance_bytes) =
+                    max_same_table_scan_instances(&plan, self.config.min_bytes);
+                let distribute = auto_decision(&leaf_bytes, repeats, instance_bytes, &self.config);
                 tracing::debug!(
                     known_scan_bytes = known_sum,
                     min_bytes = self.config.min_bytes,
@@ -359,7 +405,7 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
 pub fn max_same_table_scan_instances(
     plan: &Arc<dyn ExecutionPlan>,
     min_instance_bytes: u64,
-) -> u32 {
+) -> (u32, u64) {
     use std::collections::HashMap;
     fn identity_of(plan: &Arc<dyn ExecutionPlan>) -> Option<String> {
         if let Some(ds) = plan
@@ -397,7 +443,11 @@ pub fn max_same_table_scan_instances(
             })
             .unwrap_or(0)
     }
-    fn walk(plan: &Arc<dyn ExecutionPlan>, min_bytes: u64, counts: &mut HashMap<String, u32>) {
+    fn walk(
+        plan: &Arc<dyn ExecutionPlan>,
+        min_bytes: u64,
+        counts: &mut HashMap<String, (u32, u64)>,
+    ) {
         // A parted interleave union is ONE scan instance of one table,
         // sized as the sum of its parts.
         if plan
@@ -409,7 +459,9 @@ pub fn max_same_table_scan_instances(
             while let Some(n) = node {
                 if let Some(id) = identity_of(&n) {
                     if total >= min_bytes {
-                        *counts.entry(id).or_insert(0) += 1;
+                        let e = counts.entry(id).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 = e.1.max(total);
                     }
                     return;
                 }
@@ -419,9 +471,12 @@ pub fn max_same_table_scan_instances(
         }
         let children = plan.children();
         if children.is_empty() {
-            if known_bytes(plan) >= min_bytes {
+            let bytes = known_bytes(plan);
+            if bytes >= min_bytes {
                 if let Some(id) = identity_of(plan) {
-                    *counts.entry(id).or_insert(0) += 1;
+                    let e = counts.entry(id).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 = e.1.max(bytes);
                 }
             }
             return;
@@ -432,7 +487,11 @@ pub fn max_same_table_scan_instances(
     }
     let mut counts = HashMap::new();
     walk(plan, min_instance_bytes, &mut counts);
-    counts.values().copied().max().unwrap_or(0)
+    counts
+        .values()
+        .copied()
+        .max_by_key(|(n, _)| *n)
+        .unwrap_or((0, 0))
 }
 
 /// Collect one `Option<bytes>` per scan leaf (nodes with no
@@ -737,18 +796,48 @@ mod tests {
     fn auto_decision_veto_table() {
         let big = &[Some(u64::MAX)][..]; // bytes alone say distribute
         let auto = MeshGateConfig::auto_with_min_bytes(0);
+        let gib: u64 = 1024 * 1024 * 1024;
         // Below the instance ceiling: bytes decide.
-        assert!(auto_decision(big, 1, &auto));
-        assert!(auto_decision(big, 2, &auto));
+        assert!(auto_decision(big, 1, gib, &auto));
+        assert!(auto_decision(big, 2, gib, &auto));
         // At/above the ceiling (default 3): veto regardless of bytes.
-        assert!(!auto_decision(big, 3, &auto));
-        assert!(!auto_decision(big, 7, &auto));
+        assert!(!auto_decision(big, 3, gib, &auto));
+        assert!(!auto_decision(big, 7, gib, &auto));
         // max_table_scans = 0 disables the guard entirely.
         let off = MeshGateConfig {
             max_table_scans: 0,
             ..auto
         };
-        assert!(auto_decision(big, 9, &off));
+        assert!(auto_decision(big, 9, gib, &off));
+    }
+
+    /// The veto's capacity condition: it only fires while one
+    /// instance of the repeated table fits comfortably in RAM. The
+    /// two calibration points are the real boxes: SF=100 Q21
+    /// (~12.8 GB instance, 32 GB box → veto) and SF=1000
+    /// (~128 GB instance, 128 GB box → distribute).
+    #[test]
+    fn veto_capacity_condition_scales() {
+        let big = &[Some(u64::MAX)][..];
+        let gib: u64 = 1024 * 1024 * 1024;
+        let auto = MeshGateConfig::auto_with_min_bytes(0);
+        // SF=100 shape: 12.8 GiB instance on a 32 GiB box → veto.
+        let sf100 = MeshGateConfig {
+            system_ram_bytes: Some(32 * gib),
+            ..auto
+        };
+        assert!(!auto_decision(big, 3, 13 * gib, &sf100));
+        // SF=1000 shape: 128 GiB instance on a 128 GiB box → the
+        // page-cache rationale inverts; distribute on bytes.
+        let sf1000 = MeshGateConfig {
+            system_ram_bytes: Some(128 * gib),
+            ..auto
+        };
+        assert!(auto_decision(big, 3, 128 * gib, &sf1000));
+        // Boundary: exactly the fraction still vetoes.
+        assert!(!auto_decision(big, 3, 64 * gib, &sf1000));
+        // Unknown RAM (non-Linux dev host): veto applies.
+        assert!(!auto_decision(big, 3, u64::MAX, &auto));
     }
 
     /// The Q21 shape in miniature: THREE scan instances of one base
@@ -765,7 +854,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            max_same_table_scan_instances(&plan, 0),
+            max_same_table_scan_instances(&plan, 0).0,
             3,
             "three self-join arms = three instances:\n{}",
             displayable(plan.as_ref()).indent(true)
@@ -787,13 +876,13 @@ mod tests {
         let (_tmp, path) = write_fixture();
         let ctx = fixture_ctx(&path).await;
         let plan = physical_plan(&ctx, "SELECT a.k FROM t a JOIN t b ON a.k = b.k").await;
-        assert_eq!(max_same_table_scan_instances(&plan, 2), 2);
+        assert_eq!(max_same_table_scan_instances(&plan, 2).0, 2);
         // Above the per-instance byte floor, small scans don't count
         // at all — 3 copies of a tiny table can never veto.
-        assert_eq!(max_same_table_scan_instances(&plan, u64::MAX), 0);
+        assert_eq!(max_same_table_scan_instances(&plan, u64::MAX).0, 0);
         let big = &[Some(u64::MAX)][..];
         assert!(
-            auto_decision(big, 2, &MeshGateConfig::auto_with_min_bytes(0)),
+            auto_decision(big, 2, u64::MAX, &MeshGateConfig::auto_with_min_bytes(0)),
             "2 instances stay distributed"
         );
     }
@@ -845,7 +934,7 @@ mod tests {
         ctx.register_table("t", Arc::new(prov)).expect("register");
         let plan = physical_plan(&ctx, "SELECT k, SUM(v) FROM t GROUP BY k").await;
         assert_eq!(
-            max_same_table_scan_instances(&plan, 0),
+            max_same_table_scan_instances(&plan, 0).0,
             1,
             "a parted union is one instance:\n{}",
             displayable(plan.as_ref()).indent(true)
