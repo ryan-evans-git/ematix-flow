@@ -182,9 +182,9 @@ pub struct HarnessOverrides {
     /// build), so harnesses keep this `true` and A/B via the env var.
     pub sampled_join_side: bool,
     /// `GraceJoinDemotionRule` (Σ.SP Phase 1b). The rule ALSO
-    /// self-gates on `EMAT_GRACE_JOIN` (OPT-IN, default OFF until the
-    /// full-suite box protocol decides), so keeping this `true` merely
-    /// registers it; a default install never demotes.
+    /// self-gates on `EMAT_GRACE_JOIN` (tri-state, default ON since
+    /// Σ.MG; `=0` opts out) AND on an honest oversize estimate, so a
+    /// default install demotes only genuinely over-budget builds.
     pub grace_join: bool,
     /// `ClusteredSinglePhaseAggRule` (RANGE.AGG). Note the rule ALSO
     /// self-gates on `EMAT_RANGE_AGG` (default ON), so harnesses keep
@@ -392,10 +392,11 @@ pub fn with_optimizer_rules_overridden(
     }
     // GraceJoinDemotionRule (Σ.SP Phase 1b, 2026-07-11): after the
     // join-side correction so it prices the FINAL build orientation.
-    // Opt-in (EMAT_GRACE_JOIN=1): an honestly-oversized Inner build
-    // demotes to the grace-partitioned spill join instead of riding
-    // the page-cache margin into a kernel OOM (DF 53 hash joins
-    // cannot spill). docs/plans/SPILLABLE_JOIN.md.
+    // Default ON (EMAT_GRACE_JOIN=0 opts out): an honestly-oversized
+    // Inner/semi/anti build demotes to the grace-partitioned spill
+    // join instead of riding the page-cache margin into a kernel OOM
+    // (DF 53 hash joins cannot spill). Healthy plans demote nothing —
+    // the oversize estimate is the real gate. docs/plans/SPILLABLE_JOIN.md.
     if o.grace_join {
         builder = builder.with_physical_optimizer_rule(Arc::new(
             crate::grace_join_rule::GraceJoinDemotionRule::default(),
