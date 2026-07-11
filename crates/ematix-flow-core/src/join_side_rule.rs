@@ -411,7 +411,8 @@ fn leaf_column_stats(
         return Some((cs, scan.num_rows() as u64));
     }
     // Union of same-schema scans — the multi-file (parted) provider
-    // shape: `UnionExec[EmatixFastParquetExec × N]`. Merge the
+    // shape: width-pinned `EmatixInterleaveUnionExec` (Σ.MW.2), or a
+    // stock `UnionExec` from any other plan source. Merge the
     // children's Exact stats: min-of-mins, max-of-maxes, summed rows
     // and nulls. Overlapping part files are naturally rejected by
     // the caller's `domain == rows` density check (their row sum
@@ -419,6 +420,9 @@ fn leaf_column_stats(
     if leaf
         .as_any()
         .is::<datafusion::physical_plan::union::UnionExec>()
+        || leaf
+            .as_any()
+            .is::<crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>()
     {
         let mut rows: u64 = 0;
         let mut min = i128::MAX;
