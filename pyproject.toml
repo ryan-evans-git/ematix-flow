@@ -65,13 +65,14 @@ dependencies = [
 ]
 
 [project.urls]
+Homepage = "https://ematix.dev"
 Repository = "https://github.com/ryan-evans-git/ematix-flow"
-# Point at the rendered docs site (mkdocs-material → GitHub Pages)
-# rather than the raw README. PyPI's package page is the dominant
-# inbound link for new users; sending them to the doc site gives
-# them search, navigation, and per-surface guides instead of a
-# 900-line README.
-Documentation = "https://ryan-evans-git.github.io/ematix-flow/"
+# Point at ematix.dev (the canonical docs + benchmarks site), not the
+# legacy GitHub Pages mkdocs render. PyPI's package page is the
+# dominant inbound link for new users, and PyPI is a high-authority
+# domain — linking ematix.dev here is both the right destination and
+# a crawl/authority signal for the site.
+Documentation = "https://ematix.dev"
 Issues = "https://github.com/ryan-evans-git/ematix-flow/issues"
 Changelog = "https://github.com/ryan-evans-git/ematix-flow/blob/main/CHANGELOG.md"
 
