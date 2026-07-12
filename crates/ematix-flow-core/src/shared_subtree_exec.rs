@@ -177,6 +177,15 @@ impl SharedSubtreeExec {
     pub fn cached(&self) -> &Arc<CachedBatches> {
         &self.cached
     }
+
+    /// The shared subtree this node computes (once) and serves from.
+    /// `children()` deliberately hides it — optimizer rules must not
+    /// rewrite a shared subtree per consumer — so plan analyses that
+    /// need to SEE through the sharing (e.g. the mesh gate's Σ.Q15.FP
+    /// hazard walk) descend via this accessor instead.
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
 }
 
 impl std::fmt::Debug for SharedSubtreeExec {

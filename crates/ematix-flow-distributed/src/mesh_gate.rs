@@ -33,11 +33,18 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::common::Result as DfResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
 use datafusion_distributed::{DistributedExec, DistributedPhysicalOptimizerRule};
 
 /// Default AUTO threshold for `EMAT_MESH_MIN_BYTES`: 8 MiB.
@@ -104,11 +111,26 @@ pub struct MeshGateConfig {
     /// with runtime blooms (which distributed arrow scans don't
     /// carry). TPC-H Q21 (lineitem × 3: inner + semi + anti) is the
     /// motivating shape — mesh 12.0 s vs single-node 6.7 s at SF=100
-    /// on 4× c7i.4xlarge; Q15 (lineitem × 2) meshes at parity and
-    /// deliberately stays distributed. `EMAT_MESH_MAX_TABLE_SCANS`
-    /// (decline at N or more; 0 disables the guard), default
-    /// [`DEFAULT_MESH_MAX_TABLE_SCANS`].
+    /// on 4× c7i.4xlarge. (Q15, lineitem × 2, meshed at parity and
+    /// used to stay distributed on purpose — the Σ.Q15.FP correctness
+    /// veto below now forces it single-node for a different reason.)
+    /// `EMAT_MESH_MAX_TABLE_SCANS` (decline at N or more; 0 disables
+    /// the guard), default [`DEFAULT_MESH_MAX_TABLE_SCANS`].
     pub max_table_scans: u32,
+    /// Σ.Q15.FP correctness veto (2026-07-12): force single-node when
+    /// the plan equality-compares two non-literal FLOAT expressions
+    /// with an order-sensitive float reduction (`sum`/`avg`) below.
+    /// Distributed partial-merge order is nondeterministic, the
+    /// aggregate is evaluated once per comparison side, and f64
+    /// addition is not associative — the equality can miss by one ULP
+    /// and silently DROP ROWS (TPC-H Q15 returned 0 rows on ~1/3 of
+    /// mesh runs at SF=100). `min`/`max` are order-exact for floats
+    /// and do not trip this (Q02 keeps its mesh plan). Overrides even
+    /// `EMAT_MESH=1`: a forced-mesh wrong answer is still a wrong
+    /// answer. `EMAT_MESH_FLOAT_EQ_VETO=0` disables — debugging only,
+    /// documented as returning wrong answers. The durable fix
+    /// (deterministic distributed float reduction) is a post-1.0 arc.
+    pub float_eq_veto: bool,
     /// Detected system RAM (bytes) for the veto's capacity condition
     /// ([`VETO_INSTANCE_RAM_FRACTION`]). `None` when undetectable
     /// (non-Linux dev hosts) — the veto then applies unconditionally,
@@ -142,6 +164,8 @@ impl MeshGateConfig {
                 std::env::var("EMAT_MESH_MAX_TABLE_SCANS").ok().as_deref(),
             ),
             system_ram_bytes: detect_system_ram(),
+            float_eq_veto: ematix_flow_core::flags::tri_state("EMAT_MESH_FLOAT_EQ_VETO")
+                .unwrap_or(true),
         }
     }
 
@@ -153,6 +177,7 @@ impl MeshGateConfig {
             min_bytes: DEFAULT_MESH_MIN_BYTES,
             max_table_scans: DEFAULT_MESH_MAX_TABLE_SCANS,
             system_ram_bytes: detect_system_ram(),
+            float_eq_veto: true,
         }
     }
 
@@ -164,6 +189,7 @@ impl MeshGateConfig {
             min_bytes: DEFAULT_MESH_MIN_BYTES,
             max_table_scans: DEFAULT_MESH_MAX_TABLE_SCANS,
             system_ram_bytes: detect_system_ram(),
+            float_eq_veto: true,
         }
     }
 
@@ -177,6 +203,7 @@ impl MeshGateConfig {
             // Deterministic in tests: no host-RAM dependence; the
             // veto applies unconditionally unless a test sets RAM.
             system_ram_bytes: None,
+            float_eq_veto: true,
         }
     }
 }
@@ -268,6 +295,123 @@ fn auto_should_distribute(leaf_bytes: &[Option<u64>], min_bytes: u64) -> bool {
     sum >= min_bytes
 }
 
+/// Σ.Q15.FP — is `dt` a float type whose addition is non-associative?
+/// (Decimals are exact; they never trip the veto.)
+fn is_float_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    )
+}
+
+/// Non-literal expression of float type against `schema`. Literals are
+/// excluded on purpose: `l_discount = 0.06`-style constant comparisons
+/// are deterministic (both sides identical every evaluation) — the
+/// hazard needs two independently COMPUTED floats.
+fn expr_is_computed_float(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    expr.as_any().downcast_ref::<Literal>().is_none()
+        && expr
+            .data_type(schema)
+            .map(|dt| is_float_type(&dt))
+            .unwrap_or(false)
+}
+
+/// Recursively scan a predicate for `Eq` between two computed floats.
+fn predicate_has_float_eq(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    let Some(be) = expr.as_any().downcast_ref::<BinaryExpr>() else {
+        return false;
+    };
+    if *be.op() == Operator::Eq
+        && expr_is_computed_float(be.left(), schema)
+        && expr_is_computed_float(be.right(), schema)
+    {
+        return true;
+    }
+    predicate_has_float_eq(be.left(), schema) || predicate_has_float_eq(be.right(), schema)
+}
+
+/// Does this aggregate compute an order-sensitive float reduction?
+/// `sum`/`avg` over floats depend on partial-merge order; `min`/`max`
+/// are exact regardless of order.
+fn agg_is_order_sensitive_float(agg: &AggregateExec) -> bool {
+    agg.aggr_expr().iter().any(|a| {
+        let name = a.fun().name().to_ascii_lowercase();
+        (name == "sum" || name == "avg") && is_float_type(a.field().data_type())
+    })
+}
+
+/// Σ.Q15.FP correctness hazard detector (see
+/// [`MeshGateConfig::float_eq_veto`]): true when the plan contains an
+/// equality between two computed float expressions — a hash-join key,
+/// a nested-loop join filter, or a `FilterExec` predicate — with an
+/// order-sensitive float reduction (`sum`/`avg` over floats) anywhere
+/// below. TPC-H Q15 (`total_revenue = (SELECT max(total_revenue) …)`
+/// where `total_revenue` is a float `sum`) is the motivating shape; it
+/// returned 0 rows on ~1/3 of distributed runs. Q02's
+/// `ps_supplycost = (SELECT min(…))` does NOT trip it: `min` is exact.
+pub(crate) fn float_reduction_equality_hazard(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    fn walk(plan: &Arc<dyn ExecutionPlan>, hazard: &mut bool) -> bool {
+        let mut below = false;
+        for child in plan.children() {
+            below |= walk(child, hazard);
+        }
+        // SharedSubtreeExec hides its input from `children()` (shared
+        // subtrees must not be rewritten per consumer) — and it is
+        // precisely how Q15's repeated float aggregate reaches both
+        // sides of the equality. Descend through the accessor: the
+        // sharing is what keeps SINGLE-NODE runs deterministic, but
+        // staging splits its consumers across processes, each of which
+        // re-populates independently.
+        if let Some(shared) = plan
+            .as_any()
+            .downcast_ref::<ematix_flow_core::shared_subtree_exec::SharedSubtreeExec>()
+        {
+            below |= walk(shared.input(), hazard);
+        }
+        if below && !*hazard {
+            if let Some(join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+                let schema_l = join.left().schema();
+                let schema_r = join.right().schema();
+                if join.on().iter().any(|(l, r)| {
+                    expr_is_computed_float(l, schema_l.as_ref())
+                        || expr_is_computed_float(r, schema_r.as_ref())
+                }) {
+                    *hazard = true;
+                }
+            }
+            if let Some(join) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
+                if let Some(f) = join.filter() {
+                    if predicate_has_float_eq(f.expression(), f.schema()) {
+                        *hazard = true;
+                    }
+                }
+            }
+            if let Some(filter) = plan.as_any().downcast_ref::<FilterExec>() {
+                if predicate_has_float_eq(filter.predicate(), filter.input().schema().as_ref()) {
+                    *hazard = true;
+                }
+            }
+        }
+        below
+            || plan
+                .as_any()
+                .downcast_ref::<AggregateExec>()
+                .map(agg_is_order_sensitive_float)
+                .unwrap_or(false)
+    }
+    let mut hazard = false;
+    walk(plan, &mut hazard);
+    hazard
+}
+
+/// Σ.Q15.FP — does the correctness veto apply? Pure decision helper
+/// (see [`MeshGateConfig::float_eq_veto`]): veto is enabled, the mode
+/// could distribute (`off` never does — nothing to veto), and the
+/// plan carries the float-reduction equality hazard.
+fn q15_veto_applies(config: &MeshGateConfig, plan: &Arc<dyn ExecutionPlan>) -> bool {
+    config.float_eq_veto && config.mode != Some(false) && float_reduction_equality_hazard(plan)
+}
+
 /// `PhysicalOptimizerRule` wrapping
 /// [`DistributedPhysicalOptimizerRule`] behind the [`MeshGateConfig`]
 /// tri-state. Install it exactly where the bare stage splitter used
@@ -326,6 +470,17 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
         // future double-install or plan re-optimization.
         if plan.as_any().is::<DistributedExec>() {
             tracing::debug!("mesh gate: plan already distributed, passing through");
+            return Ok(plan);
+        }
+        // Σ.Q15.FP correctness veto — BEFORE the mode switch, so it
+        // overrides even forced mesh: a distributed run of this shape
+        // can silently drop rows (see MeshGateConfig::float_eq_veto).
+        if q15_veto_applies(&self.config, &plan) {
+            tracing::info!(
+                "mesh gate: float-reduction equality hazard (Σ.Q15.FP) → \
+                 single-node correctness veto (overrides EMAT_MESH=1; \
+                 EMAT_MESH_FLOAT_EQ_VETO=0 disables — wrong answers possible)"
+            );
             return Ok(plan);
         }
         match self.config.mode {
@@ -667,6 +822,92 @@ mod tests {
             .create_physical_plan()
             .await
             .expect("physical plan")
+    }
+
+    /// Σ.Q15.FP — the Q15 shape (float SUM → MAX → equality) must trip
+    /// the hazard detector and stay single-node EVEN under forced
+    /// mesh; the escape hatch restores distribution for debugging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn float_sum_equality_trips_hazard_and_vetoes_forced_mesh() {
+        let (_tmp, path) = write_fixture();
+        let ctx = fixture_ctx(&path).await;
+        let plan = physical_plan(
+            &ctx,
+            "SELECT a.k, a.s FROM \
+             (SELECT k, SUM(v) AS s FROM t GROUP BY k) a JOIN \
+             (SELECT MAX(s2) AS m FROM (SELECT k, SUM(v) AS s2 FROM t GROUP BY k)) b \
+             ON a.s = b.m",
+        )
+        .await;
+        assert!(
+            float_reduction_equality_hazard(&plan),
+            "Q15 shape must be detected:\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+
+        let rule = AdaptiveMeshGateRule::new(MeshGateConfig::forced());
+        let out = rule
+            .optimize(plan.clone(), &ConfigOptions::default())
+            .expect("optimize");
+        assert!(
+            Arc::ptr_eq(&plan, &out),
+            "correctness veto must override forced mesh"
+        );
+
+        // Escape hatch (debugging only — wrong answers possible):
+        // with the veto disabled the decision helper stands down, so
+        // forced mesh would proceed to the splitter. (Asserted at the
+        // decision level: invoking the real splitter needs a full
+        // distributed session, not a bare ConfigOptions.)
+        assert!(!q15_veto_applies(
+            &MeshGateConfig {
+                float_eq_veto: false,
+                ..MeshGateConfig::forced()
+            },
+            &plan
+        ));
+        // Mode `off` never distributes — nothing to veto.
+        assert!(!q15_veto_applies(&MeshGateConfig::off(), &plan));
+        // And the veto itself: enabled + forced mesh + hazard.
+        assert!(q15_veto_applies(&MeshGateConfig::forced(), &plan));
+    }
+
+    /// Order-exact shapes must NOT trip the hazard: `min` (Q02's
+    /// shape), integer sums, and literal comparisons.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_reductions_and_literals_do_not_trip_hazard() {
+        let (_tmp, path) = write_fixture();
+        let ctx = fixture_ctx(&path).await;
+        let min_plan = physical_plan(
+            &ctx,
+            "SELECT a.k FROM (SELECT k, MIN(v) AS s FROM t GROUP BY k) a \
+             JOIN (SELECT MIN(v) AS m FROM t) b ON a.s = b.m",
+        )
+        .await;
+        assert!(
+            !float_reduction_equality_hazard(&min_plan),
+            "min is order-exact for floats (Q02 keeps its mesh plan)"
+        );
+        let int_plan = physical_plan(
+            &ctx,
+            "SELECT a.k FROM (SELECT k, SUM(k) AS s FROM t GROUP BY k) a \
+             JOIN (SELECT MAX(s2) AS m FROM (SELECT k, SUM(k) AS s2 FROM t GROUP BY k)) b \
+             ON a.s = b.m",
+        )
+        .await;
+        assert!(
+            !float_reduction_equality_hazard(&int_plan),
+            "integer sums are exact in any order"
+        );
+        let lit_plan = physical_plan(
+            &ctx,
+            "SELECT k FROM (SELECT k, SUM(v) AS s FROM t GROUP BY k) WHERE s = 42.0",
+        )
+        .await;
+        assert!(
+            !float_reduction_equality_hazard(&lit_plan),
+            "a literal comparison is identical on every evaluation"
+        );
     }
 
     /// Gate OFF → the input plan comes back as the SAME Arc: zero
