@@ -64,12 +64,36 @@
 //! fall back to `displayable` + recursive children, which catches
 //! `TableScan` source path and pushed-down predicates.
 //!
+//! ## Σ.Q15 — DynamicFilter normalization + canonical copy (2026-07-12)
+//!
+//! DataFusion's post-optimization `FilterPushdown` injects join-key
+//! `DynamicFilter [..]` placeholders into probe-side scans — pushed
+//! THROUGH group-by aggregates when the join key is the group key. In
+//! sessions whose scans stay stock `DataSourceExec` (the distributed
+//! campaign session; plain sessions were shielded only because the
+//! fast-scan resolver replaces the node, which pushdown can't touch),
+//! exactly ONE of Q15's two revenue subtrees is such a probe. The
+//! placeholder split the structural hashes, the rule silently
+//! disengaged (0 wraps), and the two independent parallel f64 SUMs
+//! ULP-diverged — `total_revenue = (SELECT max(..))` dropped every row
+//! on a large fraction of runs. Fix, two halves (both required):
+//!
+//! 1. the structural hash strips `DynamicFilter` fragments (they are
+//!    per-consumer runtime pruning hints, not part of the computation's
+//!    identity), so the twin sites hash equal again;
+//! 2. every wrap in a duplicate group holds the SAME canonical
+//!    dynamic-filter-FREE copy of the subtree. Removing a dynamic
+//!    filter is always sound (it only prunes rows its owning join would
+//!    reject anyway); imposing one site's filter on another consumer is
+//!    not — and with per-site subtrees the cache content would depend
+//!    on which wrap populated first. Groups where every copy carries a
+//!    DynamicFilter are skipped (no safe copy to share).
+//!
 //! See `project_tpch_correctness_gaps` for diagnosis, the
 //! `shared_subtree_exec` module for the cache primitive, and
 //! `crates/ematix-flow-core/examples/q21_inspect.rs` for the
 //! reproducer (env: `Q=15 PARTITIONS=14`).
 
-use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -132,11 +156,15 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
         config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Pass 1: walk plan top-down, hash each Final-mode AggregateExec
-        // subtree that contains an f64 column. Count occurrences. The
-        // walk is cheap — 11-trial bench (2026-05-22) shows zero
-        // measurable cost on Q22 vs the rule not being installed at
-        // all. Earlier "Q22 +7%" measurements were 3/7-trial noise.
-        let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        // subtree that contains an f64 column. Count occurrences, and
+        // record the first copy whose subtree carries no DynamicFilter —
+        // the canonical copy every wrap in the group will share (Σ.Q15,
+        // see below). The walk is cheap — 11-trial bench (2026-05-22)
+        // shows zero measurable cost on Q22 vs the rule not being
+        // installed at all. Earlier "Q22 +7%" measurements were
+        // 3/7-trial noise.
+        type Site = (usize, Option<Arc<dyn ExecutionPlan>>);
+        let mut sites: std::collections::HashMap<u64, Site> = std::collections::HashMap::new();
         let _ = plan.clone().transform_down(|node| {
             if let Some(agg) = node.as_any().downcast_ref::<AggregateExec>()
                 && matches!(
@@ -146,15 +174,63 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
                 && has_float_aggregate(agg)
             {
                 let h = subtree_hash(&node);
-                *counts.entry(h).or_default() += 1;
+                let entry = sites.entry(h).or_insert((0, None));
+                entry.0 += 1;
+                if entry.1.is_none() && !subtree_has_dynamic_filter(&node) {
+                    entry.1 = Some(node.clone());
+                }
             }
             Ok(Transformed::no(node))
         })?;
 
-        let dupes: HashSet<u64> = counts
-            .into_iter()
-            .filter_map(|(h, n)| (n >= 2).then_some(h))
-            .collect();
+        // Σ.Q15 (2026-07-12): the structural hash ignores `DynamicFilter`
+        // placeholders (per-consumer runtime pruning hints — see
+        // `strip_dynamic_filters`), so a probe-side copy hashes equal to
+        // its filter-free twin. That makes it MANDATORY that every wrap in
+        // a group hold the SAME canonical dynamic-filter-FREE subtree:
+        // with per-site subtrees the shared cache's content would depend
+        // on which wrap executed first, and a dynamic-filtered stream is
+        // only valid for the consumer whose join installed the filter.
+        // Removing a dynamic filter is always sound (it only prunes rows
+        // its owning join would reject anyway); imposing one site's filter
+        // on another consumer is not. A group where every copy carries a
+        // DynamicFilter has no safe copy to share — skip it.
+        //
+        // PV.M.7 filter fusion is applied ONCE per group here (not per
+        // wrap site) for the same reason: every wrap must hold one Arc.
+        // The fusion is schema-preserving (a ProjectionExec replaces the
+        // FilterExec's projection), so the registry key stays valid.
+        // Sealed CSE subtrees are never InjectFused-eligible, so there is
+        // no collision.
+        let mut dupes: std::collections::HashMap<u64, Arc<dyn ExecutionPlan>> =
+            std::collections::HashMap::new();
+        for (h, (n, canonical)) in sites {
+            if n < 2 {
+                continue;
+            }
+            match canonical {
+                Some(c) => {
+                    let fused = if cse_filter_fusion_enabled() {
+                        crate::drop_redundant_filter_rule::fuse_redundant_bridge_filters(c.clone())?
+                    } else {
+                        c.clone()
+                    };
+                    debug_assert_eq!(
+                        fused.schema(),
+                        c.schema(),
+                        "PV.M.7 CSE filter-fusion must preserve subtree schema"
+                    );
+                    dupes.insert(h, fused);
+                }
+                None => {
+                    tracing::info!(
+                        sites = n,
+                        "dedupe-f64: skipping duplicate aggregate group — every copy \
+                         carries a DynamicFilter, so no safe canonical subtree exists"
+                    );
+                }
+            }
+        }
         if dupes.is_empty() {
             return Ok(plan);
         }
@@ -192,31 +268,24 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
                 && has_float_aggregate(agg)
             {
                 let h = subtree_hash(&node);
-                if dupes.contains(&h) {
-                    let cached = registry.get_or_create(h, node.schema());
-                    // PV.M.7: fuse redundant bridge FilterExecs into the
-                    // masked scan BEFORE sealing the subtree. After the wrap,
-                    // SharedSubtreeExec.children()==[] makes the inner
-                    // FilterExec→scan unreachable to every later physical rule
-                    // (this is the ONLY place with the unwrapped subtree in
-                    // hand). The fusion is schema-preserving (a ProjectionExec
-                    // replaces the FilterExec's projection), so the registry
-                    // key `node.schema()` stays valid. Sealed CSE subtrees are
-                    // never InjectFused-eligible, so there is no collision.
-                    let inner = if cse_filter_fusion_enabled() {
-                        crate::drop_redundant_filter_rule::fuse_redundant_bridge_filters(
-                            node.clone(),
-                        )?
-                    } else {
-                        node.clone()
-                    };
-                    debug_assert_eq!(
-                        inner.schema(),
-                        node.schema(),
-                        "PV.M.7 CSE filter-fusion must preserve subtree schema"
-                    );
+                if let Some(canonical) = dupes.get(&h) {
+                    // Conservative guard: a hash-equal site whose schema
+                    // differs from the canonical copy would corrupt the
+                    // parent plan — leave it alone. (Structural identity
+                    // implies schema identity, so this never fires in
+                    // practice; it backstops a hash collision or a
+                    // display-normalization overreach.)
+                    if canonical.schema() != node.schema() {
+                        return Ok(Transformed::no(node));
+                    }
+                    let cached = registry.get_or_create(h, canonical.schema());
+                    // Σ.Q15: every wrap holds the SAME canonical subtree
+                    // Arc (PV.M.7 fusion already applied once, above) —
+                    // see the canonical-copy comment on pass 1.5. After
+                    // the wrap, SharedSubtreeExec.children()==[] seals
+                    // the subtree from every later physical rule.
                     let wrapped: Arc<dyn ExecutionPlan> =
-                        Arc::new(SharedSubtreeExec::new(inner, cached));
+                        Arc::new(SharedSubtreeExec::new(canonical.clone(), cached));
                     return Ok(Transformed::yes(wrapped));
                 }
             }
@@ -407,20 +476,330 @@ fn hash_node(node: &Arc<dyn ExecutionPlan>, h: &mut DefaultHasher) {
     // providers, etc.) and any node type we don't model explicitly:
     // hash a one-line display of the node + recurse into children. The
     // display string captures column projections, predicates pushed
-    // into the scan, and the source path / table name.
+    // into the scan, and the source path / table name. Σ.Q15:
+    // `DynamicFilter` placeholders are stripped first — they are
+    // per-consumer runtime pruning hints injected into probe-side scans
+    // by DataFusion's post-optimization FilterPushdown, not part of the
+    // computation's identity (pass 1.5 guarantees the copy actually
+    // shared is a filter-free one).
     h.write_u8(255);
     let disp = datafusion::physical_plan::displayable(node.as_ref())
         .one_line()
         .to_string();
-    disp.hash(h);
+    strip_dynamic_filters(&disp).hash(h);
     for child in node.children() {
         hash_node(child, h);
     }
 }
 
+/// Σ.Q15 (2026-07-12) — strip `DynamicFilter [ .. ]` placeholders from a
+/// node's display line before hashing. DataFusion's post-optimization
+/// `FilterPushdown` injects these join-key runtime-pruning hints into
+/// probe-side scans; they are owned by ONE consumer's join and say nothing
+/// about the computation's identity, so a probe-side copy of a duplicated
+/// subtree must hash equal to its filter-free twin. Handles a preceding
+/// ` AND ` (mid/trailing conjunct) or, failing that, a following ` AND `
+/// (leading conjunct), and balances nested `[..]` in the payload.
+fn strip_dynamic_filters(disp: &str) -> String {
+    const TOKEN: &str = "DynamicFilter";
+    let mut out = String::with_capacity(disp.len());
+    let mut rest = disp;
+    while let Some(pos) = rest.find(TOKEN) {
+        let (before, after_token) = (&rest[..pos], &rest[pos + TOKEN.len()..]);
+        let (before, stripped_preceding_and) = match before.strip_suffix(" AND ") {
+            Some(b) => (b, true),
+            None => (before, false),
+        };
+        out.push_str(before);
+        // Consume the bracketed payload (`[ .. ]`, balanced); a bare token
+        // consumes only itself.
+        let bytes = after_token.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'[' {
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        } else {
+            i = 0;
+        }
+        let mut tail = &after_token[i..];
+        if !stripped_preceding_and {
+            tail = tail.strip_prefix(" AND ").unwrap_or(tail);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// True if any node in the subtree displays a `DynamicFilter` placeholder —
+/// the detection surface matches the hash's display-based fallback, so a
+/// copy this returns `false` for is exactly a copy whose hash needed no
+/// normalization.
+fn subtree_has_dynamic_filter(node: &Arc<dyn ExecutionPlan>) -> bool {
+    let disp = datafusion::physical_plan::displayable(node.as_ref())
+        .one_line()
+        .to_string();
+    if disp.contains("DynamicFilter") {
+        return true;
+    }
+    node.children().into_iter().any(subtree_has_dynamic_filter)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_dynamic_filters_normalizes_display() {
+        // Trailing conjunct — the shape DataFusion 53 actually produces on
+        // a probe-side parquet scan (static predicate first).
+        assert_eq!(
+            strip_dynamic_filters("predicate=a@0 >= 5 AND DynamicFilter [ empty ]"),
+            "predicate=a@0 >= 5"
+        );
+        // Leading conjunct.
+        assert_eq!(
+            strip_dynamic_filters("predicate=DynamicFilter [ empty ] AND a@0 >= 5"),
+            "predicate=a@0 >= 5"
+        );
+        // Mid conjunct keeps the surrounding conjunction intact.
+        assert_eq!(
+            strip_dynamic_filters("x AND DynamicFilter [ p [ q ] r ] AND y"),
+            "x AND y"
+        );
+        // Bare token, no payload.
+        assert_eq!(strip_dynamic_filters("DynamicFilter"), "");
+        // Multiple occurrences.
+        assert_eq!(
+            strip_dynamic_filters("s1 AND DynamicFilter [ empty ], t=[DynamicFilter [ x ] AND s2]"),
+            "s1, t=[s2]"
+        );
+        // Identity on filter-free displays.
+        assert_eq!(
+            strip_dynamic_filters("FilterExec: a@0 > 1, projection=[a@0]"),
+            "FilterExec: a@0 > 1, projection=[a@0]"
+        );
+    }
+
+    /// Σ.Q15 (2026-07-12): DataFusion's post-optimization `FilterPushdown`
+    /// injects a join-key `DynamicFilter [..]` placeholder into the
+    /// probe-side PARQUET scan of the dimension join — pushed THROUGH the
+    /// aggregation because the join key is the group key. Only one of the
+    /// two duplicated revenue subtrees is a probe of that join, so the
+    /// placeholder split the structural hashes and the rule silently
+    /// disengaged (0 wraps) → two independent parallel f64 SUMs → ULP
+    /// mismatch → the Q15 equality dropped every row. (Plain campaign
+    /// sessions were shielded only because the fast-scan resolver replaces
+    /// `DataSourceExec`, which pushdown can't touch; distributed sessions
+    /// keep the stock codec-serializable scan and flaked.)
+    ///
+    /// Guards, in order: the plan really carries a DynamicFilter
+    /// (precondition — this fixture reproduces the hazard); the rule still
+    /// engages (2 wraps); both wraps hold the SAME filter-free canonical
+    /// subtree (cache content must not depend on which site populates
+    /// first, and must never be another consumer's pruned stream); the
+    /// query returns its 1 row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_filter_on_one_site_does_not_split_dedupe() {
+        use crate::shared_subtree_exec::SharedSubtreeExec;
+        use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Fact table: 20 supplier groups × 200 rows. Prices rise with the
+        // group id so group sums are strictly increasing — the MAX is
+        // unique and the expected result is exactly 1 row.
+        let li_schema = Arc::new(Schema::new(vec![
+            Field::new("supp_id", DataType::Int64, false),
+            Field::new("ship_day", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("disc", DataType::Float64, false),
+        ]));
+        let mut supp_ids = Vec::new();
+        let mut ship_days = Vec::new();
+        let mut prices = Vec::new();
+        let mut discs = Vec::new();
+        for g in 0..20_i64 {
+            for r in 0..200_i64 {
+                supp_ids.push(g);
+                ship_days.push(r);
+                // Not exactly representable → sum is order-sensitive.
+                prices.push(100.0 + (g as f64) * 10.0 + (r as f64) * 0.1);
+                discs.push(0.01 + (r as f64) * 0.0001);
+            }
+        }
+        let li_batch = RecordBatch::try_new(
+            li_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(supp_ids)),
+                Arc::new(Int64Array::from(ship_days)),
+                Arc::new(Float64Array::from(prices)),
+                Arc::new(Float64Array::from(discs)),
+            ],
+        )
+        .unwrap();
+        let li_path = dir.path().join("li.parquet");
+        let mut w = ArrowWriter::try_new(std::fs::File::create(&li_path).unwrap(), li_schema, None)
+            .unwrap();
+        w.write(&li_batch).unwrap();
+        w.close().unwrap();
+
+        // Dimension table: small → JoinSelection picks it as the build
+        // side, and its join keys become the DynamicFilter pushed into the
+        // fact-scan probe side.
+        let supp_schema = Arc::new(Schema::new(vec![
+            Field::new("supp_id", DataType::Int64, false),
+            Field::new("sname", DataType::Utf8, false),
+        ]));
+        let supp_batch = RecordBatch::try_new(
+            supp_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..20_i64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..20).map(|i| format!("s{i}")).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let supp_path = dir.path().join("supp.parquet");
+        let mut w = ArrowWriter::try_new(
+            std::fs::File::create(&supp_path).unwrap(),
+            supp_schema,
+            None,
+        )
+        .unwrap();
+        w.write(&supp_batch).unwrap();
+        w.close().unwrap();
+
+        let make_ctx = |with_rule: bool| {
+            let li = li_path.clone();
+            let supp = supp_path.clone();
+            async move {
+                let mut b = SessionStateBuilder::new()
+                    .with_config(SessionConfig::new().with_target_partitions(4))
+                    .with_default_features();
+                if with_rule {
+                    b = b.with_physical_optimizer_rule(Arc::new(
+                        DedupeAggregateForFloatDeterminism::default(),
+                    ));
+                }
+                let ctx = SessionContext::new_with_state(b.build());
+                ctx.register_parquet("li", li.to_str().unwrap(), ParquetReadOptions::default())
+                    .await
+                    .unwrap();
+                ctx.register_parquet(
+                    "supp",
+                    supp.to_str().unwrap(),
+                    ParquetReadOptions::default(),
+                )
+                .await
+                .unwrap();
+                ctx
+            }
+        };
+
+        // TPC-H Q15 shape: the CTE materializes twice (DataFusion 53 has
+        // no CTE materialization) — once joined with the dimension table
+        // (the probe that receives the DynamicFilter) and once inside the
+        // scalar MAX subquery (filter-free).
+        let sql = "
+            WITH r AS (
+                SELECT supp_id AS supplier_no, sum(price * (1 - disc)) AS total_revenue
+                FROM li
+                WHERE ship_day >= 50 AND ship_day < 150
+                GROUP BY supp_id
+            )
+            SELECT s.supp_id, r.total_revenue
+            FROM supp s, r
+            WHERE s.supp_id = r.supplier_no
+              AND r.total_revenue = (SELECT max(total_revenue) FROM r)
+            ORDER BY s.supp_id
+        ";
+
+        // Precondition, on a RULE-FREE session: the fixture really does
+        // reproduce the one-sided DynamicFilter pushdown. (With the rule
+        // installed the placeholder is gone from the final plan BY DESIGN
+        // — the probe site's subtree is replaced by the canonical
+        // filter-free copy — so the hazard must be asserted before the
+        // rule runs.) If a DataFusion upgrade stops producing the
+        // placeholder here, this test needs a new reproduction — do not
+        // weaken the guard.
+        let bare_ctx = make_ctx(false).await;
+        let bare_plan = bare_ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let bare_disp = datafusion::physical_plan::displayable(bare_plan.as_ref())
+            .indent(false)
+            .to_string();
+        assert!(
+            bare_disp.contains("DynamicFilter"),
+            "fixture must reproduce the DynamicFilter pushdown; plan:\n{bare_disp}"
+        );
+
+        let ctx = make_ctx(true).await;
+        let df = ctx.sql(sql).await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let disp = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(false)
+            .to_string();
+
+        fn collect_wrap_inputs(p: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
+            if let Some(s) = p.as_any().downcast_ref::<SharedSubtreeExec>() {
+                out.push(s.input().clone());
+            }
+            for c in p.children() {
+                collect_wrap_inputs(c, out);
+            }
+        }
+        let mut wraps = Vec::new();
+        collect_wrap_inputs(&plan, &mut wraps);
+        assert_eq!(
+            wraps.len(),
+            2,
+            "dedupe must engage despite the one-sided DynamicFilter; plan:\n{disp}"
+        );
+        // Both wraps share the SAME canonical filter-free subtree: cache
+        // content is deterministic regardless of which wrap populates
+        // first, and is never another consumer's pruned stream.
+        assert!(
+            Arc::ptr_eq(&wraps[0], &wraps[1]),
+            "wraps must hold one canonical Arc"
+        );
+        assert!(
+            !subtree_has_dynamic_filter(&wraps[0]),
+            "the shared subtree must be the dynamic-filter-FREE copy"
+        );
+
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 1, "Q15 shape must return exactly its unique-max row");
+    }
 
     // PV.M.7 #308: the masked-fusion default flipped ON. It is wall-time-
     // neutral on Q15 at SF=10/100 (a CPU-work saving — one fewer l_shipdate
