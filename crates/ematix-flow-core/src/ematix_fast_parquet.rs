@@ -1019,6 +1019,73 @@ impl BridgeFilter {
         &self.predicates
     }
 
+    /// Σ.CC — 64-bit fingerprint of the predicate set for the
+    /// condition cache; `None` when ANY predicate is a per-query
+    /// runtime artifact (join-derived blooms/sets), which must never
+    /// be cached across queries. Covers every semantic field of the
+    /// static variants (f64 via `to_bits`, operators via `Debug`);
+    /// order-sensitive, matching the planner's deterministic
+    /// predicate order. The match is exhaustive on purpose: a new
+    /// variant must DECIDE its cacheability here or fail to compile.
+    pub fn cond_fingerprint(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for p in &self.predicates {
+            match p {
+                // Per-query runtime artifacts — never cacheable.
+                ColumnPredicate::I64InBloom { .. }
+                | ColumnPredicate::I64InSet { .. }
+                | ColumnPredicate::StringInBloom { .. }
+                | ColumnPredicate::StringInSet { .. } => return None,
+                ColumnPredicate::I32Range { col_idx, clauses } => {
+                    (1u8, col_idx).hash(&mut h);
+                    for c in clauses {
+                        format!("{:?}", c.op).hash(&mut h);
+                        c.literal_i32.hash(&mut h);
+                    }
+                }
+                ColumnPredicate::I32In { col_idx, values } => {
+                    (2u8, col_idx, values).hash(&mut h);
+                }
+                ColumnPredicate::F64Range { col_idx, clauses } => {
+                    (3u8, col_idx).hash(&mut h);
+                    for c in clauses {
+                        format!("{:?}", c.op).hash(&mut h);
+                        c.literal_f64.to_bits().hash(&mut h);
+                    }
+                }
+                ColumnPredicate::StringEq { col_idx, value } => {
+                    (4u8, col_idx, value).hash(&mut h);
+                }
+                ColumnPredicate::StringNotEq { col_idx, value } => {
+                    (5u8, col_idx, value).hash(&mut h);
+                }
+                ColumnPredicate::StringIn { col_idx, values } => {
+                    (6u8, col_idx, values).hash(&mut h);
+                }
+                ColumnPredicate::StringLike {
+                    col_idx,
+                    pattern,
+                    negated,
+                } => {
+                    (7u8, col_idx, pattern, negated).hash(&mut h);
+                }
+                ColumnPredicate::I32ColumnPair {
+                    left_col,
+                    right_col,
+                    op,
+                } => {
+                    (8u8, left_col, right_col).hash(&mut h);
+                    format!("{op:?}").hash(&mut h);
+                }
+                ColumnPredicate::I64Range { col_idx, lo, hi } => {
+                    (9u8, col_idx, lo, hi).hash(&mut h);
+                }
+            }
+        }
+        Some(h.finish())
+    }
+
     /// Σ.E5 #513: build a combined row bitmap by AND-combining one
     /// per-predicate bitmap. Returns `(bitmap, total_rows)`. For i32
     /// predicates uses the fast dict-mask + RLE-aware kernel; for
@@ -1032,8 +1099,25 @@ impl BridgeFilter {
             filter_i32_column_to_bitmap, filter_i32_column_to_bitmap_dense,
             filter_i64_column_to_bitmap_dense,
         };
+        // Σ.CC: a repeated STATIC predicate set answers from the
+        // condition cache — zero predicate-column decodes for this
+        // row group. Runtime blooms/sets fingerprint to None and
+        // bypass; file identity (mtime, len) is in the key, so
+        // rewrites never false-hit.
+        let cond_key = self
+            .cond_fingerprint()
+            .and_then(|fp| crate::cond_cache::key_for(path, rg, fp));
+        if let Some(k) = &cond_key {
+            if let Some((bm, total)) = crate::cond_cache::lookup(k) {
+                return Ok(((*bm).clone(), total));
+            }
+        }
         let mut combined: Option<(Vec<u8>, usize)> = None;
         for p in &self.predicates {
+            // Σ.LM.1 observability: one tick per predicate-column
+            // bitmap decode — the quantity the short-circuit below
+            // exists to reduce (tests pin the elision through it).
+            BRIDGE_PREDICATE_EVALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (b, total) = match p {
                 ColumnPredicate::I32Range { col_idx, .. }
                 | ColumnPredicate::I32In { col_idx, .. } => {
@@ -1252,11 +1336,47 @@ impl BridgeFilter {
                     }
                 }
             }
+            // Σ.LM.1 (PREWHERE-style short-circuit, 2026-07-12): once
+            // the accumulated bitmap is all-zero this row group is
+            // dead — every remaining predicate COLUMN DECODE is pure
+            // waste (AND with zero stays zero). ClickHouse's
+            // multi-step PREWHERE stops exactly here; so do we. The
+            // stats-based RG skip above can't catch these (footer
+            // ranges overlapped; the data didn't).
+            if let Some((acc, _)) = combined.as_ref() {
+                if bitmap_all_zero(acc) {
+                    break;
+                }
+            }
         }
-        combined.ok_or_else(|| {
+        let out = combined.ok_or_else(|| {
             DataFusionError::External("BridgeFilter::build_bitmap: no predicates".into())
-        })
+        })?;
+        if let Some(k) = cond_key {
+            crate::cond_cache::insert(k, Arc::new(out.0.clone()), out.1);
+        }
+        Ok(out)
     }
+}
+
+/// Σ.LM.1 — word-wise all-zero check for the short-circuit above. A
+/// 64 KiB-row bitmap is 8 KiB; this scans it as u64 words and is
+/// ~free next to one avoided column decode.
+#[inline]
+pub(crate) fn bitmap_all_zero(bitmap: &[u8]) -> bool {
+    let (head, words, tail) = unsafe { bitmap.align_to::<u64>() };
+    head.iter().all(|b| *b == 0) && words.iter().all(|w| *w == 0) && tail.iter().all(|b| *b == 0)
+}
+
+/// Σ.LM.1 — process-global count of per-predicate bitmap decodes in
+/// [`BridgeFilter::build_bitmap`]. Monotonic; tests read deltas to pin
+/// the short-circuit (an all-zero accumulator must stop the remaining
+/// predicate-column decodes for that row group).
+static BRIDGE_PREDICATE_EVALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read [`BRIDGE_PREDICATE_EVALS`] (relaxed).
+pub fn bridge_predicate_evals() -> u64 {
+    BRIDGE_PREDICATE_EVALS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl ColumnPredicate {
@@ -6903,6 +7023,202 @@ mod tests {
             fp_rate < 0.05,
             "bloom false-positive rate {fp_rate:.4} exceeds 5%"
         );
+    }
+
+    /// Σ.LM.1 — the PREWHERE-style short-circuit: once the AND-
+    /// accumulated bitmap is all-zero, `build_bitmap` must NOT decode
+    /// the remaining predicate columns for that row group. Pinned
+    /// structurally, immune to parallel-test counter noise: predicate
+    /// 2 names an out-of-bounds column, so it ERRORS if evaluated —
+    /// `Ok(all-zero)` proves the elision, and the reversed order
+    /// proves the probe actually trips when reached.
+    #[test]
+    fn build_bitmap_short_circuits_on_all_zero_accumulator() {
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+        use std::fs::File;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let schema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    PType::primitive_type_builder("a", PhysicalType::INT32)
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        let vals: Vec<i32> = (0..512).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int32ColumnWriter(t) = col.untyped() {
+            t.write_batch(&vals, None, None).unwrap();
+        }
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        // Killer first: IN(-1) matches nothing → all-zero accumulator.
+        let killer = ColumnPredicate::I32In {
+            col_idx: 0,
+            values: vec![-1],
+        };
+        // Sanity: the killer ALONE must produce an all-zero bitmap —
+        // if a kernel treats an empty dict selection as pass-through,
+        // everything below is meaningless.
+        let (kb, kt) = BridgeFilter::new(vec![killer.clone()])
+            .build_bitmap(&path, 0)
+            .expect("killer alone");
+        assert_eq!(kt, vals.len());
+        let set_bits: u32 = kb.iter().map(|b| b.count_ones()).sum();
+        assert_eq!(set_bits, 0, "killer bitmap must be all-zero");
+        // Probe second: column 99 does not exist → evaluating it errors.
+        let err_probe = ColumnPredicate::I32In {
+            col_idx: 99,
+            values: vec![0],
+        };
+
+        let filter = BridgeFilter::new(vec![killer.clone(), err_probe.clone()]);
+        let (bitmap, total) = filter
+            .build_bitmap(&path, 0)
+            .expect("short-circuit must skip the out-of-bounds probe");
+        assert_eq!(total, vals.len());
+        assert!(
+            bitmap_all_zero(&bitmap),
+            "killer predicate must zero the bitmap"
+        );
+
+        // Reversed order: the probe is evaluated FIRST and must blow
+        // up (the bridge panics on an out-of-bounds column) — proving
+        // the probe is a real tripwire, not silently ignored, so the
+        // Ok() above can only mean the short-circuit skipped it.
+        let reversed = BridgeFilter::new(vec![err_probe, killer]);
+        let tripped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reversed.build_bitmap(&path, 0)
+        }));
+        assert!(
+            tripped.is_err() || matches!(&tripped, Ok(Err(_))),
+            "out-of-bounds predicate must fail when actually evaluated"
+        );
+    }
+
+    /// Σ.CC — the condition cache serves a repeated static predicate
+    /// WITHOUT touching the data file. Structural proof: compute once
+    /// (miss), overwrite the file with same-length garbage while
+    /// restoring its mtime (identity key unchanged), and the repeat
+    /// must return the identical bitmap from cache — a recompute
+    /// would fail on the garbage, which the mtime-bumped third call
+    /// proves.
+    #[test]
+    fn cond_cache_serves_repeat_without_file_reads() {
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+        use std::fs::File;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let schema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    PType::primitive_type_builder("a", PhysicalType::INT32)
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        let vals: Vec<i32> = (0..256).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int32ColumnWriter(t) = col.untyped() {
+            t.write_batch(&vals, None, None).unwrap();
+        }
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        let filter = BridgeFilter::new(vec![ColumnPredicate::I32In {
+            col_idx: 0,
+            values: vec![7, 11],
+        }]);
+        assert!(filter.cond_fingerprint().is_some(), "static set must fp");
+
+        // 1) Miss → compute from the real file.
+        let (first, total) = filter.build_bitmap(&path, 0).expect("first compute");
+        assert_eq!(total, vals.len());
+
+        // 2) Corrupt the file IN PLACE (same length), restore mtime →
+        //    the identity key is unchanged and the repeat must be a
+        //    cache hit with the identical bitmap.
+        let orig_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::write(&path, vec![0xAAu8; len]).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(orig_mtime))
+            .unwrap();
+        let (second, total2) = filter
+            .build_bitmap(&path, 0)
+            .expect("repeat must be served from the condition cache");
+        assert_eq!(second, first);
+        assert_eq!(total2, total);
+
+        // 3) Bump mtime → new identity → recompute hits the garbage
+        //    and must fail: proof the step-2 success came from cache.
+        f.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+            .unwrap();
+        let recompute = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            filter.build_bitmap(&path, 0)
+        }));
+        assert!(
+            recompute.is_err() || matches!(&recompute, Ok(Err(_))),
+            "identity change must force a recompute, which fails on garbage"
+        );
+
+        // Runtime-bloom predicates never fingerprint.
+        let mut bloom = crate::bloom::BloomFilter::for_keys(4);
+        bloom.insert_i64(1);
+        let bloomy = BridgeFilter::new(vec![ColumnPredicate::I64InBloom {
+            col_idx: 0,
+            bloom: Arc::new(bloom),
+        }]);
+        assert!(bloomy.cond_fingerprint().is_none());
+    }
+
+    /// Σ.LM.1 — word-scan all-zero helper edge cases.
+    #[test]
+    fn bitmap_all_zero_edges() {
+        assert!(bitmap_all_zero(&[]));
+        assert!(bitmap_all_zero(&[0u8; 17]));
+        let mut b = vec![0u8; 17];
+        b[16] = 0x80;
+        assert!(!bitmap_all_zero(&b));
+        b[16] = 0;
+        b[0] = 1;
+        assert!(!bitmap_all_zero(&b));
     }
 
     /// Σ.AH.1 re-audit (2026-07-01) — pin scan-decode-level consumption

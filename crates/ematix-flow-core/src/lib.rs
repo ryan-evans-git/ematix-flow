@@ -10,6 +10,12 @@ pub mod delta_backend;
 pub mod flags;
 /// Σ.AI.6 bounded-by-default DataFusion memory pool (`EMAT_MEM_POOL_FRACTION`).
 pub mod mem_pool;
+// Σ.CC: query condition cache — repeated static predicates answer
+// their per-row-group bitmaps from a bounded LRU instead of
+// re-decoding predicate columns (EMAT_COND_CACHE_BYTES, default
+// 256 MiB, 0 disables). ClickHouse 25.x's condition cache mapped
+// onto RG granularity; composes with the Σ.LM.1 short-circuit.
+pub mod cond_cache;
 // Σ.AI.6d (2026-07-08): decode-pressure shedding — the scan-side
 // MemAvailable hook for the UNTRACKED decode memory the DataFusion
 // pool floor cannot see (MEMORY_BUDGET.md option 3). Opt-in
