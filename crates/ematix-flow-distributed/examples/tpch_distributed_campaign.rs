@@ -360,6 +360,14 @@ fn build_session_state(
     }
     let overrides = HarnessOverrides {
         auto_target_partitions: explicit.is_none(),
+        // Σ.MG.2 hang fix (2026-07-12): grace demotion must NOT run
+        // in a distributed session. Its arrow-side estimates are
+        // sampling-blind (LIKE=0.2 default) and over-trigger, and a
+        // GraceHashJoinExec inside a stage plan is undecodable by
+        // workers (no codec; per-node spill semantics don't cross the
+        // mesh) — the 2026-07-11 23:07Z mesh leg hung exactly here.
+        // Single-node sessions keep grace ON (its SF1000 purpose).
+        grace_join: !distributed,
         ..HarnessOverrides::default()
     };
 
@@ -642,6 +650,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Σ.MG.2: single-node emission twin (same table providers, no
+    // distributed rules) — bloom build sides must never route into
+    // the mesh. Only built when shipping is live.
+    let emit_ctx: Option<SessionContext> = if distributed
+        && ematix_flow_core::flags::tri_state("EMAT_MESH_BLOOM_SHIP").unwrap_or(true)
+    {
+        match ematix_flow_distributed::bloom_emitter::single_node_emission_ctx(&ctx).await {
+            Ok(twin) => Some(twin),
+            Err(e) => {
+                eprintln!("  bloom emission twin failed (shipping disabled): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // CUSTOM_SQL=<sql> — run one ad-hoc query through the distributed ctx
     // (diagnostic for DIST.1a). Prints row count + a 1-batch sample, or the
     // distributed EXPLAIN when EXPLAIN_ONLY=1. Returns after.
@@ -689,7 +714,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if std::env::var_os("EXPLAIN_ONLY").is_some() {
             // Arm blooms so the dumped plan matches what a real run
             // executes (Σ.MG.2 diagnostics).
-            emit_and_arm_blooms(&ctx, &sql, &bloom_slot, distributed).await;
+            emit_and_arm_blooms(emit_ctx.as_ref(), &sql, &bloom_slot).await;
             match ctx.sql(&format!("EXPLAIN {sql}")).await {
                 Ok(df) => match df.collect().await {
                     Ok(batches) => {
@@ -715,7 +740,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // execution). Failure is non-fatal: no blooms = no pruning,
         // never wrong results.
         let arm_blooms =
-            || async { emit_and_arm_blooms(&ctx, &sql, &bloom_slot, distributed).await };
+            || async { emit_and_arm_blooms(emit_ctx.as_ref(), &sql, &bloom_slot).await };
 
         // What did the adaptive mesh gate decide for this query?
         // Planning here is cheap relative to a trial (and each trial
@@ -854,15 +879,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// slot; clears the slot when disabled / non-distributed / nothing
 /// eligible. Returns the number of blooms armed.
 async fn emit_and_arm_blooms(
-    ctx: &SessionContext,
+    emit_ctx: Option<&SessionContext>,
     sql: &str,
     slot: &BloomSlot,
-    distributed: bool,
 ) -> usize {
-    if !distributed || !ematix_flow_core::flags::tri_state("EMAT_MESH_BLOOM_SHIP").unwrap_or(true) {
+    // `emit_ctx` is the SINGLE-NODE twin (Σ.MG.2 hang fix) — never
+    // the distributed ctx, whose splitter would route the build-side
+    // pre-execution into the Flight mesh and deadlock (2026-07-12
+    // 00:28Z: coordinator parked on futexes, workers idle). None ⇒
+    // shipping disabled / non-distributed run.
+    let Some(ctx) = emit_ctx else {
         slot.clear();
         return 0;
-    }
+    };
     let max_keys = std::env::var("EMAT_MESH_BLOOM_MAX_KEYS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -871,16 +900,28 @@ async fn emit_and_arm_blooms(
         max_build_rows: max_keys,
         ..Default::default()
     };
-    let blooms = match ctx.sql(sql).await {
-        Ok(df) => match df.into_optimized_plan() {
-            Ok(lp) => {
-                ematix_flow_distributed::bloom_emitter::emit_build_side_blooms(ctx, &lp, &opts)
-                    .await
-                    .unwrap_or_default()
-            }
+    // Defense in depth: a wedged emission degrades to "no blooms"
+    // (pruning lost, correctness + liveness kept), never a hung leg.
+    let emitted = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        match ctx.sql(sql).await {
+            Ok(df) => match df.into_optimized_plan() {
+                Ok(lp) => {
+                    ematix_flow_distributed::bloom_emitter::emit_build_side_blooms(ctx, &lp, &opts)
+                        .await
+                        .unwrap_or_default()
+                }
+                Err(_) => Default::default(),
+            },
             Err(_) => Default::default(),
-        },
-        Err(_) => Default::default(),
+        }
+    })
+    .await;
+    let blooms = match emitted {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("  bloom emit timed out (30s) — running unbloomd");
+            Default::default()
+        }
     };
     let n = blooms.len();
     if n == 0 {
@@ -967,11 +1008,22 @@ mod campaign_preset_parity_tests {
             preset::PRODUCTION_LOGICAL_RULE_NAMES,
             "distributed LOGICAL chain diverged from the production preset"
         );
-        let n = preset::PRODUCTION_PHYSICAL_RULE_NAMES.len();
+        // The distributed chain = production preset MINUS grace
+        // demotion (single-node-only: a GraceHashJoinExec inside a
+        // stage plan is undecodable by workers and its spill is
+        // per-node — the 2026-07-11 mesh hang) + the Σ.MG.2
+        // embedded-bloom wrap + the mesh-gated splitter LAST.
+        let expected_prefix: Vec<&str> = preset::PRODUCTION_PHYSICAL_RULE_NAMES
+            .iter()
+            .copied()
+            .filter(|n| *n != "ematix_flow_grace_join_demotion")
+            .collect();
+        let n = expected_prefix.len();
         assert_eq!(
             &physical[..n],
-            preset::PRODUCTION_PHYSICAL_RULE_NAMES,
-            "distributed PHYSICAL chain must start with the production preset"
+            &expected_prefix[..],
+            "distributed PHYSICAL chain must be the production preset \
+             minus grace demotion"
         );
         assert_eq!(
             physical.len(),
