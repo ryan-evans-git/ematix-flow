@@ -11,7 +11,7 @@
 # care which layout we use; this is the cheapest concession.
 #
 # Usage (run from coordinator only):
-#   register-tables.sh --sf {10|100}
+#   register-tables.sh --sf {1|10|100|1000}
 #
 # Required env:
 #   BENCH_BUCKET   S3 bucket (no s3:// prefix)
@@ -26,8 +26,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
-if [[ "$SF" != "1" && "$SF" != "10" && "$SF" != "100" ]]; then
-    echo "--sf must be 1, 10, or 100 (got: ${SF:-<empty>})" >&2
+if [[ "$SF" != "1" && "$SF" != "10" && "$SF" != "100" && "$SF" != "1000" ]]; then
+    echo "--sf must be 1, 10, 100, or 1000 (got: ${SF:-<empty>})" >&2
     exit 2
 fi
 if [[ -z "${BENCH_BUCKET:-}" ]]; then

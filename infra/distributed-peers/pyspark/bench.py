@@ -290,7 +290,7 @@ def cluster_size_from_spark(spark) -> int:
 # -----------------------------------------------------------------------------
 def parse_args(argv: List[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PySpark TPC-H benchmark")
-    p.add_argument("--sf", type=int, required=True, choices=[1, 10, 100],
+    p.add_argument("--sf", type=int, required=True, choices=[1, 10, 100, 1000],
                    help="TPC-H scale factor")
     p.add_argument("--bucket", required=True, help="S3 bucket (data + results)")
     p.add_argument("--trials", type=int, default=5, help="measured trials per query")
