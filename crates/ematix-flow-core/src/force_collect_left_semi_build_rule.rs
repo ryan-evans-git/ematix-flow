@@ -798,8 +798,26 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
         // CollectLeft build to a single partition (its
         // `required_input_distribution` demands SinglePartition) and
         // drops the now-unnecessary Hash repartition on the probe side
-        // (Unspecified distribution). Mirrors the Σ.BS dedupe-rule fix.
-        EnforceDistribution::new().optimize(rewritten.data, config)
+        // (Unspecified distribution).
+        //
+        // The repair MUST bracket exactly as the stock physical pipeline
+        // does — OutputRequirements(add) → EnforceDistribution →
+        // EnforceSorting → OutputRequirements(remove) — NOT a bare
+        // `EnforceDistribution::new().optimize(...)`. EnforceDistribution
+        // alone is not ordering-preserving: in the stock pipeline
+        // EnforceSorting always runs after it, so a bare re-run strips
+        // the top-level `SortPreservingMergeExec` (the global merge +
+        // fetch) off an `ORDER BY ... LIMIT n` query. The remaining
+        // per-partition `SortExec(TopK, preserve_partitioning=true)` then
+        // emits up to `n × partitions` unmerged rows — caught by TPC-DS
+        // q14/q18/q72 returning ~1400 rows for `LIMIT 100`. Mirrors the
+        // sibling `join_side_rule` / `grace_join_rule` bracket.
+        use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
+        use datafusion::physical_optimizer::output_requirements::OutputRequirements;
+        let repaired = OutputRequirements::new_add_mode().optimize(rewritten.data, config)?;
+        let repaired = EnforceDistribution::new().optimize(repaired, config)?;
+        let repaired = EnforceSorting::new().optimize(repaired, config)?;
+        OutputRequirements::new_remove_mode().optimize(repaired, config)
     }
 
     fn name(&self) -> &str {
@@ -1727,6 +1745,106 @@ mod tests {
             before,
             format!("{out:?}"),
             "a build-side-only date filter must not trigger a swap"
+        );
+    }
+
+    /// Σ.TPCDS.1 (2026-07-12) — correctness guard on the semi-join +
+    /// GROUP BY + `ORDER BY … LIMIT` shape whose partitioning repair the
+    /// rule performs. The rule closed with a bare
+    /// `EnforceDistribution::new().optimize(...)`; run outside the stock
+    /// pipeline (where EnforceSorting always follows EnforceDistribution),
+    /// on TPC-DS q14/q18/q72 that dropped the root
+    /// `SortPreservingMergeExec(fetch)`, leaving a per-partition
+    /// `SortExec(TopK, preserve_partitioning=true)` that emitted up to
+    /// `limit × target_partitions` unmerged rows (q72: 1359 for LIMIT 100).
+    /// The fix brackets the repair like the stock pipeline
+    /// (OutputRequirements→EnforceDistribution→EnforceSorting→remove);
+    /// see the sibling `join_side_rule` / `grace_join_rule`.
+    ///
+    /// NOTE: the strip only manifests on q14/q18/q72's full multi-join
+    /// depth — a minimal synthetic plan keeps its SPM under either code
+    /// path, so this test does NOT isolate that regression on its own.
+    /// The end-to-end evidence lives in `tpcds_exec_probe` (q72 1359→100
+    /// across the fix). This test pins that the fixed bracket returns the
+    /// correct row count on this shape and exercises the repair path
+    /// under `target_partitions > 1`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn semi_join_order_by_limit_returns_correct_count() {
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::physical_plan::{collect, displayable};
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        fn tbl(name: &str, n: i64) -> (String, Arc<MemTable>) {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from((0..n).collect::<Vec<i64>>()))],
+            )
+            .unwrap();
+            (
+                name.to_string(),
+                Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+            )
+        }
+
+        // Full production preset (the rule's real neighbours can set up
+        // the vulnerable plan state), with >1 partition so the exchanges
+        // — and the strip hazard — exist.
+        let state = crate::preset::with_optimizer_rules(
+            SessionStateBuilder::new()
+                .with_config(SessionConfig::new().with_target_partitions(16))
+                .with_default_features(),
+        )
+        .build();
+        let ctx = SessionContext::new_with_state(state);
+        for (n, t) in [tbl("big", 4000), tbl("small", 400), tbl("other", 4000)] {
+            ctx.register_table(&n, t).unwrap();
+        }
+
+        // Inner join over a semi-bounded build (`big ⋉ small`) feeding a
+        // GROUP BY, then ORDER BY … LIMIT — the q72 shape. The GROUP BY
+        // keeps the plan hash-partitioned, so ORDER BY … LIMIT compiles
+        // to per-partition `SortExec(TopK, preserve_partitioning=true)` +
+        // a root `SortPreservingMergeExec(fetch)`. The rule flips the
+        // semi build to CollectLeft; a bare EnforceDistribution re-run
+        // then dropped that root merge.
+        let sql = "SELECT x.a, count(*) AS c \
+                   FROM (SELECT a FROM big WHERE a IN (SELECT a FROM small)) x \
+                   JOIN other o ON x.a = o.a \
+                   GROUP BY x.a \
+                   ORDER BY c DESC, x.a \
+                   LIMIT 5";
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let text = displayable(plan.as_ref()).indent(false).to_string();
+
+        // Control 1: the rule actually engaged (else the test guards
+        // nothing — update the fixture if the planner shape changes).
+        assert!(
+            text.contains("CollectLeft"),
+            "control: the rule must flip a semi-bounded build to CollectLeft:\n{text}"
+        );
+        // Control 2: the plan is genuinely multi-partition (the GROUP BY
+        // hash-repartitions), so the per-partition-limit hazard is real
+        // and this test is not vacuously passing on a 1-partition plan.
+        assert!(
+            text.contains("RepartitionExec"),
+            "control: the GROUP BY must keep the plan multi-partition:\n{text}"
+        );
+
+        // The semantic that encodes the bug: exactly LIMIT rows, not up
+        // to LIMIT × target_partitions.
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 5,
+            "ORDER BY … LIMIT 5 must return 5 rows, not 5 × partitions"
         );
     }
 }
