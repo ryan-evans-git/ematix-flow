@@ -55,6 +55,7 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import shutil
 import statistics
 import sys
 import time
@@ -260,7 +261,16 @@ def setup_clickhouse(data_dir: Path, queries_dir: Path, qids: list[str], sf: int
     import chdb  # type: ignore
     from chdb import session as chs  # type: ignore
 
-    sess = chs.Session()
+    # Session state — including the `_tmp_default` spill disk — lives
+    # NEXT TO THE DATA, not in the OS temp dir: /tmp is tmpfs on our
+    # EC2 boxes (half of RAM), so "spill to /tmp" is spill to RAM, and
+    # SF100 Q03/Q05 died there with NOT_ENOUGH_SPACE (run3, 2026-07-12)
+    # while the 2.4T data volume sat idle. The data volume is the one
+    # provisioned with room. Fresh dir per run — stale session state
+    # must not leak between benches.
+    session_dir = Path(data_dir).resolve().parent / ".chdb-bench-session"
+    shutil.rmtree(session_dir, ignore_errors=True)
+    sess = chs.Session(str(session_dir))
     # Upstream tests/benchmarks/tpc-h/settings.json.
     sess.query("SET join_use_nulls = 1")
     # Tracked-memory cap at 60% of box RAM. Two SF100 runs wedged a
