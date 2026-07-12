@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-node TPC-H benchmark runner for DuckDB, Polars, and pandas.
+"""Single-node TPC-H benchmark runner for DuckDB, Polars, pandas, and ClickHouse.
 
 This is the single-node peer of the Trino/PySpark campaign runners
 (infra/distributed-peers/trino/bench.py). It runs each of the 22 TPC-H
@@ -26,6 +26,10 @@ Engines:
               scripts/bench-tpch-pandas.py, reading whole tables via
               pd.read_parquet. pandas at SF10/SF100 is expected to OOM;
               failures are recorded per-query and the run continues.
+    clickhouse — embedded ClickHouse via chdb (pip install chdb), the
+              in-process peer of the duckdb arm. CREATE VIEW over
+              file(glob, Parquet), runs ClickHouse's own published
+              TPC-H queries vendored as q*.clickhouse.sql.
 
 Usage:
     pip install duckdb polars pandas pyarrow boto3
@@ -242,6 +246,60 @@ def setup_polars(data_dir: Path, queries_dir: Path, qids: list[str], sf: int):
     return pl.__version__, runners, skipped
 
 
+def setup_clickhouse(data_dir: Path, queries_dir: Path, qids: list[str], sf: int):
+    """ClickHouse via chdb — the embedded ClickHouse engine, the exact
+    in-process peer of the duckdb arm (same box, same parquet globs, no
+    server ops). Queries are ClickHouse's OWN published TPC-H set
+    (ClickHouse/ClickHouse tests/benchmarks/tpc-h/queries), vendored as
+    q*.clickhouse.sql with comment lines stripped (Q11's 0.0001 literal
+    must be the FIRST occurrence for apply_tpch_query_params) and Q15's
+    CREATE VIEW/DROP VIEW pair inlined as a CTE (single-statement
+    harness; SELECT body identical to upstream). settings.json from the
+    same upstream dir sets join_use_nulls=1 (SQL-standard outer-join
+    NULLs — Q13 correctness)."""
+    import chdb  # type: ignore
+    from chdb import session as chs  # type: ignore
+
+    sess = chs.Session()
+    # Upstream tests/benchmarks/tpc-h/settings.json.
+    sess.query("SET join_use_nulls = 1")
+    # Match the duckdb arm's posture: the engine gets the whole box
+    # (duckdb's default memory_limit is 80% of RAM; chdb inherits
+    # server-style per-query caps that would handicap SF>=100 joins).
+    sess.query("SET max_memory_usage = 0")
+    for t in TABLES:
+        glob = f"{data_dir}/{t}/*.parquet"
+        sess.query(
+            f"CREATE OR REPLACE VIEW {t} AS SELECT * FROM file('{glob}', Parquet)"
+        )
+
+    runners: dict[str, "callable"] = {}
+    skipped: dict[str, str] = {}
+    for qid in qids:
+        sql = load_query(queries_dir, qid, variant="clickhouse")
+        if sql is None:
+            print(f"  {qid}: no .clickhouse.sql variant — skipping", flush=True)
+            skipped[qid] = "missing q*.clickhouse.sql"
+            continue
+        sql = apply_tpch_query_params(qid, sql, sf)
+
+        def make(sql=sql):
+            def run() -> tuple[float, int]:
+                t0 = time.perf_counter()
+                res = sess.query(sql, "CSV")
+                out = str(res)
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                if getattr(res, "has_error", lambda: False)():
+                    raise RuntimeError(res.error_message())
+                rows = sum(1 for line in out.splitlines() if line.strip())
+                return elapsed_ms, rows
+            return run
+
+        runners[qid] = make()
+    engine_version = str(sess.query("SELECT version()", "CSV")).strip().strip('"')
+    return f"{engine_version} (chdb {chdb.__version__})", runners, skipped
+
+
 def setup_pandas(data_dir: Path, queries_dir: Path, qids: list[str], sf: int):
     """pandas has no SQL — it reuses the hand-coded per-query functions
     from scripts/bench-tpch-pandas.py. That module hardcodes its data dir
@@ -310,8 +368,9 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--engine", choices=["duckdb", "polars", "pandas"], required=True)
-    p.add_argument("--sf", type=int, choices=[1, 10, 100], required=True)
+    p.add_argument("--engine", choices=["duckdb", "polars", "pandas", "clickhouse"],
+                   required=True)
+    p.add_argument("--sf", type=int, choices=[1, 10, 100, 1000], required=True)
     p.add_argument("--data-dir", type=Path, default=None,
                    help="local dir with per-table subdirs "
                         "(default: /opt/ematix/data/sf{sf})")
@@ -377,6 +436,8 @@ def main(argv: list[str] | None = None) -> int:
             version, runners, skipped = setup_duckdb(data_dir, queries_dir, qids, args.sf)
         elif args.engine == "polars":
             version, runners, skipped = setup_polars(data_dir, queries_dir, qids, args.sf)
+        elif args.engine == "clickhouse":
+            version, runners, skipped = setup_clickhouse(data_dir, queries_dir, qids, args.sf)
         else:
             version, runners, skipped = setup_pandas(data_dir, queries_dir, qids, args.sf)
     except ImportError as exc:
