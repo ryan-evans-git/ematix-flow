@@ -109,6 +109,25 @@ pub struct BloomEmitterOptions {
     /// case is reading one extra row to discover the cap was hit.
     /// Default: 50_000 — fits in a 6 KiB header at ~12 bits/key.
     pub max_build_rows: usize,
+    /// Σ.MG.3 emission cost gate: skip a candidate whose BUILD
+    /// subtree scans more than this many bytes — pre-executing the
+    /// build is real single-node work paid inside the query, and the
+    /// row cap alone doesn't bound it (a `LIMIT` above a selective
+    /// filter still reads most of the table). Q02 SF100 paid ~8s
+    /// scanning partsupp for a bloom worth nothing. 0 = uncapped.
+    /// Default here: 0 (library-neutral); production reads
+    /// [`Self::from_env`] (2 GiB).
+    pub max_build_scan_bytes: u64,
+    /// Σ.MG.3: emit only when the PROBE side scans at least this many
+    /// bytes — pruning pays on lineitem-class scans, not on queries
+    /// that are already sub-second. 0 = no floor. Default 0;
+    /// production via [`Self::from_env`] (16 GiB).
+    pub min_probe_scan_bytes: u64,
+    /// Σ.MG.3: emit only when probe bytes ≥ ratio × build bytes (both
+    /// known) — the Trino dynamic-filter posture: small build, big
+    /// probe. 0.0 = no ratio condition. Default 0.0; production via
+    /// [`Self::from_env`] (4.0).
+    pub min_probe_build_ratio: f64,
     /// Optional callback to override the table-name component of the
     /// uuid. Called once per probe-side base table. Returning `None`
     /// uses the table's local DataFusion name unchanged. Default
@@ -121,6 +140,9 @@ impl std::fmt::Debug for BloomEmitterOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BloomEmitterOptions")
             .field("max_build_rows", &self.max_build_rows)
+            .field("max_build_scan_bytes", &self.max_build_scan_bytes)
+            .field("min_probe_scan_bytes", &self.min_probe_scan_bytes)
+            .field("min_probe_build_ratio", &self.min_probe_build_ratio)
             .field("table_uuid_for", &self.table_uuid_for.is_some())
             .finish()
     }
@@ -130,9 +152,79 @@ impl Default for BloomEmitterOptions {
     fn default() -> Self {
         Self {
             max_build_rows: 50_000,
+            max_build_scan_bytes: 0,
+            min_probe_scan_bytes: 0,
+            min_probe_build_ratio: 0.0,
             table_uuid_for: None,
         }
     }
+}
+
+impl BloomEmitterOptions {
+    /// Production configuration — what the campaign harness and
+    /// `DistributedBackend` install (bench == release: these defaults
+    /// are the benched defaults).
+    ///
+    ///   EMAT_MESH_BLOOM_MAX_KEYS         build-side key cap, default 1M
+    ///   EMAT_MESH_BLOOM_MAX_BUILD_BYTES  Σ.MG.3 build scan cap,
+    ///                                    default 2 GiB, 0 = uncapped
+    ///   EMAT_MESH_BLOOM_MIN_PROBE_BYTES  Σ.MG.3 probe floor,
+    ///                                    default 16 GiB, 0 = none
+    ///   EMAT_MESH_BLOOM_MIN_RATIO        Σ.MG.3 probe/build ratio,
+    ///                                    default 4.0, 0 = none
+    pub fn from_env() -> Self {
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(default)
+        }
+        let max_keys = std::env::var("EMAT_MESH_BLOOM_MAX_KEYS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1_000_000);
+        let ratio = std::env::var("EMAT_MESH_BLOOM_MIN_RATIO")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(4.0);
+        Self {
+            max_build_rows: max_keys,
+            max_build_scan_bytes: env_u64("EMAT_MESH_BLOOM_MAX_BUILD_BYTES", 2 << 30),
+            min_probe_scan_bytes: env_u64("EMAT_MESH_BLOOM_MIN_PROBE_BYTES", 16 << 30),
+            min_probe_build_ratio: ratio,
+            table_uuid_for: None,
+        }
+    }
+}
+
+/// Σ.MG.3 — the emission cost gate. `None` bytes (a source that
+/// reports no statistics) is permissive on that condition: parquet
+/// sources always report, and a source that doesn't shouldn't lose
+/// pruning to a heuristic that can't see it.
+pub(crate) fn emission_cost_gate(
+    build_bytes: Option<u64>,
+    probe_bytes: Option<u64>,
+    opts: &BloomEmitterOptions,
+) -> bool {
+    if opts.max_build_scan_bytes > 0
+        && let Some(b) = build_bytes
+        && b > opts.max_build_scan_bytes
+    {
+        return false;
+    }
+    if opts.min_probe_scan_bytes > 0
+        && let Some(p) = probe_bytes
+        && p < opts.min_probe_scan_bytes
+    {
+        return false;
+    }
+    if opts.min_probe_build_ratio > 0.0
+        && let (Some(b), Some(p)) = (build_bytes, probe_bytes)
+        && (p as f64) < opts.min_probe_build_ratio * (b as f64)
+    {
+        return false;
+    }
+    true
 }
 
 /// Σ.J.2.b.vii — walk the plan, pre-execute build sides, return a
@@ -151,14 +243,26 @@ pub async fn emit_build_side_blooms(
     let mut candidates: Vec<JoinCandidate> = Vec::new();
     collect_join_candidates(plan, &mut candidates);
 
+    // Σ.MG.3: probe-side scan bytes, memoized per base table (several
+    // candidates often share a probe table).
+    let mut probe_bytes_cache: HashMap<String, Option<u64>> = HashMap::new();
+
     let mut out: HashMap<String, Arc<BloomFilter>> = HashMap::new();
     for cand in candidates {
-        match build_bloom_for_candidate(ctx, &cand, opts).await {
+        let probe_bytes = match probe_bytes_cache.get(&cand.probe_table) {
+            Some(b) => *b,
+            None => {
+                let b = probe_table_scan_bytes(ctx, &cand.probe_table).await;
+                probe_bytes_cache.insert(cand.probe_table.clone(), b);
+                b
+            }
+        };
+        match build_bloom_for_candidate(ctx, &cand, opts, probe_bytes).await {
             Ok(Some((uuid, bloom))) => {
                 out.insert(uuid, Arc::new(bloom));
             }
             Ok(None) => {
-                // Build side too big, or empty — silently skip.
+                // Build side too big / cost-gated / empty — skip.
             }
             Err(e) => {
                 tracing::warn!(
@@ -170,6 +274,28 @@ pub async fn emit_build_side_blooms(
         }
     }
     Ok(out)
+}
+
+/// Σ.MG.3: total scan bytes of a bare scan of `table` — the quantity
+/// the bloom would prune. `None` when the source reports no byte
+/// statistics (permissive in [`emission_cost_gate`]).
+async fn probe_table_scan_bytes(ctx: &SessionContext, table: &str) -> Option<u64> {
+    let df = ctx.table(table).await.ok()?;
+    let phys = df.create_physical_plan().await.ok()?;
+    sum_scan_bytes(&phys)
+}
+
+/// Sum known scan-leaf bytes of a physical plan (None if no leaf
+/// reports) — same statistic the adaptive mesh gate thresholds on.
+fn sum_scan_bytes(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Option<u64> {
+    let mut leaves = Vec::new();
+    crate::mesh_gate::collect_scan_leaf_bytes(plan, &mut leaves);
+    let known: Vec<u64> = leaves.into_iter().flatten().collect();
+    if known.is_empty() {
+        None
+    } else {
+        Some(known.iter().copied().sum())
+    }
 }
 
 /// Σ.J.2.b.viii — one-call coordinator-side: emit blooms for `plan`,
@@ -403,6 +529,7 @@ async fn build_bloom_for_candidate(
     ctx: &SessionContext,
     cand: &JoinCandidate,
     opts: &BloomEmitterOptions,
+    probe_bytes: Option<u64>,
 ) -> DfResult<Option<(String, BloomFilter)>> {
     // Project just the join-key column from the build sub-plan.
     let cap = opts.max_build_rows + 1;
@@ -411,7 +538,22 @@ async fn build_bloom_for_candidate(
         .limit(0, Some(cap))?
         .build()?;
     let df = ctx.execute_logical_plan(key_only_plan).await?;
-    let batches = df.collect().await?;
+    // Σ.MG.3 cost gate BEFORE execution: the row cap alone doesn't
+    // bound emission cost (a LIMIT above a selective filter still
+    // reads most of the build table). Plan physically, price the
+    // scans, and only then execute.
+    let phys = df.create_physical_plan().await?;
+    let build_bytes = sum_scan_bytes(&phys);
+    if !emission_cost_gate(build_bytes, probe_bytes, opts) {
+        tracing::debug!(
+            probe = %cand.probe_uuid_hint,
+            build_bytes = ?build_bytes,
+            probe_bytes = ?probe_bytes,
+            "Σ.MG.3: emission cost gate skipped bloom candidate"
+        );
+        return Ok(None);
+    }
+    let batches = datafusion::physical_plan::collect(phys, ctx.task_ctx()).await?;
 
     let mut n_rows = 0usize;
     let mut keys: Vec<i64> = Vec::with_capacity(opts.max_build_rows.min(8192));
@@ -513,6 +655,142 @@ mod tests {
         )?;
         let mt = MemTable::try_new(schema, vec![vec![rb]])?;
         ctx.register_table(name, Arc::new(mt))?;
+        Ok(())
+    }
+
+    /// Σ.MG.3 — the pure cost-gate decision matrix. Unknown bytes are
+    /// permissive per condition; zeros disable conditions.
+    #[test]
+    fn emission_cost_gate_matrix() {
+        let gated = BloomEmitterOptions {
+            max_build_scan_bytes: 2 << 30,  // 2 GiB
+            min_probe_scan_bytes: 16 << 30, // 16 GiB
+            min_probe_build_ratio: 4.0,
+            ..Default::default()
+        };
+        let gb = |n: u64| Some(n << 30);
+
+        // The Q07 shape: small build, lineitem-class probe → emit.
+        assert!(emission_cost_gate(gb(1), gb(45), &gated));
+        // The Q02 shape that cost 8s: partsupp-sized build → skip.
+        assert!(!emission_cost_gate(gb(12), gb(45), &gated));
+        // Probe under the floor (already-fast query) → skip.
+        assert!(!emission_cost_gate(gb(1), gb(4), &gated));
+        // Ratio: 2 GiB build, 6 GiB probe... probe floor already
+        // blocks that; isolate ratio with floor disabled.
+        let ratio_only = BloomEmitterOptions {
+            min_probe_scan_bytes: 0,
+            ..gated.clone()
+        };
+        assert!(!emission_cost_gate(gb(2), gb(6), &ratio_only)); // 3× < 4×
+        assert!(emission_cost_gate(gb(2), gb(9), &ratio_only)); // 4.5×
+
+        // Unknown bytes: permissive on that condition.
+        assert!(emission_cost_gate(None, gb(45), &gated));
+        assert!(emission_cost_gate(gb(1), None, &gated));
+        assert!(emission_cost_gate(None, None, &gated));
+
+        // All-zero = gate fully off (library-neutral Default).
+        assert!(emission_cost_gate(
+            gb(100),
+            Some(1),
+            &BloomEmitterOptions::default()
+        ));
+    }
+
+    /// Σ.MG.3 — production defaults ship through `from_env` (reads
+    /// only; the override paths are plain `parse()` calls covered by
+    /// the matrix above — setting process-global env in parallel
+    /// tests races).
+    #[test]
+    fn from_env_carries_cost_gate_defaults() {
+        for k in [
+            "EMAT_MESH_BLOOM_MAX_KEYS",
+            "EMAT_MESH_BLOOM_MAX_BUILD_BYTES",
+            "EMAT_MESH_BLOOM_MIN_PROBE_BYTES",
+            "EMAT_MESH_BLOOM_MIN_RATIO",
+        ] {
+            assert!(
+                std::env::var_os(k).is_none(),
+                "{k} set in test env — defaults test would be invalid"
+            );
+        }
+        let opts = BloomEmitterOptions::from_env();
+        assert_eq!(opts.max_build_rows, 1_000_000);
+        assert_eq!(opts.max_build_scan_bytes, 2 << 30);
+        assert_eq!(opts.min_probe_scan_bytes, 16 << 30);
+        assert_eq!(opts.min_probe_build_ratio, 4.0);
+    }
+
+    /// Σ.MG.3 wiring — parquet-backed (MemTable scans report no byte
+    /// statistics, which the gate treats permissively; parquet is the
+    /// production case): a probe floor above the fixture size skips
+    /// emission end-to-end, gate-off emits.
+    #[tokio::test]
+    async fn emission_cost_gate_skips_small_probe_end_to_end() -> DfResult<()> {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |name: &str, rows: i64| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(format!("{name}_ident"), DataType::Int64, false),
+                Field::new(format!("{name}_val"), DataType::Int64, false),
+            ]));
+            let rb = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|v| v % 7).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            let path = tmp.path().join(format!("{name}.parquet"));
+            let f = std::fs::File::create(&path).unwrap();
+            let mut w = ArrowWriter::try_new(f, schema, None).unwrap();
+            w.write(&rb).unwrap();
+            w.close().unwrap();
+            path
+        };
+        let big = write("big", 5_000);
+        let dim = write("dim", 100);
+
+        let ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_collect_statistics(true));
+        ctx.register_parquet("big", big.to_str().unwrap(), Default::default())
+            .await?;
+        ctx.register_parquet("dim", dim.to_str().unwrap(), Default::default())
+            .await?;
+        let plan = ctx
+            .sql(
+                "SELECT big_val FROM big \
+                 INNER JOIN dim ON big_ident = dim_ident \
+                 WHERE dim_val = 3",
+            )
+            .await?
+            .into_optimized_plan()?;
+
+        // Probe floor far above the KB-scale fixture → skip.
+        let gated = BloomEmitterOptions {
+            min_probe_scan_bytes: 10 << 20, // 10 MiB
+            ..Default::default()
+        };
+        let blooms = emit_build_side_blooms(&ctx, &plan, &gated).await?;
+        assert!(
+            blooms.is_empty(),
+            "probe floor must gate emission, got {:?}",
+            blooms.keys().collect::<Vec<_>>()
+        );
+
+        // Gate off → the same candidate emits.
+        let blooms = emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
+        assert!(
+            blooms.contains_key("big.big_ident"),
+            "ungated candidate must emit, got {:?}",
+            blooms.keys().collect::<Vec<_>>()
+        );
         Ok(())
     }
 
