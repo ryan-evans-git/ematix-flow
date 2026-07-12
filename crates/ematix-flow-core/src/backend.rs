@@ -630,6 +630,61 @@ pub trait Backend: Send + Sync + 'static {
             self.dialect()
         )))
     }
+
+    /// Σ.XO (2026-07-12): write a batch stream AND upsert per-source
+    /// committed offsets in ONE target-database transaction — the
+    /// exactly-once primitive for transactional SQL targets.
+    ///
+    /// `offsets` is `(source_id, offsets_json)` pairs; each lands as a
+    /// row in the target's `_ematix_offsets(pipeline_id, source_id,
+    /// offsets_json, updated_at)` table (created lazily inside the
+    /// same transaction; unqualified name — default schema). Upsert on
+    /// `PRIMARY KEY (pipeline_id, source_id)`; source ids absent from
+    /// `offsets` keep their previous row, mirroring
+    /// [`crate::state_store::CommitSnapshot::offsets`] semantics.
+    /// When `offsets` is empty no offsets table is touched — the call
+    /// degenerates to a plain transactional write.
+    ///
+    /// - `Ok(Some(rows))` — batch and offsets are both durably
+    ///   committed, atomically. A crash after this call can never
+    ///   re-deliver these rows to this target (recovery reads the
+    ///   offset row back via [`load_committed_offsets`]).
+    /// - `Ok(None)` — capability not supported (the default). The
+    ///   stream is dropped unconsumed; callers must probe support via
+    ///   [`load_committed_offsets`] BEFORE routing writes here.
+    ///
+    /// [`load_committed_offsets`]: Backend::load_committed_offsets
+    async fn write_arrow_stream_with_offsets(
+        &self,
+        _target: &TargetTable,
+        _stream: ArrowBatchStream,
+        _mode: WriteMode,
+        _pipeline_id: &str,
+        _offsets: &[(String, String)],
+    ) -> Result<Option<u64>, BackendError> {
+        Ok(None)
+    }
+
+    /// Σ.XO (2026-07-12): read back the offsets last committed into
+    /// this target by [`write_arrow_stream_with_offsets`].
+    ///
+    /// - `Ok(None)` — capability not supported (the default). Doubles
+    ///   as the support probe for exactly-once delivery resolution.
+    /// - `Ok(Some(vec![]))` — supported, but nothing committed yet
+    ///   (fresh target: the `_ematix_offsets` table may not even
+    ///   exist — that is NOT an error, the write side creates it
+    ///   lazily).
+    /// - `Ok(Some(rows))` — `(source_id, offsets_json)` pairs for
+    ///   `pipeline_id`; on restart these are authoritative over both
+    ///   broker- and StateStore-committed source offsets.
+    ///
+    /// [`write_arrow_stream_with_offsets`]: Backend::write_arrow_stream_with_offsets
+    async fn load_committed_offsets(
+        &self,
+        _pipeline_id: &str,
+    ) -> Result<Option<Vec<(String, String)>>, BackendError> {
+        Ok(None)
+    }
 }
 
 /// Re-export for trait method signatures.
@@ -1754,6 +1809,128 @@ impl Backend for PostgresBackend {
             .map_err(PgError::Postgres)
             .map_err(BackendError::from)?;
         Ok(total)
+    }
+
+    // Σ.XO (2026-07-12): the plain write path above already runs in
+    // one transaction — this variant rides the same bracket and adds
+    // the lazy `_ematix_offsets` DDL + per-source upsert before
+    // COMMIT. Drop-without-commit (any `?` early-return) rolls the
+    // whole thing back, batch rows included.
+    async fn write_arrow_stream_with_offsets(
+        &self,
+        target: &TargetTable,
+        stream: ArrowBatchStream,
+        mode: WriteMode,
+        pipeline_id: &str,
+        offsets: &[(String, String)],
+    ) -> Result<Option<u64>, BackendError> {
+        use futures_util::StreamExt;
+
+        let mut client = self
+            .pool
+            .raw_pool()
+            .get()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+        if mode == WriteMode::Truncate {
+            tx.batch_execute(&format!(
+                "TRUNCATE TABLE {}.{}",
+                quote_ident(&target.schema),
+                quote_ident(&target.name)
+            ))
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+        }
+        let mut total: u64 = 0;
+        let mut s = stream;
+        while let Some(batch) = s.next().await {
+            let batch = batch?;
+            total += insert_record_batch(&tx, &target.schema, &target.name, &batch).await?;
+        }
+        // Empty offsets = plain transactional write; don't create a
+        // meta table the pipeline will never read. Unqualified name —
+        // lands in the connection's default search_path schema, where
+        // `load_committed_offsets` reads it back.
+        if !offsets.is_empty() {
+            tx.batch_execute(
+                "CREATE TABLE IF NOT EXISTS _ematix_offsets (\
+                     pipeline_id TEXT NOT NULL, \
+                     source_id TEXT NOT NULL, \
+                     offsets_json TEXT NOT NULL, \
+                     updated_at TIMESTAMPTZ NOT NULL, \
+                     PRIMARY KEY (pipeline_id, source_id))",
+            )
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+            let stmt = tx
+                .prepare(
+                    "INSERT INTO _ematix_offsets \
+                         (pipeline_id, source_id, offsets_json, updated_at) \
+                     VALUES ($1, $2, $3, now()) \
+                     ON CONFLICT (pipeline_id, source_id) DO UPDATE SET \
+                         offsets_json = EXCLUDED.offsets_json, \
+                         updated_at = EXCLUDED.updated_at",
+                )
+                .await
+                .map_err(PgError::Postgres)
+                .map_err(BackendError::from)?;
+            for (source_id, offsets_json) in offsets {
+                tx.execute(&stmt, &[&pipeline_id, source_id, offsets_json])
+                    .await
+                    .map_err(PgError::Postgres)
+                    .map_err(BackendError::from)?;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+        Ok(Some(total))
+    }
+
+    // Σ.XO (2026-07-12): missing `_ematix_offsets` (checked via
+    // to_regclass against the search_path) = supported, nothing
+    // committed yet — the write side creates the table lazily.
+    async fn load_committed_offsets(
+        &self,
+        pipeline_id: &str,
+    ) -> Result<Option<Vec<(String, String)>>, BackendError> {
+        let client = self
+            .pool
+            .raw_pool()
+            .get()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        let exists_row = client
+            .query_one("SELECT to_regclass('_ematix_offsets') IS NOT NULL", &[])
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+        let exists: bool = exists_row.get(0);
+        if !exists {
+            return Ok(Some(Vec::new()));
+        }
+        let rows = client
+            .query(
+                "SELECT source_id, offsets_json FROM _ematix_offsets \
+                 WHERE pipeline_id = $1 ORDER BY source_id",
+                &[&pipeline_id],
+            )
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+        Ok(Some(
+            rows.iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                .collect(),
+        ))
     }
 }
 

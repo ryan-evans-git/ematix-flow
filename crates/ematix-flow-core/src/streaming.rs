@@ -443,6 +443,10 @@ pub struct StreamingPipelineConfig {
     /// pipeline. Seeds [`ReplayOptions::max_attempts`] when the
     /// operator surface (HTTP API / CLI) doesn't override per run.
     pub dlq_max_attempts: u32,
+    /// Σ.XO (2026-07-12): requested delivery guarantee. See
+    /// [`DeliveryMode`] for the resolution rules; the resolved form
+    /// is decided once at [`StreamingPipeline::run`] startup.
+    pub delivery: DeliveryMode,
 }
 
 /// Phase 39.5a P2.15: per-batch transform-error handling.
@@ -478,6 +482,50 @@ pub enum TransformErrorPolicy {
     Dlq,
 }
 
+/// Σ.XO (2026-07-12): requested delivery guarantee for target writes.
+///
+/// - `Auto` (default) — exactly-once when the pipeline is eligible
+///   (see below), else the historical at-least-once contract.
+/// - `AtLeastOnce` — force the historical contract even on an
+///   eligible pipeline.
+/// - `ExactlyOnce` — demand exactly-once; an ineligible pipeline is a
+///   hard error at startup, never a silent downgrade.
+///
+/// Eligibility (resolved by [`StreamingPipeline::resolve_delivery`]):
+/// exactly ONE target, whose backend implements
+/// [`Backend::write_arrow_stream_with_offsets`] (probed via
+/// [`Backend::load_committed_offsets`]), no CDC mode (CDC has its own
+/// per-event idempotency gate), and no stateful transform. The
+/// stateful-transform exclusion is load-bearing, not conservatism:
+/// offsets stamped into the target at write time cover rows still
+/// buffered in window/session state, so recovery would seek past rows
+/// that never reached the target — data loss, worse than a duplicate.
+///
+/// Fan-out stays at-least-once in this arc: N targets would need N
+/// per-target offset tables plus a reconciliation rule for targets
+/// that disagree after a partial fan-out failure — a follow-up, not a
+/// bolt-on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeliveryMode {
+    #[default]
+    Auto,
+    AtLeastOnce,
+    ExactlyOnce,
+}
+
+/// Σ.XO: what [`StreamingPipeline::resolve_delivery`] settled on for
+/// this run. `ExactlyOnce` carries the target-committed offsets read
+/// during the eligibility probe so startup recovery doesn't re-query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedDelivery {
+    AtLeastOnce,
+    ExactlyOnce {
+        /// `(source_id, offsets_json)` rows committed by a previous
+        /// run's atomic writes. Empty on a fresh target.
+        recovered: Vec<(String, String)>,
+    },
+}
+
 impl StreamingPipelineConfig {
     /// Sensible defaults for production: 500ms idle pause, Append
     /// mode. Caller still supplies source_query, target, and
@@ -504,7 +552,15 @@ impl StreamingPipelineConfig {
             target_primary_keys: Vec::new(),
             dlq_store: DlqStoreMode::default(),
             dlq_max_attempts: DEFAULT_MAX_ATTEMPTS,
+            delivery: DeliveryMode::default(),
         }
+    }
+
+    /// Builder-style (Σ.XO): request a delivery guarantee. Default
+    /// is [`DeliveryMode::Auto`].
+    pub fn with_delivery(mut self, delivery: DeliveryMode) -> Self {
+        self.delivery = delivery;
+        self
     }
 
     /// Builder-style: opt the pipeline into CDC apply mode. Each
@@ -936,6 +992,145 @@ impl StreamingPipeline {
         Ok((n_upserts, n_deletes, n_offsets))
     }
 
+    /// Σ.XO (2026-07-12): resolve the configured [`DeliveryMode`]
+    /// against this pipeline's actual shape. Called once at
+    /// [`Self::run`] startup; also callable directly for config
+    /// validation.
+    ///
+    /// The capability probe is [`Backend::load_committed_offsets`]
+    /// itself — `None` means the target can't do atomic
+    /// batch+offsets, `Some(rows)` means it can AND hands us any
+    /// previously committed offsets in the same round-trip.
+    pub async fn resolve_delivery(&self) -> Result<ResolvedDelivery, BackendError> {
+        let pipeline = self.config.pipeline_name.as_str();
+        if self.config.delivery == DeliveryMode::AtLeastOnce {
+            return Ok(ResolvedDelivery::AtLeastOnce);
+        }
+        let explicit = self.config.delivery == DeliveryMode::ExactlyOnce;
+        // Collect every ineligibility so an explicit demand fails
+        // with the full list, not a fix-one-find-another loop.
+        let mut blockers: Vec<String> = Vec::new();
+        if self.targets.len() != 1 {
+            blockers.push(format!(
+                "pipeline fans out to {} targets — exactly-once is single-target \
+                 in this arc (per-target offset tables are a follow-up)",
+                self.targets.len()
+            ));
+        }
+        if self.config.cdc.is_some() {
+            blockers.push(
+                "CDC apply mode has its own per-event idempotency gate and does \
+                 not route through the atomic batch+offsets write path"
+                    .into(),
+            );
+        }
+        if self
+            .config
+            .transform
+            .as_ref()
+            .is_some_and(|t| t.is_stateful())
+        {
+            blockers.push(
+                "stateful (windowed/session/join) transforms buffer rows outside \
+                 the target transaction — target-committed offsets would seek \
+                 past rows that never reached the target on restart"
+                    .into(),
+            );
+        }
+        let recovered = if blockers.is_empty() {
+            // Single target guaranteed by the check above.
+            let (backend, _table) = &self.targets[0];
+            match backend.load_committed_offsets(pipeline).await? {
+                Some(rows) => Some(rows),
+                None => {
+                    blockers.push(
+                        "the target backend does not support atomic batch+offsets \
+                         writes (Backend::write_arrow_stream_with_offsets); \
+                         supported today: SQLite, DuckDB, Postgres, MySQL"
+                            .into(),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        match recovered {
+            Some(rows) => Ok(ResolvedDelivery::ExactlyOnce { recovered: rows }),
+            None if explicit => Err(BackendError::Other(format!(
+                "pipeline `{pipeline}`: delivery = \"exactly_once\" cannot be \
+                 satisfied — {}. Fix the config or set delivery = \
+                 \"at_least_once\" explicitly; exactly-once never silently \
+                 downgrades.",
+                blockers.join("; ")
+            ))),
+            None => Ok(ResolvedDelivery::AtLeastOnce),
+        }
+    }
+
+    /// Σ.XO: inject target-committed offsets into the sources —
+    /// the same `seek_to` seam [`Self::load_state`] uses for
+    /// StateStore-recovered offsets. Runs at [`Self::run`] startup,
+    /// i.e. AFTER any `load_state` call, so for sources present in
+    /// both, the target's offsets are the last seek applied and
+    /// therefore win over StateStore- and broker-committed ones.
+    async fn apply_target_committed_offsets(
+        &self,
+        recovered: &[(String, String)],
+    ) -> Result<(), BackendError> {
+        for (source_id, offsets_json) in recovered {
+            let Some((backend, query)) = self.sources.iter().find(|(_, q)| q == source_id) else {
+                // A source was renamed/removed since the offsets
+                // were committed. Loud, not fatal: the remaining
+                // sources still recover correctly.
+                tracing::warn!(
+                    pipeline = %self.config.pipeline_name,
+                    source = %source_id,
+                    "target has committed offsets for a source that is no longer \
+                     configured — ignoring them"
+                );
+                continue;
+            };
+            if !backend.supports_seek_to() {
+                return Err(BackendError::Other(format!(
+                    "pipeline `{}` has target-committed offsets for source `{}` \
+                     but that source backend does not support seek_to — refusing \
+                     to silently re-deliver rows the target already has",
+                    self.config.pipeline_name, query
+                )));
+            }
+            backend.seek_to(offsets_json.as_bytes()).await?;
+        }
+        Ok(())
+    }
+
+    /// Σ.XO: snapshot every source's current offsets as
+    /// `(source_id, offsets_json)` pairs for stamping into the
+    /// target write. Sources whose `offset_snapshot` returns `None`
+    /// (nothing advanced, or no offset notion) drop out — absent
+    /// pairs leave the target's previous row unchanged, mirroring
+    /// [`crate::state_store::CommitSnapshot::offsets`] semantics.
+    ///
+    /// Offset bytes must be UTF-8 (every in-tree snapshot is JSON);
+    /// non-UTF-8 bytes are a hard error rather than a lossy encode.
+    async fn snapshot_offsets_for_eos(&self) -> Result<Vec<(String, String)>, BackendError> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (backend, query) in &self.sources {
+            if let Some(bytes) = backend.offset_snapshot().await? {
+                let json = String::from_utf8(bytes).map_err(|e| {
+                    BackendError::Other(format!(
+                        "pipeline `{}`: source `{}` produced a non-UTF-8 offset \
+                         snapshot — cannot stamp it into the target's \
+                         _ematix_offsets.offsets_json column: {e}",
+                        self.config.pipeline_name, query
+                    ))
+                })?;
+                out.push((query.clone(), json));
+            }
+        }
+        Ok(out)
+    }
+
     /// Phase 39.5a PR 3 + P1.7a: post-iteration durability sweep.
     ///
     /// Two responsibilities:
@@ -954,12 +1149,32 @@ impl StreamingPipeline {
     /// leaves the broker uncommitted (rows re-deliver, idempotent
     /// target absorbs). The reverse order would risk acked-but-
     /// uncommitted state on crash → data loss.
-    async fn finalize_iteration(&self) -> Result<(), BackendError> {
+    ///
+    /// Σ.XO: under resolved exactly-once (`eos`), the target's
+    /// atomic write already durably committed the offsets — the
+    /// source-side commit is ADVISORY (same precedent as the
+    /// StateStore path): its failure logs a warning and must not
+    /// fail the iteration, because the recovery authority is the
+    /// target, not the broker.
+    async fn finalize_iteration(&self, eos: bool) -> Result<(), BackendError> {
         if let Some(store) = &self.config.state_store {
             let _ = self.commit_state(store.as_ref()).await?;
         }
-        for (backend, _query) in &self.sources {
-            backend.commit_offsets().await?;
+        for (backend, query) in &self.sources {
+            match backend.commit_offsets().await {
+                Ok(()) => {}
+                Err(e) if eos => {
+                    tracing::warn!(
+                        pipeline = %self.config.pipeline_name,
+                        source = %query,
+                        error = %e,
+                        "advisory source-side offset commit failed under \
+                         exactly-once — target-committed offsets remain \
+                         authoritative; continuing"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -979,6 +1194,27 @@ impl StreamingPipeline {
         shutdown: ShutdownSignal,
     ) -> Result<StreamingPipelineMetrics, BackendError> {
         let mut summary = StreamingPipelineMetrics::default();
+
+        // Σ.XO: settle the delivery guarantee before the first read.
+        // An explicit-but-ineligible exactly-once demand errors HERE
+        // (startup), never mid-stream. When exactly-once resolves,
+        // seek every source to the target-committed offsets — this
+        // runs after any `load_state` call the CLI made, so target
+        // offsets win over StateStore- and broker-recovered ones.
+        let delivery = self.resolve_delivery().await?;
+        let eos = match &delivery {
+            ResolvedDelivery::AtLeastOnce => false,
+            ResolvedDelivery::ExactlyOnce { recovered } => {
+                self.apply_target_committed_offsets(recovered).await?;
+                tracing::info!(
+                    pipeline = %self.config.pipeline_name,
+                    recovered_sources = recovered.len(),
+                    "delivery resolved to exactly-once (atomic batch+offsets \
+                     writes; target offsets are the recovery authority)"
+                );
+                true
+            }
+        };
 
         // Phase 39.5a P1.8: spawn the periodic dirty-only checkpoint
         // ticker if the pipeline has both a `state_store` and a
@@ -1099,7 +1335,7 @@ impl StreamingPipeline {
                         self.metrics.errors.inc();
                     })?;
                     if !idle_emits.is_empty() {
-                        let n = self.write_emits_and_commit(idle_emits).await?;
+                        let n = self.write_emits_and_commit(idle_emits, eos).await?;
                         summary.total_rows += n;
                         summary.iterations += 1;
                         self.metrics.batches.inc();
@@ -1217,7 +1453,17 @@ impl StreamingPipeline {
                 // and noise in tests. Still finalize the iteration
                 // (commit source offsets, or commit state+offsets
                 // to the state store under PR 3).
-                self.finalize_iteration().await?;
+                //
+                // Σ.XO: under exactly-once the target offset row must
+                // still advance past the consumed-then-filtered rows,
+                // or a restart after a long filtered stretch would
+                // re-read (and re-filter) all of it — bounded-replay
+                // parity with the StateStore path, via a rows-less
+                // atomic write.
+                if eos {
+                    self.advance_target_offsets_only().await?;
+                }
+                self.finalize_iteration(eos).await?;
                 summary.iterations += 1;
                 continue;
             }
@@ -1276,6 +1522,45 @@ impl StreamingPipeline {
                     }
                 }
                 first_err
+            } else if eos {
+                // Σ.XO: single target guaranteed by resolution. The
+                // offsets are snapshotted BEFORE the write so the
+                // rows and the source positions that produced them
+                // commit in ONE target transaction — a crash at any
+                // point leaves both or neither.
+                match self.snapshot_offsets_for_eos().await {
+                    Err(e) => Some(e),
+                    Ok(offsets) => {
+                        let (backend, table) = &self.targets[0];
+                        let batches_for_target: Vec<RecordBatch> = batches.clone();
+                        let target_stream: ArrowBatchStream = Box::pin(futures_util::stream::iter(
+                            batches_for_target.into_iter().map(Ok),
+                        ));
+                        match backend
+                            .write_arrow_stream_with_offsets(
+                                table,
+                                target_stream,
+                                self.config.mode,
+                                &self.config.pipeline_name,
+                                &offsets,
+                            )
+                            .await
+                        {
+                            Ok(Some(_written)) => None,
+                            // Resolution said supported; `None` here
+                            // means the capability regressed at
+                            // runtime — hard error, never a silent
+                            // downgrade mid-stream.
+                            Ok(None) => Some(BackendError::Other(format!(
+                                "pipeline `{}`: target backend answered the \
+                                 exactly-once capability probe but returned \
+                                 unsupported from write_arrow_stream_with_offsets",
+                                self.config.pipeline_name
+                            ))),
+                            Err(e) => Some(e),
+                        }
+                    }
+                }
             } else {
                 // Π.4a historical path: fan out the batches through
                 // the universal Arrow append. Each target gets its
@@ -1333,6 +1618,21 @@ impl StreamingPipeline {
                             )
                             .await?;
                         self.metrics.dlq_writes.inc_by(dlq_count);
+                        // Σ.XO: the failed atomic write advanced
+                        // nothing in the target, but the batch is now
+                        // durably in the DLQ — advance the target's
+                        // offset row past it (rows-less atomic write)
+                        // or every restart would re-consume the
+                        // poison batch forever: target offsets are
+                        // the recovery authority, so a source-side
+                        // commit alone cannot retire it. If the
+                        // target is too broken even for the offsets
+                        // row, this errors and the batch re-delivers
+                        // — at-least-once into the DLQ, per its
+                        // documented contract.
+                        if eos {
+                            self.advance_target_offsets_only().await?;
+                        }
                     } else {
                         return Err(e);
                     }
@@ -1344,14 +1644,50 @@ impl StreamingPipeline {
             // `state_store` configured replaces source-side
             // `commit_offsets` with an atomic state+offsets commit
             // to the store; otherwise the historical per-source
-            // commit loop applies.
-            self.finalize_iteration().await?;
+            // commit loop applies. Under Σ.XO exactly-once both are
+            // advisory — the atomic write above already committed.
+            self.finalize_iteration(eos).await?;
 
             self.metrics.batches.inc();
             summary.total_rows += n_rows_out;
             summary.iterations += 1;
         }
         Ok(summary)
+    }
+
+    /// Σ.XO: commit the current source offsets into the target's
+    /// `_ematix_offsets` row WITHOUT any batch rows — the degenerate
+    /// atomic write. Used when the offsets must advance but there is
+    /// nothing to write (post-transform-empty iterations; a batch
+    /// retired into the DLQ). No-op when no source has snapshot-able
+    /// offsets.
+    async fn advance_target_offsets_only(&self) -> Result<(), BackendError> {
+        let offsets = self.snapshot_offsets_for_eos().await?;
+        if offsets.is_empty() {
+            return Ok(());
+        }
+        let (backend, table) = &self.targets[0];
+        let empty: ArrowBatchStream = Box::pin(futures_util::stream::empty());
+        match backend
+            .write_arrow_stream_with_offsets(
+                table,
+                empty,
+                // Never Truncate here — a rows-less write must not
+                // clear the target table.
+                WriteMode::Append,
+                &self.config.pipeline_name,
+                &offsets,
+            )
+            .await?
+        {
+            Some(_) => Ok(()),
+            None => Err(BackendError::Other(format!(
+                "pipeline `{}`: target backend answered the exactly-once \
+                 capability probe but returned unsupported from \
+                 write_arrow_stream_with_offsets",
+                self.config.pipeline_name
+            ))),
+        }
     }
 
     /// Phase 39.4 PR 2: fan-out windowed-emit batches to every
@@ -1361,7 +1697,16 @@ impl StreamingPipeline {
     /// failure bubbles, supervisor restart re-replays the source,
     /// the at-least-once + idempotent-target invariant absorbs
     /// duplicates.
-    async fn write_emits_and_commit(&self, emits: Vec<RecordBatch>) -> Result<u64, BackendError> {
+    ///
+    /// Σ.XO: only stateful transforms produce idle emits, and
+    /// stateful transforms are excluded from exactly-once at
+    /// resolution — so `eos` is always false here today; the
+    /// parameter keeps the advisory-commit rule in one place.
+    async fn write_emits_and_commit(
+        &self,
+        emits: Vec<RecordBatch>,
+        eos: bool,
+    ) -> Result<u64, BackendError> {
         let n_rows: u64 = emits.iter().map(|b| b.num_rows() as u64).sum();
         if n_rows == 0 {
             return Ok(0);
@@ -1380,7 +1725,7 @@ impl StreamingPipeline {
             return Err(e);
         }
         self.metrics.rows_written.inc_by(n_rows);
-        self.finalize_iteration().await?;
+        self.finalize_iteration(eos).await?;
         Ok(n_rows)
     }
 
@@ -5043,6 +5388,188 @@ mod tests {
         // `rewind` stub that returns an "unimplemented" error — same
         // discipline as Phases 1–2.
 
+        /// Σ.XO — delivery resolution + the crash/redelivery contract.
+        /// Reuses [`rewind::SeekableBackend`]: its cursor + seek_to are
+        /// the source, its gated `xo_target` mode is the transactional
+        /// target.
+        mod exactly_once {
+            use super::rewind::SeekableBackend;
+            use super::*;
+
+            fn table(name: &str) -> TargetTable {
+                TargetTable {
+                    schema: "".into(),
+                    name: name.into(),
+                }
+            }
+
+            fn cfg(delivery: DeliveryMode) -> StreamingPipelineConfig {
+                StreamingPipelineConfig::new("topic", table("t"), "p").with_delivery(delivery)
+            }
+
+            async fn run_briefly(pipeline: &StreamingPipeline) -> StreamingPipelineMetrics {
+                let (sig, trigger) = ShutdownSignal::new();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    trigger.trigger();
+                });
+                pipeline.run(sig).await.expect("pipeline.run")
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn explicit_exactly_once_unsupported_target_errors() {
+                let source = Arc::new(SeekableBackend::new("src", vec![]));
+                let target = Arc::new(SeekableBackend::target("tgt"));
+                let pipeline = StreamingPipeline::new(
+                    source as Arc<dyn Backend>,
+                    vec![(target as Arc<dyn Backend>, table("t"))],
+                    cfg(DeliveryMode::ExactlyOnce),
+                );
+                let err = pipeline
+                    .resolve_delivery()
+                    .await
+                    .expect_err("ineligible explicit exactly-once must refuse");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("does not support atomic batch+offsets"),
+                    "{msg}"
+                );
+                assert!(msg.contains("never silently downgrades"), "{msg}");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn explicit_exactly_once_fan_out_errors() {
+                let source = Arc::new(SeekableBackend::new("src", vec![]));
+                let a = Arc::new(SeekableBackend::xo_target("a"));
+                let b = Arc::new(SeekableBackend::xo_target("b"));
+                let pipeline = StreamingPipeline::new(
+                    source as Arc<dyn Backend>,
+                    vec![
+                        (a as Arc<dyn Backend>, table("a")),
+                        (b as Arc<dyn Backend>, table("b")),
+                    ],
+                    cfg(DeliveryMode::ExactlyOnce),
+                );
+                let err = pipeline.resolve_delivery().await.expect_err("fan-out");
+                assert!(err.to_string().contains("fans out"), "{err}");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn auto_downgrades_when_target_unsupported() {
+                let source = Arc::new(SeekableBackend::new("src", vec![]));
+                let target = Arc::new(SeekableBackend::target("tgt"));
+                let pipeline = StreamingPipeline::new(
+                    source as Arc<dyn Backend>,
+                    vec![(target as Arc<dyn Backend>, table("t"))],
+                    cfg(DeliveryMode::Auto),
+                );
+                assert_eq!(
+                    pipeline.resolve_delivery().await.unwrap(),
+                    ResolvedDelivery::AtLeastOnce,
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn auto_resolves_exactly_once_on_capable_target() {
+                let source = Arc::new(SeekableBackend::new("src", vec![]));
+                let target = Arc::new(SeekableBackend::xo_target("tgt"));
+                let pipeline = StreamingPipeline::new(
+                    source as Arc<dyn Backend>,
+                    vec![(target as Arc<dyn Backend>, table("t"))],
+                    cfg(DeliveryMode::Auto),
+                );
+                assert_eq!(
+                    pipeline.resolve_delivery().await.unwrap(),
+                    ResolvedDelivery::ExactlyOnce { recovered: vec![] },
+                );
+            }
+
+            /// The headline crash contract: a "crash" that loses every
+            /// source-side commit (fresh consumer, cursor 0 — full
+            /// broker redelivery) lands ZERO duplicate rows, because
+            /// startup recovery seeks to the offsets the target
+            /// committed in the same transaction as the rows.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn redelivery_after_crash_lands_no_duplicates() {
+                let data = vec![one_row_batch(1), one_row_batch(2)];
+                let tgt = Arc::new(SeekableBackend::xo_target("tgt"));
+
+                let src1 = Arc::new(SeekableBackend::new("src", data.clone()));
+                let p1 = StreamingPipeline::new(
+                    src1 as Arc<dyn Backend>,
+                    vec![(tgt.clone() as Arc<dyn Backend>, table("t"))],
+                    cfg(DeliveryMode::ExactlyOnce),
+                );
+                run_briefly(&p1).await;
+                assert_eq!(
+                    tgt.xo_landed().iter().sum::<u64>(),
+                    2,
+                    "run 1 lands both rows"
+                );
+                assert_eq!(
+                    tgt.xo_offsets().get("topic").map(String::as_str),
+                    Some("2"),
+                    "target committed the post-batch offset atomically"
+                );
+
+                // Crash: nothing survived on the source side.
+                let src2 = Arc::new(SeekableBackend::new("src", data.clone()));
+                let p2 = StreamingPipeline::new(
+                    src2.clone() as Arc<dyn Backend>,
+                    vec![(tgt.clone() as Arc<dyn Backend>, table("t"))],
+                    cfg(DeliveryMode::ExactlyOnce),
+                );
+                run_briefly(&p2).await;
+                assert_eq!(
+                    tgt.xo_landed().iter().sum::<u64>(),
+                    2,
+                    "full redelivery must land ZERO duplicate rows"
+                );
+                assert_eq!(
+                    src2.cursor(),
+                    2,
+                    "recovery seeked the fresh consumer to the target-committed offset"
+                );
+            }
+
+            /// Honest contrast: the SAME redelivery under forced
+            /// at-least-once duplicates — the historical contract
+            /// Σ.XO exists to escape. If this test ever fails, the
+            /// no-duplicates test above is proving nothing.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn redelivery_under_at_least_once_duplicates() {
+                let data = vec![one_row_batch(1), one_row_batch(2)];
+                let tgt = Arc::new(SeekableBackend::xo_target("tgt"));
+
+                let src1 = Arc::new(SeekableBackend::new("src", data.clone()));
+                let p1 = StreamingPipeline::new(
+                    src1 as Arc<dyn Backend>,
+                    vec![(tgt.clone() as Arc<dyn Backend>, table("t"))],
+                    cfg(DeliveryMode::AtLeastOnce),
+                );
+                run_briefly(&p1).await;
+                let after_run1: usize = tgt.captured().iter().map(|b| b.num_rows()).sum();
+                assert_eq!(after_run1, 2);
+
+                let src2 = Arc::new(SeekableBackend::new("src", data.clone()));
+                let p2 = StreamingPipeline::new(
+                    src2 as Arc<dyn Backend>,
+                    vec![(tgt.clone() as Arc<dyn Backend>, table("t"))],
+                    cfg(DeliveryMode::AtLeastOnce),
+                );
+                run_briefly(&p2).await;
+                let after_run2: usize = tgt.captured().iter().map(|b| b.num_rows()).sum();
+                assert_eq!(
+                    after_run2, 4,
+                    "at-least-once redelivery duplicates — the contract Σ.XO escapes"
+                );
+                assert!(
+                    tgt.xo_landed().is_empty(),
+                    "forced ALO must not touch the atomic path"
+                );
+            }
+        }
+
         mod rewind {
             use super::*;
             use crate::state_store::{InMemoryStateStore, StateStore};
@@ -5061,7 +5588,7 @@ mod tests {
             /// Offset bytes are the JSON-encoded cursor index —
             /// backend-opaque, per the `offset_snapshot`/`seek_to`
             /// contract.
-            struct SeekableBackend {
+            pub(super) struct SeekableBackend {
                 label: String,
                 data: Vec<RecordBatch>,
                 cursor: Mutex<usize>,
@@ -5070,10 +5597,19 @@ mod tests {
                 /// release more data for the rewound run.
                 limit: Mutex<usize>,
                 captured: Mutex<Vec<RecordBatch>>,
+                /// Σ.XO: when false (every pre-XO constructor), the
+                /// atomic batch+offsets capability probe reports
+                /// unsupported, so existing tests keep resolving
+                /// at-least-once. `xo_target` flips it.
+                xo_enabled: bool,
+                /// Σ.XO target state, mutated together under one lock
+                /// section — the in-memory analog of one transaction.
+                xo_offsets: Mutex<std::collections::HashMap<String, String>>,
+                xo_landed: Mutex<Vec<u64>>,
             }
 
             impl SeekableBackend {
-                fn new(label: &str, data: Vec<RecordBatch>) -> Self {
+                pub(super) fn new(label: &str, data: Vec<RecordBatch>) -> Self {
                     let limit = data.len();
                     Self {
                         label: label.into(),
@@ -5081,23 +5617,43 @@ mod tests {
                         cursor: Mutex::new(0),
                         limit: Mutex::new(limit),
                         captured: Mutex::new(Vec::new()),
+                        xo_enabled: false,
+                        xo_offsets: Mutex::new(std::collections::HashMap::new()),
+                        xo_landed: Mutex::new(Vec::new()),
                     }
                 }
 
-                fn target(label: &str) -> Self {
+                pub(super) fn target(label: &str) -> Self {
                     Self::new(label, Vec::new())
+                }
+
+                /// Σ.XO: a target that supports atomic batch+offsets.
+                pub(super) fn xo_target(label: &str) -> Self {
+                    let mut s = Self::target(label);
+                    s.xo_enabled = true;
+                    s
                 }
 
                 fn set_limit(&self, limit: usize) {
                     *self.limit.lock().unwrap() = limit;
                 }
 
-                fn cursor(&self) -> usize {
+                pub(super) fn cursor(&self) -> usize {
                     *self.cursor.lock().unwrap()
                 }
 
-                fn captured(&self) -> Vec<RecordBatch> {
+                pub(super) fn captured(&self) -> Vec<RecordBatch> {
                     self.captured.lock().unwrap().clone()
+                }
+
+                /// Σ.XO: per-atomic-write committed row counts.
+                pub(super) fn xo_landed(&self) -> Vec<u64> {
+                    self.xo_landed.lock().unwrap().clone()
+                }
+
+                /// Σ.XO: the offsets rows the target has committed.
+                pub(super) fn xo_offsets(&self) -> std::collections::HashMap<String, String> {
+                    self.xo_offsets.lock().unwrap().clone()
                 }
 
                 fn encode(idx: usize) -> Vec<u8> {
@@ -5235,6 +5791,48 @@ mod tests {
                         .position(|b| batch_max_event_ts(b).is_some_and(|t| t >= ts_us))
                         .unwrap_or(self.data.len());
                     Ok(Self::encode(idx))
+                }
+                // Σ.XO: rows + offsets land under ONE lock section —
+                // the in-memory analog of one target transaction.
+                async fn write_arrow_stream_with_offsets(
+                    &self,
+                    _target: &TargetTable,
+                    stream: ArrowBatchStream,
+                    _mode: WriteMode,
+                    _pipeline_id: &str,
+                    offsets: &[(String, String)],
+                ) -> Result<Option<u64>, BackendError> {
+                    if !self.xo_enabled {
+                        return Ok(None);
+                    }
+                    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                    let n: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+                    {
+                        let mut landed = self.xo_landed.lock().unwrap();
+                        let mut offs = self.xo_offsets.lock().unwrap();
+                        landed.push(n);
+                        for (sid, js) in offsets {
+                            offs.insert(sid.clone(), js.clone());
+                        }
+                    }
+                    self.captured.lock().unwrap().extend(batches);
+                    Ok(Some(n))
+                }
+                async fn load_committed_offsets(
+                    &self,
+                    _pipeline_id: &str,
+                ) -> Result<Option<Vec<(String, String)>>, BackendError> {
+                    if !self.xo_enabled {
+                        return Ok(None);
+                    }
+                    Ok(Some(
+                        self.xo_offsets
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    ))
                 }
             }
 

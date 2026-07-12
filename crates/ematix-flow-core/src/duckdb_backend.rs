@@ -1091,6 +1091,142 @@ impl Backend for DuckDBBackend {
         .await
     }
 
+    // Σ.XO (2026-07-12): batch append + `_ematix_offsets` upsert in
+    // ONE transaction. The Appender participates in the explicit
+    // BEGIN on the same connection (flushed before COMMIT), so
+    // ROLLBACK discards appended rows along with the offsets row.
+    async fn write_arrow_stream_with_offsets(
+        &self,
+        target: &TargetTable,
+        stream: ArrowBatchStream,
+        mode: WriteMode,
+        pipeline_id: &str,
+        offsets: &[(String, String)],
+    ) -> Result<Option<u64>, BackendError> {
+        use futures_util::StreamExt;
+
+        let mut s = stream;
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        while let Some(b) = s.next().await {
+            batches.push(b?);
+        }
+        let target_schema = target.schema.clone();
+        let target_table = target.name.clone();
+        let pipeline_id = pipeline_id.to_string();
+        let offsets = offsets.to_vec();
+
+        self.with_conn_blocking(move |c| {
+            c.execute_batch("BEGIN")
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            let result: Result<u64, BackendError> = (|| {
+                let qualified = format!(
+                    "\"{}\".\"{}\"",
+                    target_schema.replace('"', "\"\""),
+                    target_table.replace('"', "\"\""),
+                );
+                if mode == WriteMode::Truncate {
+                    c.execute_batch(&format!("DELETE FROM {qualified}"))
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                }
+                let mut total: u64 = 0;
+                for batch in &batches {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let mut appender = c
+                        .appender_to_db(&target_table, &target_schema)
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    appender
+                        .append_record_batch(batch.clone())
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    appender
+                        .flush()
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    total += batch.num_rows() as u64;
+                }
+                // Empty offsets = plain transactional write; no
+                // surprise meta table in the target.
+                if !offsets.is_empty() {
+                    c.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS _ematix_offsets (\
+                             pipeline_id TEXT NOT NULL, \
+                             source_id TEXT NOT NULL, \
+                             offsets_json TEXT NOT NULL, \
+                             updated_at TIMESTAMP NOT NULL, \
+                             PRIMARY KEY (pipeline_id, source_id))",
+                    )
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                    let mut stmt = c
+                        .prepare(
+                            "INSERT INTO _ematix_offsets \
+                                 (pipeline_id, source_id, offsets_json, updated_at) \
+                             VALUES (?1, ?2, ?3, now()) \
+                             ON CONFLICT (pipeline_id, source_id) DO UPDATE SET \
+                                 offsets_json = excluded.offsets_json, \
+                                 updated_at = excluded.updated_at",
+                        )
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    for (source_id, offsets_json) in &offsets {
+                        stmt.execute(duckdb::params![&pipeline_id, source_id, offsets_json])
+                            .map_err(|e| BackendError::Query(e.to_string()))?;
+                    }
+                }
+                Ok(total)
+            })();
+            match result {
+                Ok(total) => {
+                    if let Err(e) = c.execute_batch("COMMIT") {
+                        let _ = c.execute_batch("ROLLBACK");
+                        return Err(BackendError::Query(e.to_string()));
+                    }
+                    Ok(Some(total))
+                }
+                Err(e) => {
+                    let _ = c.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+        .await
+    }
+
+    // Σ.XO (2026-07-12): missing `_ematix_offsets` = supported but
+    // nothing committed yet (write side creates it lazily).
+    async fn load_committed_offsets(
+        &self,
+        pipeline_id: &str,
+    ) -> Result<Option<Vec<(String, String)>>, BackendError> {
+        let pipeline_id = pipeline_id.to_string();
+        self.with_conn_blocking(move |c| {
+            let table_exists: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM information_schema.tables \
+                     WHERE table_name = '_ematix_offsets'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            if table_exists == 0 {
+                return Ok(Some(Vec::new()));
+            }
+            let mut stmt = c
+                .prepare(
+                    "SELECT source_id, offsets_json FROM _ematix_offsets \
+                     WHERE pipeline_id = ?1 ORDER BY source_id",
+                )
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            let rows = stmt
+                .query_map(duckdb::params![&pipeline_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| BackendError::Query(e.to_string()))?
+                .collect::<Result<Vec<(String, String)>, _>>()
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(Some(rows))
+        })
+        .await
+    }
+
     async fn run_append(
         &self,
         spec: &TableSpec,
@@ -2247,5 +2383,88 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(n, 1, "deleted_at must be populated");
+    }
+
+    // --- Σ.XO: atomic batch + offsets (exactly-once primitive) -----------
+
+    /// Round-trip + upsert-overwrite, mirroring the SQLite suite.
+    /// Column names avoid the `*key` suffix (house rule).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xo_write_with_offsets_round_trip_and_upsert() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+
+        let b = DuckDBBackend::open(":memory:").unwrap();
+        b.execute("CREATE TABLE xo_sink (ident BIGINT)")
+            .await
+            .unwrap();
+        // Fresh target: probe says supported-but-empty even before
+        // the meta table exists.
+        assert_eq!(
+            b.load_committed_offsets("pipe-a").await.unwrap(),
+            Some(Vec::new())
+        );
+
+        let target = TargetTable {
+            schema: "main".into(),
+            name: "xo_sink".into(),
+        };
+        let mk_stream = |vals: Vec<i64>| -> crate::backend::ArrowBatchStream {
+            let schema = std::sync::Arc::new(S::new(vec![F::new("ident", Dt::Int64, false)]));
+            let batch =
+                RecordBatch::try_new(schema, vec![std::sync::Arc::new(Int64Array::from(vals))])
+                    .unwrap();
+            Box::pin(futures_util::stream::iter(vec![Ok(batch)]))
+        };
+
+        let written = b
+            .write_arrow_stream_with_offsets(
+                &target,
+                mk_stream(vec![1, 2]),
+                WriteMode::Append,
+                "pipe-a",
+                &[("src-1".into(), r#"{"0":5}"#.into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, Some(2));
+        assert_eq!(
+            b.load_committed_offsets("pipe-a").await.unwrap().unwrap(),
+            vec![("src-1".to_string(), r#"{"0":5}"#.to_string())]
+        );
+
+        // Upsert: same (pipeline, source) is replaced, not duplicated.
+        b.write_arrow_stream_with_offsets(
+            &target,
+            mk_stream(vec![3]),
+            WriteMode::Append,
+            "pipe-a",
+            &[("src-1".into(), r#"{"0":9}"#.into())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            b.load_committed_offsets("pipe-a").await.unwrap().unwrap(),
+            vec![("src-1".to_string(), r#"{"0":9}"#.to_string())]
+        );
+        // Scoped by pipeline_id.
+        assert_eq!(
+            b.load_committed_offsets("pipe-b").await.unwrap(),
+            Some(Vec::new())
+        );
+
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream("SELECT count(*) FROM xo_sink")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = s.try_collect().await.unwrap();
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 3, "both atomic writes landed");
     }
 }

@@ -1336,6 +1336,129 @@ impl Backend for SQLiteBackend {
         .await
     }
 
+    // Σ.XO (2026-07-12): batch insert + `_ematix_offsets` upsert in
+    // ONE transaction. The lazy CREATE TABLE IF NOT EXISTS rides the
+    // same transaction, so a crash at any point leaves either
+    // everything (rows + offsets + table) or nothing.
+    async fn write_arrow_stream_with_offsets(
+        &self,
+        target: &TargetTable,
+        stream: ArrowBatchStream,
+        mode: WriteMode,
+        pipeline_id: &str,
+        offsets: &[(String, String)],
+    ) -> Result<Option<u64>, BackendError> {
+        use futures_util::StreamExt;
+
+        require_main_schema(&target.schema)?;
+        let mut s = stream;
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        while let Some(b) = s.next().await {
+            batches.push(b?);
+        }
+        let target = target.clone();
+        let pipeline_id = pipeline_id.to_string();
+        let offsets = offsets.to_vec();
+        self.with_conn_blocking(move |c| {
+            c.execute_batch("BEGIN")
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            // Same rollback-on-any-failure discipline as
+            // `write_arrow_stream`: the connection is shared, and a
+            // dangling BEGIN poisons every later write.
+            let result: Result<u64, BackendError> = (|| {
+                let table_ref = format!("\"{}\"", target.name.replace('"', "\"\""));
+                if mode == WriteMode::Truncate {
+                    c.execute_batch(&format!("DELETE FROM {table_ref}"))
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                }
+                let mut total: u64 = 0;
+                for batch in &batches {
+                    total += insert_record_batch(c, &target, batch)?;
+                }
+                // Empty offsets = plain transactional write; don't
+                // create a meta table the pipeline will never read.
+                if !offsets.is_empty() {
+                    c.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS _ematix_offsets (\
+                             pipeline_id TEXT NOT NULL, \
+                             source_id TEXT NOT NULL, \
+                             offsets_json TEXT NOT NULL, \
+                             updated_at TEXT NOT NULL, \
+                             PRIMARY KEY (pipeline_id, source_id))",
+                    )
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                    let mut stmt = c
+                        .prepare(
+                            "INSERT INTO _ematix_offsets \
+                                 (pipeline_id, source_id, offsets_json, updated_at) \
+                             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+                             ON CONFLICT (pipeline_id, source_id) DO UPDATE SET \
+                                 offsets_json = excluded.offsets_json, \
+                                 updated_at = excluded.updated_at",
+                        )
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    for (source_id, offsets_json) in &offsets {
+                        stmt.execute(rusqlite::params![&pipeline_id, source_id, offsets_json])
+                            .map_err(|e| BackendError::Query(e.to_string()))?;
+                    }
+                }
+                Ok(total)
+            })();
+            match result {
+                Ok(total) => {
+                    if let Err(e) = c.execute_batch("COMMIT") {
+                        let _ = c.execute_batch("ROLLBACK");
+                        return Err(BackendError::Query(e.to_string()));
+                    }
+                    Ok(Some(total))
+                }
+                Err(e) => {
+                    let _ = c.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+        .await
+    }
+
+    // Σ.XO (2026-07-12): a missing `_ematix_offsets` table is
+    // "supported, nothing committed yet" — the write side creates it
+    // lazily, so a fresh target must not read as unsupported.
+    async fn load_committed_offsets(
+        &self,
+        pipeline_id: &str,
+    ) -> Result<Option<Vec<(String, String)>>, BackendError> {
+        let pipeline_id = pipeline_id.to_string();
+        self.with_conn_blocking(move |c| {
+            let table_exists: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master \
+                     WHERE type = 'table' AND name = '_ematix_offsets'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            if table_exists == 0 {
+                return Ok(Some(Vec::new()));
+            }
+            let mut stmt = c
+                .prepare(
+                    "SELECT source_id, offsets_json FROM _ematix_offsets \
+                     WHERE pipeline_id = ?1 ORDER BY source_id",
+                )
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![&pipeline_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| BackendError::Query(e.to_string()))?
+                .collect::<Result<Vec<(String, String)>, _>>()
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(Some(rows))
+        })
+        .await
+    }
+
     async fn run_append(
         &self,
         spec: &TableSpec,
@@ -3209,5 +3332,211 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(n, 1, "deleted_at must be populated");
+    }
+
+    // --- Σ.XO: atomic batch + offsets (exactly-once primitive) -----------
+
+    /// Column names deliberately avoid the `*key` suffix (downcast
+    /// trap — house rule).
+    fn xo_batch(idents: Vec<i64>) -> RecordBatch {
+        use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+        let schema = std::sync::Arc::new(S::new(vec![F::new("ident", Dt::Int64, false)]));
+        RecordBatch::try_new(schema, vec![std::sync::Arc::new(Int64Array::from(idents))]).unwrap()
+    }
+
+    fn xo_stream(batches: Vec<RecordBatch>) -> crate::backend::ArrowBatchStream {
+        Box::pin(futures_util::stream::iter(batches.into_iter().map(Ok)))
+    }
+
+    /// Fresh target: capability probe answers "supported, nothing
+    /// committed" even though `_ematix_offsets` doesn't exist yet —
+    /// the write side creates it lazily.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xo_load_committed_offsets_without_table_is_supported_empty() {
+        let b = SQLiteBackend::open(":memory:").unwrap();
+        let loaded = b.load_committed_offsets("pipe-x").await.unwrap();
+        assert_eq!(loaded, Some(Vec::new()));
+    }
+
+    /// Round-trip: the offsets stamped by the atomic write come back
+    /// verbatim from `load_committed_offsets`, scoped by pipeline_id;
+    /// a second write for the same (pipeline, source) upserts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xo_write_with_offsets_round_trip_and_upsert() {
+        let b = SQLiteBackend::open(":memory:").unwrap();
+        b.execute("CREATE TABLE xo_sink (ident INTEGER)")
+            .await
+            .unwrap();
+        let target = TargetTable {
+            schema: "main".into(),
+            name: "xo_sink".into(),
+        };
+
+        let written = b
+            .write_arrow_stream_with_offsets(
+                &target,
+                xo_stream(vec![xo_batch(vec![1, 2])]),
+                WriteMode::Append,
+                "pipe-a",
+                &[("src-1".into(), r#"{"0":5}"#.into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, Some(2));
+
+        let loaded = b.load_committed_offsets("pipe-a").await.unwrap().unwrap();
+        assert_eq!(
+            loaded,
+            vec![("src-1".to_string(), r#"{"0":5}"#.to_string())]
+        );
+        // Other pipelines see nothing.
+        assert_eq!(
+            b.load_committed_offsets("pipe-b").await.unwrap(),
+            Some(Vec::new())
+        );
+
+        // Same (pipeline, source) again → the offsets row is
+        // REPLACED, not duplicated; absent source ids are untouched.
+        let written = b
+            .write_arrow_stream_with_offsets(
+                &target,
+                xo_stream(vec![xo_batch(vec![3])]),
+                WriteMode::Append,
+                "pipe-a",
+                &[
+                    ("src-1".into(), r#"{"0":9}"#.into()),
+                    ("src-2".into(), r#"{"1":4}"#.into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, Some(1));
+        let mut loaded = b.load_committed_offsets("pipe-a").await.unwrap().unwrap();
+        loaded.sort();
+        assert_eq!(
+            loaded,
+            vec![
+                ("src-1".to_string(), r#"{"0":9}"#.to_string()),
+                ("src-2".to_string(), r#"{"1":4}"#.to_string()),
+            ]
+        );
+    }
+
+    /// The load-bearing atomicity property: when the batch insert
+    /// fails, the offsets upsert rolls back WITH it — a crash can
+    /// never pair written rows with un-advanced offsets or vice
+    /// versa. (Int32 is an unsupported Arrow type on the SQLite
+    /// write path, so the second batch fails mid-transaction.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xo_failed_write_rolls_back_rows_and_offsets_together() {
+        use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+
+        let b = SQLiteBackend::open(":memory:").unwrap();
+        b.execute("CREATE TABLE xo_sink (ident INTEGER)")
+            .await
+            .unwrap();
+        let target = TargetTable {
+            schema: "main".into(),
+            name: "xo_sink".into(),
+        };
+
+        // Seed one committed write so we can verify failure leaves
+        // the PREVIOUS offsets intact (not just "no offsets").
+        b.write_arrow_stream_with_offsets(
+            &target,
+            xo_stream(vec![xo_batch(vec![1])]),
+            WriteMode::Append,
+            "pipe-a",
+            &[("src-1".into(), r#"{"0":1}"#.into())],
+        )
+        .await
+        .unwrap();
+
+        let bad_schema = std::sync::Arc::new(S::new(vec![F::new("ident", Dt::Int32, false)]));
+        let bad_batch = RecordBatch::try_new(
+            bad_schema,
+            vec![std::sync::Arc::new(arrow_array::Int32Array::from(vec![7]))],
+        )
+        .unwrap();
+        let err = b
+            .write_arrow_stream_with_offsets(
+                &target,
+                xo_stream(vec![xo_batch(vec![2]), bad_batch]),
+                WriteMode::Append,
+                "pipe-a",
+                &[("src-1".into(), r#"{"0":2}"#.into())],
+            )
+            .await
+            .expect_err("unsupported Arrow type must fail the write");
+        assert!(
+            err.to_string().contains("unsupported Arrow type"),
+            "got: {err}"
+        );
+
+        // Neither the rows nor the offsets from the failed call are
+        // visible; the connection stays usable (no dangling BEGIN).
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream("SELECT count(*) FROM xo_sink")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = s.try_collect().await.unwrap();
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 1, "only the seed row survives the rollback");
+        let loaded = b.load_committed_offsets("pipe-a").await.unwrap().unwrap();
+        assert_eq!(
+            loaded,
+            vec![("src-1".to_string(), r#"{"0":1}"#.to_string())],
+            "offsets must still be the seed write's"
+        );
+    }
+
+    /// Empty offsets slice = plain transactional write; the meta
+    /// table is not created (no surprise tables in targets whose
+    /// sources can't snapshot offsets).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xo_empty_offsets_skips_meta_table() {
+        let b = SQLiteBackend::open(":memory:").unwrap();
+        b.execute("CREATE TABLE xo_sink (ident INTEGER)")
+            .await
+            .unwrap();
+        let target = TargetTable {
+            schema: "main".into(),
+            name: "xo_sink".into(),
+        };
+        let written = b
+            .write_arrow_stream_with_offsets(
+                &target,
+                xo_stream(vec![xo_batch(vec![1])]),
+                WriteMode::Append,
+                "pipe-a",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, Some(1));
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='_ematix_offsets'",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = s.try_collect().await.unwrap();
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(
+            n, 0,
+            "_ematix_offsets must not exist after an empty-offsets write"
+        );
     }
 }
