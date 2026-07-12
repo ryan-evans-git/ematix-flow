@@ -263,10 +263,16 @@ def setup_clickhouse(data_dir: Path, queries_dir: Path, qids: list[str], sf: int
     sess = chs.Session()
     # Upstream tests/benchmarks/tpc-h/settings.json.
     sess.query("SET join_use_nulls = 1")
-    # Match the duckdb arm's posture: the engine gets the whole box
-    # (duckdb's default memory_limit is 80% of RAM; chdb inherits
-    # server-style per-query caps that would handicap SF>=100 joins).
-    sess.query("SET max_memory_usage = 0")
+    # Match the duckdb arm's posture EXACTLY: 80% of box RAM (duckdb's
+    # default memory_limit). Unlimited (=0) let a SF100 join thrash a
+    # 32 GB box into an ssh-dead wedge on 2026-07-12 — same-box legs
+    # need the same headroom discipline as every other engine. Spill
+    # knobs let CH degrade instead of dying at the cap.
+    ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    cap = int(ram * 0.8)
+    sess.query(f"SET max_memory_usage = {cap}")
+    sess.query(f"SET max_bytes_before_external_group_by = {cap // 2}")
+    sess.query(f"SET max_bytes_before_external_sort = {cap // 2}")
     for t in TABLES:
         glob = f"{data_dir}/{t}/*.parquet"
         sess.query(
