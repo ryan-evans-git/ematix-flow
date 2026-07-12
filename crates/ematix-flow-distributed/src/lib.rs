@@ -316,13 +316,17 @@ impl DistributedBackend {
             "distributed session: adaptive mesh gate resolved"
         );
         builder = builder
-            // Σ.MG.2: bloom wrap BEFORE the gate/splitter so
-            // BloomFilterExec lands inside worker stages; the codec
-            // serializes it into the stage protobuf.
+            // Σ.MG.2 (hang #3 fix): bloom wrap AFTER the gate/splitter
+            // — pre-split wrapping perturbs the splitter's topology
+            // decisions (leaf-exemption defeat → a local CollectLeft
+            // build side becomes a remote stage → fleet deadlock, Q02
+            // SF100 2026-07-12). Post-split, the rule wraps scans
+            // inside the frozen stages via the network nodes'
+            // children(); the codec ships the wrap in the stage proto.
+            .with_physical_optimizer_rule(Arc::new(gate))
             .with_physical_optimizer_rule(Arc::new(bloom_codec::EmbeddedBloomRule::new(
                 self.bloom_slot.clone(),
             )))
-            .with_physical_optimizer_rule(Arc::new(gate))
             .with_distributed_user_codec(bloom_codec::BloomExecCodec)
             .with_distributed_worker_resolver(resolver);
         // Σ.B follow-up: install the TLS-aware channel resolver
