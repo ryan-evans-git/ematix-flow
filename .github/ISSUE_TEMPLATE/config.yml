@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://ematix.dev
+    about: Guides, concepts, and the reference — check here first.
+  - name: Report a security vulnerability
+    url: https://github.com/ryan-evans-git/ematix-flow/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue.
+  - name: Email the team
+    url: mailto:support@ematix.dev
+    about: For anything that doesn't fit an issue.
