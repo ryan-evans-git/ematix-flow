@@ -2315,7 +2315,7 @@ fn provider_meta_cache_key(path: &str) -> Option<ProviderMetaCacheKey> {
 /// `try_new` paths do) so AUTO resolves order-independently.
 /// NOTE: this replaces the pre-campaign presence semantics
 /// (`EMAT_DOWNCAST_KEYS=0` used to mean ON; it now means OFF).
-fn key_downcast_enabled() -> bool {
+pub(crate) fn key_downcast_enabled() -> bool {
     crate::flags::scale_gated_large("EMAT_DOWNCAST_KEYS")
 }
 
@@ -2371,7 +2371,7 @@ impl EmatixFastParquetTableProvider {
     /// exercise the i32-key narrowing without mutating a process-global env
     /// var (which would race other parallel tests). Production `try_new`
     /// passes `key_downcast_enabled()`.
-    fn try_new_opt(path: impl Into<String>, downcast_keys: bool) -> DfResult<Self> {
+    pub(crate) fn try_new_opt(path: impl Into<String>, downcast_keys: bool) -> DfResult<Self> {
         let path = path.into();
         // KEYS.2: when the i32-key downcast is enabled, bypass the
         // process-global meta cache entirely (read AND write). The cache
