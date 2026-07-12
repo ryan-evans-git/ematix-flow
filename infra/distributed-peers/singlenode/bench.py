@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-node TPC-H benchmark runner for DuckDB, Polars, and pandas.
+"""Single-node TPC-H benchmark runner for DuckDB, Polars, pandas, and ClickHouse.
 
 This is the single-node peer of the Trino/PySpark campaign runners
 (infra/distributed-peers/trino/bench.py). It runs each of the 22 TPC-H
@@ -26,6 +26,10 @@ Engines:
               scripts/bench-tpch-pandas.py, reading whole tables via
               pd.read_parquet. pandas at SF10/SF100 is expected to OOM;
               failures are recorded per-query and the run continues.
+    clickhouse — embedded ClickHouse via chdb (pip install chdb), the
+              in-process peer of the duckdb arm. CREATE VIEW over
+              file(glob, Parquet), runs ClickHouse's own published
+              TPC-H queries vendored as q*.clickhouse.sql.
 
 Usage:
     pip install duckdb polars pandas pyarrow boto3
@@ -51,6 +55,7 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import shutil
 import statistics
 import sys
 import time
@@ -242,6 +247,241 @@ def setup_polars(data_dir: Path, queries_dir: Path, qids: list[str], sf: int):
     return pl.__version__, runners, skipped
 
 
+def setup_clickhouse(data_dir: Path, queries_dir: Path, qids: list[str], sf: int,
+                     native: bool = False, extra_meta: dict | None = None):
+    """ClickHouse via chdb — the embedded ClickHouse engine, the exact
+    in-process peer of the duckdb arm (same box, same parquet globs, no
+    server ops). Queries are ClickHouse's OWN published TPC-H set
+    (ClickHouse/ClickHouse tests/benchmarks/tpc-h/queries), vendored as
+    q*.clickhouse.sql with comment lines stripped (Q11's 0.0001 literal
+    must be the FIRST occurrence for apply_tpch_query_params) and Q15's
+    CREATE VIEW/DROP VIEW pair inlined as a CTE (single-statement
+    harness; SELECT body identical to upstream). settings.json from the
+    same upstream dir sets join_use_nulls=1 (SQL-standard outer-join
+    NULLs — Q13 correctness).
+
+    Two modes, one methodology split the site charts label explicitly:
+    `native=False` queries the shared parquet in place (`file()` views —
+    no statistics, so CH's stats-based join reordering cannot engage);
+    `native=True` is the load-then-query leg (their published mode:
+    MergeTree ingest first, load cost recorded via `extra_meta`)."""
+    import chdb  # type: ignore
+    from chdb import session as chs  # type: ignore
+
+    # Session state — including the `_tmp_default` spill disk — lives
+    # NEXT TO THE DATA, not in the OS temp dir: /tmp is tmpfs on our
+    # EC2 boxes (half of RAM), so "spill to /tmp" is spill to RAM, and
+    # SF100 Q03/Q05 died there with NOT_ENOUGH_SPACE (run3, 2026-07-12)
+    # while the 2.4T data volume sat idle. The data volume is the one
+    # provisioned with room. Fresh dir per run — stale session state
+    # must not leak between benches.
+    session_dir = Path(data_dir).resolve().parent / ".chdb-bench-session"
+    shutil.rmtree(session_dir, ignore_errors=True)
+    sess = chs.Session(str(session_dir))
+    # Upstream tests/benchmarks/tpc-h/settings.json.
+    sess.query("SET join_use_nulls = 1")
+    # Tracked-memory cap at 60% of box RAM. Two SF100 runs wedged a
+    # 32 GB box ssh-dead (2026-07-12): unlimited (=0), then 80% (DuckDB-
+    # parity posture). CH's tracker only sees its own allocations —
+    # file() parquet scans churn tens of GB of page cache on top, so at
+    # 80% tracked the kernel hits reclaim-thrash before the tracker
+    # trips. 60% leaves real headroom: a query that can't fit fails
+    # loudly with MEMORY_LIMIT_EXCEEDED (recorded as a DNF) instead of
+    # taking the box down. Spill knobs at half the cap let group-by/
+    # sort degrade before that.
+    ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    cap = int(ram * 0.6)
+    sess.query(f"SET max_memory_usage = {cap}")
+    sess.query(f"SET max_bytes_before_external_group_by = {cap // 2}")
+    sess.query(f"SET max_bytes_before_external_sort = {cap // 2}")
+    if native:
+        # Load-then-query leg: ClickHouse's own published TPC-H DDL
+        # (spec-typed, PRIMARY KEY per spec — vendored verbatim in
+        # tpch_init_clickhouse.sql), data INSERTed from the same parquet
+        # the query-in-place legs read. This is the mode behind the
+        # numbers on clickhouse.com — sorted parts, sparse indexes, and
+        # table statistics for their join reordering — and it pays for
+        # them in load time + duplicated storage, both recorded in the
+        # result JSON so the site can show the full cost.
+        sess.query("SET default_table_engine = 'MergeTree'")
+        # Strip comment LINES before splitting on ';' — comments may
+        # contain semicolons (the vendor header does), and a naive
+        # split would feed comment fragments to the engine as SQL.
+        ddl_path = Path(__file__).resolve().parent / "tpch_init_clickhouse.sql"
+        ddl_sql = "\n".join(
+            l for l in ddl_path.read_text().splitlines()
+            if not l.strip().startswith("--")
+        )
+        for stmt in ddl_sql.split(";"):
+            if stmt.strip():
+                sess.query(stmt)
+        load_s: dict[str, float] = {}
+        t_all = time.perf_counter()
+        for t in TABLES:
+            glob = f"{data_dir}/{t}/*.parquet"
+            t0 = time.perf_counter()
+            res = sess.query(f"INSERT INTO {t} SELECT * FROM file('{glob}', Parquet)")
+            if getattr(res, "has_error", lambda: False)():
+                raise RuntimeError(f"mergetree load {t}: {res.error_message()}")
+            load_s[t] = round(time.perf_counter() - t0, 2)
+            print(f"  load {t}: {load_s[t]}s", flush=True)
+        total_s = round(time.perf_counter() - t_all, 2)
+        disk = str(sess.query(
+            "SELECT sum(bytes_on_disk) FROM system.parts WHERE active", "CSV"
+        )).strip().strip('"')
+        if extra_meta is not None:
+            extra_meta.update({
+                "mode": "load-then-query (native MergeTree)",
+                "load_seconds_per_table": load_s,
+                "load_seconds_total": total_s,
+                "native_bytes_on_disk": int(disk) if disk.isdigit() else disk,
+            })
+        print(f"==> mergetree load complete: {total_s}s, {disk} bytes on disk",
+              flush=True)
+    else:
+        for t in TABLES:
+            glob = f"{data_dir}/{t}/*.parquet"
+            sess.query(
+                f"CREATE OR REPLACE VIEW {t} AS SELECT * FROM file('{glob}', Parquet)"
+            )
+
+    runners: dict[str, "callable"] = {}
+    skipped: dict[str, str] = {}
+    for qid in qids:
+        sql = load_query(queries_dir, qid, variant="clickhouse")
+        if sql is None:
+            print(f"  {qid}: no .clickhouse.sql variant — skipping", flush=True)
+            skipped[qid] = "missing q*.clickhouse.sql"
+            continue
+        sql = apply_tpch_query_params(qid, sql, sf)
+
+        def make(sql=sql):
+            def run() -> tuple[float, int]:
+                t0 = time.perf_counter()
+                res = sess.query(sql, "CSV")
+                out = str(res)
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                if getattr(res, "has_error", lambda: False)():
+                    raise RuntimeError(res.error_message())
+                rows = sum(1 for line in out.splitlines() if line.strip())
+                return elapsed_ms, rows
+            return run
+
+        runners[qid] = make()
+    engine_version = str(sess.query("SELECT version()", "CSV")).strip().strip('"')
+    return f"{engine_version} (chdb {chdb.__version__})", runners, skipped
+
+
+def setup_clickhouse_server(data_dir: Path, queries_dir: Path, qids: list[str], sf: int,
+                            extra_meta: dict | None = None):
+    """ClickHouse SERVER — the engine behind clickhouse.com's published
+    load-then-query numbers, driven via `clickhouse client` subprocesses
+    against a local server. Exists because chdb's EMBEDDED MergeTree
+    path picks pathological multi-join plans — Q02/Q05 regress from
+    ~1-6 s (parquet views, same engine version) to >400 s (native
+    tables) — so the embedded engine cannot fairly represent their
+    published mode. Query timing uses the client's `--time` output
+    (server-reported elapsed; excludes ~30-50 ms subprocess spawn,
+    negligible at these scales). Per-query settings mirror the chdb
+    arm: join_use_nulls + 60% tracked cap + spill at half.
+
+    Requires (see the SF100 campaign notes): the server binary at
+    $EMAT_CH_BIN (default /opt/ematix/ch-server/clickhouse), a server
+    running on 127.0.0.1 with its paths on the DATA volume, and a
+    `sf{sf}` symlink under user_files_path pointing at the parquet
+    data dir (server `file()` resolves relative to user_files_path)."""
+    import subprocess
+
+    ch_bin = os.environ.get("EMAT_CH_BIN", "/opt/ematix/ch-server/clickhouse")
+    ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    cap = int(ram * 0.6)
+    common = [
+        ch_bin, "client",
+        "--join_use_nulls=1",
+        f"--max_memory_usage={cap}",
+        f"--max_bytes_before_external_group_by={cap // 2}",
+        f"--max_bytes_before_external_sort={cap // 2}",
+    ]
+
+    version = subprocess.run(
+        [ch_bin, "client", "--query", "SELECT version()"],
+        capture_output=True, text=True, timeout=30,
+    ).stdout.strip()
+    if not version:
+        raise RuntimeError("clickhouse server not reachable on 127.0.0.1 — start it first")
+
+    def sql(query: str, timeout: int = 7200, db: str | None = "tpch") -> None:
+        args = common + ([f"--database={db}"] if db else []) + ["--query", query]
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr.strip()[:500])
+
+    sql("DROP DATABASE IF EXISTS tpch", db=None)
+    sql("CREATE DATABASE tpch", db=None)
+    ddl_path = Path(__file__).resolve().parent / "tpch_init_clickhouse.sql"
+    p = subprocess.run(common + ["--database=tpch"], input=ddl_path.read_text(),
+                       capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        raise RuntimeError(f"server DDL failed: {p.stderr[:400]}")
+
+    load_s: dict[str, float] = {}
+    t_all = time.perf_counter()
+    for t in TABLES:
+        t0 = time.perf_counter()
+        sql(f"INSERT INTO {t} SELECT * FROM file('sf{sf}/{t}/*.parquet', Parquet)")
+        load_s[t] = round(time.perf_counter() - t0, 2)
+        print(f"  load {t}: {load_s[t]}s", flush=True)
+    total_s = round(time.perf_counter() - t_all, 2)
+    disk = subprocess.run(
+        common + ["--query",
+                  "SELECT sum(bytes_on_disk) FROM system.parts WHERE active AND database='tpch'"],
+        capture_output=True, text=True, timeout=60,
+    ).stdout.strip()
+    if extra_meta is not None:
+        extra_meta.update({
+            "mode": "load-then-query (native MergeTree, clickhouse-server)",
+            "load_seconds_per_table": load_s,
+            "load_seconds_total": total_s,
+            "native_bytes_on_disk": int(disk) if disk.isdigit() else disk,
+        })
+    print(f"==> server mergetree load complete: {total_s}s, {disk} bytes on disk",
+          flush=True)
+
+    runners: dict[str, "callable"] = {}
+    skipped: dict[str, str] = {}
+    for qid in qids:
+        q = load_query(queries_dir, qid, variant="clickhouse")
+        if q is None:
+            print(f"  {qid}: no .clickhouse.sql variant — skipping", flush=True)
+            skipped[qid] = "missing q*.clickhouse.sql"
+            continue
+        q = apply_tpch_query_params(qid, q, sf)
+
+        # Per-execution bound: pathological plans (Q02-on-MergeTree ran
+        # 20+ min/execution at ~2 threads on server 26.6 while the same
+        # engine answers it from parquet in 0.87 s) record as honest
+        # per-query failures instead of stalling the leg for hours.
+        exec_timeout = int(os.environ.get("EMAT_CH_TIMEOUT", "3600"))
+
+        def make(q=q):
+            def run() -> tuple[float, int]:
+                p = subprocess.run(
+                    common + ["--database=tpch", "--time", "--format=CSV", "--query", q],
+                    capture_output=True, text=True, timeout=exec_timeout,
+                )
+                if p.returncode != 0:
+                    raise RuntimeError(p.stderr.strip()[:400])
+                # --time prints server-reported elapsed seconds as the
+                # last stderr line.
+                secs = float(p.stderr.strip().splitlines()[-1])
+                rows = sum(1 for line in p.stdout.splitlines() if line.strip())
+                return secs * 1000.0, rows
+            return run
+
+        runners[qid] = make()
+    return f"{version} (clickhouse-server)", runners, skipped
+
+
 def setup_pandas(data_dir: Path, queries_dir: Path, qids: list[str], sf: int):
     """pandas has no SQL — it reuses the hand-coded per-query functions
     from scripts/bench-tpch-pandas.py. That module hardcodes its data dir
@@ -310,8 +550,11 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--engine", choices=["duckdb", "polars", "pandas"], required=True)
-    p.add_argument("--sf", type=int, choices=[1, 10, 100], required=True)
+    p.add_argument("--engine",
+                   choices=["duckdb", "polars", "pandas", "clickhouse",
+                            "clickhouse-mergetree", "clickhouse-server"],
+                   required=True)
+    p.add_argument("--sf", type=int, choices=[1, 10, 100, 1000], required=True)
     p.add_argument("--data-dir", type=Path, default=None,
                    help="local dir with per-table subdirs "
                         "(default: /opt/ematix/data/sf{sf})")
@@ -372,11 +615,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"==> engine={args.engine} sf={args.sf}: {len(qids)} candidate queries")
 
     # Lazy engine setup — imports happen inside these.
+    load_meta: dict = {}
     try:
         if args.engine == "duckdb":
             version, runners, skipped = setup_duckdb(data_dir, queries_dir, qids, args.sf)
         elif args.engine == "polars":
             version, runners, skipped = setup_polars(data_dir, queries_dir, qids, args.sf)
+        elif args.engine in ("clickhouse", "clickhouse-mergetree"):
+            version, runners, skipped = setup_clickhouse(
+                data_dir, queries_dir, qids, args.sf,
+                native=(args.engine == "clickhouse-mergetree"),
+                extra_meta=load_meta)
+        elif args.engine == "clickhouse-server":
+            version, runners, skipped = setup_clickhouse_server(
+                data_dir, queries_dir, qids, args.sf, extra_meta=load_meta)
         else:
             version, runners, skipped = setup_pandas(data_dir, queries_dir, qids, args.sf)
     except ImportError as exc:
@@ -411,6 +663,8 @@ def main(argv: list[str] | None = None) -> int:
         "provenance": provenance.collect(),
         "queries": queries_out,
     }
+    if load_meta:
+        result["load"] = load_meta
 
     stamp = args.stamp or dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     local_path = Path(f"/tmp/{args.engine}-sf{args.sf}.json")
