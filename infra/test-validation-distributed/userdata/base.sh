@@ -14,7 +14,7 @@ exec > >(tee /var/log/base-userdata.log) 2>&1
 
 echo "=== base userdata: $(date -u +%FT%TZ) ==="
 uname -a
-cat /etc/os-release | head -5
+head -5 /etc/os-release || true
 
 # Pin defaults for the rest of cloud-init
 export AWS_DEFAULT_REGION=${aws_region}

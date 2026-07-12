@@ -66,7 +66,12 @@ for t in region nation supplier customer part partsupp orders lineitem; do
   fi
 done
 chown -R ec2-user:ec2-user /opt/ematix/data
-ls -lhR /opt/ematix/data/sf${scale_factor}/ | head -60
+# SIGPIPE trap (2026-07-12, SF1000 fleet): `ls -lhR | head -60` under
+# `set -e -o pipefail` dies at exit 141 when the listing exceeds 60 lines
+# (head exits, ls still writing -> SIGPIPE; race-dependent per node — it
+# killed 2/4 nodes silently right before binary resolve). List boundedly
+# without a pipe.
+du -sh /opt/ematix/data/sf${scale_factor}/* 2>/dev/null || true
 
 # Binaries: prefer PREBUILT artifacts uploaded to s3://<bucket>/bin/<sha>/
 # by the gen box (skips the ~15-min compile). Fall back to cargo build if
