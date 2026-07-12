@@ -47,11 +47,17 @@ limits — the right vehicle.
    probe column}`; decode reconstructs the exec around the child.
 2. **Coordinator wiring** (per query, async, before physical
    planning): emit blooms from the optimized logical plan, then wrap
-   the matching arrow scans with `BloomFilterExec` — either via a
-   physical rule reading a per-query slot installed before the mesh
-   gate, or by applying `EnableContextBloomRule` explicitly to the
-   pre-split plan. The wrap must happen BEFORE the stage splitter so
-   the exec lands inside worker stages.
+   the matching arrow scans with `BloomFilterExec` via a physical
+   rule reading a per-query slot installed AFTER the mesh gate. The
+   wrap must happen AFTER the stage splitter, descending through the
+   network-boundary nodes' `children()` into the frozen stage bodies.
+   (Original design said before-the-splitter; that ordering deadlocked
+   the fleet — hang #3, 2026-07-12: a bloom-wrapped scan is no longer
+   a leaf, defeating the annotator's leaf exemption under
+   `CoalescePartitionsExec`, so a local CollectLeft build side became
+   a remote stage on Q02 SF100. The
+   `post_splitter_bloom_wrap_is_topology_invariant` test pins the
+   corrected contract.)
 3. **Worker**: register the codec in `flow-worker`'s session builder
    (one line next to `default_bloom_session_builder`). Workers must
    roll BEFORE coordinators start emitting plan-embedded blooms —

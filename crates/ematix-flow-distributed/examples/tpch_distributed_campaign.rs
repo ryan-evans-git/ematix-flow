@@ -377,13 +377,20 @@ fn build_session_state(
     let (builder, _handles) = preset::with_optimizer_rules_overridden(base, &overrides);
 
     if distributed {
-        // Σ.MG.2: the embedded-bloom wrap must run BEFORE the
-        // mesh-gated stage splitter so BloomFilterExec lands inside
-        // worker stages; the codec serializes it into the stage
-        // protobuf (headers can't carry SF-scale blooms).
+        // Σ.MG.2 (hang #3 fix, 2026-07-12): the embedded-bloom wrap
+        // must run AFTER the mesh-gated stage splitter. Pre-split
+        // wrapping changed the splitter's topology decisions — a
+        // BloomFilterExec around a scan defeats the annotator's leaf
+        // exemption under CoalescePartitionsExec, turning a local
+        // CollectLeft build side into a remote stage (Q02 SF100
+        // deadlocked the fleet exactly there). Post-split, the rule
+        // descends through the network-boundary nodes and wraps scans
+        // INSIDE the frozen stages; the codec serializes the wrap
+        // into the stage protobuf (headers can't carry SF-scale
+        // blooms).
         let builder = builder
-            .with_physical_optimizer_rule(Arc::new(EmbeddedBloomRule::new(bloom_slot)))
             .with_physical_optimizer_rule(Arc::new(AdaptiveMeshGateRule::from_env()))
+            .with_physical_optimizer_rule(Arc::new(EmbeddedBloomRule::new(bloom_slot)))
             .with_distributed_user_codec(BloomExecCodec)
             .with_distributed_worker_resolver(resolver);
         builder
@@ -1011,8 +1018,10 @@ mod campaign_preset_parity_tests {
         // The distributed chain = production preset MINUS grace
         // demotion (single-node-only: a GraceHashJoinExec inside a
         // stage plan is undecodable by workers and its spill is
-        // per-node — the 2026-07-11 mesh hang) + the Σ.MG.2
-        // embedded-bloom wrap + the mesh-gated splitter LAST.
+        // per-node — the 2026-07-11 mesh hang) + the mesh-gated
+        // splitter + the Σ.MG.2 embedded-bloom wrap LAST (hang #3:
+        // wrapping pre-split perturbs the splitter's topology and
+        // deadlocks the fleet — blooms wrap INSIDE frozen stages).
         let expected_prefix: Vec<&str> = preset::PRODUCTION_PHYSICAL_RULE_NAMES
             .iter()
             .copied()
@@ -1028,27 +1037,22 @@ mod campaign_preset_parity_tests {
         assert_eq!(
             physical.len(),
             n + 2,
-            "distributed chain adds the Σ.MG.2 embedded-bloom wrap then \
-             the mesh-gated stage splitter: {physical:?}"
-        );
-        assert_eq!(
-            physical[n], "ematix_embedded_bloom",
-            "the bloom wrap must run BEFORE the splitter so the exec \
-             lands inside worker stages"
-        );
-        assert!(
-            physical[n + 1].to_lowercase().contains("distributed"),
-            "the LAST rule must wrap the datafusion-distributed stage splitter, got {}",
-            physical[n + 1]
+            "distributed chain adds the mesh-gated stage splitter then \
+             the Σ.MG.2 embedded-bloom wrap: {physical:?}"
         );
         // 2026-07 adaptive mesh gate: the splitter slot is the
         // EMAT_MESH tri-state gate wrapping it
         // (ematix_flow_distributed::mesh_gate). Pin the exact name
         // so a silent revert to the ungated splitter trips here.
         assert_eq!(
+            physical[n], "ematix_adaptive_distributed_mesh_gate",
+            "the mesh-gated stage splitter must run before the bloom wrap"
+        );
+        assert_eq!(
             physical[n + 1],
-            "ematix_adaptive_distributed_mesh_gate",
-            "the LAST rule must be the EMAT_MESH adaptive mesh gate"
+            "ematix_embedded_bloom",
+            "the bloom wrap must run AFTER the splitter — pre-split \
+             wrapping changes stage topology (hang #3, Q02 SF100)"
         );
     }
 
