@@ -247,7 +247,8 @@ def setup_polars(data_dir: Path, queries_dir: Path, qids: list[str], sf: int):
     return pl.__version__, runners, skipped
 
 
-def setup_clickhouse(data_dir: Path, queries_dir: Path, qids: list[str], sf: int):
+def setup_clickhouse(data_dir: Path, queries_dir: Path, qids: list[str], sf: int,
+                     native: bool = False, extra_meta: dict | None = None):
     """ClickHouse via chdb — the embedded ClickHouse engine, the exact
     in-process peer of the duckdb arm (same box, same parquet globs, no
     server ops). Queries are ClickHouse's OWN published TPC-H set
@@ -257,7 +258,13 @@ def setup_clickhouse(data_dir: Path, queries_dir: Path, qids: list[str], sf: int
     CREATE VIEW/DROP VIEW pair inlined as a CTE (single-statement
     harness; SELECT body identical to upstream). settings.json from the
     same upstream dir sets join_use_nulls=1 (SQL-standard outer-join
-    NULLs — Q13 correctness)."""
+    NULLs — Q13 correctness).
+
+    Two modes, one methodology split the site charts label explicitly:
+    `native=False` queries the shared parquet in place (`file()` views —
+    no statistics, so CH's stats-based join reordering cannot engage);
+    `native=True` is the load-then-query leg (their published mode:
+    MergeTree ingest first, load cost recorded via `extra_meta`)."""
     import chdb  # type: ignore
     from chdb import session as chs  # type: ignore
 
@@ -287,11 +294,50 @@ def setup_clickhouse(data_dir: Path, queries_dir: Path, qids: list[str], sf: int
     sess.query(f"SET max_memory_usage = {cap}")
     sess.query(f"SET max_bytes_before_external_group_by = {cap // 2}")
     sess.query(f"SET max_bytes_before_external_sort = {cap // 2}")
-    for t in TABLES:
-        glob = f"{data_dir}/{t}/*.parquet"
-        sess.query(
-            f"CREATE OR REPLACE VIEW {t} AS SELECT * FROM file('{glob}', Parquet)"
-        )
+    if native:
+        # Load-then-query leg: ClickHouse's own published TPC-H DDL
+        # (spec-typed, PRIMARY KEY per spec — vendored verbatim in
+        # tpch_init_clickhouse.sql), data INSERTed from the same parquet
+        # the query-in-place legs read. This is the mode behind the
+        # numbers on clickhouse.com — sorted parts, sparse indexes, and
+        # table statistics for their join reordering — and it pays for
+        # them in load time + duplicated storage, both recorded in the
+        # result JSON so the site can show the full cost.
+        sess.query("SET default_table_engine = 'MergeTree'")
+        ddl_path = Path(__file__).resolve().parent / "tpch_init_clickhouse.sql"
+        for stmt in ddl_path.read_text().split(";"):
+            body = [l for l in stmt.splitlines() if l.strip() and not l.strip().startswith("--")]
+            if body:
+                sess.query(stmt)
+        load_s: dict[str, float] = {}
+        t_all = time.perf_counter()
+        for t in TABLES:
+            glob = f"{data_dir}/{t}/*.parquet"
+            t0 = time.perf_counter()
+            res = sess.query(f"INSERT INTO {t} SELECT * FROM file('{glob}', Parquet)")
+            if getattr(res, "has_error", lambda: False)():
+                raise RuntimeError(f"mergetree load {t}: {res.error_message()}")
+            load_s[t] = round(time.perf_counter() - t0, 2)
+            print(f"  load {t}: {load_s[t]}s", flush=True)
+        total_s = round(time.perf_counter() - t_all, 2)
+        disk = str(sess.query(
+            "SELECT sum(bytes_on_disk) FROM system.parts WHERE active", "CSV"
+        )).strip().strip('"')
+        if extra_meta is not None:
+            extra_meta.update({
+                "mode": "load-then-query (native MergeTree)",
+                "load_seconds_per_table": load_s,
+                "load_seconds_total": total_s,
+                "native_bytes_on_disk": int(disk) if disk.isdigit() else disk,
+            })
+        print(f"==> mergetree load complete: {total_s}s, {disk} bytes on disk",
+              flush=True)
+    else:
+        for t in TABLES:
+            glob = f"{data_dir}/{t}/*.parquet"
+            sess.query(
+                f"CREATE OR REPLACE VIEW {t} AS SELECT * FROM file('{glob}', Parquet)"
+            )
 
     runners: dict[str, "callable"] = {}
     skipped: dict[str, str] = {}
@@ -388,7 +434,9 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--engine", choices=["duckdb", "polars", "pandas", "clickhouse"],
+    p.add_argument("--engine",
+                   choices=["duckdb", "polars", "pandas", "clickhouse",
+                            "clickhouse-mergetree"],
                    required=True)
     p.add_argument("--sf", type=int, choices=[1, 10, 100, 1000], required=True)
     p.add_argument("--data-dir", type=Path, default=None,
@@ -451,13 +499,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"==> engine={args.engine} sf={args.sf}: {len(qids)} candidate queries")
 
     # Lazy engine setup — imports happen inside these.
+    load_meta: dict = {}
     try:
         if args.engine == "duckdb":
             version, runners, skipped = setup_duckdb(data_dir, queries_dir, qids, args.sf)
         elif args.engine == "polars":
             version, runners, skipped = setup_polars(data_dir, queries_dir, qids, args.sf)
-        elif args.engine == "clickhouse":
-            version, runners, skipped = setup_clickhouse(data_dir, queries_dir, qids, args.sf)
+        elif args.engine in ("clickhouse", "clickhouse-mergetree"):
+            version, runners, skipped = setup_clickhouse(
+                data_dir, queries_dir, qids, args.sf,
+                native=(args.engine == "clickhouse-mergetree"),
+                extra_meta=load_meta)
         else:
             version, runners, skipped = setup_pandas(data_dir, queries_dir, qids, args.sf)
     except ImportError as exc:
@@ -492,6 +544,8 @@ def main(argv: list[str] | None = None) -> int:
         "provenance": provenance.collect(),
         "queries": queries_out,
     }
+    if load_meta:
+        result["load"] = load_meta
 
     stamp = args.stamp or dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     local_path = Path(f"/tmp/{args.engine}-sf{args.sf}.json")
