@@ -244,19 +244,63 @@ pub struct EmatixFastParquetMultiTableProvider {
 }
 
 impl EmatixFastParquetMultiTableProvider {
-    /// Build from an explicit, ordered list of part-file paths. Every part must
-    /// share the first part's schema (fields); a mismatch is an error. Empty
-    /// input is an error.
+    /// Build from an explicit, ordered list of part-file paths. Empty input is
+    /// an error. Every part must share the first part's schema (fields); a
+    /// genuine mismatch is an error.
+    ///
+    /// Σ.PK.1 (parted key-domain straddle): KEYS.2 narrows an INT64 join/group
+    /// key to Int32 per file when THAT file's footer stats prove every value
+    /// fits i32. For a range-partitioned dataset (`<table>-NNNN` split by key
+    /// range), a key whose *global* domain crosses `i32::MAX` — e.g.
+    /// `l_orderkey` at SF ≳ 350 — fits i32 in the low parts but not the high
+    /// ones, so the parts derive DIFFERENT schemas (Int32 vs Int64) and cannot
+    /// union. Narrowing safety must therefore be judged over the whole table,
+    /// not per file: when the per-part decisions disagree, every part is rebuilt
+    /// with narrowing OFF so they share the raw Int64 key schema. When every
+    /// part agrees (SF100 and below), narrowing is kept — the common path is
+    /// untouched.
     pub fn try_new_files(paths: Vec<String>) -> DfResult<Self> {
+        // Resolve the KEYS.2 downcast decision ONCE, for the whole table.
+        // Observe every part first so `scale_class` AUTO classifies the dataset
+        // by its full membership (mirrors per-file `try_new`), then read the
+        // gate — so all parts make the SAME decision rather than each its own.
+        for p in &paths {
+            crate::scale_class::observe_file(p);
+        }
+        Self::try_new_files_opt(paths, crate::ematix_fast_parquet::key_downcast_enabled())
+    }
+
+    /// [`Self::try_new_files`] with an explicit KEYS.2 downcast flag, so tests
+    /// can drive the parted-straddle reconciliation deterministically without
+    /// mutating the process-global `EMAT_DOWNCAST_KEYS` env (which races
+    /// parallel tests). Production `try_new_files` passes the scale-gated
+    /// `key_downcast_enabled()`.
+    fn try_new_files_opt(paths: Vec<String>, downcast_keys: bool) -> DfResult<Self> {
         if paths.is_empty() {
             return Err(DataFusionError::Plan(
                 "multi-file provider: no part files given".into(),
             ));
         }
-        let mut parts = Vec::with_capacity(paths.len());
-        for p in paths {
-            parts.push(EmatixFastParquetTableProvider::try_new(p)?);
+        let build = |downcast: bool| -> DfResult<Vec<EmatixFastParquetTableProvider>> {
+            paths
+                .iter()
+                .map(|p| EmatixFastParquetTableProvider::try_new_opt(p.clone(), downcast))
+                .collect()
+        };
+        let mut parts = build(downcast_keys)?;
+        // If per-part narrowing produced divergent schemas, the key domain
+        // straddles i32 across parts (Σ.PK.1). Rebuild with narrowing off so
+        // every part keeps its raw Int64 keys — a schema all parts share.
+        let base = parts[0].schema();
+        let consistent = parts
+            .iter()
+            .skip(1)
+            .all(|part| part.schema().fields() == base.fields());
+        if !consistent && downcast_keys {
+            parts = build(false)?;
         }
+        // Post-reconciliation, any remaining mismatch is a genuine schema
+        // difference (not a narrowing artefact) and is an error.
         let schema = parts[0].schema();
         for (i, part) in parts.iter().enumerate().skip(1) {
             if part.schema().fields() != schema.fields() {
@@ -425,6 +469,71 @@ mod tests {
             CompressionCodec::Uncompressed,
         )
         .expect("write parquet");
+    }
+
+    /// Like `write_part`, but the key column is named `xkey` so
+    /// `is_downcast_key_name` (KEYS.2) treats it as a downcast candidate — the
+    /// exact trigger for the Σ.PK.1 parted straddle. (Naming a fixture column
+    /// `*key` is normally avoided precisely because it flips this narrowing on;
+    /// here that IS the behaviour under test.)
+    fn write_keyed_part(path: &Path, keys: &[i64], vals: &[i64]) {
+        write_table_to_path(
+            path,
+            &[
+                ("xkey", ColumnData::I64(keys)),
+                ("val", ColumnData::I64(vals)),
+            ],
+            CompressionCodec::Uncompressed,
+        )
+        .expect("write parquet");
+    }
+
+    /// Σ.PK.1: range-partitioned parts whose INT64 key straddles `i32::MAX`
+    /// (fits i32 in the low part, exceeds it in the high part) must still union.
+    /// Per-part KEYS.2 narrowing would give part 0 an Int32 `xkey` and part 1 an
+    /// Int64 `xkey` — divergent schemas that previously errored "part 1 schema
+    /// differs from part 0". The provider must reconcile to one raw-Int64 schema
+    /// and answer correctly (a value above `i32::MAX` must survive intact).
+    #[tokio::test]
+    async fn parted_key_straddling_i32_reconciles_and_unions() {
+        let dir = tempfile::tempdir().unwrap();
+        let lo: Vec<i64> = (1..=4).collect();
+        let big = i32::MAX as i64 + 1; // 2_147_483_648 — first value past i32
+        let hi: Vec<i64> = (big..big + 4).collect();
+        let vlo: Vec<i64> = lo.iter().map(|k| k * 2).collect();
+        let vhi: Vec<i64> = hi.iter().map(|k| k * 2).collect();
+        let p0 = dir.path().join("t-0000.parquet");
+        let p1 = dir.path().join("t-0001.parquet");
+        write_keyed_part(&p0, &lo, &vlo);
+        write_keyed_part(&p1, &hi, &vhi);
+        let paths = vec![
+            p0.to_string_lossy().into_owned(),
+            p1.to_string_lossy().into_owned(),
+        ];
+
+        // Force KEYS.2 downcast ON, as SF1000 AUTO would. Before the fix this
+        // panics at `try_new_files_opt` (part 1's Int64 xkey != part 0's Int32).
+        let prov = EmatixFastParquetMultiTableProvider::try_new_files_opt(paths, true)
+            .expect("straddling parts must reconcile to one schema, not error");
+
+        // The reconciled key keeps its raw Int64 — never a lossy Int32 that
+        // would truncate part 1's values above i32::MAX.
+        let f = prov.schema().field_with_name("xkey").unwrap().clone();
+        assert_eq!(
+            f.data_type(),
+            &arrow_schema::DataType::Int64,
+            "straddling key must stay Int64, not narrow to a lossy Int32"
+        );
+
+        // And the union answers across both parts: 8 rows, and the max key
+        // (above i32::MAX) round-trips without truncation.
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(prov)).unwrap();
+        let out = run(&ctx, "SELECT count(*) c, max(xkey) m FROM t").await;
+        assert!(
+            out.contains(&(big + 3).to_string()),
+            "max key above i32::MAX must survive intact, got:\n{out}"
+        );
     }
 
     /// Build 3 parts (disjoint key ranges) + one combined file with the same
