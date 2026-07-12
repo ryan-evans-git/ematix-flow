@@ -482,6 +482,210 @@ def setup_clickhouse_server(data_dir: Path, queries_dir: Path, qids: list[str], 
     return f"{version} (clickhouse-server)", runners, skipped
 
 
+# Tables whose parquet parts are index-aligned by tpchgen (part N of
+# lineitem is generated from exactly the order range of part N of
+# orders), so assigning part files round-robin to nodes colocates the
+# l_orderkey = o_orderkey join. Nothing else colocates — every other
+# table is replicated in full on every node.
+CH_SHARDED_TABLES = {"lineitem", "orders"}
+
+
+def setup_clickhouse_distributed(data_dir: Path, queries_dir: Path, qids: list[str],
+                                 sf: int, extra_meta: dict | None = None):
+    """ClickHouse DISTRIBUTED — an N-shard MergeTree cluster driven from
+    the initiator via `clickhouse client`. Layout (the strongest CORRECT
+    distributed configuration we could give ClickHouse on this fleet):
+
+    - `lineitem` + `orders` are SHARDED by parquet part index (see
+      `CH_SHARDED_TABLES`); colocation is verified at setup time by an
+      oracle count (locally-joined count must equal count(lineitem)) and
+      the leg ABORTS if it does not hold — a fast wrong answer is not a
+      benchmark.
+    - every other table is REPLICATED in full on every node, so
+      per-shard join fragments resolve them locally.
+    - queries run against Distributed wrappers in db `tpch` with
+      distributed_product_mode='local' (sound because sharded×sharded
+      joins are colocated and everything else is a full local replica);
+      dim-driven queries (e.g. Q13's customer LEFT JOIN orders) fall
+      back to ClickHouse's initiator-side reads of the Distributed
+      table, which is their stock behavior.
+
+    Requires: the same server binary running on EVERY node (cwd
+    /opt/ematix/ch-server, paths on the data volume, cluster `tpch4` in
+    its config, listen_host reachable intra-VPC), `sf{sf}` user_files
+    symlinks per node over identical parquet sets, and
+    EMAT_CH_CLUSTER_HOSTS=<initiator,worker,...> private IPs. Per-node
+    memory posture mirrors the single-node legs: 60% tracked cap, spill
+    at half."""
+    import re
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor
+
+    hosts = [h.strip() for h in os.environ["EMAT_CH_CLUSTER_HOSTS"].split(",") if h.strip()]
+    if len(hosts) < 2:
+        raise RuntimeError("EMAT_CH_CLUSTER_HOSTS must list 2+ private IPs (initiator first)")
+    ch_bin = os.environ.get("EMAT_CH_BIN", "/opt/ematix/ch-server/clickhouse")
+    ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    cap = int(ram * 0.6)
+
+    def common(host: str) -> list[str]:
+        return [
+            ch_bin, "client", "--host", host,
+            "--join_use_nulls=1",
+            f"--max_memory_usage={cap}",
+            f"--max_bytes_before_external_group_by={cap // 2}",
+            f"--max_bytes_before_external_sort={cap // 2}",
+        ]
+
+    settings = ["--distributed_product_mode=local", "--prefer_localhost_replica=1"]
+
+    def sql(host: str, query: str, timeout: int = 7200) -> str:
+        p = subprocess.run(common(host) + ["--query", query],
+                           capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            raise RuntimeError(f"{host}: {p.stderr.strip()[:500]}")
+        return p.stdout.strip()
+
+    for h in hosts:
+        if not sql(h, "SELECT version()", timeout=30):
+            raise RuntimeError(f"clickhouse server not reachable on {h} — stage the cluster first")
+
+    # Per-table DDL from the vendored init file (strip comment LINES
+    # before splitting on ';' — comments contain semicolons).
+    ddl_path = Path(__file__).resolve().parent / "tpch_init_clickhouse.sql"
+    ddl_sql = "\n".join(l for l in ddl_path.read_text().splitlines()
+                        if not l.strip().startswith("--"))
+    ddl_by_table: dict[str, str] = {}
+    for stmt in (s.strip() for s in ddl_sql.split(";") if s.strip()):
+        m = re.match(r"create\s+table\s+(\w+)", stmt, re.IGNORECASE)
+        if m and m.group(1).lower() in TABLES:
+            ddl_by_table[m.group(1).lower()] = stmt
+    missing = [t for t in TABLES if t not in ddl_by_table]
+    if missing:
+        raise RuntimeError(f"DDL missing for tables: {missing}")
+
+    # Databases + tables on every node: sharded facts live in tpch_local;
+    # full replicas + Distributed wrappers live in tpch (queries only see
+    # tpch, and remote fragments see the same layout on every shard).
+    for h in hosts:
+        sql(h, "DROP DATABASE IF EXISTS tpch")
+        sql(h, "DROP DATABASE IF EXISTS tpch_local")
+        sql(h, "CREATE DATABASE tpch")
+        sql(h, "CREATE DATABASE tpch_local")
+        for t in TABLES:
+            db = "tpch_local" if t in CH_SHARDED_TABLES else "tpch"
+            p = subprocess.run(common(h) + [f"--database={db}"],
+                               input=ddl_by_table[t], capture_output=True,
+                               text=True, timeout=60)
+            if p.returncode != 0:
+                raise RuntimeError(f"{h} DDL {t}: {p.stderr[:400]}")
+        for t in sorted(CH_SHARDED_TABLES):
+            sql(h, f"CREATE TABLE tpch.{t} AS tpch_local.{t} "
+                   f"ENGINE = Distributed(tpch4, tpch_local, {t})")
+
+    # Shard lists come from the initiator's local listing; the fleet
+    # provisions identical parquet sets on every node, and the
+    # colocation oracle below catches any drift.
+    shard_files: dict[str, dict[str, list[str]]] = {}
+    for t in sorted(CH_SHARDED_TABLES):
+        stems = sorted(f.stem for f in (data_dir / t).glob("*.parquet"))
+        if not stems:
+            raise RuntimeError(f"no parquet parts for {t} under {data_dir}")
+        per_node: dict[str, list[str]] = {h: [] for h in hosts}
+        for i, stem in enumerate(stems):
+            per_node[hosts[i % len(hosts)]].append(stem)
+        shard_files[t] = per_node
+
+    load_s: dict[str, float] = {}
+    t_all = time.perf_counter()
+
+    def load_node(h: str) -> float:
+        t0 = time.perf_counter()
+        for t in TABLES:
+            if t in CH_SHARDED_TABLES:
+                glob = "{" + ",".join(shard_files[t][h]) + "}.parquet"
+                sql(h, f"INSERT INTO tpch_local.{t} SELECT * FROM "
+                       f"file('sf{sf}/{t}/{glob}', Parquet)")
+            else:
+                sql(h, f"INSERT INTO tpch.{t} SELECT * FROM "
+                       f"file('sf{sf}/{t}/*.parquet', Parquet)")
+        return round(time.perf_counter() - t0, 2)
+
+    with ThreadPoolExecutor(max_workers=len(hosts)) as ex:
+        per_node_s = dict(zip(hosts, ex.map(load_node, hosts)))
+    total_s = round(time.perf_counter() - t_all, 2)
+    for h, s in per_node_s.items():
+        print(f"  node {h}: loaded in {s}s", flush=True)
+        load_s[h] = s
+
+    disk_total = 0
+    for h in hosts:
+        d = sql(h, "SELECT sum(bytes_on_disk) FROM system.parts WHERE active "
+                   "AND database IN ('tpch','tpch_local')", timeout=60)
+        disk_total += int(d) if d.isdigit() else 0
+
+    # Colocation oracle — the correctness precondition for
+    # distributed_product_mode='local' on the sharded pair.
+    n_li = sql(hosts[0], "SELECT count() FROM tpch.lineitem", timeout=600)
+    p = subprocess.run(
+        common(hosts[0]) + settings + [
+            "--query",
+            "SELECT count() FROM tpch.lineitem l INNER JOIN tpch.orders o "
+            "ON l.l_orderkey = o.o_orderkey"],
+        capture_output=True, text=True, timeout=1800)
+    if p.returncode != 0:
+        raise RuntimeError(f"colocation oracle failed to run: {p.stderr[:400]}")
+    n_join = p.stdout.strip()
+    if n_li != n_join:
+        raise RuntimeError(
+            f"colocation oracle FAILED: count(lineitem)={n_li} but locally-joined "
+            f"count={n_join} — part files are not orderkey-aligned; refusing to bench")
+    print(f"==> colocation oracle OK: {n_li} lineitem rows join locally", flush=True)
+
+    if extra_meta is not None:
+        extra_meta.update({
+            "mode": "distributed load-then-query (MergeTree shards + Distributed engine)",
+            "cluster_hosts": len(hosts),
+            "sharded_tables": sorted(CH_SHARDED_TABLES),
+            "replicated_tables": [t for t in TABLES if t not in CH_SHARDED_TABLES],
+            "distributed_product_mode": "local",
+            "load_seconds_per_node": load_s,
+            "load_seconds_total": total_s,
+            "native_bytes_on_disk_all_nodes": disk_total,
+        })
+    print(f"==> distributed load complete: {total_s}s wall, {disk_total} bytes "
+          f"on disk across {len(hosts)} nodes", flush=True)
+
+    exec_timeout = int(os.environ.get("EMAT_CH_TIMEOUT", "3600"))
+    runners: dict[str, "callable"] = {}
+    skipped: dict[str, str] = {}
+    for qid in qids:
+        q = load_query(queries_dir, qid, variant="clickhouse")
+        if q is None:
+            print(f"  {qid}: no .clickhouse.sql variant — skipping", flush=True)
+            skipped[qid] = "missing q*.clickhouse.sql"
+            continue
+        q = apply_tpch_query_params(qid, q, sf)
+
+        def make(q=q):
+            def run() -> tuple[float, int]:
+                p = subprocess.run(
+                    common(hosts[0]) + settings + ["--database=tpch", "--time",
+                                                   "--format=CSV", "--query", q],
+                    capture_output=True, text=True, timeout=exec_timeout,
+                )
+                if p.returncode != 0:
+                    raise RuntimeError(p.stderr.strip()[:400])
+                secs = float(p.stderr.strip().splitlines()[-1])
+                rows = sum(1 for line in p.stdout.splitlines() if line.strip())
+                return secs * 1000.0, rows
+            return run
+
+        runners[qid] = make()
+    version = sql(hosts[0], "SELECT version()", timeout=30)
+    return f"{version} (clickhouse-distributed x{len(hosts)})", runners, skipped
+
+
 def setup_pandas(data_dir: Path, queries_dir: Path, qids: list[str], sf: int):
     """pandas has no SQL — it reuses the hand-coded per-query functions
     from scripts/bench-tpch-pandas.py. That module hardcodes its data dir
@@ -552,7 +756,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--engine",
                    choices=["duckdb", "polars", "pandas", "clickhouse",
-                            "clickhouse-mergetree", "clickhouse-server"],
+                            "clickhouse-mergetree", "clickhouse-server",
+                            "clickhouse-distributed"],
                    required=True)
     p.add_argument("--sf", type=int, choices=[1, 10, 100, 1000], required=True)
     p.add_argument("--data-dir", type=Path, default=None,
@@ -628,6 +833,9 @@ def main(argv: list[str] | None = None) -> int:
                 extra_meta=load_meta)
         elif args.engine == "clickhouse-server":
             version, runners, skipped = setup_clickhouse_server(
+                data_dir, queries_dir, qids, args.sf, extra_meta=load_meta)
+        elif args.engine == "clickhouse-distributed":
+            version, runners, skipped = setup_clickhouse_distributed(
                 data_dir, queries_dir, qids, args.sf, extra_meta=load_meta)
         else:
             version, runners, skipped = setup_pandas(data_dir, queries_dir, qids, args.sf)
