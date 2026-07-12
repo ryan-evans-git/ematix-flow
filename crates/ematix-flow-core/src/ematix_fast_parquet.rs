@@ -3034,6 +3034,19 @@ impl TableProvider for EmatixFastParquetTableProvider {
                         TableProviderFilterPushDown::Exact
                     }
                     Some(_) => TableProviderFilterPushDown::Inexact,
+                    // Σ.SC P3W: int-eq isn't a BridgeFilter shape, but
+                    // when a sidecar index sits next to this part the
+                    // scan hook needs to SEE the predicate to answer it
+                    // from the index. Inexact ⇒ the eq re-applies above
+                    // regardless; without a sidecar file the plan is
+                    // byte-identical to before.
+                    None if crate::sidecar_exec::is_sidecar_pushable(
+                        e,
+                        std::path::Path::new(&self.path),
+                    ) =>
+                    {
+                        TableProviderFilterPushDown::Inexact
+                    }
                     None => TableProviderFilterPushDown::Unsupported,
                 }
             })
@@ -3074,6 +3087,20 @@ impl EmatixFastParquetTableProvider {
         let projection = projection
             .cloned()
             .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+        // Σ.SC P3W: a covered, gate-approved point predicate answers
+        // from the sidecar index instead of scanning this part (or
+        // proves EMPTY from footer bounds without touching a data
+        // page — the parted range-prune win). Falls through to the
+        // normal scan on any miss; pushdown stays Inexact so the eq
+        // and any sibling filters re-apply above.
+        if let Some(exec) = crate::sidecar_exec::try_sidecar_lookup(
+            std::path::Path::new(&self.path),
+            &self.schema,
+            &projection,
+            filters,
+        )? {
+            return Ok(exec);
+        }
         let projected_schema: Schema = self.schema.project(&projection)?;
         let projected_schema: SchemaRef = Arc::new(projected_schema);
         // KEYS.2 — native-width schema the readers decode to (equals

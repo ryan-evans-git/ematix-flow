@@ -121,6 +121,11 @@ pub mod sidecar_index;
 // feat/sidecar-indexes Phase 2: write-side sidecar creation (backfill a
 // `.parquet.idx` onto existing Parquet). Backs the `flow index build` CLI.
 pub mod sidecar_build;
+// Σ.SC P3W: the SQL path onto sidecar indexes — the fast-parquet
+// provider swaps a part's scan for a SidecarLookupExec on covered
+// selective point predicates (EMAT_SIDECAR_SQL, default ON; inert
+// without a sidecar file).
+pub mod sidecar_exec;
 // feat/sidecar-indexes Phase I.3: Iceberg manifest-level file pruning for the
 // mesh coordinator. Off by default; needs `--features iceberg` (pulls
 // iceberg-rust). Combines with `sidecar_index` for the SF1000 pruning stack.

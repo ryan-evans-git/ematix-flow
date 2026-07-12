@@ -96,6 +96,41 @@ per-index `(min_key, max_key)` summary + relative sidecar path into
 - Thread column stats / `IndexSummary` into a scan-vs-index decision.
 - Tests: high-selectivity predicate picks scan; low-selectivity picks index.
 
+### Phase 3W — provider wiring (SQL path) [designed 2026-07-12]
+
+The lookup primitives (P1) and gate (P3) have no provider callers — SQL
+never reaches a sidecar, and run-shard's `Indexed` targets carry
+`sidecar_uri` unopened. This phase makes the fast-parquet providers
+answer selective predicates via the sidecar:
+
+- **Insertion point**: `EmatixFastParquetTableProvider::
+  scan_with_partition_budget` — the multi provider and run-shard's
+  IcebergScan targets both delegate per part, so one hook covers local
+  SQL, parted tables, and distributed WorkUnits.
+- **Eligibility (plan time, per part)**: sidecar file exists AND
+  filters contain `col = <int literal>` where `col` names a sorted-i64
+  index on the sidecar AND every projected column's type is
+  materializable by the codec (`Int64`, `Int32`/`Date32`,
+  `Utf8`/`Binary` via `read_column_{i64,i32,byte_array}_where_eq`) AND
+  the P3 selectivity gate (footer-stats uniform estimate ≤
+  `EMAT_SIDECAR_MAX_SELECTIVITY`, default 0.05) approves. Any miss →
+  that part scans normally (mixed unions are fine); `eq` first, range
+  variants later (codec API already exists).
+- **`SidecarLookupExec`**: 1-partition leaf exec; execute = shared
+  open (P3 pattern) → typed per-projected-column
+  `read_column_*_where_eq` → one RecordBatch. Lazy v3 lookups make the
+  per-column re-probe cheap; a one-hit-set multi-column materializer
+  is a codec follow-up ask.
+- **Pushdown honesty**: the provider keeps reporting `Inexact` — the
+  eq (and any other filters) re-apply above the exec; correctness
+  never depends on the index being complete.
+- **Off-switch**: `EMAT_SIDECAR_SQL` tri-state, default ON — inert
+  wherever no sidecar file exists (all current benches), so shipped
+  defaults stay benched defaults.
+- **Observability**: the existing `sidecar_{hit,miss,stale,
+  skipped_selectivity}` counters fire from the exec/gate; plan
+  display shows `SidecarLookupExec(index=<col>, key=<k>)`.
+
 ### Phase 4 — site documentation
 - `ematix.dev` page: "Indexing Parquet with sidecars" — what a sidecar is, the
   four index types, **how to create indexes** (write-side config + the
@@ -197,7 +232,38 @@ specified it.
   statistics (self-contained, no sidecar open) rather than from the sidecar;
   round-trip proven via manual `ManifestWriterBuilder` construction (the
   buildable-today path) rather than a full catalog transaction.
-- **I.5 (async sidecar opener)** — NOT STARTED (cross-repo ask; unchanged).
+- **I.5 (async sidecar opener)** — superseded in spirit by ematix-parquet
+  0.17.2's `LazyParquetIndex` (footer-only open + group-pruned lookups);
+  the remaining cross-repo ask is the 0.17.3 lazy `i32`/`byte_array`
+  materializers (P3W widens `sidecar_materializable` in lockstep).
+- **P3W (SQL provider wiring)** — LANDED (this commit, 2026-07-12).
+  `sidecar_exec::try_sidecar_lookup` hooks
+  `EmatixFastParquetTableProvider::scan_with_partition_budget`, so the
+  multi provider and run-shard's IcebergScan targets inherit it per
+  part. Covered `col = <int>` predicates plan a `SidecarLookupExec`
+  (or an empty relation via footer bounds — the parted range-prune);
+  int-eq shapes became sidecar-conditionally pushable
+  (`supports_filters_pushdown` claims Inexact only when a sidecar file
+  exists, keeping sidecar-less plans byte-identical). Deviations from
+  the design sketch: projections are Int64-only until the 0.17.3 lazy
+  materializers; range predicates deferred with them.
+
+## P5 rerun on the lazy path (2026-07-12, local)
+
+Same fixture/machine as the 2026-07-08 table, ematix-parquet 0.17.2
+(`LazyParquetIndex`): scan 5.8–6.2 ms vs index 575–637 ms — **the
+scattered-match sweep still loses ~100×**. The lazy open removed the
+body-decode cost, so what remains is MATERIALIZATION: uniform-stride
+matches touch ~every source page, and masked per-row decode of every
+page loses to the vectorized full scan by construction. The index's
+honest wins are (a) **clustered matches** — sorted sources where a
+key's rows sit in one page/row-group (the SF1000 lineitem shape;
+`sidecar_lookup_parted` measures it), and (b) **parted range-prune** —
+point lookups on part-contiguous tables answer from ONE part while
+every other part proves empty from footer bounds (the
+`sql_point_lookup_answers_from_sidecar_across_parts` test pins this
+end-to-end through SQL). The P3 gate's conservative default remains
+correct for scattered shapes.
 
 ## Phase 5 results (2026-07-08, local)
 
