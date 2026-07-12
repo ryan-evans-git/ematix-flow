@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a new capability, connector, or delivery mode.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Adoption blockers are especially useful signal — e.g. a target the
+        data-quality probe doesn't support yet, or a delivery guarantee you
+        need for a particular pipeline.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The use case or problem, not just the proposed solution. What does the pipeline need to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed capability
+      description: What would ematix-flow need to support? A connector, a load mode, a quality target, an API, etc.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What are you doing today instead?
+      description: Current workaround, or the other tool you'd reach for (Spark, dbt, Great Expectations, a custom consumer, …).
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd be willing to help implement this.

@@ -1,0 +1,63 @@
+name: Bug report
+description: Something isn't behaving the way the docs say it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. A minimal reproduction
+        is the single most useful thing you can include.
+
+        For **security vulnerabilities, do not use this form** — see
+        [SECURITY.md](../blob/main/SECURITY.md) for private disclosure.
+  - type: input
+    id: version
+    attributes:
+      label: ematix-flow version
+      description: "`pip show ematix-flow` or the git commit you're on."
+      placeholder: "0.14.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the framework?
+      options:
+        - Batch pipeline / load modes
+        - Streaming / Kafka runtime
+        - Data quality / freshness
+        - Scheduler / workflows / DAG
+        - Distributed mesh
+        - Query engine / SQL / performance
+        - Web UI
+        - CLI / config / connections
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: connections
+    attributes:
+      label: Source → target connection kinds
+      description: e.g. "Kafka → Postgres", "S3/Parquet → DuckDB". Delivery behavior often depends on the target.
+      placeholder: "Kafka → Postgres"
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest pipeline definition + steps that trigger the bug. Redact any credentials.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What you expected to happen, and what actually happened (include error output / stack traces).
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS / Python / platform
+      placeholder: "macOS 15 (Apple Silicon), Python 3.12"

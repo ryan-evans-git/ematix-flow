@@ -2,10 +2,16 @@
 
 ## Reporting a vulnerability
 
-Email **ryanevans23@gmail.com** with a description of the issue and
-how to reproduce it. Please don't open a public issue. We aim to
-acknowledge within 72 hours and ship a fix or coordinated
-disclosure plan within 14 days for high-severity findings.
+**Please don't open a public issue for a vulnerability.** Use one of
+these private channels instead:
+
+- **GitHub** — the repository's **Security → Report a vulnerability**
+  tab ([private advisory](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)).
+- **Email** — **support@ematix.dev**.
+
+Include a description of the issue and how to reproduce it. We aim to
+acknowledge within 72 hours and ship a fix or coordinated disclosure
+plan within 14 days for high-severity findings.
 
 ## Automated scanning in CI
 
