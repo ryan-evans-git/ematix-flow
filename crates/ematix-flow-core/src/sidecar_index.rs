@@ -20,6 +20,7 @@
 //! subsequent commits (see `docs/SIDECAR_INDEXES_PLAN.md`).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use datafusion::common::ScalarValue;
@@ -271,6 +272,146 @@ pub fn sidecar_i64_eq_opt(
         })?;
     SIDECAR_HIT.fetch_add(1, Ordering::Relaxed);
     Ok(Some(values))
+}
+
+/// Σ.SC P3W — the SQL provider's plan-time decision for
+/// `WHERE <col> = key` on a single part. Unlike [`sidecar_i64_eq_opt`]
+/// (execute-by-index-NAME, one target column), this resolves the index
+/// by SOURCE COLUMN — SQL names the data column, not the index — and
+/// only DECIDES; materialization happens at execute time via
+/// [`sidecar_rows_where_eq`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum SidecarEqDecision {
+    /// No/stale/uncovered sidecar, or the P3 gate estimates the match
+    /// fraction above threshold — scan normally.
+    Scan,
+    /// The key is provably outside this part's footer bounds — the
+    /// exact answer is the empty set; no data page needs reading.
+    EmptyProven,
+    /// Use the sidecar: the named sorted-i64 index covers `col` and
+    /// the gate approved.
+    Lookup { index_name: String },
+}
+
+/// Plan-time eligibility for the SQL sidecar path (see
+/// [`SidecarEqDecision`]). Opens are footer-only (v3 lazy); errors
+/// degrade to `Scan` — the provider must never fail planning because
+/// an advisory index is unreadable.
+pub fn sidecar_eq_decision(source_path: &Path, col: &str, key: i64) -> SidecarEqDecision {
+    let idx_path = sidecar_path(source_path);
+    if !idx_path.exists() {
+        return SidecarEqDecision::Scan;
+    }
+    let Ok(source) = ematix_parquet_io::ParquetFile::open(source_path) else {
+        return SidecarEqDecision::Scan;
+    };
+    let idx = match ematix_parquet_codec::index::LazyParquetIndex::open(&idx_path, &source) {
+        Ok(idx) => idx,
+        Err(e) if is_stale(&e) => {
+            SIDECAR_STALE.fetch_add(1, Ordering::Relaxed);
+            return SidecarEqDecision::Scan;
+        }
+        Err(_) => return SidecarEqDecision::Scan,
+    };
+    let Some(entry) = idx.manifest().indexes.iter().find(|entry| {
+        matches!(&entry.kind,
+            ematix_parquet_codec::index::IndexKind::Sorted { source_column, .. }
+                if source_column == col)
+    }) else {
+        SIDECAR_MISS.fetch_add(1, Ordering::Relaxed);
+        return SidecarEqDecision::Scan;
+    };
+    match footer_i64_bounds(source_path, col) {
+        Ok(Some((min, max))) => {
+            if key < min || key > max {
+                SIDECAR_PRUNED_RANGE.fetch_add(1, Ordering::Relaxed);
+                return SidecarEqDecision::EmptyProven;
+            }
+            if estimate_eq_selectivity(min, max, key) > sidecar_max_selectivity() {
+                SIDECAR_SKIPPED_SELECTIVITY.fetch_add(1, Ordering::Relaxed);
+                return SidecarEqDecision::Scan;
+            }
+        }
+        // No estimate → the index path (someone built it on purpose);
+        // footer errors → conservative scan.
+        Ok(None) => {}
+        Err(_) => return SidecarEqDecision::Scan,
+    }
+    SidecarEqDecision::Lookup {
+        index_name: entry.name.clone(),
+    }
+}
+
+/// Σ.SC P3W — execute-time multi-column materialization for the SQL
+/// sidecar path: `WHERE <index> = key`, projecting `columns` (source
+/// ordinal + output field per entry) into one [`RecordBatch`] of
+/// `out_schema`. Typed dispatch mirrors the codec surface: `Int64`,
+/// `Int32`/`Date32` (i32-backed), `Utf8` (byte-array). The CALLER
+/// (plan-time eligibility) guarantees types — an unexpected type here
+/// is an internal error, not a fallback.
+pub fn sidecar_rows_where_eq(
+    source_path: &Path,
+    index_name: &str,
+    key: i64,
+    ordinals: &[usize],
+    out_schema: datafusion::arrow::datatypes::SchemaRef,
+) -> DfResult<datafusion::arrow::array::RecordBatch> {
+    use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::DataType as ArrowType;
+
+    let source = ematix_parquet_io::ParquetFile::open(source_path).map_err(|e| {
+        DataFusionError::Execution(format!("sidecar: open source {source_path:?}: {e:?}"))
+    })?;
+    let idx_path = sidecar_path(source_path);
+    let idx =
+        ematix_parquet_codec::index::LazyParquetIndex::open(&idx_path, &source).map_err(|e| {
+            // A rewrite between plan and execute lands here — loud, not
+            // silently empty (razor-thin race; rebuilds mid-query are
+            // operator error).
+            DataFusionError::Execution(format!(
+                "sidecar: index {idx_path:?} unreadable at execute (rewritten since \
+                 planning?): {e:?}"
+            ))
+        })?;
+
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(ordinals.len());
+    for (ordinal, field) in ordinals.iter().zip(out_schema.fields()) {
+        let arr: ArrayRef = match field.data_type() {
+            ArrowType::Int64 => {
+                let v = idx
+                    .read_column_i64_where_eq(&source, index_name, key, *ordinal)
+                    .map_err(|e| lookup_err(index_name, field.name(), &e))?;
+                Arc::new(Int64Array::from(v))
+            }
+            // Int32/Date32/Utf8 arrive with ematix-parquet 0.17.3's
+            // lazy i32/byte-array materializers (the eager reader has
+            // them; LazyParquetIndex ships i64-only in 0.17.2) —
+            // sidecar_materializable() widens in lockstep.
+            other => {
+                return Err(DataFusionError::Internal(format!(
+                    "sidecar_rows_where_eq: unmaterializable type {other} for {} — \
+                     plan-time eligibility must exclude it",
+                    field.name()
+                )));
+            }
+        };
+        arrays.push(arr);
+    }
+    SIDECAR_HIT.fetch_add(1, Ordering::Relaxed);
+    RecordBatch::try_new(out_schema, arrays)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+fn lookup_err(index_name: &str, col: &str, e: &impl std::fmt::Debug) -> DataFusionError {
+    DataFusionError::Execution(format!("sidecar: eq lookup {index_name} col {col}: {e:?}"))
+}
+
+/// The projected Arrow types the SQL sidecar path can materialize —
+/// plan-time eligibility check for [`sidecar_rows_where_eq`]. Widens
+/// to Int32/Date32/Utf8 with the ematix-parquet 0.17.3 lazy
+/// materializers.
+pub fn sidecar_materializable(dt: &datafusion::arrow::datatypes::DataType) -> bool {
+    matches!(dt, datafusion::arrow::datatypes::DataType::Int64)
 }
 
 /// Footer `[min, max]` of `column` (by name), or `None` when it cannot be

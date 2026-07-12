@@ -120,9 +120,12 @@ pub async fn execute_work_unit(wu: &WorkUnit) -> Result<WorkUnitMetrics, RunShar
         // clause re-applies the pruned predicate at row level via the
         // provider's BridgeFilter pushdown (required for correctness on
         // `full_scan` targets — the manifest prune is conservative, not
-        // exact). `indexed` targets scan identically for now: their
-        // sidecar_uri is carried but unopened until the Phase 3 provider
-        // wiring lands the row-level sidecar lookup. Execution knobs
+        // exact). Σ.SC P3W: `indexed` targets now exercise their sidecars
+        // through the provider itself — the multi provider delegates per
+        // part to the single-file scan, whose sidecar hook answers covered
+        // point predicates from the index file next to the data file
+        // (sidecar_uri stays advisory metadata; the hook keys off the
+        // sidecar file's on-disk presence). Execution knobs
         // (dict-preservation/late-mat) run the provider defaults here — the
         // multi provider doesn't thread per-file builders yet.
         Input::IcebergScan { table, targets, .. } => {
