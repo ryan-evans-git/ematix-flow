@@ -19,6 +19,7 @@ ematix-flow-core = { workspace = true }
 async-trait = "0.1"
 datafusion = { workspace = true }
 datafusion-distributed = { workspace = true }
+datafusion-proto = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 serde = { workspace = true }

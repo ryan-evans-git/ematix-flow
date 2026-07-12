@@ -164,6 +164,16 @@ where
         &self,
         ctx: WorkerQueryContext,
     ) -> Result<SessionState, DataFusionError> {
+        // Σ.MG.2: the plan-embedded transport needs the codec on
+        // every worker session unconditionally — stage plans carrying
+        // BloomFilterExec arrive WITHOUT any bloom headers.
+        let ctx = WorkerQueryContext {
+            builder: datafusion_distributed::DistributedExt::with_distributed_user_codec(
+                ctx.builder,
+                crate::bloom_codec::BloomExecCodec,
+            ),
+            headers: ctx.headers,
+        };
         let blooms = context_blooms_from_headers(&ctx.headers);
         if blooms.is_empty() {
             // No blooms inbound → behave like the underlying builder

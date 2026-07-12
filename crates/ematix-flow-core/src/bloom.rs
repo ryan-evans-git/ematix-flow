@@ -585,6 +585,12 @@ impl BloomFilterExec {
     pub fn bloom(&self) -> &Arc<BloomFilter> {
         &self.bloom
     }
+
+    /// Key column index in the input schema (Σ.MG.2: the plan-embedded
+    /// codec serializes this alongside the bloom bytes).
+    pub fn key_col_idx(&self) -> usize {
+        self.key_col_idx
+    }
 }
 
 impl DisplayAs for BloomFilterExec {

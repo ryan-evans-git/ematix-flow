@@ -62,6 +62,7 @@ pub mod peer_discovery;
 // them from the inbound request headers and stash them in a SessionState
 // extension (`ContextBlooms`) where a downstream optimizer rule can
 // wrap matching scans in `BloomFilterExec`.
+pub mod bloom_codec;
 pub mod bloom_flight;
 // Σ.J.2.b.vii — automatic build-side bloom emitter. Walks a
 // LogicalPlan looking for small-build-side Inner equijoins on Int64
@@ -134,6 +135,15 @@ pub struct DistributedBackend {
     /// access constructs + caches; subsequent calls reuse without
     /// re-running the builder.
     ctx: Arc<OnceCell<Arc<SessionContext>>>,
+    /// Σ.MG.2 take-once bloom hand-off for the plan-embedded
+    /// transport. Filled (under [`Self::bloom_plan_lock`]) right
+    /// before each distributed query plans; the session's
+    /// `EmbeddedBloomRule` consumes it.
+    bloom_slot: bloom_codec::BloomSlot,
+    /// Serializes fill→plan so concurrent queries on one backend can
+    /// never take each other's blooms (a wrong bloom would silently
+    /// drop rows; a missing one only costs pruning).
+    bloom_plan_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for DistributedBackend {
@@ -168,6 +178,8 @@ impl DistributedBackend {
             peers,
             tls: cfg.tls,
             ctx: Arc::new(OnceCell::new()),
+            bloom_slot: bloom_codec::BloomSlot::new(),
+            bloom_plan_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -183,6 +195,47 @@ impl DistributedBackend {
         self.ctx
             .get_or_init(|| async { self.build_context() })
             .await
+    }
+
+    /// Σ.MG.2: pre-execute small build sides for `query` and arm the
+    /// take-once bloom slot. Caller must hold [`Self::bloom_plan_lock`]
+    /// across arm→physical-planning. Any failure clears the slot and
+    /// logs — missing blooms only cost pruning, never correctness.
+    /// No-ops (clearing) when peers are empty or
+    /// `EMAT_MESH_BLOOM_SHIP=0`.
+    async fn arm_blooms_for(&self, ctx: &SessionContext, query: &str) {
+        if self.peers.is_empty()
+            || !ematix_flow_core::flags::tri_state("EMAT_MESH_BLOOM_SHIP").unwrap_or(true)
+        {
+            self.bloom_slot.clear();
+            return;
+        }
+        let max_keys = std::env::var("EMAT_MESH_BLOOM_MAX_KEYS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1_000_000);
+        let opts = bloom_emitter::BloomEmitterOptions {
+            max_build_rows: max_keys,
+            ..Default::default()
+        };
+        let blooms = match ctx.sql(query).await {
+            Ok(df) => match df.into_optimized_plan() {
+                Ok(lp) => bloom_emitter::emit_build_side_blooms(ctx, &lp, &opts)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::debug!("bloom emit failed (non-fatal): {e}");
+                        Default::default()
+                    }),
+                Err(_) => Default::default(),
+            },
+            Err(_) => Default::default(),
+        };
+        if blooms.is_empty() {
+            self.bloom_slot.clear();
+        } else {
+            tracing::debug!(count = blooms.len(), "plan-embedded blooms armed");
+            self.bloom_slot.fill(blooms);
+        }
     }
 
     fn build_context(&self) -> Arc<SessionContext> {
@@ -235,7 +288,14 @@ impl DistributedBackend {
             "distributed session: adaptive mesh gate resolved"
         );
         builder = builder
+            // Σ.MG.2: bloom wrap BEFORE the gate/splitter so
+            // BloomFilterExec lands inside worker stages; the codec
+            // serializes it into the stage protobuf.
+            .with_physical_optimizer_rule(Arc::new(bloom_codec::EmbeddedBloomRule::new(
+                self.bloom_slot.clone(),
+            )))
             .with_physical_optimizer_rule(Arc::new(gate))
+            .with_distributed_user_codec(bloom_codec::BloomExecCodec)
             .with_distributed_worker_resolver(resolver);
         // Σ.B follow-up: install the TLS-aware channel resolver
         // when a TLS config is present. `TlsChannelResolver::new`
@@ -360,6 +420,11 @@ impl Backend for DistributedBackend {
         // `peers.len() > 0` the planner injects ArrowFlightReadExec
         // nodes and fans the work out across peers.
         let ctx = self.session_context().await.clone();
+        // Σ.MG.2 plan-embedded blooms: emit once, then hold the plan
+        // lock across arm→plan so a concurrent query can't take this
+        // query's blooms. EMAT_MESH_BLOOM_SHIP=0 opts out.
+        let _plan_guard = self.bloom_plan_lock.lock().await;
+        self.arm_blooms_for(&ctx, query).await;
         let df = ctx
             .sql(query)
             .await
@@ -368,6 +433,7 @@ impl Backend for DistributedBackend {
             .execute_stream()
             .await
             .map_err(|e| BackendError::Query(format!("execute: {e}")))?;
+        drop(_plan_guard);
         // Adapt DataFusion's `SendableRecordBatchStream` (yields
         // `Result<RecordBatch, DataFusionError>`) into the trait's
         // `ArrowBatchStream` (yields `Result<RecordBatch, BackendError>`).
@@ -635,6 +701,8 @@ impl BatchTransform for DistributedSqlTransform {
             }
         }
 
+        let _plan_guard = self.backend.bloom_plan_lock.lock().await;
+        self.backend.arm_blooms_for(&ctx, &self.sql).await;
         let df = ctx
             .sql(&self.sql)
             .await
@@ -643,6 +711,7 @@ impl BatchTransform for DistributedSqlTransform {
             .execute_stream()
             .await
             .map_err(|e| BackendError::Query(format!("execute: {e}")))?;
+        drop(_plan_guard);
         let batches: Vec<datafusion::arrow::array::RecordBatch> = stream
             .map_err(|e| BackendError::Query(format!("stream: {e}")))
             .try_collect()
