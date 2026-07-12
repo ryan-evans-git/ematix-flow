@@ -304,10 +304,16 @@ def setup_clickhouse(data_dir: Path, queries_dir: Path, qids: list[str], sf: int
         # them in load time + duplicated storage, both recorded in the
         # result JSON so the site can show the full cost.
         sess.query("SET default_table_engine = 'MergeTree'")
+        # Strip comment LINES before splitting on ';' — comments may
+        # contain semicolons (the vendor header does), and a naive
+        # split would feed comment fragments to the engine as SQL.
         ddl_path = Path(__file__).resolve().parent / "tpch_init_clickhouse.sql"
-        for stmt in ddl_path.read_text().split(";"):
-            body = [l for l in stmt.splitlines() if l.strip() and not l.strip().startswith("--")]
-            if body:
+        ddl_sql = "\n".join(
+            l for l in ddl_path.read_text().splitlines()
+            if not l.strip().startswith("--")
+        )
+        for stmt in ddl_sql.split(";"):
+            if stmt.strip():
                 sess.query(stmt)
         load_s: dict[str, float] = {}
         t_all = time.perf_counter()
