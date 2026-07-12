@@ -1539,6 +1539,146 @@ impl Backend for MySQLBackend {
         Ok(total)
     }
 
+    // Σ.XO (2026-07-12): batch insert + `_ematix_offsets` upsert in
+    // ONE InnoDB transaction on a single pooled connection.
+    //
+    // Deviation from the SQLite/DuckDB/PG shape: MySQL DDL implicitly
+    // COMMITs, so the lazy CREATE TABLE IF NOT EXISTS cannot ride the
+    // transaction — it runs (idempotently) right before START
+    // TRANSACTION instead. Row + offset atomicity is unaffected; the
+    // worst crash outcome is an empty meta table.
+    async fn write_arrow_stream_with_offsets(
+        &self,
+        target: &TargetTable,
+        stream: ArrowBatchStream,
+        mode: WriteMode,
+        pipeline_id: &str,
+        offsets: &[(String, String)],
+    ) -> Result<Option<u64>, BackendError> {
+        use futures_util::StreamExt;
+
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        if !offsets.is_empty() {
+            conn.query_drop(
+                "CREATE TABLE IF NOT EXISTS _ematix_offsets (\
+                     pipeline_id VARCHAR(255) NOT NULL, \
+                     source_id VARCHAR(255) NOT NULL, \
+                     offsets_json TEXT NOT NULL, \
+                     updated_at TIMESTAMP(6) NOT NULL, \
+                     PRIMARY KEY (pipeline_id, source_id)) ENGINE=InnoDB",
+            )
+            .await
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        }
+        conn.query_drop("START TRANSACTION")
+            .await
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let work: Result<u64, BackendError> = async {
+            // TRUNCATE is DDL in MySQL (implicit commit) — the
+            // atomic variant deletes instead, trading speed for the
+            // atomicity this method exists to provide.
+            if mode == WriteMode::Truncate {
+                conn.query_drop(format!(
+                    "DELETE FROM {}",
+                    qualified(&target.schema, &target.name)
+                ))
+                .await
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            }
+            let mut s = stream;
+            let mut total: u64 = 0;
+            while let Some(batch) = s.next().await {
+                let batch = batch?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let schema = batch.schema();
+                let cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+                let placeholders = vec!["?"; cols.len()].join(", ");
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    qualified(&target.schema, &target.name),
+                    cols.iter()
+                        .map(|c| quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    placeholders
+                );
+                for row_idx in 0..batch.num_rows() {
+                    let params = arrow_row_to_mysql_params(&batch, row_idx)?;
+                    conn.exec_drop(&sql, params)
+                        .await
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    total += 1;
+                }
+            }
+            // Bind offsets_json twice instead of using the
+            // deprecated VALUES() form in the update arm.
+            for (source_id, offsets_json) in offsets {
+                conn.exec_drop(
+                    "INSERT INTO _ematix_offsets \
+                         (pipeline_id, source_id, offsets_json, updated_at) \
+                     VALUES (?, ?, ?, NOW(6)) \
+                     ON DUPLICATE KEY UPDATE offsets_json = ?, updated_at = NOW(6)",
+                    (pipeline_id, source_id, offsets_json, offsets_json),
+                )
+                .await
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            }
+            Ok(total)
+        }
+        .await;
+        match work {
+            Ok(total) => {
+                conn.query_drop("COMMIT")
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                Ok(Some(total))
+            }
+            Err(e) => {
+                let _ = conn.query_drop("ROLLBACK").await;
+                Err(e)
+            }
+        }
+    }
+
+    // Σ.XO (2026-07-12): missing `_ematix_offsets` in the current
+    // database = supported, nothing committed yet (the write side
+    // creates it lazily).
+    async fn load_committed_offsets(
+        &self,
+        pipeline_id: &str,
+    ) -> Result<Option<Vec<(String, String)>>, BackendError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        let exists: Option<i64> = conn
+            .query_first(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_schema = DATABASE() AND table_name = '_ematix_offsets'",
+            )
+            .await
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        if exists.unwrap_or(0) == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let rows: Vec<(String, String)> = conn
+            .exec(
+                "SELECT source_id, offsets_json FROM _ematix_offsets \
+                 WHERE pipeline_id = ? ORDER BY source_id",
+                (pipeline_id,),
+            )
+            .await
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        Ok(Some(rows))
+    }
+
     async fn run_append(
         &self,
         spec: &TableSpec,

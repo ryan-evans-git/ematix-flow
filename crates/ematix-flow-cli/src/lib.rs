@@ -345,6 +345,12 @@ pub struct PipelineCliConfig {
     /// Defaults to 500 ms.
     #[serde(default = "default_idle_pause_ms")]
     pub idle_pause_ms: u64,
+    /// Σ.XO: requested delivery guarantee — `"auto"` (default),
+    /// `"at_least_once"`, or `"exactly_once"`. See
+    /// `streaming::DeliveryMode` and docs/DELIVERY_SEMANTICS.md;
+    /// `"exactly_once"` on an ineligible pipeline errors at startup.
+    #[serde(default = "default_delivery")]
+    pub delivery: String,
     /// Optional dead-letter topic. Same Kafka-only constraint as
     /// `StreamingPipelineConfig::dead_letter_topic`.
     pub dead_letter_topic: Option<String>,
@@ -636,6 +642,10 @@ pub struct TransformTlsClientIdentityToml {
 
 fn default_transform_on_error() -> String {
     "fail".into()
+}
+
+fn default_delivery() -> String {
+    "auto".into()
 }
 
 /// `[transform.window]` block — config-block surface for the
@@ -2077,6 +2087,7 @@ impl PipelineCliConfig {
         cfg.validate_state_store_session_pairing()?;
         cfg.validate_join_config()?;
         cfg.validate_transform_on_error()?;
+        cfg.parsed_delivery()?;
         cfg.validate_dlq_config()?;
         cfg.validate_transform_dialect()?;
         cfg.validate_transform_engine()?;
@@ -2283,6 +2294,22 @@ impl PipelineCliConfig {
             other => Err(ConfigError::Parse(format!(
                 "[transform] on_error = {other:?} not supported \
                  (use \"fail\", \"drop\", or \"dlq\")"
+            ))),
+        }
+    }
+
+    /// Σ.XO: validate + lower the `delivery` knob. Eligibility is NOT
+    /// checked here — only the runtime knows the target's capability —
+    /// but a typo must die at config-load, not resolve to Auto.
+    fn parsed_delivery(&self) -> Result<ematix_flow_core::streaming::DeliveryMode, ConfigError> {
+        use ematix_flow_core::streaming::DeliveryMode;
+        match self.delivery.as_str() {
+            "auto" => Ok(DeliveryMode::Auto),
+            "at_least_once" => Ok(DeliveryMode::AtLeastOnce),
+            "exactly_once" => Ok(DeliveryMode::ExactlyOnce),
+            other => Err(ConfigError::Parse(format!(
+                "delivery = {other:?} not supported (use \"auto\", \
+                 \"at_least_once\", or \"exactly_once\")"
             ))),
         }
     }
@@ -3132,6 +3159,11 @@ impl PipelineCliConfig {
         );
         cfg.idle_pause_ms = self.idle_pause_ms;
         cfg.mode = WriteMode::Append;
+        // Σ.XO: validated at config-load; expect() documents that.
+        cfg = cfg.with_delivery(
+            self.parsed_delivery()
+                .expect("delivery already validated at config-load"),
+        );
         if let Some(dlt) = &self.dead_letter_topic {
             cfg = cfg.with_dead_letter_topic(dlt.clone());
         }
@@ -7698,6 +7730,42 @@ mod tests {
             "no [state_store] block must parse to None — \
              39.4 tumbling/hopping pipelines stay opt-out"
         );
+    }
+
+    // ----- Σ.XO: `delivery` knob -----
+
+    #[test]
+    fn delivery_defaults_to_auto() {
+        let cfg = PipelineCliConfig::from_toml_str(&minimal_pipeline_with_state_store("")).unwrap();
+        assert_eq!(cfg.delivery, "auto");
+        assert_eq!(
+            cfg.parsed_delivery().unwrap(),
+            ematix_flow_core::streaming::DeliveryMode::Auto
+        );
+    }
+
+    #[test]
+    fn delivery_exactly_once_parses() {
+        let toml = minimal_pipeline_with_state_store("").replace(
+            "source_query = \"events\"",
+            "source_query = \"events\"\ndelivery = \"exactly_once\"",
+        );
+        let cfg = PipelineCliConfig::from_toml_str(&toml).unwrap();
+        assert_eq!(
+            cfg.parsed_delivery().unwrap(),
+            ematix_flow_core::streaming::DeliveryMode::ExactlyOnce
+        );
+    }
+
+    #[test]
+    fn delivery_typo_dies_at_config_load() {
+        let toml = minimal_pipeline_with_state_store("").replace(
+            "source_query = \"events\"",
+            "source_query = \"events\"\ndelivery = \"exactly-once\"",
+        );
+        let err = PipelineCliConfig::from_toml_str(&toml)
+            .expect_err("a delivery typo must die at load, not resolve to auto");
+        assert!(err.to_string().contains("delivery"), "{err}");
     }
 
     #[test]
