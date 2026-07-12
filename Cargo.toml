@@ -105,6 +105,11 @@ cranelift-native = "0.107"
 # `docs/PHASE_SIGMA_B_TRAIT_SPIKE.md` "PR 2 distributed-engine
 # pivot" for the rationale.
 datafusion-distributed = "1"
+# Σ.MG.2 plan-embedded blooms: PhysicalExtensionCodec for
+# BloomFilterExec so blooms ride the serialized stage plan (MB-scale
+# proto payloads) instead of gRPC headers (~8 KB cap). Same version
+# datafusion-distributed 1.0 links.
+datafusion-proto = "53.1"
 # Σ.B PR 3: gRPC transport for the `flow-worker` binary that hosts
 # `datafusion_distributed::Worker::into_worker_server()`. Pinned to
 # 0.14 to match the version datafusion-distributed 1.0 uses

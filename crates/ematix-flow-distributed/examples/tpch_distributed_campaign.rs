@@ -76,6 +76,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_distributed::{CompressionType, DistributedExt, WorkerResolver};
 use ematix_flow_core::preset::{self, HarnessOverrides};
+use ematix_flow_distributed::bloom_codec::{BloomExecCodec, BloomSlot, EmbeddedBloomRule};
 use ematix_flow_distributed::mesh_gate::AdaptiveMeshGateRule;
 use serde::Serialize;
 use url::Url;
@@ -340,7 +341,11 @@ fn explicit_partitions() -> Option<usize> {
 /// gate decision itself replays per query at plan-optimization time
 /// (the rule runs on every plan), reported per query as
 /// `QueryStats::plan_mode`.
-fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState {
+fn build_session_state(
+    distributed: bool,
+    resolver: StaticPeers,
+    bloom_slot: BloomSlot,
+) -> SessionState {
     let explicit = explicit_partitions();
     let mut cfg = SessionConfig::new().with_collect_statistics(true);
     if let Some(n) = explicit {
@@ -364,8 +369,14 @@ fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState
     let (builder, _handles) = preset::with_optimizer_rules_overridden(base, &overrides);
 
     if distributed {
+        // Σ.MG.2: the embedded-bloom wrap must run BEFORE the
+        // mesh-gated stage splitter so BloomFilterExec lands inside
+        // worker stages; the codec serializes it into the stage
+        // protobuf (headers can't carry SF-scale blooms).
         let builder = builder
+            .with_physical_optimizer_rule(Arc::new(EmbeddedBloomRule::new(bloom_slot)))
             .with_physical_optimizer_rule(Arc::new(AdaptiveMeshGateRule::from_env()))
+            .with_distributed_user_codec(BloomExecCodec)
             .with_distributed_worker_resolver(resolver);
         builder
             .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
@@ -578,7 +589,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // NO_DISTRIBUTE: single-node diagnostic (same rules, no Flight mesh).
     let distributed = std::env::var_os("NO_DISTRIBUTE").is_none();
     let provenance = capture_provenance(&workspace_root, &peers, distributed);
-    let state = build_session_state(distributed, resolver);
+    let bloom_slot = BloomSlot::new();
+    let state = build_session_state(distributed, resolver, bloom_slot.clone());
     eprintln!(
         "  (distributed={distributed} target_partitions={} instance_type={:?})",
         state.config().target_partitions(),
@@ -675,6 +687,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // network/stage boundaries) and skip execution. Diagnostic for the
         // Q11/Q15 0-rows distributed correctness bug (SF100/DIST.1a).
         if std::env::var_os("EXPLAIN_ONLY").is_some() {
+            // Arm blooms so the dumped plan matches what a real run
+            // executes (Σ.MG.2 diagnostics).
+            emit_and_arm_blooms(&ctx, &sql, &bloom_slot, distributed).await;
             match ctx.sql(&format!("EXPLAIN {sql}")).await {
                 Ok(df) => match df.collect().await {
                     Ok(batches) => {
@@ -690,11 +705,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        // Σ.MG.2 plan-embedded blooms (distributed only; tri-state
+        // EMAT_MESH_BLOOM_SHIP, default ON): every planning below
+        // (probe, warmups, trials) re-emits + re-arms the take-once
+        // slot. Emission pre-executes the small build sides, so it is
+        // REAL per-query work — it runs INSIDE the trial timer,
+        // exactly as production's read_arrow_stream pays it (and as
+        // Trino/Spark pay their dynamic-filter builds during
+        // execution). Failure is non-fatal: no blooms = no pruning,
+        // never wrong results.
+        let arm_blooms =
+            || async { emit_and_arm_blooms(&ctx, &sql, &bloom_slot, distributed).await };
+
         // What did the adaptive mesh gate decide for this query?
         // Planning here is cheap relative to a trial (and each trial
         // re-plans anyway via ctx.sql); "unknown" means planning
         // itself failed — the warmups/trials below will surface the
         // same error.
+        let n_blooms = arm_blooms().await;
+        if n_blooms > 0 {
+            eprintln!("  blooms: {n_blooms} embedded");
+        }
         let (plan_mode, scan_bytes): (String, Option<u64>) = match ctx.sql(&sql).await {
             Ok(df) => match df.create_physical_plan().await {
                 Ok(plan) => (plan_mode_of(&plan).to_string(), sum_scan_leaf_bytes(&plan)),
@@ -715,6 +746,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Warmups (untimed, but verify it runs cleanly).
         for w in 0..warmups {
+            arm_blooms().await;
             match run_query(&ctx, &sql).await {
                 Ok(_) => {}
                 Err(e) => {
@@ -728,7 +760,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut trials_ms: Vec<f64> = Vec::with_capacity(trials);
         let mut rows_returned: usize = 0;
         for _ in 0..trials {
+            // Timer starts BEFORE emit+arm: the bloom build is part
+            // of the measured query, not free setup.
             let t0 = Instant::now();
+            arm_blooms().await;
             match run_query(&ctx, &sql).await {
                 Ok(batches) => {
                     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -815,6 +850,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Σ.MG.2: emit plan-embedded blooms for `sql` and arm the take-once
+/// slot; clears the slot when disabled / non-distributed / nothing
+/// eligible. Returns the number of blooms armed.
+async fn emit_and_arm_blooms(
+    ctx: &SessionContext,
+    sql: &str,
+    slot: &BloomSlot,
+    distributed: bool,
+) -> usize {
+    if !distributed || !ematix_flow_core::flags::tri_state("EMAT_MESH_BLOOM_SHIP").unwrap_or(true) {
+        slot.clear();
+        return 0;
+    }
+    let max_keys = std::env::var("EMAT_MESH_BLOOM_MAX_KEYS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1_000_000);
+    let opts = ematix_flow_distributed::bloom_emitter::BloomEmitterOptions {
+        max_build_rows: max_keys,
+        ..Default::default()
+    };
+    let blooms = match ctx.sql(sql).await {
+        Ok(df) => match df.into_optimized_plan() {
+            Ok(lp) => {
+                ematix_flow_distributed::bloom_emitter::emit_build_side_blooms(ctx, &lp, &opts)
+                    .await
+                    .unwrap_or_default()
+            }
+            Err(_) => Default::default(),
+        },
+        Err(_) => Default::default(),
+    };
+    let n = blooms.len();
+    if n == 0 {
+        slot.clear();
+    } else {
+        slot.fill(blooms);
+    }
+    n
+}
+
 async fn run_query(
     ctx: &SessionContext,
     sql: &str,
@@ -857,7 +933,7 @@ mod campaign_preset_parity_tests {
 
     #[test]
     fn single_node_rule_chain_equals_production_preset() {
-        let state = build_session_state(false, no_peers());
+        let state = build_session_state(false, no_peers(), BloomSlot::new());
         let (physical, logical) = preset::ematix_rule_names(&state);
         assert_eq!(
             physical,
@@ -883,6 +959,7 @@ mod campaign_preset_parity_tests {
             StaticPeers {
                 urls: vec![Url::parse("http://127.0.0.1:50051").unwrap()],
             },
+            BloomSlot::new(),
         );
         let (physical, logical) = preset::ematix_rule_names(&state);
         assert_eq!(
@@ -898,21 +975,28 @@ mod campaign_preset_parity_tests {
         );
         assert_eq!(
             physical.len(),
-            n + 1,
-            "distributed chain must add exactly one rule (the mesh-gated stage splitter): {physical:?}"
+            n + 2,
+            "distributed chain adds the Σ.MG.2 embedded-bloom wrap then \
+             the mesh-gated stage splitter: {physical:?}"
+        );
+        assert_eq!(
+            physical[n], "ematix_embedded_bloom",
+            "the bloom wrap must run BEFORE the splitter so the exec \
+             lands inside worker stages"
         );
         assert!(
-            physical[n].to_lowercase().contains("distributed"),
-            "the appended rule must wrap the datafusion-distributed stage splitter, got {}",
-            physical[n]
+            physical[n + 1].to_lowercase().contains("distributed"),
+            "the LAST rule must wrap the datafusion-distributed stage splitter, got {}",
+            physical[n + 1]
         );
-        // 2026-07 adaptive mesh gate: the appended rule is no longer
-        // the BARE splitter but the EMAT_MESH tri-state gate wrapping
-        // it (ematix_flow_distributed::mesh_gate). Pin the exact name
+        // 2026-07 adaptive mesh gate: the splitter slot is the
+        // EMAT_MESH tri-state gate wrapping it
+        // (ematix_flow_distributed::mesh_gate). Pin the exact name
         // so a silent revert to the ungated splitter trips here.
         assert_eq!(
-            physical[n], "ematix_adaptive_distributed_mesh_gate",
-            "the appended rule must be the EMAT_MESH adaptive mesh gate"
+            physical[n + 1],
+            "ematix_adaptive_distributed_mesh_gate",
+            "the LAST rule must be the EMAT_MESH adaptive mesh gate"
         );
     }
 
@@ -927,7 +1011,7 @@ mod campaign_preset_parity_tests {
         use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
         use datafusion::datasource::MemTable;
 
-        let state = build_session_state(false, no_peers());
+        let state = build_session_state(false, no_peers(), BloomSlot::new());
         let ctx = SessionContext::from(state);
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "n",

@@ -4066,6 +4066,7 @@ dependencies = [
  "criterion",
  "datafusion",
  "datafusion-distributed",
+ "datafusion-proto",
  "ematix-flow-core",
  "ematix-iceberg",
  "futures-util",

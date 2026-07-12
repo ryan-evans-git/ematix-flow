@@ -103,10 +103,18 @@ impl PhysicalOptimizerRule for EnableContextBloomRule {
             return Ok(plan); // hot-path fast-out for non-distributed queries
         }
         let result = plan.transform_up(|node| {
-            let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(table_stem) = table_stem_for(scan.path()) else {
+            // Two scan flavors: the ematix fast path (worker shards,
+            // single-node) and — Σ.MG.2 — arrow `DataSourceExec`
+            // listings (the coordinator's pre-split distributed plan,
+            // where the plan-embedded transport wraps BEFORE the
+            // stage splitter).
+            let table_stem =
+                if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
+                    table_stem_for(scan.path())
+                } else {
+                    arrow_scan_table_stem(&node)
+                };
+            let Some(table_stem) = table_stem else {
                 return Ok(Transformed::no(node));
             };
             // Find an Int64 column whose uuid matches one of our
@@ -114,7 +122,7 @@ impl PhysicalOptimizerRule for EnableContextBloomRule {
             // multiple times is correct but wasteful, and Σ.J.2.b.vi
             // ships the single-bloom case; multi-bloom-per-scan is a
             // follow-up (Σ.J.2.b.ix).
-            let schema = scan.schema();
+            let schema = node.schema();
             for (idx, field) in schema.fields().iter().enumerate() {
                 if field.data_type() != &DataType::Int64 {
                     continue;
@@ -148,6 +156,34 @@ fn table_stem_for(path: &str) -> Option<String> {
     p.file_stem()
         .and_then(|s| s.to_str())
         .map(|s| s.to_lowercase())
+        .map(|s| strip_part_suffix(&s))
+}
+
+/// `lineitem-0003` → `lineitem`: parted part files carry a `-NNNN`
+/// suffix; the bloom uuid is keyed on the TABLE.
+fn strip_part_suffix(stem: &str) -> String {
+    if let Some((base, suffix)) = stem.rsplit_once('-') {
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return base.to_string();
+        }
+    }
+    stem.to_string()
+}
+
+/// Table identity for an arrow `DataSourceExec` parquet listing: the
+/// first file's stem (part suffix stripped) — `.../lineitem/
+/// lineitem-0001.parquet` and `.../lineitem.parquet` both resolve to
+/// `lineitem`.
+fn arrow_scan_table_stem(node: &Arc<dyn ExecutionPlan>) -> Option<String> {
+    let ds = node
+        .as_any()
+        .downcast_ref::<datafusion::datasource::source::DataSourceExec>()?;
+    let cfg = ds
+        .data_source()
+        .as_any()
+        .downcast_ref::<datafusion::datasource::physical_plan::FileScanConfig>()?;
+    let first = cfg.file_groups.iter().flat_map(|g| g.files()).next()?;
+    table_stem_for(first.object_meta.location.as_ref())
 }
 
 #[cfg(test)]

@@ -70,7 +70,18 @@ bloom-heavy queries.
 
 ## Status
 
-- Eligibility + both orientations: **merged** (this PR), oracles in
+- Eligibility + both orientations: **merged** (#197), oracles in
   `bloom_emitter::tests`.
-- Codec + coordinator wiring + worker roll: **not started** — next
-  arc after the SF=1000 baseline quantifies the gap.
+- Codec + coordinator wiring + worker registration: **implemented**
+  (2026-07-11 late): `bloom_codec.rs` (`BloomExecCodec` +
+  take-once `BloomSlot` + `EmbeddedBloomRule`),
+  `EnableContextBloomRule` grew the arrow-scan arm (+ part-suffix
+  stripping), worker session builder registers the codec
+  unconditionally, campaign + `DistributedBackend` emit + arm per
+  query — INSIDE the trial timer (the bloom build is measured work,
+  same as Trino/Spark pay for dynamic filters).
+  `EMAT_MESH_BLOOM_SHIP` tri-state (default ON),
+  `EMAT_MESH_BLOOM_MAX_KEYS` (default 1M keys ≈ 1.5 MB bloom,
+  under proto message limits).
+- Remaining: box-scale validation (mesh Q07 expected → ~3 s), then
+  the SF=1000 campaign measures the real payoff.
