@@ -13,7 +13,8 @@
         up down logs demo-deps \
         demo-streaming-init demo-streaming-producer demo-streaming-pipeline \
         demo-workflow-scheduler demo-workflow-status \
-        demo-s3-init demo-s3-seed demo-s3-pipeline
+        demo-s3-init demo-s3-seed demo-s3-pipeline \
+        bench-data bench-repro
 
 help:  ## Show this help.
 	@awk 'BEGIN {FS=":.*##"; printf "Targets:\n"} \
@@ -129,3 +130,36 @@ demo-s3-seed:  ## Demo 11: upload 3 parquet files to MinIO bucket.
 
 demo-s3-pipeline:  ## Demo 11: run the S3 → Postgres pipeline (Ctrl+C to stop).
 	$(PYTHON) examples/11_s3_parquet_to_postgres/pipeline.py
+
+# ---- benchmark reproduction (see REPRODUCING.md) -------------------
+# Single entry point for reproducing published TPC-H latency numbers.
+# Delegates to the strict protocol in scripts/bench/; engine-list driven
+# so new comparison engines slot into ENGINES without touching this.
+SF ?= 1
+ENGINES ?= ematix duckdb
+TRIALS ?= 10
+BENCH_OUT ?= bench-results/repro-sf$(SF)
+
+bench-data:  ## Generate TPC-H data at SF=$$SF into examples/tpch/data/sfN (dbgen-equivalent).
+	cargo run --release -p ematix-flow-core --example tpch_generate -- \
+		--sf $(SF) --out examples/tpch/data/sf$(SF)
+
+bench-repro: bench-data  ## Reproduce single-node TPC-H latency. Vars: SF=1 ENGINES="ematix duckdb" TRIALS=10.
+	cargo build --release --example tpch_triangulation_bench --features triangulation
+	@for e in $(ENGINES); do \
+		echo ">> strict 22q: $$e (SF=$(SF), trials=$(TRIALS))"; \
+		scripts/bench/strict_22q.sh --sf $(SF) --engine $$e --isolate \
+			--trials $(TRIALS) --out $(BENCH_OUT)/$$e || exit $$?; \
+	done
+	@if echo "$(ENGINES)" | grep -qw ematix; then \
+		for e in $(ENGINES); do \
+			[ "$$e" = "ematix" ] && continue; \
+			echo ">> verdict: ematix vs $$e"; \
+			$(PYTHON) scripts/bench/strict_diff.py \
+				--a $(BENCH_OUT)/ematix/strict-22q-summary.md \
+				--b $(BENCH_OUT)/$$e/strict-22q-summary.md \
+				--label-a ematix --label-b $$e \
+				--out $(BENCH_OUT)/verdicts-ematix-vs-$$e.md || exit $$?; \
+		done; \
+	fi
+	@echo "Done. Summaries + verdicts under $(BENCH_OUT)/"
