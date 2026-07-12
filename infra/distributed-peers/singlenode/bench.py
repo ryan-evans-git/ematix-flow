@@ -457,11 +457,17 @@ def setup_clickhouse_server(data_dir: Path, queries_dir: Path, qids: list[str], 
             continue
         q = apply_tpch_query_params(qid, q, sf)
 
+        # Per-execution bound: pathological plans (Q02-on-MergeTree ran
+        # 20+ min/execution at ~2 threads on server 26.6 while the same
+        # engine answers it from parquet in 0.87 s) record as honest
+        # per-query failures instead of stalling the leg for hours.
+        exec_timeout = int(os.environ.get("EMAT_CH_TIMEOUT", "3600"))
+
         def make(q=q):
             def run() -> tuple[float, int]:
                 p = subprocess.run(
                     common + ["--database=tpch", "--time", "--format=CSV", "--query", q],
-                    capture_output=True, text=True, timeout=3600,
+                    capture_output=True, text=True, timeout=exec_timeout,
                 )
                 if p.returncode != 0:
                     raise RuntimeError(p.stderr.strip()[:400])
