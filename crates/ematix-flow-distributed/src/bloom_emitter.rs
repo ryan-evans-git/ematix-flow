@@ -68,6 +68,39 @@ use ematix_flow_core::bloom::{BloomFilter, column_uuid};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Σ.MG.2 hang fix: a SINGLE-NODE twin of `ctx` for bloom emission.
+/// Pre-executing build sides through a distributed session routes
+/// them into the stage splitter and the Flight mesh — the 2026-07-12
+/// 00:28Z mesh leg deadlocked exactly there (coordinator parked on
+/// futexes, workers idle). The twin shares the same table providers
+/// (Arc clones out of the catalog) but carries only the single-node
+/// preset rules, so emission executes locally, always.
+pub async fn single_node_emission_ctx(ctx: &SessionContext) -> DfResult<SessionContext> {
+    use datafusion::execution::session_state::SessionStateBuilder;
+    let builder = ematix_flow_core::preset::with_optimizer_rules(
+        SessionStateBuilder::new().with_default_features(),
+    );
+    let twin = SessionContext::new_with_state(builder.build());
+    for cat_name in ctx.catalog_names() {
+        let Some(cat) = ctx.catalog(&cat_name) else {
+            continue;
+        };
+        for schema_name in cat.schema_names() {
+            let Some(schema) = cat.schema(&schema_name) else {
+                continue;
+            };
+            for table_name in schema.table_names() {
+                if let Ok(Some(provider)) = schema.table(&table_name).await {
+                    // Same-name collisions across catalogs are fine —
+                    // last registration wins, matching lookup order.
+                    let _ = twin.register_table(&table_name, provider);
+                }
+            }
+        }
+    }
+    Ok(twin)
+}
+
 /// Σ.J.2.b.vii — knobs for [`emit_build_side_blooms`].
 #[derive(Clone)]
 pub struct BloomEmitterOptions {

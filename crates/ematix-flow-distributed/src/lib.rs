@@ -218,18 +218,37 @@ impl DistributedBackend {
             max_build_rows: max_keys,
             ..Default::default()
         };
-        let blooms = match ctx.sql(query).await {
-            Ok(df) => match df.into_optimized_plan() {
-                Ok(lp) => bloom_emitter::emit_build_side_blooms(ctx, &lp, &opts)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::debug!("bloom emit failed (non-fatal): {e}");
-                        Default::default()
-                    }),
+        // Σ.MG.2 hang fix: emission executes on a SINGLE-NODE twin
+        // (same table providers, no distributed rules) — build-side
+        // pre-execution through the distributed session routes into
+        // the Flight mesh and can deadlock. Timeout is defense in
+        // depth: a wedged emission degrades to "no blooms".
+        let emitted = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let twin = match bloom_emitter::single_node_emission_ctx(ctx).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!("bloom twin build failed (non-fatal): {e}");
+                    return Default::default();
+                }
+            };
+            match twin.sql(query).await {
+                Ok(df) => match df.into_optimized_plan() {
+                    Ok(lp) => bloom_emitter::emit_build_side_blooms(&twin, &lp, &opts)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::debug!("bloom emit failed (non-fatal): {e}");
+                            Default::default()
+                        }),
+                    Err(_) => Default::default(),
+                },
                 Err(_) => Default::default(),
-            },
-            Err(_) => Default::default(),
-        };
+            }
+        })
+        .await;
+        let blooms = emitted.unwrap_or_else(|_| {
+            tracing::warn!("bloom emission timed out (30s) — running unbloomd");
+            Default::default()
+        });
         if blooms.is_empty() {
             self.bloom_slot.clear();
         } else {
@@ -261,8 +280,17 @@ impl DistributedBackend {
         // optimizers compose cleanly with the distributed planner —
         // they rewrite the plan before the distributed planner shards
         // it, so the same plan shape ships across the peer mesh.
-        let mut builder = ematix_flow_core::preset::with_optimizer_rules(
+        // Σ.MG.2 hang fix: grace demotion is single-node-only (an
+        // undecodable GraceHashJoinExec inside a stage plan hangs the
+        // mesh; spill is per-node anyway). Everything else = the
+        // production preset.
+        let overrides = ematix_flow_core::preset::HarnessOverrides {
+            grace_join: false,
+            ..ematix_flow_core::preset::HarnessOverrides::default()
+        };
+        let (mut builder, _handles) = ematix_flow_core::preset::with_optimizer_rules_overridden(
             SessionStateBuilder::new().with_default_features(),
+            &overrides,
         );
         // 2026-07 adaptive mesh gate: the stage splitter is installed
         // behind the EMAT_MESH tri-state gate (see [`mesh_gate`]).
