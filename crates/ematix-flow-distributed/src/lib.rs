@@ -210,14 +210,12 @@ impl DistributedBackend {
             self.bloom_slot.clear();
             return;
         }
-        let max_keys = std::env::var("EMAT_MESH_BLOOM_MAX_KEYS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1_000_000);
-        let opts = bloom_emitter::BloomEmitterOptions {
-            max_build_rows: max_keys,
-            ..Default::default()
-        };
+        // Σ.MG.3: from_env carries the key cap AND the emission cost
+        // gate (build-scan cap / probe floor / probe:build ratio) —
+        // pre-executing a big build side costs real seconds inside
+        // the query, so only lineitem-class probes with small builds
+        // emit.
+        let opts = bloom_emitter::BloomEmitterOptions::from_env();
         // Σ.MG.2 hang fix: emission executes on a SINGLE-NODE twin
         // (same table providers, no distributed rules) — build-side
         // pre-execution through the distributed session routes into

@@ -500,7 +500,7 @@ pub fn max_same_table_scan_instances(
 /// error) is unknown. Row-count-based width estimation is
 /// deliberately NOT attempted — a leaf without a byte size is simply
 /// unknown.
-fn collect_scan_leaf_bytes(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Option<u64>>) {
+pub(crate) fn collect_scan_leaf_bytes(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Option<u64>>) {
     let children = plan.children();
     if children.is_empty() {
         let bytes = plan

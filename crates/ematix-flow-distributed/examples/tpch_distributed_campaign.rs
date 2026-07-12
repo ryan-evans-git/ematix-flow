@@ -899,14 +899,11 @@ async fn emit_and_arm_blooms(
         slot.clear();
         return 0;
     };
-    let max_keys = std::env::var("EMAT_MESH_BLOOM_MAX_KEYS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1_000_000);
-    let opts = ematix_flow_distributed::bloom_emitter::BloomEmitterOptions {
-        max_build_rows: max_keys,
-        ..Default::default()
-    };
+    // Σ.MG.3: from_env = key cap + emission cost gate (build-scan
+    // cap / probe floor / probe:build ratio). Q02 SF100 paid ~8s of
+    // partsupp scanning per trial for blooms worth nothing — only
+    // lineitem-class probes with small builds emit now.
+    let opts = ematix_flow_distributed::bloom_emitter::BloomEmitterOptions::from_env();
     // Defense in depth: a wedged emission degrades to "no blooms"
     // (pruning lost, correctness + liveness kept), never a hung leg.
     let emitted = tokio::time::timeout(std::time::Duration::from_secs(30), async {
