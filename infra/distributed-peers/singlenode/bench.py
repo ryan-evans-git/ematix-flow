@@ -618,6 +618,24 @@ def setup_clickhouse_distributed(data_dir: Path, queries_dir: Path, qids: list[s
         print(f"  node {h}: loaded in {s}s", flush=True)
         load_s[h] = s
 
+    # Every node must hold rows in every table it was assigned.
+    # ClickHouse's file() silently inserts ZERO rows when a glob matches
+    # nothing (e.g. a missing user_files symlink on one node), and the
+    # colocation oracle alone passes vacuously in that case — both of
+    # its counts see the same partial data. A fast wrong answer is not
+    # a benchmark: abort loudly instead.
+    for h in hosts:
+        for t in TABLES:
+            db = "tpch_local" if t in CH_SHARDED_TABLES else "tpch"
+            n = sql(h, f"SELECT count() FROM {db}.{t}", timeout=120)
+            if not n.isdigit() or int(n) == 0:
+                raise RuntimeError(
+                    f"post-load check FAILED: {h} {db}.{t} has {n or 0} rows — "
+                    f"its file() glob matched nothing (check the sf{sf} "
+                    f"user_files symlink on that node); refusing to bench")
+    print("==> post-load check OK: every node holds rows in every table",
+          flush=True)
+
     disk_total = 0
     for h in hosts:
         d = sql(h, "SELECT sum(bytes_on_disk) FROM system.parts WHERE active "
