@@ -356,7 +356,9 @@ pub fn sidecar_rows_where_eq(
     ordinals: &[usize],
     out_schema: datafusion::arrow::datatypes::SchemaRef,
 ) -> DfResult<datafusion::arrow::array::RecordBatch> {
-    use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
+    use datafusion::arrow::array::{
+        ArrayRef, Date32Array, Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray,
+    };
     use datafusion::arrow::datatypes::DataType as ArrowType;
 
     let source = ematix_parquet_io::ParquetFile::open(source_path).map_err(|e| {
@@ -383,10 +385,41 @@ pub fn sidecar_rows_where_eq(
                     .map_err(|e| lookup_err(index_name, field.name(), &e))?;
                 Arc::new(Int64Array::from(v))
             }
-            // Int32/Date32/Utf8 arrive with ematix-parquet 0.17.3's
-            // lazy i32/byte-array materializers (the eager reader has
-            // them; LazyParquetIndex ships i64-only in 0.17.2) —
-            // sidecar_materializable() widens in lockstep.
+            // Date32 is i32-backed in parquet; same materializer as
+            // Int32, different Arrow wrapper.
+            ArrowType::Int32 => {
+                let v = idx
+                    .read_column_i32_where_eq(&source, index_name, key, *ordinal)
+                    .map_err(|e| lookup_err(index_name, field.name(), &e))?;
+                Arc::new(Int32Array::from(v))
+            }
+            ArrowType::Date32 => {
+                let v = idx
+                    .read_column_i32_where_eq(&source, index_name, key, *ordinal)
+                    .map_err(|e| lookup_err(index_name, field.name(), &e))?;
+                Arc::new(Date32Array::from(v))
+            }
+            ArrowType::Utf8 | ArrowType::Utf8View => {
+                let raw = idx
+                    .read_column_byte_array_where_eq(&source, index_name, key, *ordinal)
+                    .map_err(|e| lookup_err(index_name, field.name(), &e))?;
+                let strs: Vec<String> = raw
+                    .into_iter()
+                    .map(|b| {
+                        String::from_utf8(b).map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "sidecar: non-UTF-8 bytes in Utf8 column {}: {e}",
+                                field.name()
+                            ))
+                        })
+                    })
+                    .collect::<DfResult<_>>()?;
+                if matches!(field.data_type(), ArrowType::Utf8View) {
+                    Arc::new(StringViewArray::from_iter_values(strs))
+                } else {
+                    Arc::new(StringArray::from_iter_values(strs))
+                }
+            }
             other => {
                 return Err(DataFusionError::Internal(format!(
                     "sidecar_rows_where_eq: unmaterializable type {other} for {} — \
@@ -407,11 +440,17 @@ fn lookup_err(index_name: &str, col: &str, e: &impl std::fmt::Debug) -> DataFusi
 }
 
 /// The projected Arrow types the SQL sidecar path can materialize —
-/// plan-time eligibility check for [`sidecar_rows_where_eq`]. Widens
-/// to Int32/Date32/Utf8 with the ematix-parquet 0.17.3 lazy
-/// materializers.
+/// plan-time eligibility check for [`sidecar_rows_where_eq`]. The
+/// index KEY stays i64 regardless; this governs TARGET columns only.
+/// Both string representations appear in practice: the footer maps
+/// BYTE_ARRAY/UTF8 to `Utf8`, but DataFusion's view-types default
+/// rewrites provider schemas to `Utf8View`.
 pub fn sidecar_materializable(dt: &datafusion::arrow::datatypes::DataType) -> bool {
-    matches!(dt, datafusion::arrow::datatypes::DataType::Int64)
+    use datafusion::arrow::datatypes::DataType;
+    matches!(
+        dt,
+        DataType::Int64 | DataType::Int32 | DataType::Date32 | DataType::Utf8 | DataType::Utf8View
+    )
 }
 
 /// Footer `[min, max]` of `column` (by name), or `None` when it cannot be

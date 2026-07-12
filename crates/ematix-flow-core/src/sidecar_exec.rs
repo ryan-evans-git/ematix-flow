@@ -340,6 +340,123 @@ mod tests {
         assert_eq!(i64_values(&batches2), i64_values(&batches));
     }
 
+    /// Widened-type fixture (0.17.3 lazy materializers): `ident` (i64,
+    /// indexed) plus Int32/Date32/Utf8 projection columns. Written via
+    /// parquet-rs because the codec test writer has no DATE annotation
+    /// route; dictionary off ⇒ PLAIN pages, the encoding every masked
+    /// decoder supports.
+    fn write_typed_part(dir: &Path, with_sidecar: bool) -> String {
+        use datafusion::parquet::basic::{
+            Compression, ConvertedType, Repetition, Type as PhysicalType,
+        };
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::data_type::ByteArray;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+
+        let prim = |name: &str, pt: PhysicalType, ct: ConvertedType| {
+            Arc::new(
+                PType::primitive_type_builder(name, pt)
+                    .with_repetition(Repetition::REQUIRED)
+                    .with_converted_type(ct)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let schema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![
+                    prim("ident", PhysicalType::INT64, ConvertedType::NONE),
+                    prim("small", PhysicalType::INT32, ConvertedType::NONE),
+                    prim("day", PhysicalType::INT32, ConvertedType::DATE),
+                    prim("tag", PhysicalType::BYTE_ARRAY, ConvertedType::UTF8),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::UNCOMPRESSED)
+                .set_dictionary_enabled(false)
+                .build(),
+        );
+        let path = dir.join("typed-0001.parquet");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+
+        let ident: Vec<i64> = (0..1000).map(|i| i * 3).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int64ColumnWriter(t) = col.untyped() {
+            t.write_batch(&ident, None, None).unwrap();
+        }
+        col.close().unwrap();
+
+        let small: Vec<i32> = (0..1000).map(|i| i * 7).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int32ColumnWriter(t) = col.untyped() {
+            t.write_batch(&small, None, None).unwrap();
+        }
+        col.close().unwrap();
+
+        let day: Vec<i32> = (0..1000).map(|i| 19_000 + i).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int32ColumnWriter(t) = col.untyped() {
+            t.write_batch(&day, None, None).unwrap();
+        }
+        col.close().unwrap();
+
+        let tag: Vec<ByteArray> = (0..1000)
+            .map(|i| ByteArray::from(format!("tag-{i:04}").into_bytes()))
+            .collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::ByteArrayColumnWriter(t) = col.untyped() {
+            t.write_batch(&tag, None, None).unwrap();
+        }
+        col.close().unwrap();
+
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        if with_sidecar {
+            build_sorted_sidecar(&path, "idx_ident", "ident", None).expect("build sidecar");
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    /// 0.17.3 widening: Int32/Date32/Utf8 projections answer from the
+    /// sidecar and match the pure-scan oracle exactly (Date32 renders
+    /// as a real date, proving the wrapper, not just the bytes).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn widened_projections_answer_from_sidecar() {
+        let fmt = |bs: &[datafusion::arrow::array::RecordBatch]| {
+            datafusion::arrow::util::pretty::pretty_format_batches(bs)
+                .unwrap()
+                .to_string()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let indexed = write_typed_part(dir.path(), true);
+        let sql = "SELECT small, day, tag FROM t WHERE ident = 42";
+        let (plan, batches) = point_query(vec![indexed], sql).await;
+        assert!(
+            plan.contains("SidecarLookupExec"),
+            "widened projection must stay on the sidecar path:\n{plan}"
+        );
+        // ident=42 → row 14 → small=98, day=19014 (2022-01-22), tag-0014.
+        let got = fmt(&batches);
+        assert!(
+            got.contains("98") && got.contains("2022-01-22") && got.contains("tag-0014"),
+            "unexpected sidecar rows:\n{got}"
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let plain = write_typed_part(dir2.path(), false);
+        let (plan2, batches2) = point_query(vec![plain], sql).await;
+        assert!(!plan2.contains("SidecarLookupExec"), "{plan2}");
+        assert_eq!(fmt(&batches2), got, "sidecar answer must equal scan oracle");
+    }
+
     /// No sidecar file ⇒ the hook is inert (plan and rows unchanged).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_sidecar_files_scan_normally() {

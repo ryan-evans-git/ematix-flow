@@ -234,8 +234,8 @@ specified it.
   buildable-today path) rather than a full catalog transaction.
 - **I.5 (async sidecar opener)** — superseded in spirit by ematix-parquet
   0.17.2's `LazyParquetIndex` (footer-only open + group-pruned lookups);
-  the remaining cross-repo ask is the 0.17.3 lazy `i32`/`byte_array`
-  materializers (P3W widens `sidecar_materializable` in lockstep).
+  the 0.17.3 lazy `i32`/`byte_array` materializers shipped 2026-07-12
+  and `sidecar_materializable` widened in lockstep (below).
 - **P3W (SQL provider wiring)** — LANDED (this commit, 2026-07-12).
   `sidecar_exec::try_sidecar_lookup` hooks
   `EmatixFastParquetTableProvider::scan_with_partition_budget`, so the
@@ -244,9 +244,11 @@ specified it.
   (or an empty relation via footer bounds — the parted range-prune);
   int-eq shapes became sidecar-conditionally pushable
   (`supports_filters_pushdown` claims Inexact only when a sidecar file
-  exists, keeping sidecar-less plans byte-identical). Deviations from
-  the design sketch: projections are Int64-only until the 0.17.3 lazy
-  materializers; range predicates deferred with them.
+  exists, keeping sidecar-less plans byte-identical). Projections
+  widened to `Int64`/`Int32`/`Date32`/`Utf8` on ematix-parquet 0.17.3
+  (2026-07-12; the index KEY stays i64) — pinned by
+  `widened_projections_answer_from_sidecar` against a pure-scan
+  oracle. Range predicates remain deferred.
 
 ## P5 rerun on the lazy path (2026-07-12, local)
 
