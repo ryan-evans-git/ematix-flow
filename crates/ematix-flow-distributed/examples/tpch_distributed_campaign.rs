@@ -43,10 +43,11 @@
 //!                           preset's concurrency-aware AUTO resolution.
 //!   NO_DISTRIBUTE           set ⇒ single-node diagnostic run (no mesh)
 //!   EMAT_MESH               tri-state gate on the stage splitter:
-//!                           1=always distribute, 0=never (plans stay
-//!                           byte-identical to single-node), unset=AUTO
-//!                           per query from scan-byte statistics. See
-//!                           `ematix_flow_distributed::mesh_gate`.
+//!                           1=always distribute, 0=never, unset=AUTO
+//!                           per query from scan-byte statistics.
+//!                           Local commits localize stock parquet
+//!                           leaves onto the fast provider (Σ.Q15.LS).
+//!                           See `ematix_flow_distributed::mesh_gate`.
 //!   EMAT_MESH_MIN_BYTES     AUTO threshold in bytes (default 4 GiB,
 //!                           initial value pending campaign calibration)
 //!   CUSTOM_SQL / EXPLAIN_ONLY  diagnostics, unchanged (see below)

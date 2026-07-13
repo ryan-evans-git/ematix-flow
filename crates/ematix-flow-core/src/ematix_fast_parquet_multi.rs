@@ -270,6 +270,16 @@ impl EmatixFastParquetMultiTableProvider {
         Self::try_new_files_opt(paths, crate::ematix_fast_parquet::key_downcast_enabled())
     }
 
+    /// Σ.Q15.LS — [`Self::try_new_files`] with the KEYS.2 downcast pinned
+    /// OFF: the multi-file mirror of
+    /// [`EmatixFastParquetTableProvider::try_new_no_downcast`]. The mesh
+    /// gate's local-commit leaf swap must reproduce the STOCK parquet
+    /// schema exactly (parents were planned against it), and stock never
+    /// narrows Int64 keys.
+    pub fn try_new_files_no_downcast(paths: Vec<String>) -> DfResult<Self> {
+        Self::try_new_files_opt(paths, false)
+    }
+
     /// [`Self::try_new_files`] with an explicit KEYS.2 downcast flag, so tests
     /// can drive the parted-straddle reconciliation deterministically without
     /// mutating the process-global `EMAT_DOWNCAST_KEYS` env (which races
@@ -344,6 +354,38 @@ impl EmatixFastParquetMultiTableProvider {
     pub fn num_parts(&self) -> usize {
         self.parts.len()
     }
+
+    /// Σ.Q15.LS — synchronous core of `scan` (the multi-file mirror of
+    /// [`EmatixFastParquetTableProvider::scan_exec`]): fan the SAME
+    /// projection + filters into each part's sync scan, split the
+    /// partition budget across parts (Σ.MW.1, ceil per Σ.MW.2), and
+    /// union via the width-pinned [`EmatixInterleaveUnionExec`].
+    /// Factored out so the mesh gate's local-commit leaf swap — a sync
+    /// physical-rule context — can build the parted exec directly;
+    /// `TableProvider::scan` below delegates here, so the two paths
+    /// cannot drift.
+    pub fn scan_exec(
+        &self,
+        target_partitions: usize,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let per_part = target_partitions.div_ceil(self.parts.len()).max(1);
+        let mut children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(self.parts.len());
+        for part in &self.parts {
+            children.push(part.scan_exec(
+                target_partitions,
+                projection,
+                filters,
+                Some(per_part),
+            )?);
+        }
+        // A single part needs no union wrapper.
+        if children.len() == 1 {
+            return Ok(children.pop().expect("len checked"));
+        }
+        Ok(Arc::new(EmatixInterleaveUnionExec::try_new(children)?))
+    }
 }
 
 /// Exact file-metadata row count of a single-file provider (via its public
@@ -405,47 +447,42 @@ impl TableProvider for EmatixFastParquetMultiTableProvider {
         })
     }
 
+    /// Fans the SAME projection + filters into each part's scan (reusing all
+    /// of the single-file provider's machinery: RG assignment, BridgeFilter
+    /// pushdown, late-mat), then unions the per-part execs. Each child yields
+    /// its own partitions, so the union runs the parts in parallel.
+    ///
+    /// Σ.MW.1: split the session's partition budget across parts instead of
+    /// letting every part size itself to the full `target_partitions` — the
+    /// union's width is what the operators above poll CONCURRENTLY, and
+    /// parts × target_partitions multiplied the query's decode working set
+    /// by the part count (13-part SF100 lineitem: ~182 streams, Q01 ~9 GB
+    /// peak, kernel OOM on 32 GB boxes within a few executions).
+    ///
+    /// Σ.MW.2: CEIL division, so Σ(part partitions) lands in
+    /// [target, target + parts) — never below target. Below-target
+    /// width made `EnforceDistribution` "helpfully" wrap every part
+    /// in RoundRobinBatch(target) (parts × target streams, the
+    /// Σ.MW.1 bug re-introduced one level up); the width-pinned
+    /// union refuses that, so the union's own width must carry the
+    /// query's parallelism. A table with more parts than the budget
+    /// still degrades to one partition per part.
+    ///
+    /// (All of the above lives in [`Self::scan_exec`]; `limit` is unused —
+    /// the per-part scans ignore it, exactly as before the Σ.Q15.LS sync
+    /// factoring.)
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        limit: Option<usize>,
+        _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        // Fan the SAME projection + filters into each part's scan (reusing all of
-        // the single-file provider's machinery: RG assignment, BridgeFilter
-        // pushdown, late-mat), then union the per-part execs. Each child yields
-        // its own partitions, so the union runs the parts in parallel.
-        //
-        // Σ.MW.1: split the session's partition budget across parts instead of
-        // letting every part size itself to the full `target_partitions` — the
-        // union's width is what the operators above poll CONCURRENTLY, and
-        // parts × target_partitions multiplied the query's decode working set
-        // by the part count (13-part SF100 lineitem: ~182 streams, Q01 ~9 GB
-        // peak, kernel OOM on 32 GB boxes within a few executions).
-        //
-        // Σ.MW.2: CEIL division, so Σ(part partitions) lands in
-        // [target, target + parts) — never below target. Below-target
-        // width made `EnforceDistribution` "helpfully" wrap every part
-        // in RoundRobinBatch(target) (parts × target streams, the
-        // Σ.MW.1 bug re-introduced one level up); the width-pinned
-        // union below refuses that, so the union's own width must
-        // carry the query's parallelism. A table with more parts than
-        // the budget still degrades to one partition per part.
-        let target = state.config_options().execution.target_partitions;
-        let per_part = target.div_ceil(self.parts.len()).max(1);
-        let mut children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(self.parts.len());
-        for part in &self.parts {
-            children.push(
-                part.scan_with_partition_budget(state, projection, filters, limit, Some(per_part))
-                    .await?,
-            );
-        }
-        // A single part needs no union wrapper.
-        if children.len() == 1 {
-            return Ok(children.pop().expect("len checked"));
-        }
-        Ok(Arc::new(EmatixInterleaveUnionExec::try_new(children)?))
+        self.scan_exec(
+            state.config_options().execution.target_partitions,
+            projection,
+            filters,
+        )
     }
 }
 

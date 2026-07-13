@@ -73,10 +73,11 @@ pub mod bloom_flight;
 pub mod bloom_emitter;
 
 // Adaptive mesh gate — tri-state `EMAT_MESH` wrapper around the
-// datafusion-distributed stage splitter. Off → byte-identical
-// single-node plans with peers configured; AUTO → per-query decision
-// from scan-leaf byte statistics (`EMAT_MESH_MIN_BYTES` threshold).
-// See module docs.
+// datafusion-distributed stage splitter. Off → single-node plans
+// with peers configured; AUTO → per-query decision from scan-leaf
+// byte statistics (`EMAT_MESH_MIN_BYTES` threshold). Every local
+// commit localizes stock parquet leaves onto the ematix fast
+// provider (Σ.Q15.LS). See module docs.
 pub mod mesh_gate;
 
 use std::sync::Arc;

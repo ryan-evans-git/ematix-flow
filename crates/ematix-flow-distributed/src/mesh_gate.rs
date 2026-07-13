@@ -15,9 +15,9 @@
 //! `ematix_flow_core::flags::tri_state`)
 //!
 //! - `EMAT_MESH=1`/`true` → always distribute (the pre-gate behavior).
-//! - `EMAT_MESH=0`/`false` → never distribute: the physical plan is
-//!   returned untouched (same `Arc`), byte-identical to the
-//!   single-node plan. Peers stay configured but unused.
+//! - `EMAT_MESH=0`/`false` → never distribute. Peers stay configured
+//!   but unused; the plan's stock parquet leaves are localized
+//!   (Σ.Q15.LS below) like every other local commit.
 //! - unset / unrecognized → AUTO: sum `total_byte_size` across the
 //!   plan's scan leaves. If the known sum is >= `EMAT_MESH_MIN_BYTES`
 //!   (default [`DEFAULT_MESH_MIN_BYTES`] = 8 MiB — calibrated 2026-07,
@@ -30,6 +30,23 @@
 //! The decision happens inside [`PhysicalOptimizerRule::optimize`],
 //! i.e. **per query at plan time** — `from_env()` only snapshots the
 //! flag values once at session build.
+//!
+//! ## Σ.Q15.LS — local commits ride the fast provider (2026-07-13)
+//!
+//! A peers-configured session registers tables as STOCK parquet
+//! (`DataSourceExec` leaves) because shipped plan fragments must be
+//! codec-serializable. But a query this gate commits to LOCAL
+//! execution never ships — and leaving it on the stock arrow decode
+//! path is an order-of-magnitude tax: SF1000 Q15 measured **125.7 s**
+//! in a distributed session vs **7.5 s** in a plain session on the
+//! fast provider. Stock leaves also blind the machinery keyed on
+//! `EmatixFastParquetExec` — e.g. the Σ.JS.3 sampler's
+//! `resolve_column_to_scan` only grounds through fast scans, and
+//! bloom pushdown fuses into the fast scan's decode (BridgeFilter
+//! sideband) instead of filtering post-materialization. So every
+//! commit-to-local return rewrites eligible stock parquet leaves into
+//! `EmatixFastParquetExec` (see [`localize_scans`]); the distributed
+//! returns are deliberately untouched.
 
 use std::sync::Arc;
 
@@ -481,14 +498,17 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
                  single-node correctness veto (overrides EMAT_MESH=1; \
                  EMAT_MESH_FLOAT_EQ_VETO=0 disables — wrong answers possible)"
             );
-            return Ok(plan);
+            // Σ.Q15.LS: the veto is exactly the measured Q15 shape —
+            // committing it local on STOCK leaves was the 125.7 s run.
+            return Ok(localize_scans(&plan, config).unwrap_or(plan));
         }
         match self.config.mode {
-            // Force OFF: hand back the SAME Arc — byte-identical
-            // single-node plan, zero mesh coordination.
+            // Force OFF: single-node, zero mesh coordination; local
+            // commit → localize the leaves (Σ.Q15.LS). A plan with no
+            // eligible stock leaf still comes back as the SAME Arc.
             Some(false) => {
                 tracing::debug!("mesh gate: mode=off → single-node");
-                Ok(plan)
+                Ok(localize_scans(&plan, config).unwrap_or(plan))
             }
             // Force ON: the pre-gate behavior.
             Some(true) => {
@@ -522,7 +542,8 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
                 if distribute {
                     self.inner.optimize(plan, config)
                 } else {
-                    Ok(plan)
+                    // Σ.Q15.LS: AUTO chose single-node → localize.
+                    Ok(localize_scans(&plan, config).unwrap_or(plan))
                 }
             }
         }
@@ -535,6 +556,268 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+// ============================================================
+// Σ.Q15.LS — localize stock parquet leaves on local commits
+// ============================================================
+
+/// Σ.Q15.LS (2026-07-13): bottom-up rewrite of a locally-committed
+/// plan's stock parquet leaves (`DataSourceExec`) into
+/// `EmatixFastParquetExec` (single file) /
+/// `EmatixInterleaveUnionExec`-of-fast-scans (parted dir). Returns
+/// `None` when nothing was rewritten so callers can hand back the
+/// ORIGINAL `Arc` untouched — a MemTable/CSV/already-localized plan
+/// pays nothing.
+///
+/// Only the gate's commit-to-local returns call this. The
+/// `DistributedExec` passthrough and both distribute arms never do:
+/// stage fragments ship over Arrow Flight and must stay
+/// codec-serializable, and workers can only decode stock leaves.
+///
+/// Correctness contract (enforced per leaf in [`try_fast_scan`], any
+/// miss keeps the original leaf via a `tracing::debug` fall-back —
+/// the optimization must NEVER fail a query):
+/// - the replacement's schema must equal the stock leaf's EXACTLY
+///   (parents were planned against it, and `schema_check()` holds the
+///   rule to it); the provider is built with the KEYS.2 downcast
+///   pinned OFF since stock never narrows Int64 keys.
+/// - a `ParquetSource` predicate is only droppable while it is
+///   pruning-advisory: with `pushdown_filters` off (the default), DF
+///   53's `try_pushdown_filters` reports `PushedDown::No` upward and
+///   the residual `FilterExec` is RETAINED, so dropping the predicate
+///   costs row-group pruning, never answers. Exact pushdown may have
+///   REMOVED the filter → fall back.
+/// - scan-level `limit` (fetch pushdown may have consumed the
+///   `LimitExec`), declared output orderings / `preserve_order`, hive
+///   partition columns, and non-`file://` stores → fall back.
+/// - partition-count discipline: nothing re-runs EnforceDistribution
+///   after this rule, and single-partition leaves are the ones
+///   planners hang SinglePartition assumptions on (Single-mode
+///   aggregates, merge-free sorts). A single-file swap is therefore
+///   capped at the stock leaf's partition count; a parted swap can't
+///   go below one partition per part, so it falls back when the stock
+///   leaf was single-partition. Widening a ≥2-partition leaf is safe:
+///   every DF operator reads partition counts off its CURRENT
+///   children (rebuilt bottom-up here via `with_new_children`), and
+///   exact-count requirements only exist for Hash/Single
+///   distributions, which never sit directly on an unknown-partitioned
+///   scan.
+fn localize_scans(
+    plan: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    use ematix_flow_core::shared_subtree_exec::SharedSubtreeExec;
+    // SharedSubtreeExec hides its input from `children()` (rules must
+    // not rewrite a shared subtree per consumer) — but it is exactly
+    // where Q15's lineitem scans live. Descend via the accessor and
+    // rebuild around the SAME `CachedBatches` Arc: all consumer
+    // instances keep sharing one populate, preserving the
+    // compute-once determinism the Σ.Q15.FP analysis relies on. (The
+    // registry's structural key still maps to the original subtree;
+    // that is fine — the rewrite is answer-preserving, so the cached
+    // payload is identical either way.)
+    if let Some(shared) = plan.as_any().downcast_ref::<SharedSubtreeExec>() {
+        let input = localize_scans(shared.input(), config)?;
+        return Some(Arc::new(SharedSubtreeExec::new(
+            input,
+            Arc::clone(shared.cached()),
+        )));
+    }
+    let children = plan.children();
+    if children.is_empty() {
+        return localize_leaf(plan, config);
+    }
+    let mut new_children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(children.len());
+    let mut changed = false;
+    for child in children {
+        match localize_scans(child, config) {
+            Some(next) => {
+                changed = true;
+                new_children.push(next);
+            }
+            None => new_children.push(Arc::clone(child)),
+        }
+    }
+    if !changed {
+        return None;
+    }
+    match Arc::clone(plan).with_new_children(new_children) {
+        Ok(rebuilt) => Some(rebuilt),
+        Err(e) => {
+            // A parent that refuses the (schema-identical) rebuild is
+            // unexpected but must not fail the query — keep the whole
+            // stock subtree.
+            tracing::debug!(
+                node = plan.name(),
+                error = %e,
+                "Σ.Q15.LS: parent rebuild failed; keeping stock subtree"
+            );
+            None
+        }
+    }
+}
+
+/// One leaf: `Some(fast exec)` when this is a stock parquet
+/// `DataSourceExec` that passes every [`try_fast_scan`] gate, else
+/// `None` (non-parquet leaves are skipped without noise; parquet
+/// leaves that decline log why at debug).
+fn localize_leaf(
+    plan: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    let ds = plan
+        .as_any()
+        .downcast_ref::<datafusion::datasource::source::DataSourceExec>()?;
+    let cfg = ds
+        .data_source()
+        .as_any()
+        .downcast_ref::<datafusion::datasource::physical_plan::FileScanConfig>()?;
+    let parquet = cfg
+        .file_source
+        .as_any()
+        .downcast_ref::<datafusion::datasource::physical_plan::ParquetSource>()?;
+    match try_fast_scan(plan, cfg, parquet, config) {
+        Ok(exec) => {
+            tracing::debug!(
+                leaf = %datafusion::physical_plan::displayable(exec.as_ref()).one_line(),
+                "Σ.Q15.LS: stock parquet leaf localized"
+            );
+            Some(exec)
+        }
+        Err(reason) => {
+            tracing::debug!(reason, "Σ.Q15.LS: keeping stock parquet leaf");
+            None
+        }
+    }
+}
+
+/// The gated swap itself. `Err(reason)` = keep the stock leaf (see
+/// [`localize_scans`] for the contract each gate enforces).
+fn try_fast_scan(
+    plan: &Arc<dyn ExecutionPlan>,
+    cfg: &datafusion::datasource::physical_plan::FileScanConfig,
+    parquet: &datafusion::datasource::physical_plan::ParquetSource,
+    config: &ConfigOptions,
+) -> Result<Arc<dyn ExecutionPlan>, String> {
+    use datafusion::catalog::TableProvider;
+    use datafusion::datasource::physical_plan::FileSource;
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
+    use ematix_flow_core::ematix_fast_parquet_multi::EmatixFastParquetMultiTableProvider;
+
+    if !cfg.table_partition_cols().is_empty() {
+        // Hive partition columns are synthesized by the stock opener
+        // (and their filters may have pushed Exact at the logical
+        // layer); the fast provider knows nothing of them.
+        return Err("hive partition columns".into());
+    }
+    if cfg.limit.is_some() {
+        // A scan-level fetch means LimitPushdown may have REMOVED the
+        // LimitExec above; the fast exec has no fetch support.
+        return Err("scan-level limit (fetch pushdown)".into());
+    }
+    if !cfg.output_ordering.is_empty() || cfg.preserve_order {
+        // Parents may rely on the declared ordering merge-free; the
+        // fast exec declares none.
+        return Err("declared output ordering".into());
+    }
+    if parquet.filter().is_some()
+        && (parquet.table_parquet_options().global.pushdown_filters
+            || config.execution.parquet.pushdown_filters)
+    {
+        // Exact filter pushdown: the residual FilterExec may be gone,
+        // so the predicate is load-bearing and we can't map it onto a
+        // BridgeFilter from a physical expr (v1 scope cut). Without
+        // exact pushdown the predicate is pruning-only and droppable.
+        return Err("exact filter pushdown".into());
+    }
+    if !cfg.object_store_url.as_str().starts_with("file://") {
+        // The fast provider reads the local filesystem directly.
+        return Err(format!(
+            "non-local object store {}",
+            cfg.object_store_url.as_str()
+        ));
+    }
+    // Collect file paths. Dedupe: byte-range parallelism lists the
+    // SAME file once per range-partition; the fast provider re-derives
+    // its own row-group partitioning from the footer. (A missing or
+    // unreadable file surfaces as a provider-construction error below
+    // → fall back.)
+    let mut paths: Vec<String> = Vec::new();
+    for group in &cfg.file_groups {
+        for file in group.files() {
+            // object_store paths are rooted without the leading '/'.
+            let p = format!("/{}", file.object_meta.location.as_ref());
+            if !paths.iter().any(|q| q == &p) {
+                paths.push(p);
+            }
+        }
+    }
+    if paths.is_empty() {
+        return Err("no files".into());
+    }
+
+    let stock_schema = plan.schema();
+    let stock_partitions = plan.output_partitioning().partition_count().max(1);
+    let target = config.execution.target_partitions.max(1);
+    let provider_err = |e: datafusion::common::DataFusionError| format!("provider: {e}");
+
+    let exec: Arc<dyn ExecutionPlan> = if paths.len() == 1 {
+        let provider = EmatixFastParquetTableProvider::try_new_no_downcast(paths.remove(0))
+            .map_err(provider_err)?;
+        let projection = projection_onto(&stock_schema, &provider.schema())?;
+        provider
+            .scan_exec(target, Some(&projection), &[], Some(stock_partitions))
+            .map_err(provider_err)?
+    } else {
+        if stock_partitions <= 1 {
+            // The parted union can't shrink below one partition per
+            // part, and a 1-partition stock leaf is where
+            // SinglePartition assumptions live. Rare (a multi-file
+            // table that didn't split is tiny) — not worth the risk.
+            return Err("multi-file scan under a single-partition stock leaf".into());
+        }
+        let provider = EmatixFastParquetMultiTableProvider::try_new_files_no_downcast(paths)
+            .map_err(provider_err)?;
+        let projection = projection_onto(&stock_schema, &provider.schema())?;
+        provider
+            .scan_exec(target, Some(&projection), &[])
+            .map_err(provider_err)?
+    };
+
+    // THE load-bearing gate: every parent expression was planned
+    // against the stock leaf's schema, and the rule's schema_check()
+    // promises DataFusion an unchanged plan schema. ANY difference —
+    // type (Utf8 vs Utf8View), nullability, name, metadata — keeps
+    // the stock leaf.
+    if exec.schema() != stock_schema {
+        return Err(format!(
+            "schema mismatch: stock {:?} vs fast {:?}",
+            stock_schema.fields(),
+            exec.schema().fields()
+        ));
+    }
+    Ok(exec)
+}
+
+/// Map the stock leaf's (projected) output fields onto provider-schema
+/// column indices by NAME — the stock projection may reorder, and DF
+/// 53 `ProjectionExprs` can in principle carry computed columns, whose
+/// synthesized names simply miss here → fall back.
+fn projection_onto(
+    stock: &datafusion::arrow::datatypes::SchemaRef,
+    provider: &datafusion::arrow::datatypes::SchemaRef,
+) -> Result<Vec<usize>, String> {
+    stock
+        .fields()
+        .iter()
+        .map(|f| {
+            provider
+                .index_of(f.name())
+                .map_err(|_| format!("column `{}` missing from provider schema", f.name()))
+        })
+        .collect()
 }
 
 /// Σ.MG: the largest number of independent scan INSTANCES any single
@@ -824,6 +1107,37 @@ mod tests {
             .expect("physical plan")
     }
 
+    /// Σ.Q15.LS test oracle: count `(fast, stock-parquet)` scan leaves,
+    /// descending `SharedSubtreeExec` inputs (hidden from `children()`,
+    /// but exactly where Q15's lineitem scans live) — a display-string
+    /// check can't see through the sharing.
+    fn count_scan_leaves(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize) {
+        fn walk(p: &Arc<dyn ExecutionPlan>, fast: &mut usize, stock: &mut usize) {
+            if p.as_any()
+                .is::<ematix_flow_core::ematix_fast_parquet::EmatixFastParquetExec>()
+            {
+                *fast += 1;
+            }
+            if p.as_any()
+                .is::<datafusion::datasource::source::DataSourceExec>()
+            {
+                *stock += 1;
+            }
+            if let Some(shared) = p
+                .as_any()
+                .downcast_ref::<ematix_flow_core::shared_subtree_exec::SharedSubtreeExec>()
+            {
+                walk(shared.input(), fast, stock);
+            }
+            for c in p.children() {
+                walk(c, fast, stock);
+            }
+        }
+        let (mut fast, mut stock) = (0, 0);
+        walk(plan, &mut fast, &mut stock);
+        (fast, stock)
+    }
+
     /// Σ.Q15.FP — the Q15 shape (float SUM → MAX → equality) must trip
     /// the hazard detector and stay single-node EVEN under forced
     /// mesh; the escape hatch restores distribution for debugging.
@@ -850,8 +1164,21 @@ mod tests {
             .optimize(plan.clone(), &ConfigOptions::default())
             .expect("optimize");
         assert!(
-            Arc::ptr_eq(&plan, &out),
+            !out.as_any().is::<DistributedExec>(),
             "correctness veto must override forced mesh"
+        );
+        // Σ.Q15.LS: the veto's local commit is exactly the shape that
+        // measured 125.7 s vs 7.5 s at SF1000 — the local plan must
+        // ride the fast provider, not the stock decode path.
+        let (fast, stock) = count_scan_leaves(&out);
+        assert!(
+            fast > 0 && stock == 0,
+            "vetoed (local) plan must carry fast leaves only; fast={fast} stock={stock}"
+        );
+        assert_eq!(
+            plan.schema(),
+            out.schema(),
+            "leaf swap must be schema-invariant"
         );
 
         // Escape hatch (debugging only — wrong answers possible):
@@ -910,10 +1237,13 @@ mod tests {
         );
     }
 
-    /// Gate OFF → the input plan comes back as the SAME Arc: zero
-    /// rewrite, zero mesh coordination.
+    /// Gate OFF over a stock-parquet plan → still single-node (no
+    /// `DistributedExec`), but Σ.Q15.LS rewrites the stock leaves to
+    /// `EmatixFastParquetExec`: a locally-committed plan never ships,
+    /// so nothing requires it to stay codec-serializable — and the
+    /// stock decode path is what cost Q15 125.7 s vs 7.5 s at SF1000.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn gate_off_returns_input_arc_unchanged() {
+    async fn gate_off_localizes_stock_parquet_leaves() {
         let (_tmp, path) = write_fixture();
         let ctx = fixture_ctx(&path).await;
         let plan = physical_plan(&ctx, FIXTURE_SQL).await;
@@ -922,25 +1252,66 @@ mod tests {
         let out = rule
             .optimize(plan.clone(), &ConfigOptions::default())
             .expect("optimize");
+        let (fast, stock) = count_scan_leaves(&out);
         assert!(
-            Arc::ptr_eq(&plan, &out),
-            "gate off must return the input plan Arc unchanged"
+            fast > 0 && stock == 0,
+            "gate-off plan must swap stock parquet leaves for fast scans; \
+             fast={fast} stock={stock}:\n{}",
+            displayable(out.as_ref()).indent(true)
+        );
+        assert_eq!(
+            plan.schema(),
+            out.schema(),
+            "leaf swap must be schema-invariant"
         );
     }
 
-    /// Gate OFF installed in a session (peers-configured shape) →
-    /// the rendered plan is byte-identical to a never-gated
-    /// single-node session's plan for the same query.
+    /// Gate OFF over a plan with NO stock parquet leaf (MemTable) →
+    /// the SAME Arc back: the localizer must not rebuild trees it has
+    /// nothing to say about (zero risk, zero churn for non-parquet
+    /// sources).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn gate_off_plan_display_byte_identical_to_single_node() {
+    async fn gate_off_non_parquet_plan_returns_input_arc_unchanged() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+                Arc::new(Float64Array::from(vec![1.0f64, 2.0, 3.0])),
+            ],
+        )
+        .expect("batch");
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let builder = ematix_flow_core::preset::with_optimizer_rules(
+            SessionStateBuilder::new()
+                .with_config(cfg)
+                .with_default_features(),
+        );
+        let ctx = SessionContext::new_with_state(builder.build());
+        ctx.register_batch("t", batch).expect("register batch");
+        let plan = physical_plan(&ctx, FIXTURE_SQL).await;
+
+        let rule = AdaptiveMeshGateRule::new(MeshGateConfig::off());
+        let out = rule
+            .optimize(plan.clone(), &ConfigOptions::default())
+            .expect("optimize");
+        assert!(
+            Arc::ptr_eq(&plan, &out),
+            "a plan without stock parquet leaves must pass through untouched"
+        );
+    }
+
+    /// Gate OFF installed in a session (the peers-configured shape,
+    /// rule appended LAST like the production chain) → the full
+    /// optimizer pipeline emits a localized plan: fast leaves, no
+    /// stock parquet, no stage wrapper.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate_off_session_plan_carries_fast_scans() {
         let (_tmp, path) = write_fixture();
 
-        // Never-gated single-node session.
-        let single_ctx = fixture_ctx(&path).await;
-        let single = physical_plan(&single_ctx, FIXTURE_SQL).await;
-
-        // Same session shape + the gate rule appended LAST (where the
-        // bare stage splitter used to sit), gate OFF.
         let cfg = SessionConfig::new()
             .with_collect_statistics(true)
             .with_target_partitions(4);
@@ -957,19 +1328,27 @@ mod tests {
             .expect("register parquet");
         let gated = physical_plan(&gated_ctx, FIXTURE_SQL).await;
 
-        let single_str = displayable(single.as_ref()).indent(true).to_string();
-        let gated_str = displayable(gated.as_ref()).indent(true).to_string();
-        assert_eq!(
-            single_str, gated_str,
-            "gate-off plan must be byte-identical to the single-node plan"
+        let (fast, stock) = count_scan_leaves(&gated);
+        assert!(
+            fast > 0 && stock == 0,
+            "session-planned gate-off query must scan via fast leaves; \
+             fast={fast} stock={stock}:\n{}",
+            displayable(gated.as_ref()).indent(true)
+        );
+        assert!(
+            !displayable(gated.as_ref())
+                .indent(true)
+                .to_string()
+                .contains("DistributedExec"),
+            "gate off never distributes"
         );
     }
 
     /// AUTO with an unreachable threshold over a real parquet table
-    /// (whose scan leaves DO report byte statistics) → single-node:
-    /// the same Arc back.
+    /// (whose scan leaves DO report byte statistics) → single-node,
+    /// with the stock leaves localized (Σ.Q15.LS).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn auto_with_max_threshold_returns_input_arc() {
+    async fn auto_below_threshold_localizes_instead_of_distributing() {
         let (_tmp, path) = write_fixture();
         let ctx = fixture_ctx(&path).await;
         let plan = physical_plan(&ctx, FIXTURE_SQL).await;
@@ -990,8 +1369,53 @@ mod tests {
             .optimize(plan.clone(), &ConfigOptions::default())
             .expect("optimize");
         assert!(
-            Arc::ptr_eq(&plan, &out),
-            "AUTO below threshold must keep the single-node plan Arc"
+            !out.as_any().is::<DistributedExec>(),
+            "AUTO below threshold must not distribute"
+        );
+        let (fast, stock) = count_scan_leaves(&out);
+        assert!(
+            fast > 0 && stock == 0,
+            "AUTO's local commit must localize the leaves; fast={fast} stock={stock}"
+        );
+        assert_eq!(
+            plan.schema(),
+            out.schema(),
+            "leaf swap must be schema-invariant"
+        );
+    }
+
+    /// Σ.Q15.LS: the localizer must descend `SharedSubtreeExec` —
+    /// which hides its input from `children()`, and is exactly where
+    /// Q15's lineitem scans live — while REUSING the shared
+    /// `CachedBatches` Arc. A fresh cache per rewrite would recompute
+    /// the subtree per consumer, resurrecting the nondeterministic
+    /// float-merge hazard the Σ.Q15.FP veto exists to prevent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn localize_descends_shared_subtrees_keeping_cache_identity() {
+        use ematix_flow_core::shared_subtree_exec::{CachedBatches, SharedSubtreeExec};
+        let (_tmp, path) = write_fixture();
+        let ctx = fixture_ctx(&path).await;
+        let inner = physical_plan(&ctx, FIXTURE_SQL).await;
+        let cached = Arc::new(CachedBatches::new(inner.schema()));
+        let shared: Arc<dyn ExecutionPlan> =
+            Arc::new(SharedSubtreeExec::new(inner, Arc::clone(&cached)));
+
+        let rule = AdaptiveMeshGateRule::new(MeshGateConfig::off());
+        let out = rule
+            .optimize(shared.clone(), &ConfigOptions::default())
+            .expect("optimize");
+        let (fast, stock) = count_scan_leaves(&out);
+        assert!(
+            fast > 0 && stock == 0,
+            "scans inside a shared subtree must localize; fast={fast} stock={stock}"
+        );
+        let out_shared = out
+            .as_any()
+            .downcast_ref::<SharedSubtreeExec>()
+            .expect("root stays a SharedSubtreeExec");
+        assert!(
+            Arc::ptr_eq(out_shared.cached(), &cached),
+            "rewrite must keep the SAME CachedBatches Arc (compute-once contract)"
         );
     }
 
@@ -1105,8 +1529,14 @@ mod tests {
             .optimize(plan.clone(), &ConfigOptions::default())
             .expect("optimize");
         assert!(
-            Arc::ptr_eq(&plan, &out),
-            "3+ instances of one table must veto fan-out (single-node Arc back)"
+            !out.as_any().is::<DistributedExec>(),
+            "3+ instances of one table must veto fan-out (stay single-node)"
+        );
+        // Σ.Q15.LS: the veto's local commit localizes all three arms.
+        let (fast, stock) = count_scan_leaves(&out);
+        assert!(
+            fast >= 3 && stock == 0,
+            "all self-join arms must ride fast scans; fast={fast} stock={stock}"
         );
     }
 
