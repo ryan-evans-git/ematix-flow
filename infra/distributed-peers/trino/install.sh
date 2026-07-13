@@ -163,6 +163,12 @@ case "$INSTANCE_TYPE" in
     # EXCEEDED_GLOBAL_MEMORY_LIMIT.
     c7i.2xlarge) TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB";  MAX_MEM_TOTAL="24GB" ;;
     c7i.4xlarge) TRINO_XMX="24G"; MAX_MEM_PER_NODE="16GB"; MAX_MEM_TOTAL="48GB" ;;
+    # SF1000 fleet (2026-07-13): the unknown-type fallback gave these 128 GB
+    # boxes c7i.2xlarge sizing (Xmx12G / 8GB per node) and Trino DNFd
+    # Q04/Q05/Q07/Q08/Q09 on memory — OUR config fault, not Trinos. 96G heap
+    # = 75% of RAM; 64GB per node respects the 0.7*Xmx constraint; total =
+    # 3 workers x per-node.
+    r7i.4xlarge) TRINO_XMX="96G"; MAX_MEM_PER_NODE="64GB"; MAX_MEM_TOTAL="192GB" ;;
     *)           TRINO_XMX="12G"; MAX_MEM_PER_NODE="8GB";  MAX_MEM_TOTAL="24GB" ;;
 esac
 echo "==> instance=$INSTANCE_TYPE  Xmx=$TRINO_XMX  max-memory-per-node=$MAX_MEM_PER_NODE"
