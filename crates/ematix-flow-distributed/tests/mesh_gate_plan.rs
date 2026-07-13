@@ -7,10 +7,15 @@
 //!   datafusion-distributed 1.0.0 source: the stage splitter wraps
 //!   every distributed plan in that root node, with
 //!   `NetworkShuffleExec` / `NetworkCoalesceExec` /
-//!   `NetworkBroadcastExec` as the flight boundaries inside).
+//!   `NetworkBroadcastExec` as the flight boundaries inside), and its
+//!   stage leaves stay STOCK parquet (Σ.Q15.LS must never rewrite a
+//!   shipped fragment — stages must stay codec-serializable).
 //! - AUTO + min_bytes=1 over a real parquet table → distributes.
-//! - AUTO + min_bytes=u64::MAX → stays byte-identical to the
-//!   never-gated single-node plan.
+//! - AUTO + min_bytes=u64::MAX → commits LOCAL, and (Σ.Q15.LS) the
+//!   local plan's stock `DataSourceExec` parquet leaves are rewritten
+//!   to `EmatixFastParquetExec` — measured SF1000: Q15 125.7 s in a
+//!   distributed session's local plan vs 7.5 s on the fast provider —
+//!   with answers byte-identical to a plain single-node session.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -182,6 +187,19 @@ async fn forced_on_plan_contains_distributed_stage_wrapper() {
         rendered.contains("DistributedExec"),
         "forced-on plan must carry the datafusion-distributed stage wrapper; got:\n{rendered}"
     );
+    // Σ.Q15.LS: the local-commit leaf rewrite must NEVER touch a
+    // distributed plan — stage fragments ship over Arrow Flight and
+    // must stay codec-serializable, and workers decode stock
+    // `DataSourceExec` leaves. A fast-scan leak into a stage is a
+    // fleet-wide decode failure, not a perf regression.
+    assert!(
+        !rendered.contains("EmatixFastParquetExec"),
+        "distributed stages must keep stock parquet leaves (Σ.Q15.LS); got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("DataSourceExec"),
+        "distributed stages should still scan via stock DataSourceExec; got:\n{rendered}"
+    );
 
     // And the mesh plan must actually EXECUTE correctly through the
     // live workers: 16 groups, SUM(v) over all groups totalling
@@ -229,8 +247,15 @@ async fn auto_min_bytes_one_distributes_real_table() {
     workers.abort_all();
 }
 
+/// Σ.Q15.LS Test A (plan shape): a peers-configured session whose
+/// gate commits LOCAL must not carry stock parquet leaves. The
+/// distributed registration is stock `DataSourceExec` (shipped
+/// fragments must be codec-serializable), but a locally-committed
+/// plan never ships — leaving it on the stock decode path cost Q15
+/// 125.7 s vs 7.5 s at SF1000. The gate rewrites those leaves to
+/// `EmatixFastParquetExec` on its local-commit returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn auto_min_bytes_max_keeps_single_node_plan() {
+async fn auto_min_bytes_max_localizes_scans_to_fast_execs() {
     let (_tmp, path) = write_fixture();
 
     // Resolver present (peers "configured") but the threshold is
@@ -240,15 +265,78 @@ async fn auto_min_bytes_max_keeps_single_node_plan() {
     let ctx = gated_ctx(MeshGateConfig::auto_with_min_bytes(u64::MAX), dummy, &path).await;
     let gated = render(&plan_of(&ctx).await);
 
-    let single = single_node_ctx(&path).await;
-    let expected = render(&plan_of(&single).await);
-
     assert!(
         !gated.contains("DistributedExec"),
         "AUTO below threshold must not distribute; got:\n{gated}"
     );
+    assert!(
+        gated.contains("EmatixFastParquetExec"),
+        "locally-committed plan must scan via the ematix fast provider (Σ.Q15.LS); got:\n{gated}"
+    );
+    assert!(
+        !gated.contains("DataSourceExec"),
+        "no stock parquet leaf may survive a local commit (Σ.Q15.LS); got:\n{gated}"
+    );
+}
+
+/// Σ.Q15.LS Test B (answers unchanged): the leaf rewrite is an
+/// executor swap, not a semantics change — a filter + aggregate over
+/// the localized plan must return byte-for-byte what a plain
+/// single-node session returns on the same fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn localized_plan_answers_match_single_node() {
+    let (_tmp, path) = write_fixture();
+
+    // Filter + aggregate, spanning several fixture files; ORDER BY
+    // pins output order so the comparison is byte-exact. v holds
+    // integer-valued f64s (< 2^53), so SUM is order-exact too.
+    let sql = "SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t \
+               WHERE v >= 250 AND v < 1500 GROUP BY k ORDER BY k";
+
+    let dummy = vec![Url::parse("http://127.0.0.1:1").expect("url")];
+    let ctx = gated_ctx(MeshGateConfig::auto_with_min_bytes(u64::MAX), dummy, &path).await;
+    // Tripwire: this parity run must actually exercise the SWAPPED
+    // plan — if the rewrite silently stopped firing, the comparison
+    // below would degenerate to stock-vs-stock and prove nothing.
+    let gated_plan = ctx
+        .sql(sql)
+        .await
+        .expect("plan sql")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let gated_rendered = render(&gated_plan);
+    assert!(
+        gated_rendered.contains("EmatixFastParquetExec"),
+        "parity test must run on a localized plan; got:\n{gated_rendered}"
+    );
+    let gated_batches = ctx
+        .sql(sql)
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("localized execute");
+
+    let single = single_node_ctx(&path).await;
+    let single_batches = single
+        .sql(sql)
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("single-node execute");
+
+    let gated_txt =
+        datafusion::arrow::util::pretty::pretty_format_batches(&gated_batches)
+            .expect("format")
+            .to_string();
+    let single_txt =
+        datafusion::arrow::util::pretty::pretty_format_batches(&single_batches)
+            .expect("format")
+            .to_string();
     assert_eq!(
-        gated, expected,
-        "AUTO below threshold must produce the exact single-node plan"
+        gated_txt, single_txt,
+        "localized answers must match single-node byte-for-byte"
     );
 }

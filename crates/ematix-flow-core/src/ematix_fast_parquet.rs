@@ -2367,6 +2367,20 @@ impl EmatixFastParquetTableProvider {
         Self::try_new_opt(path, key_downcast_enabled())
     }
 
+    /// Σ.Q15.LS — `try_new` with the KEYS.2 downcast pinned OFF, for
+    /// callers that must reproduce the STOCK parquet schema exactly.
+    /// The mesh gate's local-commit leaf swap
+    /// (`ematix-flow-distributed::mesh_gate`) replaces a planned
+    /// `DataSourceExec` whose parents were built against the stock
+    /// schema — a narrowed Int32 key there is a silent type mismatch,
+    /// so the swap constructs through this door and asserts schema
+    /// equality after. (No `scale_class::observe_file` here on
+    /// purpose: observation only feeds the downcast AUTO gate, which
+    /// this constructor pins off.)
+    pub fn try_new_no_downcast(path: impl Into<String>) -> DfResult<Self> {
+        Self::try_new_opt(path, false)
+    }
+
     /// KEYS.2 — `try_new` with an explicit downcast-keys flag so tests can
     /// exercise the i32-key narrowing without mutating a process-global env
     /// var (which would race other parallel tests). Production `try_new`
@@ -3204,6 +3218,30 @@ impl EmatixFastParquetTableProvider {
         _limit: Option<usize>,
         max_partitions: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        self.scan_exec(
+            state.config_options().execution.target_partitions,
+            projection,
+            filters,
+            max_partitions,
+        )
+    }
+
+    /// Σ.Q15.LS — synchronous core of `scan`/`scan_with_partition_budget`.
+    /// The `TableProvider::scan` body never awaited anything (metadata was
+    /// loaded at `try_new`; the exec opens the file at execute time), so the
+    /// async signature was pure trait ceremony. Factored out so PHYSICAL
+    /// optimizer rules — a sync context — can build the exec directly: the
+    /// mesh gate's local-commit leaf swap rewrites planned `DataSourceExec`
+    /// leaves into this exec with no runtime handle. `target_partitions`
+    /// replaces the `&dyn Session` (its only use); `max_partitions` is the
+    /// Σ.MW.1 per-scan cap, `None` = single-file behaviour exactly.
+    pub fn scan_exec(
+        &self,
+        target_partitions: usize,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        max_partitions: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let projection = projection
             .cloned()
             .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
@@ -3228,7 +3266,6 @@ impl EmatixFastParquetTableProvider {
         let projected_decode_schema: SchemaRef =
             Arc::new(self.decode_schema().project(&projection)?);
 
-        let target_partitions = state.config_options().execution.target_partitions;
         let num_rgs = self.num_row_groups;
         let num_partitions = num_rgs
             .min(target_partitions)

@@ -43,10 +43,11 @@
 //!                           preset's concurrency-aware AUTO resolution.
 //!   NO_DISTRIBUTE           set ⇒ single-node diagnostic run (no mesh)
 //!   EMAT_MESH               tri-state gate on the stage splitter:
-//!                           1=always distribute, 0=never (plans stay
-//!                           byte-identical to single-node), unset=AUTO
-//!                           per query from scan-byte statistics. See
-//!                           `ematix_flow_distributed::mesh_gate`.
+//!                           1=always distribute, 0=never, unset=AUTO
+//!                           per query from scan-byte statistics.
+//!                           Local commits localize stock parquet
+//!                           leaves onto the fast provider (Σ.Q15.LS).
+//!                           See `ematix_flow_distributed::mesh_gate`.
 //!   EMAT_MESH_MIN_BYTES     AUTO threshold in bytes (default 4 GiB,
 //!                           initial value pending campaign calibration)
 //!   CUSTOM_SQL / EXPLAIN_ONLY  diagnostics, unchanged (see below)
@@ -123,6 +124,16 @@ struct QueryStats {
     /// the empirical (scan_bytes → single-vs-mesh) crossover used to
     /// calibrate the AUTO threshold. See [`sum_scan_leaf_bytes`].
     scan_bytes: Option<u64>,
+    /// Per-trial PLANNING time (ms): `ctx.sql` + `create_physical_plan`,
+    /// i.e. the phase where the mesh gate and all physical rules run.
+    /// Execution time = trials_ms − plan_ms (bloom arming rides in
+    /// trials_ms only). Added after the SF1000 campaign, where AUTO
+    /// totaled +20% over forced mesh with byte-identical plans — this
+    /// field decomposes any future such delta for free. NaN on failed
+    /// trials, mirroring trials_ms.
+    plan_ms_trials: Vec<f64>,
+    /// Median of `plan_ms_trials` (NaN-skipping, same as median_ms).
+    median_plan_ms: f64,
 }
 
 /// Walk the optimized physical plan for the datafusion-distributed
@@ -689,7 +700,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{t}");
             }
         } else {
-            let b = run_query(&ctx, &custom).await?;
+            let (b, _plan_ms) = run_query(&ctx, &custom).await?;
             let rows: usize = b.iter().map(|x| x.num_rows()).sum();
             eprintln!("  rows={rows}");
             let head: Vec<_> = b.into_iter().take(1).collect();
@@ -790,6 +801,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Measured trials.
         let mut trials_ms: Vec<f64> = Vec::with_capacity(trials);
+        let mut plan_ms_trials: Vec<f64> = Vec::with_capacity(trials);
         let mut rows_returned: usize = 0;
         for _ in 0..trials {
             // Timer starts BEFORE emit+arm: the bloom build is part
@@ -797,14 +809,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t0 = Instant::now();
             arm_blooms().await;
             match run_query(&ctx, &sql).await {
-                Ok(batches) => {
+                Ok((batches, plan_ms)) => {
                     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                     trials_ms.push(elapsed_ms);
+                    plan_ms_trials.push(plan_ms);
                     rows_returned = batches.iter().map(|b| b.num_rows()).sum();
                 }
                 Err(e) => {
                     eprintln!("  trial FAILED: {e}");
                     trials_ms.push(f64::NAN);
+                    plan_ms_trials.push(f64::NAN);
                 }
             }
         }
@@ -813,8 +827,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let p95v = p95(&trials_ms);
         let first = trials_ms.first().copied().unwrap_or(f64::NAN);
         let med35 = median_trials_3_5(&trials_ms);
+        let med_plan = median(&plan_ms_trials);
         eprintln!(
-            "  median={med:.2}ms p95={p95v:.2}ms first={first:.2}ms med(3-5)={med35:.2}ms rows={rows_returned}"
+            "  median={med:.2}ms p95={p95v:.2}ms first={first:.2}ms med(3-5)={med35:.2}ms plan={med_plan:.2}ms rows={rows_returned}"
         );
 
         // EMAT_CACHE_STATS=1 diagnostic: per-query DELTA of the process-global
@@ -856,6 +871,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rows_returned,
                 plan_mode,
                 scan_bytes,
+                plan_ms_trials,
+                median_plan_ms: med_plan,
             },
         );
     }
@@ -936,13 +953,25 @@ async fn emit_and_arm_blooms(
     n
 }
 
+/// Run one query, returning its batches plus the PLANNING time
+/// (logical plan + physical optimization — the phase where the
+/// adaptive mesh gate and every physical rule run) in ms. Splitting
+/// plan from execution is what lets a mesh-vs-AUTO total delta be
+/// attributed: identical physical plans with differing totals and flat
+/// plan_ms ⇒ the delta is environmental (run order, cache state), not
+/// the gate's decision cost. Execution goes through
+/// `physical_plan::collect` on the SAME plan `create_physical_plan`
+/// returned — byte-identical to what `df.collect()` would have built.
 async fn run_query(
     ctx: &SessionContext,
     sql: &str,
-) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<RecordBatch>, f64), Box<dyn std::error::Error>> {
+    let t_plan = Instant::now();
     let df = ctx.sql(sql).await?;
-    let batches = df.collect().await?;
-    Ok(batches)
+    let plan = df.create_physical_plan().await?;
+    let plan_ms = t_plan.elapsed().as_secs_f64() * 1000.0;
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok((batches, plan_ms))
 }
 
 /// Walk up from CARGO_MANIFEST_DIR (or current dir at runtime) until
