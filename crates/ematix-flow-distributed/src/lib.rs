@@ -371,6 +371,33 @@ impl DistributedBackend {
         builder = builder
             .with_distributed_files_per_task(1)
             .expect("files_per_task = 1 is valid");
+        // #32 (2026-07-13) — EMAT_MESH_BROADCAST_JOINS, opt-in (default OFF).
+        // datafusion-distributed's `broadcast_joins` defaults OFF: a
+        // CollectLeft (broadcast) hash join then coalesces its build side into
+        // a SINGLE partition, which collapses the whole stage — INCLUDING the
+        // probe scan — onto ONE task. On the local SF1 harness that serialized
+        // the dominant table (lineitem) onto a single node in 11 of the 17
+        // distributed TPC-H queries — the bulk of the mesh's scale-out tax
+        // (lineitem gets one node's cores instead of the whole cluster's).
+        // Enabling it broadcasts the (already-small — DataFusion only chooses
+        // CollectLeft when the build side is below the broadcast threshold)
+        // build side to every consumer task, so the big probe shards across
+        // the mesh. Structurally proven on the harness (10/11 queries fixed,
+        // Q09 answers byte-identical); the SPEED win requires a multi-node AWS
+        // A/B, so it ships OFF by default — matching the crate's own "not yet
+        // smart about when to broadcast" caution — and is opt-in per session.
+        // The Σ.MG self-join / max-table-scan guards in [`mesh_gate`] remain in
+        // force independently (they gate AUTO's distribute decision, not this).
+        if ematix_flow_core::flags::tri_state("EMAT_MESH_BROADCAST_JOINS").unwrap_or(false) {
+            builder = builder
+                .with_distributed_broadcast_joins(true)
+                .expect("broadcast_joins is a valid distributed toggle");
+            tracing::info!(
+                "distributed session: EMAT_MESH_BROADCAST_JOINS on — CollectLeft \
+                 build sides broadcast to all tasks so big-probe scans shard \
+                 across the mesh instead of collapsing onto one task"
+            );
+        }
         Arc::new(SessionContext::from(builder.build()))
     }
 }

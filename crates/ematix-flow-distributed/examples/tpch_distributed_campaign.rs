@@ -50,6 +50,11 @@
 //!                           See `ematix_flow_distributed::mesh_gate`.
 //!   EMAT_MESH_MIN_BYTES     AUTO threshold in bytes (default 4 GiB,
 //!                           initial value pending campaign calibration)
+//!   EMAT_MESH_BROADCAST_JOINS  opt-in (default OFF). Broadcasts a
+//!                           CollectLeft join's build side to every task
+//!                           so the big probe scan shards across the mesh
+//!                           instead of collapsing onto one task. Mirrors
+//!                           the shipped `build_context` opt-in (#32).
 //!   CUSTOM_SQL / EXPLAIN_ONLY  diagnostics, unchanged (see below)
 //!
 //! ## Output
@@ -404,7 +409,7 @@ fn build_session_state(
             .with_physical_optimizer_rule(Arc::new(EmbeddedBloomRule::new(bloom_slot)))
             .with_distributed_user_codec(BloomExecCodec)
             .with_distributed_worker_resolver(resolver);
-        builder
+        let builder = builder
             .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
             .expect("LZ4_FRAME is a valid compression type")
             // Match production (`DistributedBackend::build_context`): pin
@@ -413,8 +418,24 @@ fn build_session_state(
             // core-count default, which collapses single-file scans to a
             // single task and silently prevents the mesh from engaging.
             .with_distributed_files_per_task(1)
-            .expect("files_per_task = 1 is valid")
-            .build()
+            .expect("files_per_task = 1 is valid");
+        // #32: EMAT_MESH_BROADCAST_JOINS mirrors the shipped
+        // `DistributedBackend::build_context` opt-in. datafusion-distributed's
+        // `broadcast_joins` defaults OFF, so a CollectLeft build coalesces into
+        // a single partition — collapsing the whole stage, INCLUDING the big
+        // probe scan, onto ONE task (measured here as lineitem single-tasked in
+        // 11/17 distributed TPC-H queries). ON broadcasts the already-small
+        // build side to every consumer task so the big probe shards across the
+        // mesh. Same flag name + tri_state parse as production.
+        let builder =
+            if ematix_flow_core::flags::tri_state("EMAT_MESH_BROADCAST_JOINS").unwrap_or(false) {
+                builder
+                    .with_distributed_broadcast_joins(true)
+                    .expect("broadcast_joins is a valid distributed toggle")
+            } else {
+                builder
+            };
+        builder.build()
     } else {
         builder.build()
     }
