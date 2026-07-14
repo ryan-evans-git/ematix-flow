@@ -327,16 +327,128 @@ async fn localized_plan_answers_match_single_node() {
         .await
         .expect("single-node execute");
 
-    let gated_txt =
-        datafusion::arrow::util::pretty::pretty_format_batches(&gated_batches)
-            .expect("format")
-            .to_string();
-    let single_txt =
-        datafusion::arrow::util::pretty::pretty_format_batches(&single_batches)
-            .expect("format")
-            .to_string();
+    let gated_txt = datafusion::arrow::util::pretty::pretty_format_batches(&gated_batches)
+        .expect("format")
+        .to_string();
+    let single_txt = datafusion::arrow::util::pretty::pretty_format_batches(&single_batches)
+        .expect("format")
+        .to_string();
     assert_eq!(
         gated_txt, single_txt,
         "localized answers must match single-node byte-for-byte"
+    );
+}
+
+/// Tiny single-file build-side table (`k` Int64, 4 rows). Small enough
+/// that DataFusion plans `t JOIN s` as a **CollectLeft** hash join — `s`
+/// the broadcast build side, the multi-file `t` the probe — which is the
+/// exact shape datafusion-distributed's `broadcast_joins` toggle governs.
+fn write_small_fixture() -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let path = tmp.path().join("s.parquet");
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![0i64, 1, 2, 3]))],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&path).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+    (tmp, path.to_string_lossy().into_owned())
+}
+
+/// Forced-mesh session over `t` (multi-file probe) + `s` (tiny build),
+/// mirroring `DistributedBackend::build_context` (gate installed, LZ4,
+/// files_per_task=1) with the `broadcast_joins` opt-in set explicitly —
+/// the lever `EMAT_MESH_BROADCAST_JOINS` flips in production.
+async fn bcast_join_ctx(
+    urls: Vec<Url>,
+    t_dir: &str,
+    s_file: &str,
+    broadcast: bool,
+) -> SessionContext {
+    let cfg = SessionConfig::new()
+        .with_collect_statistics(true)
+        .with_target_partitions(4);
+    let mut builder = SessionStateBuilder::new()
+        .with_config(cfg)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(
+            AdaptiveMeshGateRule::new(MeshGateConfig::forced()),
+        ))
+        .with_distributed_worker_resolver(StaticPeers { urls });
+    builder = builder
+        .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
+        .expect("LZ4_FRAME is a valid compression type")
+        .with_distributed_files_per_task(1)
+        .expect("files_per_task is configurable");
+    if broadcast {
+        builder = builder
+            .with_distributed_broadcast_joins(true)
+            .expect("broadcast_joins is a valid distributed toggle");
+    }
+    let ctx = SessionContext::new_with_state(builder.build());
+    ctx.register_parquet("t", t_dir, Default::default())
+        .await
+        .expect("register t");
+    ctx.register_parquet("s", s_file, Default::default())
+        .await
+        .expect("register s");
+    ctx
+}
+
+/// #32 mesh-efficiency fix (`EMAT_MESH_BROADCAST_JOINS` in production).
+/// A CollectLeft join over a multi-file probe: with `broadcast_joins`
+/// OFF the build side coalesces to one partition and the probe stage
+/// collapses onto a single task (no broadcast boundary); with it ON the
+/// build broadcasts to every consumer task via a `NetworkBroadcastExec`,
+/// which is what lets the big probe scan shard across the mesh. This
+/// plan-shape delta is the whole fix — on the local SF1 harness it stops
+/// 10/11 distributed TPC-H queries from single-tasking their dominant
+/// table. The assertion locks the toggle's effect against a
+/// datafusion-distributed upgrade quietly changing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broadcast_joins_toggle_governs_the_broadcast_boundary() {
+    let (_t, t_dir) = write_fixture();
+    let (_s, s_file) = write_small_fixture();
+    let (urls, _workers) = spawn_workers(2).await;
+
+    // GROUP BY forces a repartition boundary so the plan actually
+    // distributes; the CollectLeft `t JOIN s` is what the toggle governs.
+    const JOIN_SQL: &str = "SELECT t.k, SUM(t.v) AS sv FROM t JOIN s ON t.k = s.k GROUP BY t.k";
+
+    let off_ctx = bcast_join_ctx(urls.clone(), &t_dir, &s_file, false).await;
+    let off = render(
+        &off_ctx
+            .sql(JOIN_SQL)
+            .await
+            .expect("plan sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan"),
+    );
+    assert!(
+        !off.contains("NetworkBroadcastExec"),
+        "broadcast_joins OFF must not introduce a NetworkBroadcastExec — the \
+         CollectLeft build coalesces to a single partition:\n{off}"
+    );
+
+    let on_ctx = bcast_join_ctx(urls, &t_dir, &s_file, true).await;
+    let on = render(
+        &on_ctx
+            .sql(JOIN_SQL)
+            .await
+            .expect("plan sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan"),
+    );
+    assert!(
+        on.contains("NetworkBroadcastExec"),
+        "broadcast_joins ON must broadcast the CollectLeft build side to every \
+         task (NetworkBroadcastExec) — the boundary that lets the big probe \
+         scan shard across the mesh instead of collapsing onto one task:\n{on}"
     );
 }

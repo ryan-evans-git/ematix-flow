@@ -7,6 +7,7 @@
 //! These tests fail loudly if a future upgrade — or a stray
 //! `SessionConfig::set` somewhere in our code — quietly drops one of them.
 
+use datafusion_distributed::DistributedConfig as DdConfig;
 use ematix_flow_core::backend::DistributedConfig;
 use ematix_flow_distributed::DistributedBackend;
 
@@ -78,5 +79,47 @@ fn lz4_frame_compression_pinned_in_source() {
          DistributedBackend::build_context. The datafusion-distributed \
          default matches it today, but pinning prevents a silent drop on \
          dep upgrade."
+    );
+}
+
+/// #32 — `broadcast_joins` ships OFF by default. datafusion-distributed
+/// defaults it off; enabling it broadcasts a CollectLeft build side to every
+/// task so the big probe scan shards across the mesh instead of collapsing
+/// onto one node (the fix for 11/17 distributed TPC-H queries serializing
+/// their dominant table). It's opt-in via `EMAT_MESH_BROADCAST_JOINS` because
+/// the SPEED win is unproven without a multi-node A/B. This guards the default
+/// from silently flipping — a default-on would reshape every distributed
+/// plan without that evidence.
+#[tokio::test]
+async fn broadcast_joins_off_by_default() {
+    let ctx = distributed_session().await;
+    let state = ctx.state();
+    let dcfg = state
+        .config_options()
+        .extensions
+        .get::<DdConfig>()
+        .expect("datafusion-distributed DistributedConfig extension must be registered");
+    assert!(
+        !dcfg.broadcast_joins,
+        "broadcast_joins must default OFF — it is opt-in via \
+         EMAT_MESH_BROADCAST_JOINS until the multi-node speed A/B lands"
+    );
+}
+
+/// The `broadcast_joins` opt-in must stay wired into `build_context` under the
+/// `EMAT_MESH_BROADCAST_JOINS` gate (no public getter on the built session for
+/// it, same rationale as the LZ4 pin). A refactor dropping the gate would
+/// silently strand the mesh's biggest efficiency lever.
+#[test]
+fn broadcast_joins_opt_in_gate_wired_in_source() {
+    let src = include_str!("../src/lib.rs");
+    assert!(
+        src.contains("EMAT_MESH_BROADCAST_JOINS"),
+        "the broadcast-joins opt-in env gate must remain in build_context"
+    );
+    assert!(
+        src.contains("with_distributed_broadcast_joins(true)"),
+        "build_context must call with_distributed_broadcast_joins(true) under \
+         the EMAT_MESH_BROADCAST_JOINS gate"
     );
 }
