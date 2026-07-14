@@ -912,7 +912,25 @@ fn is_supported_body(node: &Arc<dyn ExecutionPlan>) -> bool {
         let owned: Arc<dyn ExecutionPlan> = (*children[0]).clone();
         return is_supported_body(&owned);
     }
-    // Multi-child bodies (joins, unions) all reject — see above.
+    // Σ.Q01.PARTED (2026-07-13): the parted fast provider presents its N
+    // parts as an `EmatixInterleaveUnionExec` — a multi-child UNION of
+    // identical-schema scan parts, NOT a join. The fused kernel consumes
+    // its interleaved batch stream exactly as it does a single-file scan:
+    // `FusedAggregateExec` already spawns one producer per input partition
+    // and merges groups across them into a single output partition, so a
+    // flat multi-row-group Q01 already exercises this very path. Accepting
+    // the union here brings the multi-agg rule to parity with
+    // `InjectFilterSumRule` (which already fuses over this union — that is
+    // why parted Q06 beats DuckDB while parted Q01 fell back to the slow
+    // standard Partial/Final path). Joins stay rejected: an aggregate over
+    // a join is the FusedPostJoinExec shape, not this rule's.
+    if node
+        .as_any()
+        .is::<crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec>()
+    {
+        return true;
+    }
+    // Other multi-child bodies (joins, non-parted unions) reject — see above.
     false
 }
 
@@ -1088,6 +1106,49 @@ mod tests {
         assert!(
             plan_str.contains("HashJoinExec"),
             "join must still be present in the default plan.\nPlan:\n{plan_str}"
+        );
+    }
+
+    /// Σ.Q01.PARTED (2026-07-13): the parted fast provider presents its
+    /// parts as an `EmatixInterleaveUnionExec` — a union of identical-schema
+    /// scans that IS an accepted fused-agg body (the fused kernel consumes
+    /// its interleaved stream, `FusedAggregateExec` fanning over the input
+    /// partitions and merging groups across them). This brings the multi-agg
+    /// rule to parity with `InjectFilterSumRule`, so parted multi-aggregate
+    /// scans (Q01) keep the fused kernel instead of the ~1.65×-slower standard
+    /// Partial/Final path. A *generic* DataFusion `UnionExec` is NOT the
+    /// parted-scan shape and must still reject — the discriminator is the
+    /// concrete parted type, not "any multi-child" (joins are pinned by
+    /// `does_not_fire_on_hash_join_body`).
+    #[test]
+    fn is_supported_body_accepts_parted_union_only() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::union::UnionExec;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("l_quantity", DataType::Float64, false),
+            Field::new("l_shipdate", DataType::Date32, false),
+        ]));
+        let leg = || Arc::new(EmptyExec::new(schema.clone())) as Arc<dyn ExecutionPlan>;
+
+        // The parted fast-provider union → accepted (the fix).
+        let parted: Arc<dyn ExecutionPlan> = Arc::new(
+            crate::ematix_fast_parquet_multi::EmatixInterleaveUnionExec::try_new(vec![
+                leg(),
+                leg(),
+            ])
+            .expect("interleave union"),
+        );
+        assert!(
+            is_supported_body(&parted),
+            "EmatixInterleaveUnionExec (parted scan) must be an accepted fused-agg body"
+        );
+
+        // A generic (non-parted) multi-child union → still rejected: the fix
+        // is specific to the parted interleave union, not any multi-child.
+        let generic: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(vec![leg(), leg()]));
+        assert!(
+            !is_supported_body(&generic),
+            "a generic UnionExec must still reject — only the parted interleave union fuses"
         );
     }
 
