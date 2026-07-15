@@ -440,12 +440,21 @@ fn q15_veto_applies(config: &MeshGateConfig, plan: &Arc<dyn ExecutionPlan>) -> b
 pub struct AdaptiveMeshGateRule {
     config: MeshGateConfig,
     inner: DistributedPhysicalOptimizerRule,
+    /// Σ.Q15.LS.2: physical rules re-run on a plan the gate commits to
+    /// LOCAL execution, AFTER `localize_scans` swaps its stock parquet
+    /// leaves to `EmatixFastParquetExec`. Carries the preset's
+    /// runtime-bloom sideband rules (via
+    /// `preset::runtime_bloom_rules`), which key on `EmatixFastParquetExec`
+    /// and ran too early (on stock leaves) to attach anything. Empty by
+    /// default so tests and non-bloom sessions pay nothing.
+    local_reprune: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
 }
 
 impl std::fmt::Debug for AdaptiveMeshGateRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdaptiveMeshGateRule")
             .field("config", &self.config)
+            .field("local_reprune", &self.local_reprune.len())
             .finish_non_exhaustive()
     }
 }
@@ -456,6 +465,7 @@ impl AdaptiveMeshGateRule {
         Self {
             config,
             inner: DistributedPhysicalOptimizerRule,
+            local_reprune: Vec::new(),
         }
     }
 
@@ -467,9 +477,41 @@ impl AdaptiveMeshGateRule {
         Self::new(MeshGateConfig::from_env())
     }
 
+    /// Σ.Q15.LS.2: attach the physical rules to re-run after a local
+    /// commit's `localize_scans` (typically
+    /// `preset::runtime_bloom_rules(&overrides)` — the runtime-bloom
+    /// sideband). Without them, a distributed-session local commit runs
+    /// its join queries without the runtime-bloom pruning native
+    /// single-node keeps.
+    pub fn with_local_reprune(
+        mut self,
+        rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
+    ) -> Self {
+        self.local_reprune = rules;
+        self
+    }
+
     /// Borrow the resolved config (logs + tests).
     pub fn config(&self) -> &MeshGateConfig {
         &self.config
+    }
+
+    /// Localize a locally-committed plan's stock parquet leaves, then
+    /// re-run [`local_reprune`](Self::local_reprune) so the runtime-bloom
+    /// sideband attaches to the now-`EmatixFastParquetExec` leaves —
+    /// matching native single-node. `localize_scans` returning `None`
+    /// (nothing to localize) still repruning is harmless: with no
+    /// fast-parquet leaf the sideband rule no-ops.
+    fn commit_local(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let mut localized = localize_scans(&plan, config).unwrap_or(plan);
+        for rule in &self.local_reprune {
+            localized = rule.optimize(localized, config)?;
+        }
+        Ok(localized)
     }
 }
 
@@ -500,7 +542,8 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
             );
             // Σ.Q15.LS: the veto is exactly the measured Q15 shape —
             // committing it local on STOCK leaves was the 125.7 s run.
-            return Ok(localize_scans(&plan, config).unwrap_or(plan));
+            // Σ.Q15.LS.2: reprune so the sideband survives the localize.
+            return self.commit_local(plan, config);
         }
         match self.config.mode {
             // Force OFF: single-node, zero mesh coordination; local
@@ -508,7 +551,7 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
             // eligible stock leaf still comes back as the SAME Arc.
             Some(false) => {
                 tracing::debug!("mesh gate: mode=off → single-node");
-                Ok(localize_scans(&plan, config).unwrap_or(plan))
+                self.commit_local(plan, config)
             }
             // Force ON: the pre-gate behavior.
             Some(true) => {
@@ -542,8 +585,10 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
                 if distribute {
                     self.inner.optimize(plan, config)
                 } else {
-                    // Σ.Q15.LS: AUTO chose single-node → localize.
-                    Ok(localize_scans(&plan, config).unwrap_or(plan))
+                    // Σ.Q15.LS: AUTO chose single-node → localize +
+                    // Σ.Q15.LS.2 reprune (restore the runtime-bloom
+                    // sideband native single-node keeps).
+                    self.commit_local(plan, config)
                 }
             }
         }

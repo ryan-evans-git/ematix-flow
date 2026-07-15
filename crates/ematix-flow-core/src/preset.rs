@@ -305,6 +305,63 @@ pub struct HarnessHandles {
 /// env-lever-derived overrides. Production members register in the
 /// exact order the preset has always used; harness additions register
 /// at their historical bench/validate positions.
+/// Σ.Q15.LS.2 (2026-07-15): the runtime-bloom sideband physical rules the
+/// preset installs, as a reusable list. Extracted so the distributed mesh
+/// gate can RE-RUN exactly these on a plan it commits to LOCAL execution,
+/// after `localize_scans` swaps the stock parquet leaves
+/// (`DataSourceExec`) to `EmatixFastParquetExec`.
+///
+/// The sideband/cascade rules key on `EmatixFastParquetExec` and run in
+/// this preset chain BEFORE the mesh gate (which is appended last). In a
+/// peers-configured session the leaves are stock parquet at that point,
+/// so the rules no-op; the gate then localizes the leaves but the blooms
+/// were never attached. Native single-node registers `EmatixFastParquetExec`
+/// from the start, so it keeps the runtime-bloom join pruning — the whole
+/// AUTO-single Q15/Q21 penalty (measured +1.9 s at SF=100). Re-running
+/// this exact list post-localize closes the gap.
+///
+/// Returns empty when `runtime_bloom_sideband` is off. The rules are
+/// structure- and partition-preserving (the sideband wraps the join build
+/// with a `BuildSideBloomEmitterExec` and attaches a sideband to the probe
+/// scan), so re-running them without a following `EnforceDistribution` is
+/// safe — the same reason the preset installs them near the end of the
+/// chain with nothing after.
+pub fn runtime_bloom_rules(
+    o: &HarnessOverrides,
+) -> Vec<Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>> {
+    if !o.runtime_bloom_sideband {
+        return Vec::new();
+    }
+    let ratio = o.l9_min_probe_to_build_ratio.unwrap_or(1024);
+    let allow_inner_join = o.l9_allow_inner_join.unwrap_or(true);
+    let require_filtered_build = o.l9_require_filtered_build.unwrap_or(true);
+    let rule: Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync> =
+        if let Some(max_extras) = o.l9_cascade_stem_max_extras {
+            // Σ.S.B legacy stem-fanout cascade (harness A/B) replaces the
+            // base rule; carries the same milestone gate config.
+            if o.l9_stock_defaults {
+                Arc::new(EnableCascadingBloomRule::default())
+            } else {
+                Arc::new(EnableCascadingBloomRule {
+                    min_probe_to_build_ratio: ratio,
+                    allow_inner_join,
+                    require_filtered_build,
+                    max_extras_per_emitter: max_extras,
+                })
+            }
+        } else if o.l9_stock_defaults {
+            Arc::new(EnableRuntimeBloomSidebandRule::default())
+        } else {
+            Arc::new(EnableRuntimeBloomSidebandRule {
+                min_probe_to_build_ratio: ratio,
+                allow_inner_join,
+                require_filtered_build,
+                ..EnableRuntimeBloomSidebandRule::default()
+            })
+        };
+    vec![rule]
+}
+
 pub fn with_optimizer_rules_overridden(
     builder: SessionStateBuilder,
     o: &HarnessOverrides,
@@ -490,37 +547,11 @@ pub fn with_optimizer_rules_overridden(
     //   (10M; 32M under EMAT_L9_PARTITIONED=1).
     // - cascade — Σ.Q05.CHAIN cascade-chain second phase, tri-state
     //   env gated (EMAT_L9_CASCADE / EMAT_MULTIKEY_BLOOM, both AUTO).
-    if o.runtime_bloom_sideband {
-        let ratio = o.l9_min_probe_to_build_ratio.unwrap_or(1024);
-        let allow_inner_join = o.l9_allow_inner_join.unwrap_or(true);
-        let require_filtered_build = o.l9_require_filtered_build.unwrap_or(true);
-        if let Some(max_extras) = o.l9_cascade_stem_max_extras {
-            // Σ.S.B legacy stem-fanout cascade (harness A/B) replaces
-            // the base rule; carries the same milestone gate config.
-            let rule = if o.l9_stock_defaults {
-                EnableCascadingBloomRule::default()
-            } else {
-                EnableCascadingBloomRule {
-                    min_probe_to_build_ratio: ratio,
-                    allow_inner_join,
-                    require_filtered_build,
-                    max_extras_per_emitter: max_extras,
-                }
-            };
-            builder = builder.with_physical_optimizer_rule(Arc::new(rule));
-        } else {
-            let rule = if o.l9_stock_defaults {
-                EnableRuntimeBloomSidebandRule::default()
-            } else {
-                EnableRuntimeBloomSidebandRule {
-                    min_probe_to_build_ratio: ratio,
-                    allow_inner_join,
-                    require_filtered_build,
-                    ..EnableRuntimeBloomSidebandRule::default()
-                }
-            };
-            builder = builder.with_physical_optimizer_rule(Arc::new(rule));
-        }
+    // Single source of truth: the runtime-bloom sideband/cascade rules
+    // are built by `runtime_bloom_rules` so the distributed mesh gate can
+    // re-run the EXACT same rules on a local commit (Σ.Q15.LS.2).
+    for rule in runtime_bloom_rules(o) {
+        builder = builder.with_physical_optimizer_rule(rule);
     }
     // Σ.AE harness diagnostic: the install helper itself no-ops unless
     // `EMAT_DROP_REDUNDANT_FILTER=1` is set at construction time.
@@ -708,6 +739,28 @@ mod tests {
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::SessionConfig;
     use std::path::PathBuf;
+
+    /// Σ.Q15.LS.2: `runtime_bloom_rules` is the single source of truth
+    /// the mesh gate re-runs on local commits. Production
+    /// (`HarnessOverrides::default()`) installs exactly one bloom rule;
+    /// turning the milestone off yields none. If this count changes,
+    /// the gate's local reprune list changes with it automatically —
+    /// that is the point of the extraction.
+    #[test]
+    fn runtime_bloom_rules_match_the_sideband_toggle() {
+        let prod = runtime_bloom_rules(&HarnessOverrides::default());
+        assert_eq!(prod.len(), 1, "production installs one runtime-bloom rule");
+        assert!(
+            prod[0].name().to_lowercase().contains("bloom"),
+            "the reprune rule must be a bloom rule, got {:?}",
+            prod[0].name()
+        );
+        let off = runtime_bloom_rules(&HarnessOverrides {
+            runtime_bloom_sideband: false,
+            ..HarnessOverrides::default()
+        });
+        assert!(off.is_empty(), "sideband off → no reprune rules");
+    }
 
     /// The single-source-of-truth tripwire (2026-07-02 hardening, see
     /// docs/PERF_Q18.md § Hardening): the production chain assembled by

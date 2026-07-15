@@ -452,3 +452,141 @@ async fn broadcast_joins_toggle_governs_the_broadcast_boundary() {
          scan shard across the mesh instead of collapsing onto one task:\n{on}"
     );
 }
+
+// ============================================================
+// Σ.Q15.LS.2 — local commits re-run the runtime-bloom sideband
+// ============================================================
+
+/// Two SINGLE-FILE parquet tables joinable on an i64 key: a `probe`
+/// (fact, 500 rows) and a small `build` (8 rows). Single files so
+/// `localize_scans` yields a bare `EmatixFastParquetExec` on each side —
+/// the shape the runtime-bloom sideband rule attaches to.
+fn write_join_fixture() -> (tempfile::TempDir, String, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pschema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Float64, false),
+    ]));
+    let ppath = tmp.path().join("probe.parquet");
+    let n = 500i64;
+    let pbatch = RecordBatch::try_new(
+        pschema.clone(),
+        vec![
+            Arc::new(Int64Array::from((0..n).map(|i| i % 8).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(
+                (0..n).map(|i| i as f64).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("probe batch");
+    let pf = std::fs::File::create(&ppath).expect("create probe");
+    let mut pw = ArrowWriter::try_new(pf, pschema.clone(), None).expect("probe writer");
+    pw.write(&pbatch).expect("write probe");
+    pw.close().expect("close probe");
+
+    let bschema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let bpath = tmp.path().join("build.parquet");
+    let bbatch = RecordBatch::try_new(
+        bschema.clone(),
+        vec![Arc::new(Int64Array::from((0..8i64).collect::<Vec<_>>()))],
+    )
+    .expect("build batch");
+    let bf = std::fs::File::create(&bpath).expect("create build");
+    let mut bw = ArrowWriter::try_new(bf, bschema.clone(), None).expect("build writer");
+    bw.write(&bbatch).expect("write build");
+    bw.close().expect("close build");
+
+    (
+        tmp,
+        ppath.to_string_lossy().into_owned(),
+        bpath.to_string_lossy().into_owned(),
+    )
+}
+
+/// Force-single (`MeshGateConfig::off()`) gated session over single-file
+/// `probe` + `build`, with an OPTIONAL local reprune (the Σ.Q15.LS.2
+/// fix). No workers needed — every commit localizes.
+async fn join_gated_ctx(
+    reprune: Vec<Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>>,
+    probe: &str,
+    build: &str,
+) -> SessionContext {
+    let cfg = SessionConfig::new()
+        .with_collect_statistics(true)
+        .with_target_partitions(4);
+    let gate = AdaptiveMeshGateRule::new(MeshGateConfig::off()).with_local_reprune(reprune);
+    let builder = SessionStateBuilder::new()
+        .with_config(cfg)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(gate))
+        .with_distributed_worker_resolver(StaticPeers { urls: vec![] })
+        .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
+        .expect("LZ4_FRAME valid")
+        .with_distributed_files_per_task(1)
+        .expect("files_per_task valid");
+    let ctx = SessionContext::new_with_state(builder.build());
+    ctx.register_parquet("probe", probe, Default::default())
+        .await
+        .expect("register probe");
+    ctx.register_parquet("build", build, Default::default())
+        .await
+        .expect("register build");
+    ctx
+}
+
+async fn join_plan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
+    ctx.sql("SELECT probe.v FROM probe JOIN build ON probe.k = build.k")
+        .await
+        .expect("plan join sql")
+        .create_physical_plan()
+        .await
+        .expect("physical plan")
+}
+
+/// Σ.Q15.LS.2: a plan the gate commits to LOCAL execution must re-run
+/// the runtime-bloom sideband on its localized leaves. WITHOUT the
+/// reprune the localized join has no `BuildSideBloomEmitterExec` (the
+/// preset's pass ran on stock leaves and no-op'd — the AUTO-single
+/// Q15/Q21 penalty); WITH it, the emitter is present, i.e. the same
+/// pruning native single-node keeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_commit_repruned_carries_runtime_bloom_sideband() {
+    use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
+    let (_tmp, probe, build) = write_join_fixture();
+
+    // Baseline — gate with NO reprune (the pre-fix localize path).
+    let ctx = join_gated_ctx(vec![], &probe, &build).await;
+    let bare = render(&join_plan(&ctx).await);
+    assert!(
+        bare.contains("EmatixFastParquetExec"),
+        "leaves must localize on a local commit; got:\n{bare}"
+    );
+    assert!(
+        !bare.contains("BuildSideBloomEmitterExec"),
+        "without the reprune the localized join must NOT carry the sideband \
+         (this is the bug being fixed); got:\n{bare}"
+    );
+
+    // Fixed — gate WITH the sideband reprune. ratio 0 = always fire and
+    // require_filtered_build off so the miniature fixture triggers
+    // deterministically; production installs the milestone config via
+    // `preset::runtime_bloom_rules`.
+    let sideband: Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync> =
+        Arc::new(EnableRuntimeBloomSidebandRule {
+            min_probe_to_build_ratio: 0,
+            allow_inner_join: true,
+            require_filtered_build: false,
+            ..EnableRuntimeBloomSidebandRule::default()
+        });
+    let ctx = join_gated_ctx(vec![sideband], &probe, &build).await;
+    let repruned = render(&join_plan(&ctx).await);
+    assert!(
+        repruned.contains("EmatixFastParquetExec"),
+        "localize still happens with the reprune; got:\n{repruned}"
+    );
+    assert!(
+        repruned.contains("BuildSideBloomEmitterExec"),
+        "Σ.Q15.LS.2: the local reprune must re-attach the runtime-bloom \
+         sideband to the localized leaves; got:\n{repruned}"
+    );
+}

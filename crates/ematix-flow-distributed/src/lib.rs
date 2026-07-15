@@ -298,7 +298,14 @@ impl DistributedBackend {
         // runs PER QUERY at plan-optimization time (the rule executes
         // on every physical plan), so one session can mesh its big
         // scans while keeping small queries free of Flight overhead.
-        let gate = mesh_gate::AdaptiveMeshGateRule::from_env();
+        // Σ.Q15.LS.2: hand the gate the SAME runtime-bloom rules the
+        // preset installed, so a plan the gate commits to LOCAL execution
+        // gets the sideband re-run after its stock leaves are localized to
+        // EmatixFastParquetExec — closing the AUTO-single Q15/Q21 penalty
+        // (native single-node keeps these blooms; the distributed session
+        // localizes too late for the preset's pass to see them).
+        let gate = mesh_gate::AdaptiveMeshGateRule::from_env()
+            .with_local_reprune(ematix_flow_core::preset::runtime_bloom_rules(&overrides));
         // Log the resolved gate ONCE at session build. Without this an
         // operator debugging "why isn't my mesh being used" has zero
         // signal — and a "distributed" run that silently executed
