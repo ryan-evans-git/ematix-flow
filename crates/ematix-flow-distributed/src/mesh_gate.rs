@@ -164,8 +164,9 @@ impl MeshGateConfig {
         let (min_bytes, unparseable) = min_bytes_of(raw.as_deref());
         if unparseable {
             // An operator who typo'd the threshold (e.g. `4GiB`, `1e9`)
-            // would otherwise silently measure the 4 GiB default — loud
-            // in a benchmark-credibility context. Warn, don't fail.
+            // would otherwise silently measure the DEFAULT_MESH_MIN_BYTES
+            // default — loud in a benchmark-credibility context. Warn,
+            // don't fail.
             tracing::warn!(
                 value = raw.as_deref().unwrap_or(""),
                 default_bytes = min_bytes,
@@ -500,7 +501,7 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
             );
             // Σ.Q15.LS: the veto is exactly the measured Q15 shape —
             // committing it local on STOCK leaves was the 125.7 s run.
-            return Ok(localize_scans(&plan, config).unwrap_or(plan));
+            return Ok(commit_local(&plan, config));
         }
         match self.config.mode {
             // Force OFF: single-node, zero mesh coordination; local
@@ -508,7 +509,7 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
             // eligible stock leaf still comes back as the SAME Arc.
             Some(false) => {
                 tracing::debug!("mesh gate: mode=off → single-node");
-                Ok(localize_scans(&plan, config).unwrap_or(plan))
+                Ok(commit_local(&plan, config))
             }
             // Force ON: the pre-gate behavior.
             Some(true) => {
@@ -543,7 +544,7 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
                     self.inner.optimize(plan, config)
                 } else {
                     // Σ.Q15.LS: AUTO chose single-node → localize.
-                    Ok(localize_scans(&plan, config).unwrap_or(plan))
+                    Ok(commit_local(&plan, config))
                 }
             }
         }
@@ -559,8 +560,61 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
 }
 
 // ============================================================
-// Σ.Q15.LS — localize stock parquet leaves on local commits
+// Local commit — localize scans (Σ.Q15.LS) + grace demotion (Σ.MG.2)
 // ============================================================
+
+/// Commit a plan to single-node execution: localize its stock parquet
+/// leaves (Σ.Q15.LS) AND re-apply the grace-join demotion that
+/// `build_context` (lib.rs) suppresses session-wide.
+///
+/// Why grace comes back HERE: the distributed session disables grace
+/// (`HarnessOverrides { grace_join: false }`, lib.rs) because a
+/// `GraceHashJoinExec` embedded in a stage fragment that ships over
+/// Arrow Flight is undecodable and hangs the mesh (Σ.MG.2). A plan the
+/// gate commits to LOCAL execution ships no stage — the hang rationale
+/// does not apply — so an honestly-oversized build should spill to disk
+/// exactly as pure `NO_DISTRIBUTE` does instead of riding the
+/// page-cache margin into a kernel OOM (DF 53 hash joins cannot spill).
+/// Without this, a float-veto / self-join-veto / AUTO-single /
+/// forced-OFF commit ran the SAME single-node query but with grace off,
+/// measurably slower at SF=100 (Q21 self-join 8.35 s vs pure-single
+/// 6.66 s; Q15 1.67 s vs 1.24 s).
+///
+/// The grace rule self-gates twice — on `EMAT_GRACE_JOIN` (default on,
+/// `=0` opts out, matching the preset) and on an honest oversize
+/// estimate (healthy plans, and dev hosts with no sensed memory budget,
+/// demote nothing) — so this is a no-op everywhere except the oversized
+/// builds it exists to catch.
+fn commit_local(plan: &Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Arc<dyn ExecutionPlan> {
+    let localized = localize_scans(plan, config).unwrap_or_else(|| Arc::clone(plan));
+    demote_oversized_joins(
+        &localized,
+        config,
+        &ematix_flow_core::grace_join_rule::GraceJoinDemotionRule::default(),
+    )
+}
+
+/// Apply `rule` to `plan`, returning the demoted plan — or, on the
+/// rule's rare `Err`, the input untouched (a missed spill optimization
+/// must NEVER fail a query). Split from [`commit_local`] so tests can
+/// inject an explicit-budget rule without racing on process-global env
+/// or the host memory sensor.
+fn demote_oversized_joins(
+    plan: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+    rule: &ematix_flow_core::grace_join_rule::GraceJoinDemotionRule,
+) -> Arc<dyn ExecutionPlan> {
+    match rule.optimize(Arc::clone(plan), config) {
+        Ok(demoted) => demoted,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "Σ.MG.2: local-commit grace demotion errored; keeping non-demoted plan"
+            );
+            Arc::clone(plan)
+        }
+    }
+}
 
 /// Σ.Q15.LS (2026-07-13): bottom-up rewrite of a locally-committed
 /// plan's stock parquet leaves (`DataSourceExec`) into
@@ -1263,6 +1317,129 @@ mod tests {
             plan.schema(),
             out.schema(),
             "leaf swap must be schema-invariant"
+        );
+    }
+
+    // ---------------- Σ.MG.2 grace-on-local-commit ----------------
+
+    /// An Inner CollectLeft hash join over in-memory sides with a KNOWN
+    /// 1000-row build — the exact shape `GraceJoinDemotionRule` targets,
+    /// oversized against a 1-byte budget. No `*key` column names (repo
+    /// de-flake trap).
+    fn oversized_inner_join() -> Arc<dyn ExecutionPlan> {
+        use datafusion::common::NullEquality;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::logical_expr::JoinType;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::joins::utils::JoinOn;
+        use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+        fn side(name: &str) -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(
+                    (0..1000).map(|i| i % 10),
+                ))],
+            )
+            .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
+        }
+        let on: JoinOn = vec![(
+            Arc::new(Column::new("ident", 0)) as _,
+            Arc::new(Column::new("ref_a", 0)) as _,
+        )];
+        Arc::new(
+            HashJoinExec::try_new(
+                side("ident"),
+                side("ref_a"),
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Σ.MG.2: the local-commit path re-applies the grace demotion the
+    /// distributed session suppresses. An oversized build (vs a 1-byte
+    /// budget) demotes to the spilling join — exactly what pure
+    /// NO_DISTRIBUTE does, and what the grace-off distributed preset
+    /// skipped. Injected-budget rule so the assertion never races on the
+    /// host memory sensor.
+    #[test]
+    fn local_commit_demotes_oversized_build() {
+        use datafusion::physical_plan::displayable;
+        use ematix_flow_core::grace_join_rule::GraceJoinDemotionRule;
+
+        let plan = oversized_inner_join();
+        let out = demote_oversized_joins(
+            &plan,
+            &ConfigOptions::default(),
+            &GraceJoinDemotionRule {
+                enabled: true,
+                budget_bytes: Some(1),
+            },
+        );
+        let txt = format!("{}", displayable(out.as_ref()).indent(true));
+        assert!(
+            txt.contains("GraceHashJoinExec"),
+            "local commit must demote an oversized build to the spilling join:\n{txt}"
+        );
+    }
+
+    /// The grace kill-switch (`EMAT_GRACE_JOIN=0` → `enabled=false`) is
+    /// honored on the local-commit path: no demotion, the input Arc back.
+    #[test]
+    fn local_commit_grace_respects_disable() {
+        use datafusion::physical_plan::displayable;
+        use ematix_flow_core::grace_join_rule::GraceJoinDemotionRule;
+
+        let plan = oversized_inner_join();
+        let out = demote_oversized_joins(
+            &plan,
+            &ConfigOptions::default(),
+            &GraceJoinDemotionRule {
+                enabled: false,
+                budget_bytes: Some(1),
+            },
+        );
+        assert!(
+            Arc::ptr_eq(&plan, &out),
+            "disabled grace must return the input untouched"
+        );
+        assert!(
+            !format!("{}", displayable(out.as_ref()).indent(true)).contains("GraceHashJoinExec")
+        );
+    }
+
+    /// A healthy (in-budget) build is NOT demoted on a local commit —
+    /// the oversize estimate is the real gate, so normal single-node
+    /// plans pay nothing.
+    #[test]
+    fn local_commit_healthy_build_not_demoted() {
+        use datafusion::physical_plan::displayable;
+        use ematix_flow_core::grace_join_rule::GraceJoinDemotionRule;
+
+        let plan = oversized_inner_join();
+        let out = demote_oversized_joins(
+            &plan,
+            &ConfigOptions::default(),
+            &GraceJoinDemotionRule {
+                enabled: true,
+                budget_bytes: Some(1 << 40),
+            },
+        );
+        assert!(
+            Arc::ptr_eq(&plan, &out),
+            "in-budget build must pass through untouched"
+        );
+        assert!(
+            !format!("{}", displayable(out.as_ref()).indent(true)).contains("GraceHashJoinExec")
         );
     }
 

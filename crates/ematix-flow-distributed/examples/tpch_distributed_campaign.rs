@@ -48,8 +48,8 @@
 //!                           Local commits localize stock parquet
 //!                           leaves onto the fast provider (Σ.Q15.LS).
 //!                           See `ematix_flow_distributed::mesh_gate`.
-//!   EMAT_MESH_MIN_BYTES     AUTO threshold in bytes (default 4 GiB,
-//!                           initial value pending campaign calibration)
+//!   EMAT_MESH_MIN_BYTES     AUTO threshold in bytes (default 8 MiB,
+//!                           DEFAULT_MESH_MIN_BYTES; see mesh_gate.rs)
 //!   EMAT_MESH_BROADCAST_JOINS  opt-in (default OFF). Broadcasts a
 //!                           CollectLeft join's build side to every task
 //!                           so the big probe scan shards across the mesh
