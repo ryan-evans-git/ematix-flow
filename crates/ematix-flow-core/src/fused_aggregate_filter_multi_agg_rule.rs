@@ -1145,7 +1145,8 @@ mod tests {
 
         // A generic (non-parted) multi-child union → still rejected: the fix
         // is specific to the parted interleave union, not any multi-child.
-        let generic: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(vec![leg(), leg()]));
+        let generic: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![leg(), leg()]).expect("union of two legs");
         assert!(
             !is_supported_body(&generic),
             "a generic UnionExec must still reject — only the parted interleave union fuses"
