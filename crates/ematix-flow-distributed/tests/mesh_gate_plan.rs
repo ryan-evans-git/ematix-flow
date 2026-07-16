@@ -452,3 +452,80 @@ async fn broadcast_joins_toggle_governs_the_broadcast_boundary() {
          scan shard across the mesh instead of collapsing onto one task:\n{on}"
     );
 }
+
+/// Σ.TW.3 — the Q20 row-loss class. Broadcast + semi/anti topology can
+/// leave each task semi-joining against a PARTIAL IN-list (the
+/// datafusion-distributed splitter put the collected side on a
+/// PartitionIsolatorExec with a task-sharded probe pipeline), silently
+/// dropping rows: SF100 Q20 returned 7108 rows vs 17971; the local
+/// parted repro returned 3 vs 9 (exactly 1/3 with 3 workers). The gate
+/// now vetoes broadcast PER QUERY when the plan contains any semi or
+/// anti join: same distribute decision, broadcast stripped from the
+/// per-query config. Inner-join plans keep broadcasting (the #216 win).
+#[tokio::test]
+async fn semi_join_plans_veto_the_broadcast_boundary() {
+    let (_t, t_dir) = write_fixture();
+    let (_s, s_file) = write_small_fixture();
+    let (urls, _workers) = spawn_workers(2).await;
+
+    // EXISTS decorrelates to a semi join; the GROUP BY forces the
+    // repartition boundary that makes the plan distribute at all.
+    const SEMI_SQL: &str = "SELECT t.k, SUM(t.v) AS sv FROM t WHERE EXISTS \
+        (SELECT 1 FROM s WHERE s.k = t.k) GROUP BY t.k ORDER BY t.k";
+
+    let on_ctx = bcast_join_ctx(urls, &t_dir, &s_file, true).await;
+    let plan = on_ctx
+        .sql(SEMI_SQL)
+        .await
+        .expect("plan sql")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let rendered = render(&plan);
+    assert!(
+        rendered.contains("Semi") || rendered.contains("Mark"),
+        "fixture must plan a semi/mark join for the veto to be exercised:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("NetworkBroadcastExec"),
+        "broadcast must be vetoed for semi/anti plans (Σ.TW.3, the Q20 \
+         row-loss class) — distribute yes, broadcast no:\n{rendered}"
+    );
+
+    // Row parity against stock single-node DataFusion on the same files
+    // — the actual bug was wrong ANSWERS, so pin the answers.
+    let batches = on_ctx
+        .sql(SEMI_SQL)
+        .await
+        .expect("exec sql")
+        .collect()
+        .await
+        .expect("collect");
+    let stock = SessionContext::new();
+    stock
+        .register_parquet("t", t_dir.as_str(), Default::default())
+        .await
+        .expect("register t");
+    stock
+        .register_parquet("s", s_file.as_str(), Default::default())
+        .await
+        .expect("register s");
+    let want = stock
+        .sql(SEMI_SQL)
+        .await
+        .expect("stock sql")
+        .collect()
+        .await
+        .expect("stock collect");
+    let fmt = |b: &[datafusion::arrow::array::RecordBatch]| {
+        datafusion::arrow::util::pretty::pretty_format_batches(b)
+            .expect("fmt")
+            .to_string()
+    };
+    assert_eq!(
+        fmt(&batches),
+        fmt(&want),
+        "semi-join answers through the vetoed distributed session must equal \
+         stock DataFusion"
+    );
+}
