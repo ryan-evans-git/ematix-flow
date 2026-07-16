@@ -471,6 +471,79 @@ impl AdaptiveMeshGateRule {
     pub fn config(&self) -> &MeshGateConfig {
         &self.config
     }
+
+    /// Distribute `plan`, applying the Σ.TW.3 broadcast × semi/anti
+    /// correctness veto: with `broadcast_joins` ON, the
+    /// datafusion-distributed splitter can put a semi/anti join's
+    /// collected side on a `PartitionIsolatorExec` with a task-sharded
+    /// probe pipeline — each task then semi-joins against a PARTIAL
+    /// IN-list and the union silently DROPS ROWS (TPC-H Q20 SF100:
+    /// 7108 rows vs 17971; local 3-worker parted repro: 3 vs 9 —
+    /// exactly 1/N). Inner joins are unaffected and keep the #216
+    /// broadcast win. The veto is per QUERY: same distribute decision,
+    /// broadcast stripped from a cloned per-query config.
+    fn distribute(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let broadcast_on = config
+            .extensions
+            .get::<datafusion_distributed::DistributedConfig>()
+            .map(|d| d.broadcast_joins)
+            .unwrap_or(false);
+        if broadcast_on && plan_contains_semi_or_anti(&plan) {
+            tracing::info!(
+                "mesh gate: Σ.TW.3 broadcast veto — semi/anti join in plan \
+                 (the Q20 row-loss class); distributing WITHOUT broadcast \
+                 for this query"
+            );
+            let mut no_bcast = config.clone();
+            if let Some(d) = no_bcast
+                .extensions
+                .get_mut::<datafusion_distributed::DistributedConfig>()
+            {
+                d.broadcast_joins = false;
+            }
+            return self.inner.optimize(plan, &no_bcast);
+        }
+        self.inner.optimize(plan, config)
+    }
+}
+
+/// Σ.TW.3 — any semi/anti/mark join anywhere in the tree (they all
+/// answer set-membership, the semantics broadcast topology corrupted
+/// on Q20). Descends through `SharedSubtreeExec` like the Σ.TW.1
+/// walkers.
+fn plan_contains_semi_or_anti(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::common::JoinType as JT;
+    use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, SortMergeJoinExec};
+    let jt: Option<JT> = if let Some(j) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        Some(*j.join_type())
+    } else if let Some(j) = plan.as_any().downcast_ref::<SortMergeJoinExec>() {
+        Some(j.join_type())
+    } else {
+        plan.as_any()
+            .downcast_ref::<NestedLoopJoinExec>()
+            .map(|j| *j.join_type())
+    };
+    if let Some(jt) = jt {
+        if matches!(
+            jt,
+            JT::LeftSemi | JT::RightSemi | JT::LeftAnti | JT::RightAnti | JT::LeftMark
+        ) {
+            return true;
+        }
+    }
+    if let Some(shared) = plan
+        .as_any()
+        .downcast_ref::<ematix_flow_core::shared_subtree_exec::SharedSubtreeExec>()
+    {
+        if plan_contains_semi_or_anti(shared.input()) {
+            return true;
+        }
+    }
+    plan.children().into_iter().any(plan_contains_semi_or_anti)
 }
 
 impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
@@ -513,7 +586,7 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
             // Force ON: the pre-gate behavior.
             Some(true) => {
                 tracing::debug!("mesh gate: mode=on → distribute");
-                self.inner.optimize(plan, config)
+                self.distribute(plan, config)
             }
             // AUTO: decide from the scan leaves' byte statistics,
             // vetoed by the Σ.MG self-join shuffle guard.
@@ -540,7 +613,7 @@ impl PhysicalOptimizerRule for AdaptiveMeshGateRule {
                     "mesh gate: mode=auto"
                 );
                 if distribute {
-                    self.inner.optimize(plan, config)
+                    self.distribute(plan, config)
                 } else {
                     // Σ.Q15.LS: AUTO chose single-node → localize.
                     Ok(localize_scans(&plan, config).unwrap_or(plan))
