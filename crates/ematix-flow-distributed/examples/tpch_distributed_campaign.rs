@@ -934,20 +934,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (Arm::MeshBroadcast, bcast_ctx.as_ref()),
             ];
             let mut probe_rows: Vec<(&'static str, usize)> = Vec::new();
-            for (arm, actx) in arms {
-                if arm != Arm::Twin {
-                    arm_blooms().await;
-                }
-                let t0 = Instant::now();
-                match run_query(actx, &sql).await {
-                    Ok((batches, _plan_ms)) => {
-                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                        probe_rows.push((arm.label(), rows));
-                        memo.record(fp, arm, ms);
-                        eprintln!("  probe {}: {ms:.1} ms rows={rows}", arm.label());
+            // Two passes per arm; the memo keeps the min, so the
+            // first (cache-warming) pass can only lose to the second.
+            // One pass systematically penalized whichever arm probed
+            // first: the twin reads on the COORDINATOR, whose page
+            // cache is cold until twin runs, while the mesh arms hit
+            // worker caches warmed by every prior mesh probe —
+            // measured at SF100 as twin losing Q02/Q05/Q21 probes it
+            // wins by seconds once warm.
+            for pass in 0..2 {
+                for (arm, actx) in arms {
+                    if arm != Arm::Twin {
+                        arm_blooms().await;
                     }
-                    Err(e) => eprintln!("  probe {} FAILED: {e}", arm.label()),
+                    let t0 = Instant::now();
+                    match run_query(actx, &sql).await {
+                        Ok((batches, _plan_ms)) => {
+                            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                            if pass == 0 {
+                                probe_rows.push((arm.label(), rows));
+                            }
+                            memo.record(fp, arm, ms);
+                            eprintln!("  probe[{pass}] {}: {ms:.1} ms rows={rows}", arm.label());
+                        }
+                        Err(e) => eprintln!("  probe[{pass}] {} FAILED: {e}", arm.label()),
+                    }
                 }
             }
             if probe_rows.windows(2).any(|w| w[0].1 != w[1].1) {
@@ -983,11 +995,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Warmups (untimed, but verify it runs cleanly). When the memo
-        // probed, the chosen arm already had one untimed run — spend
-        // the remaining warmup budget on it so total untimed runs per
-        // trial-measured configuration match the protocol (2).
+        // probed, the chosen arm already had two untimed runs (one per
+        // probe pass) — spend only the remaining warmup budget on it
+        // so total untimed runs per trial-measured configuration match
+        // the protocol (2).
         let remaining_warmups = if chosen_arm.is_some() {
-            warmups.saturating_sub(1)
+            warmups.saturating_sub(2)
         } else {
             warmups
         };
