@@ -63,6 +63,15 @@
 //!                           carry). plan_mode reports "twin". 0 ⇒
 //!                           today's localize-only behavior (A/B
 //!                           control). See docs/ADR_NATIVE_TWIN_ROUTING.md.
+//!   EMAT_MODE_MEMO          tri-state (default ON). Σ.TW.2: each join
+//!                           query probes all three arms once untimed
+//!                           (twin / forced-mesh / forced-mesh+bcast),
+//!                           then runs its trials on the argmin —
+//!                           measurement replaces the byte-threshold
+//!                           prediction. Probes are row-parity-guarded
+//!                           (any disagreement falls back to the gate
+//!                           routing). plan_mode reports the chosen
+//!                           arm. 0 ⇒ Σ.TW.1 behavior (gate + twin).
 //!   CUSTOM_SQL / EXPLAIN_ONLY  diagnostics, unchanged (see below)
 //!
 //! ## Output
@@ -350,10 +359,16 @@ fn explicit_partitions() -> Option<usize> {
 /// gate decision itself replays per query at plan-optimization time
 /// (the rule runs on every plan), reported per query as
 /// `QueryStats::plan_mode`.
+/// `gate`/`broadcast`: `None` = resolve from env (the historical
+/// behavior); `Some` pins them — Σ.TW.2's forced-mesh probe arms are
+/// separate SESSIONS (`MeshGateConfig::forced()` ± broadcast joins),
+/// because both knobs are session-build-time, not per-query.
 fn build_session_state(
     distributed: bool,
     resolver: StaticPeers,
     bloom_slot: BloomSlot,
+    gate: Option<ematix_flow_distributed::mesh_gate::MeshGateConfig>,
+    broadcast: Option<bool>,
 ) -> SessionState {
     let explicit = explicit_partitions();
     let mut cfg = SessionConfig::new().with_collect_statistics(true);
@@ -397,8 +412,12 @@ fn build_session_state(
         // INSIDE the frozen stages; the codec serializes the wrap
         // into the stage protobuf (headers can't carry SF-scale
         // blooms).
+        let gate_rule = match gate {
+            Some(config) => AdaptiveMeshGateRule::new(config),
+            None => AdaptiveMeshGateRule::from_env(),
+        };
         let builder = builder
-            .with_physical_optimizer_rule(Arc::new(AdaptiveMeshGateRule::from_env()))
+            .with_physical_optimizer_rule(Arc::new(gate_rule))
             .with_physical_optimizer_rule(Arc::new(EmbeddedBloomRule::new(bloom_slot)))
             .with_distributed_user_codec(BloomExecCodec)
             .with_distributed_worker_resolver(resolver);
@@ -420,14 +439,16 @@ fn build_session_state(
         // 11/17 distributed TPC-H queries). ON broadcasts the already-small
         // build side to every consumer task so the big probe shards across the
         // mesh. Same flag name + tri_state parse as production.
-        let builder =
-            if ematix_flow_core::flags::tri_state("EMAT_MESH_BROADCAST_JOINS").unwrap_or(false) {
-                builder
-                    .with_distributed_broadcast_joins(true)
-                    .expect("broadcast_joins is a valid distributed toggle")
-            } else {
-                builder
-            };
+        let broadcast_on = broadcast.unwrap_or_else(|| {
+            ematix_flow_core::flags::tri_state("EMAT_MESH_BROADCAST_JOINS").unwrap_or(false)
+        });
+        let builder = if broadcast_on {
+            builder
+                .with_distributed_broadcast_joins(true)
+                .expect("broadcast_joins is a valid distributed toggle")
+        } else {
+            builder
+        };
         builder.build()
     } else {
         builder.build()
@@ -630,7 +651,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let distributed = std::env::var_os("NO_DISTRIBUTE").is_none();
     let provenance = capture_provenance(&workspace_root, &peers, distributed);
     let bloom_slot = BloomSlot::new();
-    let state = build_session_state(distributed, resolver, bloom_slot.clone());
+    let state = build_session_state(
+        distributed,
+        resolver.clone(),
+        bloom_slot.clone(),
+        None,
+        None,
+    );
     eprintln!(
         "  (distributed={distributed} target_partitions={} instance_type={:?})",
         state.config().target_partitions(),
@@ -723,6 +750,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         };
 
+    // Σ.TW.2 — the measured mode-memo arms (see `mode_memo` module
+    // docs). Two additional forced-distribute sessions: the gate is
+    // pinned ON so a probe measures a REAL mesh execution even for
+    // queries AUTO would commit locally (that's exactly the decision
+    // bucket the memo exists to fix), one session with broadcast
+    // joins off and one on. All three distributed sessions share the
+    // take-once bloom slot — arms run sequentially and each mesh run
+    // re-arms before planning. Tri-state EMAT_MODE_MEMO, default ON;
+    // requires the twin (memo's single-node arm IS the twin).
+    let memo_enabled = distributed
+        && twin_ctx.is_some()
+        && ematix_flow_core::flags::tri_state("EMAT_MODE_MEMO").unwrap_or(true);
+    let mesh_arms: Option<(Arc<SessionContext>, Arc<SessionContext>)> = if memo_enabled {
+        let mesh_ctx = Arc::new(SessionContext::from(build_session_state(
+            true,
+            resolver.clone(),
+            bloom_slot.clone(),
+            Some(ematix_flow_distributed::mesh_gate::MeshGateConfig::forced()),
+            Some(false),
+        )));
+        let bcast_ctx = Arc::new(SessionContext::from(build_session_state(
+            true,
+            resolver.clone(),
+            bloom_slot.clone(),
+            Some(ematix_flow_distributed::mesh_gate::MeshGateConfig::forced()),
+            Some(true),
+        )));
+        for c in [&mesh_ctx, &bcast_ctx] {
+            for table in TPCH_TABLES {
+                let p = table_source(&data_dir, table)
+                    .unwrap_or_else(|| panic!("pre-flight passed but {table} source vanished"));
+                c.register_parquet(*table, p.to_str().unwrap(), Default::default())
+                    .await?;
+            }
+        }
+        eprintln!("  mode memo: ON (probing twin / mesh / mesh+bcast per join query)");
+        Some((mesh_ctx, bcast_ctx))
+    } else {
+        None
+    };
+    let memo = ematix_flow_distributed::mode_memo::ModeMemo::new();
+
     // CUSTOM_SQL=<sql> — run one ad-hoc query through the distributed ctx
     // (diagnostic for DIST.1a). Prints row count + a 1-batch sample, or the
     // distributed EXPLAIN when EXPLAIN_ONLY=1. Returns after.
@@ -814,48 +883,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // re-plan + execute in the native twin; localized plans keep
         // running only for join-free local commits (measured faster
         // there: Q01 −706 ms / Q06 −262 ms vs native at SF100).
-        let (plan_mode, scan_bytes): (String, Option<u64>) = match ctx.sql(&sql).await {
-            Ok(df) => match df.create_physical_plan().await {
-                Ok(plan) => {
-                    let mode = if twin_ctx.is_some()
-                        && ematix_flow_distributed::native_twin::should_route_to_twin(&plan)
-                    {
-                        "twin"
-                    } else {
-                        plan_mode_of(&plan)
-                    };
-                    (mode.to_string(), sum_scan_leaf_bytes(&plan))
-                }
+        let (mut plan_mode, scan_bytes, has_join): (String, Option<u64>, bool) =
+            match ctx.sql(&sql).await {
+                Ok(df) => match df.create_physical_plan().await {
+                    Ok(plan) => {
+                        let mode = if twin_ctx.is_some()
+                            && ematix_flow_distributed::native_twin::should_route_to_twin(&plan)
+                        {
+                            "twin"
+                        } else {
+                            plan_mode_of(&plan)
+                        };
+                        (
+                            mode.to_string(),
+                            sum_scan_leaf_bytes(&plan),
+                            ematix_flow_distributed::native_twin::plan_has_join(&plan),
+                        )
+                    }
+                    Err(e) => {
+                        eprintln!("  plan_mode probe failed (physical): {e}");
+                        ("unknown".to_string(), None, false)
+                    }
+                },
                 Err(e) => {
-                    eprintln!("  plan_mode probe failed (physical): {e}");
-                    ("unknown".to_string(), None)
+                    eprintln!("  plan_mode probe failed (logical): {e}");
+                    ("unknown".to_string(), None, false)
                 }
-            },
-            Err(e) => {
-                eprintln!("  plan_mode probe failed (logical): {e}");
-                ("unknown".to_string(), None)
-            }
-        };
+            };
         eprintln!(
             "  plan_mode={plan_mode} scan_bytes={}",
             scan_bytes.map_or("none".to_string(), |b| b.to_string())
         );
 
-        // Σ.TW.1: twin-routed queries execute in the native twin —
-        // whole code path identical to a NO_DISTRIBUTE run, including
-        // skipping the embedded-bloom emit+arm (the twin's preset
-        // carries the native runtime-bloom sideband instead; arming
-        // the mesh's plan-embedded blooms would be dead work).
-        let use_twin = plan_mode == "twin";
-        let exec_ctx: &SessionContext = if use_twin {
-            twin_ctx.as_ref().expect("twin mode implies twin ctx")
-        } else {
-            &ctx
+        // Σ.TW.2 probe-and-pick: for join queries, run each arm once
+        // (untimed — the warmup budget every engine already spends),
+        // remember the measured time, and run the trials on the
+        // argmin. The probes double as a row-parity guard: a
+        // fast-but-wrong arm (the Q15 float-veto class of bug) must
+        // never win, so any row-count disagreement falls back to the
+        // gate's own routing and logs loudly.
+        let mut chosen_arm: Option<ematix_flow_distributed::mode_memo::Arm> = None;
+        if memo_enabled && has_join {
+            use ematix_flow_distributed::mode_memo::{Arm, ModeMemo};
+            let (mesh_ctx, bcast_ctx) = mesh_arms.as_ref().expect("memo implies arms");
+            let twin = twin_ctx.as_ref().expect("memo implies twin");
+            let fp = ModeMemo::fingerprint(&sql);
+            let arms: [(Arm, &SessionContext); 3] = [
+                (Arm::Twin, twin),
+                (Arm::Mesh, mesh_ctx.as_ref()),
+                (Arm::MeshBroadcast, bcast_ctx.as_ref()),
+            ];
+            let mut probe_rows: Vec<(&'static str, usize)> = Vec::new();
+            for (arm, actx) in arms {
+                if arm != Arm::Twin {
+                    arm_blooms().await;
+                }
+                let t0 = Instant::now();
+                match run_query(actx, &sql).await {
+                    Ok((batches, _plan_ms)) => {
+                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                        probe_rows.push((arm.label(), rows));
+                        memo.record(fp, arm, ms);
+                        eprintln!("  probe {}: {ms:.1} ms rows={rows}", arm.label());
+                    }
+                    Err(e) => eprintln!("  probe {} FAILED: {e}", arm.label()),
+                }
+            }
+            if probe_rows.windows(2).any(|w| w[0].1 != w[1].1) {
+                eprintln!(
+                    "  PROBE ROW MISMATCH {probe_rows:?} — memo disabled for this \
+                     query, falling back to the gate's routing"
+                );
+            } else if let Some((arm, ms)) = memo.best(fp) {
+                eprintln!("  memo pick: {} ({ms:.1} ms)", arm.label());
+                plan_mode = arm.label().to_string();
+                chosen_arm = Some(arm);
+            }
+        }
+
+        // Σ.TW.1 routing (also the memo's fallback): twin-routed
+        // queries execute in the native twin — code path identical to
+        // a NO_DISTRIBUTE run, including skipping the embedded-bloom
+        // emit+arm (the twin's preset carries the native runtime-bloom
+        // sideband instead; arming the mesh's plan-embedded blooms
+        // would be dead work).
+        use ematix_flow_distributed::mode_memo::Arm;
+        let exec_ctx: &SessionContext = match chosen_arm {
+            Some(Arm::Twin) => twin_ctx.as_ref().expect("twin arm implies twin ctx"),
+            Some(Arm::Mesh) => mesh_arms.as_ref().expect("arm implies arms").0.as_ref(),
+            Some(Arm::MeshBroadcast) => mesh_arms.as_ref().expect("arm implies arms").1.as_ref(),
+            None if plan_mode == "twin" => twin_ctx.as_ref().expect("twin mode implies twin ctx"),
+            None => &ctx,
+        };
+        let needs_bloom_arm = match chosen_arm {
+            Some(Arm::Twin) => false,
+            Some(_) => true,
+            None => plan_mode != "twin",
         };
 
-        // Warmups (untimed, but verify it runs cleanly).
-        for w in 0..warmups {
-            if !use_twin {
+        // Warmups (untimed, but verify it runs cleanly). When the memo
+        // probed, the chosen arm already had one untimed run — spend
+        // the remaining warmup budget on it so total untimed runs per
+        // trial-measured configuration match the protocol (2).
+        let remaining_warmups = if chosen_arm.is_some() {
+            warmups.saturating_sub(1)
+        } else {
+            warmups
+        };
+        for w in 0..remaining_warmups {
+            if needs_bloom_arm {
                 arm_blooms().await;
             }
             match run_query(exec_ctx, &sql).await {
@@ -877,7 +1014,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // their own full native planning inside the timer instead
             // — exactly what the native leg pays.)
             let t0 = Instant::now();
-            if !use_twin {
+            if needs_bloom_arm {
                 arm_blooms().await;
             }
             match run_query(exec_ctx, &sql).await {
@@ -1079,7 +1216,7 @@ mod campaign_preset_parity_tests {
 
     #[test]
     fn single_node_rule_chain_equals_production_preset() {
-        let state = build_session_state(false, no_peers(), BloomSlot::new());
+        let state = build_session_state(false, no_peers(), BloomSlot::new(), None, None);
         let (physical, logical) = preset::ematix_rule_names(&state);
         assert_eq!(
             physical,
@@ -1106,6 +1243,8 @@ mod campaign_preset_parity_tests {
                 urls: vec![Url::parse("http://127.0.0.1:50051").unwrap()],
             },
             BloomSlot::new(),
+            None,
+            None,
         );
         let (physical, logical) = preset::ematix_rule_names(&state);
         assert_eq!(
@@ -1165,7 +1304,7 @@ mod campaign_preset_parity_tests {
         use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
         use datafusion::datasource::MemTable;
 
-        let state = build_session_state(false, no_peers(), BloomSlot::new());
+        let state = build_session_state(false, no_peers(), BloomSlot::new(), None, None);
         let ctx = SessionContext::from(state);
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "n",

@@ -87,6 +87,12 @@ pub mod mesh_gate;
 // docs/ADR_NATIVE_TWIN_ROUTING.md.
 pub mod native_twin;
 
+// Σ.TW.2 — measured mode memo: probe each execution arm (twin /
+// forced-mesh / forced-mesh+broadcast) once per query fingerprint and
+// run on the argmin. Replaces the byte-threshold prediction the data
+// proved non-monotonic. See module docs.
+pub mod mode_memo;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
