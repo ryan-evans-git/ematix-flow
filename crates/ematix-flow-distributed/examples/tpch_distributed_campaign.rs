@@ -55,6 +55,14 @@
 //!                           so the big probe scan shards across the mesh
 //!                           instead of collapsing onto one task. Mirrors
 //!                           the shipped `build_context` opt-in (#32).
+//!   EMAT_TWIN_ROUTE         tri-state (default ON). Σ.TW.1: a local
+//!                           commit WITH a join re-plans + executes in
+//!                           the native single-node twin (full native
+//!                           preset + native fast providers — the
+//!                           KEYS.2 downcast lever localize can't
+//!                           carry). plan_mode reports "twin". 0 ⇒
+//!                           today's localize-only behavior (A/B
+//!                           control). See docs/ADR_NATIVE_TWIN_ROUTING.md.
 //!   CUSTOM_SQL / EXPLAIN_ONLY  diagnostics, unchanged (see below)
 //!
 //! ## Output
@@ -141,30 +149,15 @@ struct QueryStats {
     median_plan_ms: f64,
 }
 
-/// Walk the optimized physical plan for the datafusion-distributed
-/// stage/flight boundary nodes. Node names discovered from the
-/// datafusion-distributed 1.0.0 source (not guessed):
-/// `DistributedExec` is the root wrapper the stage splitter installs
-/// around every plan it actually splits (execution_plans/distributed.rs),
-/// with `NetworkShuffleExec` / `NetworkCoalesceExec` /
-/// `NetworkBroadcastExec` as the Arrow Flight boundaries inside the
-/// stages. Matching any of them ⇒ the query runs on the mesh. Note
-/// the splitter returns the ORIGINAL plan when no stage split
-/// happens, so "peers configured + EMAT_MESH=1" can still legitimately
-/// report "single" for a plan with no network boundaries.
-fn plan_is_mesh(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if matches!(
-        plan.name(),
-        "DistributedExec" | "NetworkShuffleExec" | "NetworkCoalesceExec" | "NetworkBroadcastExec"
-    ) {
-        return true;
-    }
-    plan.children().into_iter().any(plan_is_mesh)
-}
-
-/// `plan_mode` label for [`QueryStats`] (see [`plan_is_mesh`]).
+/// `plan_mode` label for [`QueryStats`] — the network-boundary walker
+/// lives in [`ematix_flow_distributed::native_twin::plan_is_mesh`]
+/// (single source of truth; Σ.TW.1 routes on the same predicate).
 fn plan_mode_of(plan: &Arc<dyn ExecutionPlan>) -> &'static str {
-    if plan_is_mesh(plan) { "mesh" } else { "single" }
+    if ematix_flow_distributed::native_twin::plan_is_mesh(plan) {
+        "mesh"
+    } else {
+        "single"
+    }
 }
 
 /// Sum `total_byte_size` across the plan's scan leaves — the exact
@@ -706,6 +699,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Σ.TW.1 — the native twin for local-commit JOIN queries (docs/
+    // ADR_NATIVE_TWIN_ROUTING.md). Distinct from `emit_ctx` above:
+    // that one clones the distributed session's stock providers (it
+    // only pre-executes small build sides); this one re-registers the
+    // NATIVE fast providers because it runs whole queries — the KEYS.2
+    // key-downcast and the rest of the planning-time levers live in
+    // the provider constructors. Tri-state EMAT_TWIN_ROUTE, default
+    // ON; =0 restores the localize-only behavior (the A/B control).
+    let twin_ctx: Option<SessionContext> =
+        if distributed && ematix_flow_core::flags::tri_state("EMAT_TWIN_ROUTE").unwrap_or(true) {
+            match ematix_flow_distributed::native_twin::native_twin_ctx(&ctx).await {
+                Ok(twin) => {
+                    eprintln!("  twin routing: ON (local join commits run native)");
+                    Some(twin)
+                }
+                Err(e) => {
+                    eprintln!("  twin build failed (routing disabled): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     // CUSTOM_SQL=<sql> — run one ad-hoc query through the distributed ctx
     // (diagnostic for DIST.1a). Prints row count + a 1-batch sample, or the
     // distributed EXPLAIN when EXPLAIN_ONLY=1. Returns after.
@@ -790,9 +807,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if n_blooms > 0 {
             eprintln!("  blooms: {n_blooms} embedded");
         }
+        // Σ.TW.1: the route is decided HERE, once per query — the
+        // gate's verdict is deterministic per query shape, so warmups
+        // and trials below reuse it (production's plan-memo posture).
+        // "twin" = the gate committed local AND the plan has a join →
+        // re-plan + execute in the native twin; localized plans keep
+        // running only for join-free local commits (measured faster
+        // there: Q01 −706 ms / Q06 −262 ms vs native at SF100).
         let (plan_mode, scan_bytes): (String, Option<u64>) = match ctx.sql(&sql).await {
             Ok(df) => match df.create_physical_plan().await {
-                Ok(plan) => (plan_mode_of(&plan).to_string(), sum_scan_leaf_bytes(&plan)),
+                Ok(plan) => {
+                    let mode = if twin_ctx.is_some()
+                        && ematix_flow_distributed::native_twin::should_route_to_twin(&plan)
+                    {
+                        "twin"
+                    } else {
+                        plan_mode_of(&plan)
+                    };
+                    (mode.to_string(), sum_scan_leaf_bytes(&plan))
+                }
                 Err(e) => {
                     eprintln!("  plan_mode probe failed (physical): {e}");
                     ("unknown".to_string(), None)
@@ -808,10 +841,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             scan_bytes.map_or("none".to_string(), |b| b.to_string())
         );
 
+        // Σ.TW.1: twin-routed queries execute in the native twin —
+        // whole code path identical to a NO_DISTRIBUTE run, including
+        // skipping the embedded-bloom emit+arm (the twin's preset
+        // carries the native runtime-bloom sideband instead; arming
+        // the mesh's plan-embedded blooms would be dead work).
+        let use_twin = plan_mode == "twin";
+        let exec_ctx: &SessionContext = if use_twin {
+            twin_ctx.as_ref().expect("twin mode implies twin ctx")
+        } else {
+            &ctx
+        };
+
         // Warmups (untimed, but verify it runs cleanly).
         for w in 0..warmups {
-            arm_blooms().await;
-            match run_query(&ctx, &sql).await {
+            if !use_twin {
+                arm_blooms().await;
+            }
+            match run_query(exec_ctx, &sql).await {
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("  warmup {w} FAILED: {e}");
@@ -826,10 +873,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut rows_returned: usize = 0;
         for _ in 0..trials {
             // Timer starts BEFORE emit+arm: the bloom build is part
-            // of the measured query, not free setup.
+            // of the measured query, not free setup. (Twin trials pay
+            // their own full native planning inside the timer instead
+            // — exactly what the native leg pays.)
             let t0 = Instant::now();
-            arm_blooms().await;
-            match run_query(&ctx, &sql).await {
+            if !use_twin {
+                arm_blooms().await;
+            }
+            match run_query(exec_ctx, &sql).await {
                 Ok((batches, plan_ms)) => {
                     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                     trials_ms.push(elapsed_ms);

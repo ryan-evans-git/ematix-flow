@@ -80,6 +80,13 @@ pub mod bloom_emitter;
 // provider (Σ.Q15.LS). See module docs.
 pub mod mesh_gate;
 
+// Σ.TW.1 — native single-node twin routing: a distributed session's
+// local commits WITH joins re-plan in a real native session (the
+// planning-time levers — KEYS.2 key downcast above all — cannot be
+// retrofitted by the commit-time localize rewrite). See
+// docs/ADR_NATIVE_TWIN_ROUTING.md.
+pub mod native_twin;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
