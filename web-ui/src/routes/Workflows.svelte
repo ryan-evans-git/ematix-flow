@@ -1,5 +1,6 @@
 <script>
   import { onMount } from "svelte";
+  import { modal } from "../lib/a11y.js";
   import { listWorkflows, listPipelines, runWorkflowNow } from "../lib/api.js";
   import DagFlowchart from "../lib/DagFlowchart.svelte";
   import TriggerExpr from "../lib/TriggerExpr.svelte";
@@ -266,7 +267,7 @@
 
 {#if runNowFor}
   <div class="modal-bg" on:click={closeRunNow} role="presentation">
-    <div class="modal" on:click|stopPropagation role="dialog" aria-label="Run workflow now">
+    <div class="modal" on:click|stopPropagation role="dialog" aria-modal="true" aria-label="Run workflow now" use:modal={{ onClose: closeRunNow }}>
       <h3 class="modal-title">Run <span class="mono">{runNowFor.name}</span> now</h3>
       <p class="dim" style="font-size: 0.85em;">
         Pick the jobs to include. All trigger gates are bypassed.

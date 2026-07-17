@@ -11,19 +11,49 @@
   let el;
   let chart = null;
   let ro = null;
+  let echarts = null;
+  let appliedTheme = null;
+  let themeObserver = null;
 
-  onMount(async () => {
-    const echarts = await import("echarts");
-    chart = echarts.init(el, "dark", { renderer: "canvas" });
+  // The app's light/dark toggle sets data-theme="light" on <html>
+  // (dark is the default, no attribute). ECharts bakes the theme in at
+  // init(), so we read the current theme and re-init when it flips —
+  // otherwise charts stay dark-on-light in light mode.
+  function currentTheme() {
+    return document.documentElement.getAttribute("data-theme") === "light"
+      ? "light"
+      : "dark";
+  }
+
+  function initChart() {
+    if (!echarts || !el) return;
+    if (chart) chart.dispose();
+    appliedTheme = currentTheme();
+    chart = echarts.init(el, appliedTheme, { renderer: "canvas" });
     chart.on("click", (params) =>
       dispatch("pointclick", { name: params.name, seriesName: params.seriesName, value: params.value }),
     );
     if (option) chart.setOption(option, true);
-    ro = new ResizeObserver(() => chart && chart.resize());
-    ro.observe(el);
+    if (!ro) {
+      ro = new ResizeObserver(() => chart && chart.resize());
+      ro.observe(el);
+    }
+  }
+
+  onMount(async () => {
+    echarts = await import("echarts");
+    initChart();
+    themeObserver = new MutationObserver(() => {
+      if (currentTheme() !== appliedTheme) initChart();
+    });
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
   });
 
   onDestroy(() => {
+    if (themeObserver) themeObserver.disconnect();
     if (ro) ro.disconnect();
     if (chart) chart.dispose();
   });

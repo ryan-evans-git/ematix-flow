@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { getRun, restartRun, rerunRun, pauseRun, resumeRun } from "../lib/api.js";
 
   export let runId;
@@ -9,16 +9,24 @@
   let error = null;
   let toast = null;
   let toastError = false;
+  let toastTimer = null;
+  // Monotonic load token: a slower response for an older runId must not
+  // overwrite the current one (rapid navigation / restart chains).
+  let loadSeq = 0;
 
   async function load() {
+    const seq = ++loadSeq;
     loading = true;
     error = null;
     try {
-      run = await getRun(runId);
+      const r = await getRun(runId);
+      if (seq !== loadSeq) return; // superseded by a newer load
+      run = r;
     } catch (e) {
+      if (seq !== loadSeq) return;
       error = e.message;
     } finally {
-      loading = false;
+      if (seq === loadSeq) loading = false;
     }
   }
 
@@ -27,8 +35,11 @@
   function showToast(msg, isError = false) {
     toast = msg;
     toastError = isError;
-    setTimeout(() => { toast = null; }, 3500);
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast = null; toastTimer = null; }, 3500);
   }
+
+  onDestroy(() => { if (toastTimer) clearTimeout(toastTimer); });
 
   async function doRestart() {
     if (!run?.actions?.restart_from_step?.length) return;

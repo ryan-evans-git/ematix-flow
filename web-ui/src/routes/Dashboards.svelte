@@ -3,6 +3,7 @@
   import DashboardGrid from "../lib/DashboardGrid.svelte";
   import ChartView from "../lib/ChartView.svelte";
   import { me, can } from "../lib/session.js";
+  import { modal } from "../lib/a11y.js";
   import {
     listDashboards,
     getDashboard,
@@ -29,6 +30,9 @@
 
   let refreshMs = 0;
   let refreshTimer = null;
+  // Monotonic token: a slower response for a dashboard the user has
+  // already switched away from must not overwrite the current one.
+  let selectSeq = 0;
 
   onMount(async () => {
     try {
@@ -43,40 +47,55 @@
   onDestroy(() => clearTimer());
 
   function clearTimer() {
-    if (refreshTimer) clearInterval(refreshTimer);
+    if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = null;
   }
 
-  $: {
+  // Self-scheduling refresh: the next tick is armed only AFTER the
+  // current fetch settles, so a slow query can't stack overlapping
+  // in-flight requests that then land out of order.
+  function scheduleRefresh() {
     clearTimer();
     if (refreshMs > 0 && currentId) {
-      refreshTimer = setInterval(fetchData, refreshMs);
+      refreshTimer = setTimeout(async () => {
+        await fetchData();
+        scheduleRefresh();
+      }, refreshMs);
     }
   }
 
+  $: { refreshMs; currentId; scheduleRefresh(); }
+
   async function select(dash) {
+    const seq = ++selectSeq;
     currentId = dash.id;
     currentName = dash.name;
     editing = false;
     filters = [];
     try {
       const full = await getDashboard(dash.id);
+      if (seq !== selectSeq) return; // switched away mid-load
       tiles = (full.layout && full.layout.tiles) || [];
-      await fetchData();
+      await fetchData(seq);
     } catch (e) {
+      if (seq !== selectSeq) return;
       error = e.message;
     }
   }
 
-  async function fetchData() {
+  async function fetchData(seq = selectSeq) {
     if (!currentId) return;
+    const myId = currentId;
     loading = true;
     try {
-      tileData = (await queryDashboard(currentId, filters)).results || {};
+      const results = (await queryDashboard(myId, filters)).results || {};
+      if (seq !== selectSeq || myId !== currentId) return; // stale
+      tileData = results;
     } catch (e) {
+      if (seq !== selectSeq) return;
       error = e.message;
     } finally {
-      loading = false;
+      if (seq === selectSeq) loading = false;
     }
   }
 
@@ -293,7 +312,7 @@
 
   {#if drill}
     <div class="drill-bg" on:click={() => (drill = null)} role="presentation">
-      <div class="drill" on:click|stopPropagation role="dialog" aria-label="Drill-down">
+      <div class="drill" on:click|stopPropagation role="dialog" aria-modal="true" aria-label="Drill-down" use:modal={{ onClose: () => (drill = null) }}>
         <div class="drill-head">
           <span><b>{drill.column}</b> = <span class="mono">{drill.value}</span> · {drill.rows.length} row{drill.rows.length === 1 ? "" : "s"}</span>
           <button class="drill-x" on:click={() => (drill = null)}>×</button>

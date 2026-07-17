@@ -10,23 +10,49 @@
   let statusFilter = "";
   let sortKey = "started";  // pipeline | status | started | duration | attempt
   let sortDir = "desc";
+  const PAGE_SIZE = 50;
+  let offset = 0;
+  let loadSeq = 0;
+
+  // Reset to the first page whenever a filter changes, then load.
+  function reload() {
+    offset = 0;
+    load();
+  }
 
   async function load() {
+    const seq = ++loadSeq;
     loading = true;
     error = null;
     try {
       const body = await listRuns({
         pipeline: pipelineFilter || undefined,
         status: statusFilter || undefined,
+        limit: PAGE_SIZE,
+        offset,
       });
+      if (seq !== loadSeq) return; // superseded
       runs = body.runs;
       total = body.total;
     } catch (e) {
+      if (seq !== loadSeq) return;
       error = e.message;
     } finally {
-      loading = false;
+      if (seq === loadSeq) loading = false;
     }
   }
+
+  function nextPage() {
+    if (offset + PAGE_SIZE < total) { offset += PAGE_SIZE; load(); }
+  }
+  function prevPage() {
+    if (offset > 0) { offset = Math.max(0, offset - PAGE_SIZE); load(); }
+  }
+  function openRun(runId) {
+    window.location.hash = `#/runs/${encodeURIComponent(runId)}`;
+  }
+  $: pageStart = total === 0 ? 0 : offset + 1;
+  $: pageEnd = Math.min(offset + runs.length, total);
 
   onMount(() => {
     // Honor the `?pipeline=` query string when arriving via "all jobs →".
@@ -98,7 +124,7 @@
       <input
         type="text"
         bind:value={pipelineFilter}
-        on:change={load}
+        on:change={reload}
         placeholder="(any)"
         style="background: rgba(8,16,12,0.7); border: 1px solid var(--color-phosphor-700); color: var(--color-phosphor-200); padding: 0.25rem 0.5rem; font-family: var(--font-mono);"
       />
@@ -107,7 +133,7 @@
       Status:
       <select
         bind:value={statusFilter}
-        on:change={load}
+        on:change={reload}
         style="background: rgba(8,16,12,0.7); border: 1px solid var(--color-phosphor-700); color: var(--color-phosphor-200); padding: 0.25rem 0.5rem; font-family: var(--font-mono);"
       >
         <option value="">(any)</option>
@@ -120,7 +146,11 @@
       </select>
     </label>
     <button class="action" on:click={load}>Refresh</button>
-    <span class="mono" style="margin-left: auto;">total: {total}</span>
+    <div class="pager mono" style="margin-left: auto;">
+      <button class="action" on:click={prevPage} disabled={offset === 0}>‹ prev</button>
+      <span>{pageStart}–{pageEnd} of {total}</span>
+      <button class="action" on:click={nextPage} disabled={offset + runs.length >= total}>next ›</button>
+    </div>
   </div>
 </div>
 
@@ -146,7 +176,16 @@
     </thead>
     <tbody>
       {#each sorted as r (r.run_id)}
-        <tr on:click={() => (window.location.hash = `#/runs/${encodeURIComponent(r.run_id)}`)}>
+        <tr
+          class="run-row"
+          tabindex="0"
+          role="button"
+          aria-label={`Open run ${r.run_id}`}
+          on:click={() => openRun(r.run_id)}
+          on:keydown={(e) => {
+            if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openRun(r.run_id); }
+          }}
+        >
           <td>
             {r.pipeline}
             {#if r.kind === "replay"}
@@ -171,6 +210,9 @@
 
 
 <style>
+  .pager { display: inline-flex; gap: 0.5rem; align-items: center; }
+  .run-row { cursor: pointer; }
+  .run-row:focus-visible { outline: 2px solid var(--info, #4090b8); outline-offset: -2px; }
   .replay-badge {
     display: inline-block;
     margin-left: 6px;

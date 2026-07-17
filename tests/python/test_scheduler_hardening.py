@@ -18,7 +18,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from ematix_flow import pipeline as p
-from ematix_flow.executors import DispatchError
 from ematix_flow.run_log.protocol import ClaimResult
 from ematix_flow.scheduler.loop import _dispatch_one, _walk_and_dispatch
 
