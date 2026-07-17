@@ -182,6 +182,15 @@ class TestRedshiftArrowNative:
             iam_role="arn:aws:iam::123:role/r",
         )
 
+    def test_to_postgres_url_percent_encodes_credentials(self) -> None:
+        conn = RedshiftConnection(
+            name="rs", host="h", database="d",
+            user="us er", password="p@ss/w:rd#", port=5439,
+        )
+        url = conn.to_postgres_url()
+        # A password with @ : / # must not re-split the authority.
+        assert url == "postgres://us%20er:p%40ss%2Fw%3Ard%23@h:5439/d"
+
     def test_copy_from_parquet_emitted(self) -> None:
         cursor = MagicMock()
         executed: list[str] = []
@@ -204,9 +213,36 @@ class TestRedshiftArrowNative:
         # COPY ... FROM 's3://...' IAM_ROLE 'arn:...' FORMAT PARQUET
         assert len(executed) == 1
         copy_sql = executed[0]
-        assert copy_sql.startswith("COPY t FROM 's3://bucket/staging/")
+        # Identifier is now quoted (injection-safe).
+        assert copy_sql.startswith('COPY "t" FROM \'s3://bucket/staging/')
         assert "IAM_ROLE 'arn:aws:iam::123:role/r'" in copy_sql
         assert "FORMAT PARQUET" in copy_sql
+
+    def test_copy_quotes_injection_in_table_and_role(self) -> None:
+        cursor = MagicMock()
+        executed: list[str] = []
+        cursor.execute.side_effect = lambda sql, *a, **kw: executed.append(sql)
+        client = MagicMock()
+        client.cursor.return_value.__enter__.return_value = cursor
+        s3 = MagicMock()
+
+        conn = self._conn()
+        conn.iam_role = "arn'; DROP TABLE users; --"
+
+        redshift_write_arrow(
+            conn,
+            pa.table({"id": [1]}),
+            table_name="evil; DROP TABLE t; --",
+            _client=client,
+            _s3_client=s3,
+        )
+        copy_sql = executed[0]
+        # The malicious table name is a single quoted identifier, not raw
+        # SQL, and the role's embedded quote is escaped — no statement
+        # break-out.
+        assert '"evil; DROP TABLE t; --"' in copy_sql
+        assert "DROP TABLE t" not in copy_sql.replace('"evil; DROP TABLE t; --"', "")
+        assert "arn''; DROP TABLE users; --" in copy_sql
 
     def test_staging_file_cleaned_up_after_copy(self) -> None:
         cursor = MagicMock()

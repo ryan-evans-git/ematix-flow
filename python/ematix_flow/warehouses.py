@@ -50,6 +50,7 @@ clean place to land.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -57,6 +58,8 @@ import pyarrow as pa
 
 from ematix_flow.connections import Connection
 from ematix_flow.secrets import expand
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "BigQueryConnection",
@@ -209,8 +212,13 @@ class RedshiftConnection(Connection):
         :class:`ematix_flow.connections.PostgresConnection` path.
         Credentials are interpolated through the secrets registry.
         """
-        user = expand(self.user)
-        password = expand(self.password)
+        from urllib.parse import quote
+
+        # Percent-encode the userinfo so a password containing @ : / # etc.
+        # can't re-split the authority (and connect to an unintended host)
+        # or produce a malformed DSN.
+        user = quote(expand(self.user), safe="")
+        password = quote(expand(self.password), safe="")
         host = expand(self.host)
         database = expand(self.database)
         return f"postgres://{user}:{password}@{host}:{self.port}/{database}"
@@ -241,6 +249,7 @@ def snowflake_query_to_arrow(
     pass only ``conn`` + ``query`` and the connector is built from
     the connection's fields.
     """
+    owned = _client is None
     if _client is None:
         try:
             import snowflake.connector  # type: ignore[import-not-found]
@@ -263,9 +272,16 @@ def snowflake_query_to_arrow(
             if v:
                 connect_kwargs[fld] = v
         _client = snowflake.connector.connect(**connect_kwargs)
-    with _client.cursor() as cur:
-        cur.execute(query)
-        return cur.fetch_arrow_all()
+    try:
+        with _client.cursor() as cur:
+            cur.execute(query)
+            return cur.fetch_arrow_all()
+    finally:
+        # Close only a connection WE created; an injected _client is the
+        # caller's to manage. Without this the driver session leaked on
+        # every run (server-side session-limit / FD exhaustion).
+        if owned:
+            _close_quietly(_client)
 
 
 def bigquery_query_to_arrow(
@@ -284,6 +300,7 @@ def bigquery_query_to_arrow(
 
     ``_client`` is an internal hook for tests.
     """
+    owned = _client is None
     if _client is None:
         try:
             from google.cloud import bigquery  # type: ignore[import-not-found]
@@ -298,14 +315,23 @@ def bigquery_query_to_arrow(
             client_kwargs["location"] = expand(conn.location)
         cred_path = conn.resolved_credentials_path()
         if cred_path:
-            # The SDK reads GOOGLE_APPLICATION_CREDENTIALS from env;
-            # we set it here scoped to the client construction so we
-            # don't pollute the global env.
-            import os
-
-            os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", cred_path)
-        _client = bigquery.Client(**client_kwargs)
-    return _client.query(query).to_arrow()
+            # Pass credentials explicitly to THIS client. The old path
+            # did os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS"),
+            # which (a) permanently mutated process-global env and (b)
+            # via setdefault silently ignored this connection's own
+            # credentials_path if the env var was already set — a
+            # cross-tenant auth mixup. from_service_account_json scopes
+            # the credentials to this client only.
+            _client = bigquery.Client.from_service_account_json(
+                cred_path, **client_kwargs
+            )
+        else:
+            _client = bigquery.Client(**client_kwargs)
+    try:
+        return _client.query(query).to_arrow()
+    finally:
+        if owned:
+            _close_quietly(_client)
 
 
 def redshift_query_to_arrow(
@@ -329,6 +355,7 @@ def redshift_query_to_arrow(
 
     ``_client`` is an internal hook for tests.
     """
+    owned = _client is None
     if _client is None:
         try:
             import redshift_connector  # type: ignore[import-not-found]
@@ -345,10 +372,14 @@ def redshift_query_to_arrow(
             user=expand(conn.user),
             password=expand(conn.password),
         )
-    with _client.cursor() as cur:
-        cur.execute(query)
-        col_names = [d[0] for d in cur.description]
-        rows = cur.fetchall()
+    try:
+        with _client.cursor() as cur:
+            cur.execute(query)
+            col_names = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+    finally:
+        if owned:
+            _close_quietly(_client)
     # Build columns from the row tuples. Pyarrow infers types from
     # the data; users wanting explicit schemas should run the query
     # outside this helper.
@@ -364,6 +395,18 @@ def redshift_query_to_arrow(
 # ============================================================
 
 
+def _close_quietly(client: Any) -> None:
+    """Best-effort ``client.close()`` — never let a close error mask the
+    query result or crash the run."""
+    close = getattr(client, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("failed to close warehouse connection: %s", exc)
+
+
 def _quote_snowflake_identifier(name: str) -> str:
     """Double-quote a Snowflake identifier, escaping embedded quotes.
 
@@ -372,6 +415,18 @@ def _quote_snowflake_identifier(name: str) -> str:
     schema lands as that exact column name in the Snowflake table.
     """
     return '"' + name.replace('"', '""') + '"'
+
+
+def _quote_pg_identifier(name: str) -> str:
+    """Double-quote a Redshift/Postgres identifier, escaping embedded
+    quotes. A dotted ``schema.table`` is quoted per segment so the dot
+    stays a separator, not part of the name."""
+    return ".".join('"' + part.replace('"', '""') + '"' for part in name.split("."))
+
+
+def _sql_quote_literal(value: str) -> str:
+    """Single-quote a SQL string literal, escaping embedded quotes."""
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _arrow_type_to_snowflake(field: pa.Field) -> str:
@@ -658,6 +713,7 @@ def redshift_write_arrow(
             f"redshift_write_arrow: connection {conn.name!r} needs both "
             "s3_staging_dir and iam_role to use bulk-COPY writes"
         )
+    owned = _client is None
     if _client is None:
         try:
             import redshift_connector  # type: ignore[import-not-found]
@@ -705,9 +761,14 @@ def redshift_write_arrow(
     staging_url = f"s3://{bucket}/{key}"
     try:
         with _client.cursor() as cur:
+            # Quote the identifier and escape both string literals so a
+            # table name / IAM role / staging path containing a quote (or
+            # a `;`) can't break out of the statement.
             cur.execute(
-                f"COPY {table_name} FROM '{staging_url}' "
-                f"IAM_ROLE '{expand(conn.iam_role)}' FORMAT PARQUET"
+                f"COPY {_quote_pg_identifier(table_name)} "
+                f"FROM {_sql_quote_literal(staging_url)} "
+                f"IAM_ROLE {_sql_quote_literal(expand(conn.iam_role))} "
+                "FORMAT PARQUET"
             )
         _client.commit()
     finally:
@@ -716,6 +777,9 @@ def redshift_write_arrow(
             _s3_client.delete_object(Bucket=bucket, Key=key)
         except Exception:
             pass  # best-effort cleanup
+        # Close a connection we created (not an injected one).
+        if owned:
+            _close_quietly(_client)
     return table.num_rows
 
 
