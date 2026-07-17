@@ -355,6 +355,15 @@ impl EmatixFastParquetMultiTableProvider {
         self.parts.len()
     }
 
+    /// This table's part-file paths, in the order they were registered
+    /// (i.e. the sorted order [`Self::try_new_dir`] establishes). Lets a
+    /// caller rebuild the same table under a different KEYS.2 decision —
+    /// the Σ.TW.SCHEMA session-level reconciliation does exactly this
+    /// via [`Self::try_new_files_no_downcast`].
+    pub fn part_paths(&self) -> Vec<String> {
+        self.parts.iter().map(|p| p.path().to_string()).collect()
+    }
+
     /// Σ.Q15.LS — synchronous core of `scan` (the multi-file mirror of
     /// [`EmatixFastParquetTableProvider::scan_exec`]): fan the SAME
     /// projection + filters into each part's sync scan, split the

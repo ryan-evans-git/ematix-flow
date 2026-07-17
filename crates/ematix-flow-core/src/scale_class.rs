@@ -83,12 +83,48 @@ pub fn large_scale_seen() -> bool {
     MAX_TABLE_ROWS_SEEN.load(Ordering::Relaxed) >= threshold()
 }
 
+/// Fold a whole dataset's tables into the high-water mark BEFORE any of
+/// their providers are constructed, so every table's KEYS.2 narrowing
+/// decision sees the same classification regardless of construction
+/// order.
+///
+/// Σ.TW.SCHEMA (2026-07-17): [`observe_file`] grows the mark as each
+/// provider is built, so a session that constructs `region` (5 rows)
+/// before `lineitem` (6 B rows) narrows neither, while one that
+/// constructs them in the other order narrows `region` — the SAME table
+/// gets Int32 or Int64 depending on **when** it was built. Mixed
+/// decisions within a session put a `CAST` on a join key, which
+/// suppresses the equijoin's early filter placement: at SF=1000 the
+/// twin arm's Q05 planned `region ⋈ nation` LAST instead of FIRST,
+/// dropping the ASIA filter's pruning and materializing a full-scale
+/// join (>250 GB, kernel OOM) where the single leg ran the same query
+/// in 21.8 s. Same defect class as Σ.PK.1's parted straddle — decided
+/// per-part there, per-table here — and the same remedy: observe every
+/// member first, then let all members decide alike.
+///
+/// Callers pass one representative parquet path per table (any part).
+/// Returns whether the dataset classifies large after folding them all.
+pub fn observe_dataset(paths: &[String]) -> bool {
+    for p in paths {
+        let max = dir_max_parquet_rows(Path::new(p));
+        if max > 0 {
+            MAX_TABLE_ROWS_SEEN.fetch_max(max, Ordering::Relaxed);
+        }
+    }
+    large_scale_seen()
+}
+
 /// Record a parquet file at provider-construction time: memoized
 /// max-sibling-rows scan of its parent directory, folded into the process
 /// high-water mark. Returns whether the dataset classifies large **right
 /// now** (callers that must decide at construction time — the narrow-keys
 /// schema advertisement — use the return value; rule-time callers use
 /// [`large_scale_seen`]).
+///
+/// Order-sensitive by construction: a table observed before the dataset's
+/// biggest table sees a lower mark than one observed after. Sessions that
+/// register several tables must call [`observe_dataset`] over all of them
+/// first — see that function's Σ.TW.SCHEMA note.
 pub fn observe_file(path: &str) -> bool {
     let max = dir_max_parquet_rows(Path::new(path));
     if max > 0 {
