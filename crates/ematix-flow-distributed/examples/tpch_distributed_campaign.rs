@@ -104,6 +104,30 @@ use ematix_flow_distributed::mesh_gate::AdaptiveMeshGateRule;
 use serde::Serialize;
 use url::Url;
 
+/// OOM.SF1000 (2026-07-17): run the campaign coordinator on mimalloc,
+/// matching every production binary (`flow-worker`, CLI — see their
+/// `alloc_guard` tests). The coordinator executes the twin arm and all
+/// memo probes IN-PROCESS; on the system allocator a 20-query SF=1000
+/// sweep retained 239 GB of anon-RSS (freed but never returned) and the
+/// kernel OOM-killed Q21's twin probe before the engine's pool
+/// accounting could refuse-and-reroute. mimalloc + the gated
+/// `mi_collect` below make heap release possible at all.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Production-parity heap release between measurements — the exact
+/// discipline `run_shard` applies at work-unit completion (gate v3,
+/// `heap_pressure`): collect only under real pressure (current RSS ≥
+/// max(6144 MB, RAM/4)), so small-working-set sweeps keep their warm
+/// heap (the measured +6.1% SF=10 tax) while big sweeps return freed
+/// segments instead of ratcheting toward the kernel OOM killer.
+/// EMAT_MI_COLLECT: 0=never, 1=always, unset=auto.
+fn release_heap_if_pressured() {
+    if ematix_flow_core::heap_pressure::should_mi_collect() {
+        unsafe { libmimalloc_sys::mi_collect(true) };
+    }
+}
+
 /// Inline `WorkerResolver` — mirrors `ematix_flow_distributed::StaticWorkerResolver`,
 /// which is private to that crate. Same shape, returns the fixed peer list.
 #[derive(Clone)]
@@ -156,6 +180,13 @@ struct QueryStats {
     plan_ms_trials: Vec<f64>,
     /// Median of `plan_ms_trials` (NaN-skipping, same as median_ms).
     median_plan_ms: f64,
+    /// Coordinator-process resident set (MB) sampled after this query's
+    /// last trial. OOM.SF1000 regression sentinel: on the r7i.8xlarge
+    /// the pre-fix suite ratcheted monotonically to 239 GB and the
+    /// kernel killed Q21's twin probe; post-fix (mimalloc + gated
+    /// `mi_collect`) this column must plateau, not ratchet. `None` when
+    /// the platform read fails.
+    rss_mb_after: Option<f64>,
 }
 
 /// `plan_mode` label for [`QueryStats`] — the network-boundary walker
@@ -960,6 +991,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(e) => eprintln!("  probe[{pass}] {} FAILED: {e}", arm.label()),
                     }
+                    // OOM.SF1000: probes are the heaviest allocations in
+                    // the suite (each arm executes the full query); return
+                    // freed heap under pressure so 20 queries of probe
+                    // residue can't starve Q21's twin arm.
+                    release_heap_if_pressured();
                 }
             }
             if probe_rows.windows(2).any(|w| w[0].1 != w[1].1) {
@@ -1015,6 +1051,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
             }
+            // OOM.SF1000: untimed region — same release discipline as
+            // the probes.
+            release_heap_if_pressured();
         }
 
         // Measured trials.
@@ -1043,6 +1082,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     plan_ms_trials.push(f64::NAN);
                 }
             }
+            // OOM.SF1000: after the timer stops, exactly where
+            // `run_shard` collects at work-unit completion — never
+            // inside a measured window.
+            release_heap_if_pressured();
         }
 
         let med = median(&trials_ms);
@@ -1050,8 +1093,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let first = trials_ms.first().copied().unwrap_or(f64::NAN);
         let med35 = median_trials_3_5(&trials_ms);
         let med_plan = median(&plan_ms_trials);
+        let rss_mb_after = ematix_flow_core::heap_pressure::current_rss_mb();
         eprintln!(
-            "  median={med:.2}ms p95={p95v:.2}ms first={first:.2}ms med(3-5)={med35:.2}ms plan={med_plan:.2}ms rows={rows_returned}"
+            "  median={med:.2}ms p95={p95v:.2}ms first={first:.2}ms med(3-5)={med35:.2}ms plan={med_plan:.2}ms rows={rows_returned} rss={}MB",
+            rss_mb_after.map_or("?".to_string(), |r| format!("{r:.0}"))
         );
 
         // EMAT_CACHE_STATS=1 diagnostic: per-query DELTA of the process-global
@@ -1095,6 +1140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scan_bytes,
                 plan_ms_trials,
                 median_plan_ms: med_plan,
+                rss_mb_after,
             },
         );
     }
@@ -1219,6 +1265,31 @@ fn find_workspace_root() -> Option<PathBuf> {
 /// datafusion-distributed stage-splitter appended LAST.
 ///
 /// Run: `cargo test -p ematix-flow-distributed --example tpch_distributed_campaign`
+#[cfg(test)]
+mod alloc_guard {
+    // OOM.SF1000 (2026-07-17): the AUTO leg's coordinator runs the twin
+    // arm IN-PROCESS — 20 SF=1000 queries × (6 probes + warmups + trials)
+    // on the system allocator accumulated 239 GB of anon-RSS on a 247 GB
+    // r7i.8xlarge and the kernel OOM-killed Q21's twin probe, twice,
+    // before the engine's pool accounting could refuse-and-reroute. The
+    // campaign must run on mimalloc like every production binary
+    // (`flow-worker`, CLI) so `mi_collect` can actually return heap.
+    // `mi_is_in_heap_region` returns false for a system-malloc pointer,
+    // so this is RED without the `#[global_allocator]` in this file.
+    #[test]
+    fn global_allocator_is_mimalloc() {
+        let buf: Vec<u8> = vec![0xA5u8; 64 * 1024];
+        let p = buf.as_ptr() as *const core::ffi::c_void;
+        let in_mimalloc = unsafe { libmimalloc_sys::mi_is_in_heap_region(p) };
+        core::hint::black_box(&buf);
+        assert!(
+            in_mimalloc,
+            "global allocator is NOT mimalloc — the campaign coordinator \
+             would repeat the SF=1000 Q21 OOM (heap never returned to the OS)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod campaign_preset_parity_tests {
     use super::*;
