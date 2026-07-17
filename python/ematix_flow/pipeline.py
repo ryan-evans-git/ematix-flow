@@ -759,6 +759,11 @@ class RetryPolicy:
     backoff: str = "fixed"
     base_secs: int = 0
     max_backoff_secs: int | None = None
+    # True iff the operator passed a `retry=` policy explicitly. Lets us
+    # distinguish an opted-in retry budget of 1 (exhausting it is a
+    # `gave_up` verdict) from the default no-retry policy (a failure is
+    # just `failed` — "no retries" is not "exhausted a budget").
+    explicit: bool = False
 
 
 @dataclass
@@ -818,6 +823,7 @@ def _build_retry_policy(name: str, raw: dict | None) -> RetryPolicy:
         backoff=backoff,
         base_secs=base_secs,
         max_backoff_secs=max_backoff_secs,
+        explicit=True,
     )
 
 
@@ -1471,19 +1477,29 @@ def run_due_with_dag_detailed(
         else:
             prev = _ATTEMPT_STATE.get(name)
             attempt_count = (prev.attempt_count if prev else 0) + 1
-            # `gave_up` latches only for a *bounded retry cycle* the
-            # operator opted into (max_attempts > 1). With the default
-            # no-retry policy (max_attempts == 1), a single failure must
-            # not permanently disable the pipeline — it simply fires
-            # again on its next scheduled tick. (Without this guard the
-            # first failure set gave_up=True, which the run-due + loop
-            # gates skip forever, since state only clears on success —
-            # which can never happen while it's skipped.)
-            gave_up = policy.max_attempts > 1 and attempt_count >= policy.max_attempts
+            exhausted = attempt_count >= policy.max_attempts
+            # Two distinct notions that must not be conflated:
+            #
+            # `latch_gave_up` — the persistent skip-gate stored on
+            #   AttemptState. It latches only for a *bounded retry cycle*
+            #   the operator opted into with max_attempts > 1. With the
+            #   default no-retry policy (max_attempts == 1) a single
+            #   failure must NOT permanently disable the pipeline: the
+            #   run-due + loop gates skip a gave-up pipeline until state
+            #   clears on success, which can never happen while it's
+            #   skipped. (Hardening regression guarded here.)
+            #
+            # `budget_gave_up` — the *verdict* surfaced to alerters and
+            #   on FailedEvent. An explicitly-configured retry budget
+            #   that runs out (including an explicit max_attempts == 1)
+            #   is a give-up; the default no-retry policy is not, because
+            #   "no retries" should not read as "exhausted a budget".
+            latch_gave_up = policy.max_attempts > 1 and exhausted
+            budget_gave_up = policy.explicit and exhausted
             new_state = AttemptState(
                 attempt_count=attempt_count,
                 last_attempt_at=now,
-                gave_up=gave_up,
+                gave_up=latch_gave_up,
             )
             _ATTEMPT_STATE[name] = new_state
             if run_log is not None:
@@ -1497,10 +1513,10 @@ def run_due_with_dag_detailed(
                 error_message=err_msg,
                 error_type=err_type,
                 attempt_count=attempt_count,
-                gave_up=gave_up,
+                gave_up=budget_gave_up,
             ))
             # Always emit a `failed` event; emit an additional
-            # `gave_up` if this attempt exhausted max_attempts.
+            # `gave_up` when an explicit retry budget is exhausted.
             _fan_out_alert(
                 alerters,
                 AlertEvent_local(
@@ -1511,10 +1527,10 @@ def run_due_with_dag_detailed(
                     error_type=err_type,
                     attempt_count=attempt_count,
                     max_attempts=policy.max_attempts,
-                    gave_up=gave_up,
+                    gave_up=budget_gave_up,
                 ),
             )
-            if gave_up:
+            if budget_gave_up:
                 _fan_out_alert(
                     alerters,
                     AlertEvent_local(
