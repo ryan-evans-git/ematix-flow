@@ -746,7 +746,14 @@ def create_app(
         except QueryError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         max_rows = payload.get("max_rows")
-        job_id = query_jobs.submit(lambda: run_query(datasource.url, cleaned, max_rows))
+        from ematix_flow.web.query_jobs import QueryJobCapacityError
+
+        try:
+            job_id = query_jobs.submit(
+                lambda: run_query(datasource.url, cleaned, max_rows)
+            )
+        except QueryJobCapacityError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
         return {"job_id": job_id, "status": "pending"}
 
     @app.get("/api/query/jobs/{job_id}")
@@ -1652,10 +1659,17 @@ def create_app(
         assert history is not None
         selection = _parse_selection(body, default_all=True)
         max_attempts = body.get("max_attempts")
-        if max_attempts is not None and int(max_attempts) < 1:
-            raise HTTPException(
-                status_code=400, detail="max_attempts must be >= 1"
-            )
+        if max_attempts is not None:
+            try:
+                max_attempts = int(max_attempts)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400, detail="max_attempts must be an integer"
+                ) from exc
+            if max_attempts < 1:
+                raise HTTPException(
+                    status_code=400, detail="max_attempts must be >= 1"
+                )
         import uuid
         from datetime import datetime
 
