@@ -1471,7 +1471,15 @@ def run_due_with_dag_detailed(
         else:
             prev = _ATTEMPT_STATE.get(name)
             attempt_count = (prev.attempt_count if prev else 0) + 1
-            gave_up = attempt_count >= policy.max_attempts
+            # `gave_up` latches only for a *bounded retry cycle* the
+            # operator opted into (max_attempts > 1). With the default
+            # no-retry policy (max_attempts == 1), a single failure must
+            # not permanently disable the pipeline — it simply fires
+            # again on its next scheduled tick. (Without this guard the
+            # first failure set gave_up=True, which the run-due + loop
+            # gates skip forever, since state only clears on success —
+            # which can never happen while it's skipped.)
+            gave_up = policy.max_attempts > 1 and attempt_count >= policy.max_attempts
             new_state = AttemptState(
                 attempt_count=attempt_count,
                 last_attempt_at=now,
@@ -1857,6 +1865,40 @@ def is_due(
     except Exception as e:
         raise ValueError(f"invalid cron expression {schedule!r}: {e}") from e
     return base < next_fire <= now
+
+
+def matched_fire_time(
+    schedule: str | None,
+    now: datetime,
+    interval_seconds: int,
+    *,
+    tz: Any = None,
+) -> datetime | None:
+    """The scheduled fire datetime that makes :func:`is_due` True for
+    the window ``(now - interval_seconds, now]``, or ``None`` when the
+    schedule is not due. Same window + ``tz=`` semantics as
+    :func:`is_due`; used by the scheduler to dedupe a pipeline against
+    the specific cron fire-slot it already ran (so a run that completes
+    inside the match window isn't re-dispatched on every later poll)."""
+    if schedule is None:
+        return None
+    from croniter import croniter
+
+    tz_resolved = _resolve_tz(tz)
+    try:
+        base = now - timedelta(seconds=interval_seconds)
+        if tz_resolved is not None:
+            base_ref = base.astimezone(tz_resolved)
+            now_ref = now.astimezone(tz_resolved)
+        else:
+            base_ref, now_ref = base, now
+        cron = croniter(schedule, base_ref)
+        next_fire = cron.get_next(datetime)
+    except Exception as e:
+        raise ValueError(f"invalid cron expression {schedule!r}: {e}") from e
+    if base_ref < next_fire <= now_ref:
+        return next_fire
+    return None
 
 
 def _resolve_tz(tz: Any) -> Any:

@@ -62,9 +62,10 @@ def test_detailed_returns_fired_failed_skipped():
     result = p.run_due_with_dag_detailed(["ok", "boom"])
     assert [e.name for e in result.fired] == ["ok"]
     assert [e.name for e in result.failed] == ["boom"]
-    # First fail with default policy (max_attempts=1) → gave_up=True.
+    # Default policy (max_attempts=1, no retries): a single failure is
+    # NOT gave_up — the pipeline fires again on its next schedule.
     assert result.failed[0].error_message == "kaboom"
-    assert result.failed[0].gave_up is True
+    assert result.failed[0].gave_up is False
 
 
 def test_detailed_records_skip_reason_for_stale_upstream():
@@ -167,7 +168,7 @@ def test_cli_run_due_reports_attempt_count_in_output(tmp_path, monkeypatch, caps
     @p.register(
         name="dies",
         schedule="@hourly",
-        retry={"max_attempts": 1, "backoff": "fixed", "base_secs": 0},
+        retry={"max_attempts": 2, "backoff": "fixed", "base_secs": 0},
     )
     def _dies():
         raise RuntimeError("boom")
@@ -183,5 +184,7 @@ def test_cli_run_due_reports_attempt_count_in_output(tmp_path, monkeypatch, caps
     failed = last_json["failed"]
     assert len(failed) == 1
     assert failed[0]["pipeline"] == "dies"
-    # max_attempts=1 → gave_up=True after first failure.
-    assert failed[0].get("gave_up") is True
+    # First of two allowed attempts failed: attempt_count surfaced,
+    # still cycling (not yet gave_up).
+    assert failed[0].get("attempt_count") == 1
+    assert failed[0].get("gave_up") is False

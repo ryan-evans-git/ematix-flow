@@ -177,6 +177,14 @@ def run_scheduler(
                 interval_seconds=interval_seconds,
                 now=now,
             )
+        except Exception:
+            # A tick must never kill the daemon. Individual dispatch
+            # failures are already contained in `_dispatch_one`; this is
+            # the backstop for anything else (RunLog hiccup,
+            # order_for_run_due, pending-action bookkeeping). Log, count,
+            # and carry on to the next poll.
+            log.exception("scheduler: tick failed; continuing to next poll")
+            _safe_metric(metrics, "inc_runs", "_scheduler", "tick_error")
         finally:
             # Always release the leader lock so another replica can
             # take over if we die. The lease would expire anyway, but
@@ -255,9 +263,13 @@ def _walk_and_dispatch(
             type(e).__name__, e,
         )
 
+    # Honor each pipeline's `timezone=` when matching its cron schedule
+    # (task #558). Without `tz=`, `0 9 * * *` fires at 09:00 UTC no
+    # matter what the pipeline declared.
+    by_name = {sp.name: sp for sp in pipeline.list_pipelines()}
     due = [
-        sp.name for sp in pipeline.list_pipelines()
-        if pipeline.is_due(sp.schedule, now, interval_seconds)
+        sp.name for sp in by_name.values()
+        if pipeline.is_due(sp.schedule, now, interval_seconds, tz=sp.timezone)
     ]
     if not due:
         return
@@ -269,6 +281,22 @@ def _walk_and_dispatch(
 
     for name in ordered:
         if not _eligible_to_fire(name, now):
+            continue
+
+        # Fire-slot dedup: the cron match window (interval_seconds) is
+        # wider than the poll interval, so a single fire evaluates as
+        # "due" for several consecutive ticks. If this pipeline already
+        # ran for the current fire-slot, don't re-dispatch it — the
+        # claim lease only covers the in-flight window, and the worker
+        # releases it on completion, so without this a job that finishes
+        # in < interval_seconds re-fires every poll.
+        sp = by_name.get(name)
+        if sp is not None and _already_ran_this_slot(
+            name, sp, now, interval_seconds
+        ):
+            log.debug(
+                "scheduler: %s already ran for the current fire-slot", name
+            )
             continue
 
         claim = run_log.claim(name, worker_id, lease_seconds=lease_seconds)
@@ -296,6 +324,31 @@ def _walk_and_dispatch(
             alerters=alerters,
             metrics=metrics,
         )
+
+
+def _already_ran_this_slot(
+    name: str, sp, now: datetime, interval_seconds: int
+) -> bool:
+    """True if `name` already has a recorded run at/after the cron
+    fire-slot that makes it due for this window. Uses `_LAST_RUN`
+    (refreshed from the RunLog each tick), so the worker's completion
+    write is what closes the window against re-dispatch."""
+    slot = pipeline.matched_fire_time(
+        sp.schedule, now, interval_seconds, tz=sp.timezone
+    )
+    if slot is None:
+        return False
+    rec = pipeline._LAST_RUN.get(name)
+    if rec is None:
+        return False
+    last_ts = rec[0]
+    # Compare as absolute instants; coerce a naive last_ts to UTC and a
+    # naive slot (only possible when tz is None and `now` is naive) too.
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=UTC)
+    if slot.tzinfo is None:
+        slot = slot.replace(tzinfo=UTC)
+    return last_ts >= slot
 
 
 def _eligible_to_fire(name: str, now: datetime) -> bool:
@@ -339,9 +392,24 @@ def _dispatch_one(
             spec.pipeline_name, claim_token[:8],
         )
         _safe_metric(metrics, "inc_runs", spec.pipeline_name, "dispatched")
-    except DispatchError as e:
+    except Exception as e:
         # Spawn failed — release the claim so the next tick can retry.
-        run_log.release(claim_token)
+        # We catch every exception, not just DispatchError: an executor
+        # can raise OSError (fd exhaustion), an unwrapped k8s/boto error,
+        # etc., and none of those should escape to kill the long-running
+        # daemon or leak the claim lease until it expires.
+        if not isinstance(e, DispatchError):
+            log.exception(
+                "scheduler: unexpected error dispatching pipeline=%s",
+                spec.pipeline_name,
+            )
+        try:
+            run_log.release(claim_token)
+        except Exception as rel_exc:
+            log.warning(
+                "scheduler: failed to release claim after dispatch error: %s",
+                rel_exc,
+            )
         event = DispatchFailedEvent(
             pipeline=spec.pipeline_name,
             error_type=type(e).__name__,
