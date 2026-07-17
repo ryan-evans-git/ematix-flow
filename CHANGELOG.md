@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-17
+
+First stable release. The public Python surface (decorator names,
+config schema, `run_pipeline` distributed-transform API) is now under
+semantic-versioning stability guarantees — no breaking changes without
+a major bump. TPC-H stands at all four scales on AWS: at SF=1000 (1 TB)
+one r7i.8xlarge runs the full 22-query suite in **384.2 s** on the mesh
+AUTO path and **417.0 s** single-node, ahead of DuckDB's 467.9 s on the
+same box class and the 4-node Trino/PySpark clusters on twice the
+hardware.
+
 ### Added
 
 - **Σ.JS.1 sampled join-side correction (`SampledJoinSideRule`,
@@ -1686,7 +1697,8 @@ Highlights of what's NOT in v0.1.0:
 - Iceberg-style transactional updates against object stores (use
   Delta for that today).
 
-[Unreleased]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/ryan-evans-git/ematix-flow/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.14.2...v1.0.0
 [0.12.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.9.0...v0.10.0
