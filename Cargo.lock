@@ -3945,7 +3945,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "ematix-flow-cli"
-version = "0.14.2"
+version = "1.0.0"
 dependencies = [
  "arrow-array 58.3.0",
  "arrow-ipc 58.3.0",
@@ -3979,7 +3979,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-core"
-version = "0.14.2"
+version = "1.0.0"
 dependencies = [
  "ahash 0.8.12",
  "apache-avro 0.21.0",
@@ -4058,7 +4058,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-distributed"
-version = "0.14.2"
+version = "1.0.0"
 dependencies = [
  "arrow-array 58.3.0",
  "arrow-schema 58.3.0",
@@ -4087,7 +4087,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-hash-join"
-version = "0.14.2"
+version = "1.0.0"
 dependencies = [
  "criterion",
  "rand 0.9.4",
@@ -4095,11 +4095,11 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-push"
-version = "0.14.2"
+version = "1.0.0"
 
 [[package]]
 name = "ematix-flow-py"
-version = "0.14.2"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "arrow-array 58.3.0",
