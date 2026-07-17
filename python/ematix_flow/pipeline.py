@@ -1783,14 +1783,22 @@ def upsert_feature_view_metadata(
         )
         """
     )
-    keys_array = "ARRAY[" + ", ".join(f"'{k}'" for k in fv.entity_keys) + "]::text[]"
-    ets = f"'{fv.event_timestamp_column}'" if fv.event_timestamp_column else "NULL"
+    # Quote every interpolated string literal (escaping embedded single
+    # quotes). These come from developer-defined class attributes so the
+    # injection risk is low, but a name/version/key containing a quote
+    # would otherwise produce malformed SQL — and the escaping must be
+    # applied consistently, not only to description/owner.
+    def _lit(value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    keys_array = "ARRAY[" + ", ".join(_lit(k) for k in fv.entity_keys) + "]::text[]"
+    ets = _lit(fv.event_timestamp_column) if fv.event_timestamp_column else "NULL"
     ttl = str(fv.ttl_seconds) if fv.ttl_seconds is not None else "NULL"
     sla = (
         str(fv.freshness_sla_seconds) if fv.freshness_sla_seconds is not None else "NULL"
     )
-    desc = "'" + (fv.description or "").replace("'", "''") + "'" if fv.description else "NULL"
-    owner = "'" + (fv.owner or "").replace("'", "''") + "'" if fv.owner else "NULL"
+    desc = _lit(fv.description) if fv.description else "NULL"
+    owner = _lit(fv.owner) if fv.owner else "NULL"
     target_connection.execute(
         f"""
         INSERT INTO ematix_flow.feature_views
@@ -1798,7 +1806,8 @@ def upsert_feature_view_metadata(
              event_timestamp_column, ttl_seconds, description, owner,
              freshness_sla_seconds, last_synced_at)
         VALUES
-            ('{fv.name}', '{fv.schema}', '{fv.tablename}', '{fv.feature_version}',
+            ({_lit(fv.name)}, {_lit(fv.schema)}, {_lit(fv.tablename)},
+             {_lit(fv.feature_version)},
              {keys_array}, {ets}, {ttl}, {desc}, {owner}, {sla}, now())
         ON CONFLICT (name) DO UPDATE SET
             entity_keys = EXCLUDED.entity_keys,

@@ -515,7 +515,13 @@ class _Sql:
     expression: str
 
     def to_sql(self, col: str) -> str:
-        return self.expression.replace("col", col)
+        # Replace `col` only as a whole word, not as a substring — so an
+        # expression like `collate(col, 'C')` or one referencing a real
+        # column named `col_count` isn't mangled (the old str.replace
+        # turned `collate` into `<colname>late`).
+        import re
+
+        return re.sub(r"\bcol\b", lambda _m: col, self.expression)
 
 
 def sql(expression: str) -> _Sql:
