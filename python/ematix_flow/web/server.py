@@ -267,6 +267,10 @@ def create_app(
         version="0.4.0",
         docs_url="/api/docs",
         redoc_url=None,
+        # Keep the schema under /api/ so the bearer + RBAC middlewares
+        # (which only gate paths under /api/) cover it. The default
+        # /openapi.json would expose the full route map unauthenticated.
+        openapi_url="/api/openapi.json",
     )
 
     # Task #6: bearer-token middleware. Applied as an HTTP-level
@@ -742,7 +746,14 @@ def create_app(
         except QueryError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         max_rows = payload.get("max_rows")
-        job_id = query_jobs.submit(lambda: run_query(datasource.url, cleaned, max_rows))
+        from ematix_flow.web.query_jobs import QueryJobCapacityError
+
+        try:
+            job_id = query_jobs.submit(
+                lambda: run_query(datasource.url, cleaned, max_rows)
+            )
+        except QueryJobCapacityError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
         return {"job_id": job_id, "status": "pending"}
 
     @app.get("/api/query/jobs/{job_id}")
@@ -764,6 +775,10 @@ def create_app(
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:  # type: ignore[unused-function]
+        # Clamp so a caller can't ask the history store for an unbounded
+        # row set (mirrors the quality-runs endpoint's 1–500 bound).
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
         if history is not None:
             records, total = history.list_runs(
                 pipeline=pipeline, status=status, limit=limit, offset=offset
@@ -1644,10 +1659,17 @@ def create_app(
         assert history is not None
         selection = _parse_selection(body, default_all=True)
         max_attempts = body.get("max_attempts")
-        if max_attempts is not None and int(max_attempts) < 1:
-            raise HTTPException(
-                status_code=400, detail="max_attempts must be >= 1"
-            )
+        if max_attempts is not None:
+            try:
+                max_attempts = int(max_attempts)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400, detail="max_attempts must be an integer"
+                ) from exc
+            if max_attempts < 1:
+                raise HTTPException(
+                    status_code=400, detail="max_attempts must be >= 1"
+                )
         import uuid
         from datetime import datetime
 

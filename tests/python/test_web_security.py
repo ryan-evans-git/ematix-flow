@@ -34,6 +34,15 @@ class TestDenylist:
             "SELECT load_extension('evil.so')",
             "SELECT * FROM glob('/etc/*')",
             "WITH x AS (SELECT * FROM read_csv('/etc/passwd')) SELECT * FROM x",
+            # Replacement-scan / bare-path-in-table-position: no function
+            # token, so the denylist misses these — the real bypass.
+            "SELECT * FROM 'file:///etc/passwd'",
+            "SELECT * FROM '/etc/passwd'",
+            "SELECT * FROM 'https://evil.example/x.parquet'",
+            "SELECT * FROM 's3://bucket/x.parquet'",
+            "select * from\n  'data.parquet'",
+            "SELECT a FROM t JOIN 'file.parquet' ON t.id = 1",
+            "WITH x AS (SELECT * FROM 'sneaky.parquet') SELECT * FROM x",
             "EXPLAIN ATTACH DATABASE 'other.db' AS o",
         ],
     )
@@ -48,10 +57,38 @@ class TestDenylist:
             "SELECT payload, download_url FROM t",
             "SELECT region, SUM(amount) FROM sales GROUP BY region",
             "SELECT * FROM pragma_table_info('sales')",  # catalog-style, allowed
+            # Double-quoted identifiers are NOT paths — must stay allowed.
+            'SELECT * FROM "weird table name"',
+            # A string literal in WHERE/SELECT position is a value, not a
+            # table — must not be mistaken for a replacement scan.
+            "SELECT * FROM t WHERE url = 'https://example.com/page'",
+            "SELECT * FROM t WHERE path = '/var/log/app.log'",
+            "SELECT 'file.parquet' AS label FROM t",
         ],
     )
     def test_allows_benign_queries(self, sql):
         assert guard_readonly(sql)
+
+
+class TestErrorSanitization:
+    def test_sanitize_redacts_datasource_url(self):
+        from ematix_flow.web.analytics import _sanitize_error
+
+        url = "postgres://alice:s3cr3t@db.internal:5432/prod"
+        msg = f"could not connect to {url}: timeout"
+        out = _sanitize_error(msg, url)
+        assert "s3cr3t" not in out
+        assert url not in out
+
+    def test_sanitize_redacts_inline_credentials_generically(self):
+        from ematix_flow.web.analytics import _sanitize_error
+
+        # Even a URL the function wasn't told about (e.g. an ATTACH'd
+        # secondary DSN echoed by the driver) must have its credentials
+        # stripped.
+        msg = "auth failed for mysql://bob:hunter2@10.0.0.5/db"
+        out = _sanitize_error(msg, "sqlite:///local.db")
+        assert "hunter2" not in out
 
 
 class TestTimeoutWrapper:
@@ -103,3 +140,42 @@ class TestEndpointGuards:
         monkeypatch.setattr(analytics, "run_query", _timeout)
         r = client.post("/api/query", json={"datasource_id": "db", "sql": "SELECT 1"})
         assert r.status_code == 504
+
+    def test_engine_error_does_not_leak_credentials(self, tmp_path, monkeypatch):
+        # A datasource URL with an embedded password; force the engine to
+        # raise an error that echoes the DSN. The HTTP 400 detail must
+        # not contain the password.
+        url = "postgres://alice:s3cr3t@db.internal:5432/prod"
+        app = create_app(datasources={"pg": url})
+        client = TestClient(app)
+
+        def _boom(*a, **k):
+            raise RuntimeError(f"connection refused for {url}")
+
+        monkeypatch.setattr(analytics, "_run_with_timeout", _boom)
+        r = client.post("/api/query", json={"datasource_id": "pg", "sql": "SELECT 1"})
+        assert r.status_code == 400
+        assert "s3cr3t" not in r.text
+        assert url not in r.text
+
+
+class TestRunsPaginationClamp:
+    def test_runs_limit_is_clamped(self):
+        app = create_app(datasources={"db": "sqlite:///:memory:"})
+        client = TestClient(app)
+        # An absurd limit must be accepted (200) but clamped, not passed
+        # through unbounded. The stub path echoes the slice; we just
+        # assert it doesn't error and returns the documented shape.
+        r = client.get("/api/runs?limit=100000000&offset=-5")
+        assert r.status_code == 200
+        assert "runs" in r.json() and "total" in r.json()
+
+
+class TestOpenApiNotExposed:
+    def test_openapi_under_api_prefix(self):
+        # The schema must live under /api/ so the auth middleware covers
+        # it; the default /openapi.json would be unauthenticated.
+        app = create_app(datasources={"db": "sqlite:///:memory:"})
+        client = TestClient(app)
+        assert client.get("/openapi.json").status_code == 404
+        assert client.get("/api/openapi.json").status_code == 200

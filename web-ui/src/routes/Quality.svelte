@@ -103,15 +103,29 @@
           </thead>
           <tbody>
             {#each runs as r}
-              <tr class="row" on:click={() => toggle(r.id)}>
+              <tr
+                class="row"
+                tabindex="0"
+                role="button"
+                aria-expanded={expanded === r.id}
+                on:click={() => toggle(r.id)}
+                on:keydown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    toggle(r.id);
+                  }
+                }}
+              >
                 <td class="mono">{r.pipeline}</td>
                 <td class="mono">{r.schema ? `${r.schema}.` : ""}{r.table}</td>
                 <td><span class="pill verdict-{r.verdict}">{r.verdict}</span></td>
                 <td>
-                  {#if r.checks_failed > 0}
-                    <span class="fail-count">{r.checks_failed}</span> / {r.checks_total} failed
+                  {#if r.checks_total === 0}
+                    <span class="subtle">no checks ran</span>
                   {:else}
-                    {r.checks_total} passed
+                    {#if r.checks_failed > 0}<span class="fail-count">{r.checks_failed} failed</span>{/if}
+                    {#if r.checks_errored > 0}<span class="err-count">{r.checks_errored} errored</span>{/if}
+                    <span class="pass-count">{r.checks_total - r.checks_failed - (r.checks_errored || 0)}</span> / {r.checks_total} passed
                   {/if}
                 </td>
                 <td class="mono subtle">{fmtTime(r.finished_at)}</td>
@@ -159,7 +173,7 @@
   .verdict-pass, .state-healthy { color: var(--success); background: var(--success-soft); border-color: var(--success); }
   .verdict-warn, .state-warning { color: var(--warning); background: var(--warning-soft); border-color: var(--warning); }
   .verdict-fail, .state-breached { color: var(--danger); background: var(--danger-soft); border-color: var(--danger); }
-  .verdict-error { color: var(--fg-muted); }
+  .verdict-error, .verdict-empty { color: var(--fg-muted); }
   .state-unknown { color: var(--fg-subtle); }
 
   .fresh-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
@@ -174,8 +188,11 @@
        text-transform: uppercase; letter-spacing: 0.04em; padding: 6px 10px; border-bottom: 1px solid var(--border); }
   td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
   tr.row { cursor: pointer; }
-  tr.row:hover td { background: var(--surface-2); }
-  .fail-count { color: var(--danger); font-weight: 700; }
+  tr.row:hover td, tr.row:focus-visible td { background: var(--surface-2); }
+  tr.row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .fail-count { color: var(--danger); font-weight: 700; margin-right: 6px; }
+  .err-count { color: var(--fg-muted); font-weight: 700; margin-right: 6px; }
+  .pass-count { color: var(--success); font-weight: 700; }
   .chev { color: var(--fg-subtle); width: 1em; }
   .detail-row td { background: var(--surface-2); }
   .assertions { display: flex; flex-direction: column; gap: 6px; padding: 4px 2px; }

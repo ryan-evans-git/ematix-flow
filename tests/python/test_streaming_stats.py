@@ -121,6 +121,19 @@ def test_summarize_computes_throughput_and_cycle_time() -> None:
     assert s["span_seconds"] == pytest.approx(60.0)
 
 
+def test_summarize_clamps_counter_reset_to_zero() -> None:
+    # Daemon restarted mid-window: newest counters are SMALLER than
+    # oldest. Rates must clamp to 0, never go negative.
+    samples: deque[_Sample] = deque(maxlen=8)
+    samples.append(_Sample(ts=1000.0, rows_consumed=5000, rows_written=4900, batches=200, errors=9))
+    samples.append(_Sample(ts=1060.0, rows_consumed=10, rows_written=9, batches=1, errors=0))
+    s = summarize_window(samples, now=1060.0, window_seconds=60.0)
+    assert s["rows_consumed_per_sec"] == 0.0
+    assert s["rows_written_per_sec"] == 0.0
+    assert s["batches_per_sec"] == 0.0
+    assert s["errors_per_sec"] == 0.0
+
+
 def test_summarize_with_no_batches_yields_none_cycle() -> None:
     samples: deque[_Sample] = deque(maxlen=8)
     samples.append(_Sample(ts=1000.0, rows_consumed=0, rows_written=0, batches=0, errors=0))

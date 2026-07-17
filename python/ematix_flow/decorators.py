@@ -1389,7 +1389,17 @@ class _EmatixNamespace:
                     # failed expectation (policy="fail") short-circuits
                     # downstream SQL. Opt-in — no-ops when neither
                     # expectations= nor freshness_sla= was declared.
-                    if expectations is not None or freshness_sla is not None:
+                    # Run the post-write stage only when there is
+                    # actually something to check at run time: explicit
+                    # expectations, or a *column-based* freshness check.
+                    # `freshness_sla` alone (no freshness_column) declares
+                    # a SCHEDULED SLA (evaluated from last-success time by
+                    # the freshness monitor) — running the probe here would
+                    # do nothing but still record a misleading green "pass".
+                    _has_runtime_check = expectations is not None or (
+                        freshness_sla is not None and freshness_column is not None
+                    )
+                    if _has_runtime_check:
                         from ematix_flow import quality as _quality
 
                         _quality.run_quality_stage(

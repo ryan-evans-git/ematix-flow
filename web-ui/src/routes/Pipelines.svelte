@@ -1,5 +1,6 @@
 <script>
   import { onMount } from "svelte";
+  import { modal } from "../lib/a11y.js";
   import { getStreamDlq, listPipelines, runJobNow } from "../lib/api.js";
 
   // Run-now modal state — per-job Run now with optional cascade.
@@ -361,7 +362,7 @@
 
 {#if runNowFor}
   <div class="modal-bg" on:click={closeRunNow} role="presentation">
-    <div class="modal" on:click|stopPropagation role="dialog" aria-label="Run job now">
+    <div class="modal" on:click|stopPropagation role="dialog" aria-modal="true" aria-label="Run job now" use:modal={{ onClose: closeRunNow }}>
       <h3 class="modal-title">Run <span class="mono">{runNowFor}</span> now</h3>
       <p class="dim" style="font-size: 0.85em; margin-bottom: 0.6em;">
         Fires the job once, ignoring any trigger gates.

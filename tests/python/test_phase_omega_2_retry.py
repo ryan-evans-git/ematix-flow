@@ -294,3 +294,46 @@ def test_success_after_partial_failures_resets_state():
     assert calls == ["attempt", "attempt", "attempt"]
     # State cleared on success.
     assert p._ATTEMPT_STATE.get("recovers") is None
+
+
+def test_default_policy_does_not_latch_gave_up_after_one_failure():
+    """Regression: a pipeline with the DEFAULT retry policy
+    (max_attempts=1, i.e. no retries configured) must NOT be
+    permanently disabled by a single failure. `gave_up` is reserved for
+    *bounded retry cycles* the operator explicitly opted into; a
+    no-retry pipeline simply fails this run and fires again on its next
+    scheduled tick."""
+    calls: list[str] = []
+
+    @p.register(name="flaky", schedule="@hourly")  # no retry= → default
+    def _flaky():
+        calls.append("attempt")
+        if len(calls) == 1:
+            raise RuntimeError("transient")
+        return {}
+
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
+    p.run_due_with_dag(["flaky"], now=t)
+    # One failure must not latch gave_up (which would skip it forever).
+    st = p._ATTEMPT_STATE.get("flaky")
+    assert st is not None and st.gave_up is False
+    # The next scheduled fire runs again (here it succeeds).
+    p.run_due_with_dag(["flaky"], now=t + _dt.timedelta(hours=1))
+    assert calls == ["attempt", "attempt"]
+    # Success clears the attempt record.
+    assert p._ATTEMPT_STATE.get("flaky") is None
+
+
+def test_default_policy_reports_failure_without_gave_up_event():
+    """A default-policy failure surfaces as `failed` with gave_up=False,
+    not as a `gave_up` verdict — 'no retries' should not read as
+    'exhausted a retry budget'."""
+
+    @p.register(name="oncefail", schedule="@hourly")
+    def _once():
+        raise RuntimeError("boom")
+
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
+    res = p.run_due_with_dag_detailed(["oncefail"], now=t)
+    assert [f.name for f in res.failed] == ["oncefail"]
+    assert res.failed[0].gave_up is False

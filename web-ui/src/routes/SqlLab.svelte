@@ -49,7 +49,11 @@
     }
   });
 
+  let catalogSeq = 0;
+
   async function onDatasourceChange() {
+    const seq = ++catalogSeq;
+    const myId = datasourceId;
     tables = [];
     columnsByTable = {};
     expanded = {};
@@ -58,14 +62,20 @@
     catalogError = "";
     if (!datasourceId) return;
     try {
-      const schemas = (await listSchemas(datasourceId)).schemas || [];
+      const schemas = (await listSchemas(myId)).schemas || [];
+      // A fast switch to another datasource must not let this response
+      // populate the catalog for the wrong source.
+      if (seq !== catalogSeq) return;
       schema = schemas[0] || "";
       if (schema) {
-        tables = (await listTables(datasourceId, schema)).tables || [];
+        const tbls = (await listTables(myId, schema)).tables || [];
+        if (seq !== catalogSeq) return;
+        tables = tbls;
         // Seed autocomplete with table names (columns fill in on expand).
         schemaMap = Object.fromEntries(tables.map((t) => [t.name, []]));
       }
     } catch (e) {
+      if (seq !== catalogSeq) return;
       catalogError = e.message;
     }
   }

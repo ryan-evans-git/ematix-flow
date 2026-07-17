@@ -11,6 +11,7 @@
   // without confirm_state_reset, and the UI only sends it after
   // the operator types the stream name.
   import { onMount } from "svelte";
+  import { modal } from "../lib/a11y.js";
   import {
     getStreamDlq,
     listStreamDlqRecords,
@@ -454,7 +455,7 @@
     </table>
     <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.5rem;">
       <button class="action" on:click={prevPage} disabled={page === 0}>← prev</button>
-      <span class="mono">page {page}</span>
+      <span class="mono">page {page + 1}</span>
       <button class="action" on:click={nextPage} disabled={records.length < pageSize}>
         next →
       </button>
@@ -550,7 +551,7 @@
 
 {#if confirm}
   <div class="modal-bg" on:click={closeConfirm} role="presentation">
-    <div class="modal" on:click|stopPropagation role="dialog" aria-label={confirmCopy[confirm].title}>
+    <div class="modal" on:click|stopPropagation role="dialog" aria-modal="true" aria-label={confirmCopy[confirm].title} use:modal={{ onClose: closeConfirm }}>
       <h3 class="modal-title">{confirmCopy[confirm].title}</h3>
       <p class="dim" style="font-size: 0.85em;">{confirmCopy[confirm].body}</p>
       {#if confirm === "replay-first"}

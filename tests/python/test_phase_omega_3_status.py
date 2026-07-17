@@ -136,15 +136,22 @@ def test_snapshot_surfaces_in_flight_retry_cycle():
 
 
 def test_snapshot_marks_gave_up():
+    # gave_up applies to a *bounded* retry cycle (max_attempts > 1);
+    # exhausting it marks the pipeline. (A default / max_attempts=1
+    # pipeline never latches gave_up — it just retries next schedule.)
     @p.register(
         name="dies",
         schedule="@hourly",
-        retry={"max_attempts": 1, "backoff": "fixed", "base_secs": 0},
+        retry={"max_attempts": 2, "backoff": "fixed", "base_secs": 0},
     )
     def _dies():
         raise RuntimeError("boom")
 
-    p.run_due_with_dag(["dies"])
+    import datetime as _dt
+
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
+    p.run_due_with_dag(["dies"], now=t)  # attempt 1/2
+    p.run_due_with_dag(["dies"], now=t + _dt.timedelta(seconds=1))  # 2/2 → gave up
     [row] = p.status_snapshot()
     assert row["attempt_state"]["gave_up"] is True
 
@@ -195,12 +202,16 @@ def test_render_marks_gave_up_pipelines():
     @p.register(
         name="dead",
         schedule="@hourly",
-        retry={"max_attempts": 1, "backoff": "fixed", "base_secs": 0},
+        retry={"max_attempts": 2, "backoff": "fixed", "base_secs": 0},
     )
     def _d():
         raise RuntimeError("boom")
 
-    p.run_due_with_dag(["dead"])
+    import datetime as _dt
+
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
+    p.run_due_with_dag(["dead"], now=t)
+    p.run_due_with_dag(["dead"], now=t + _dt.timedelta(seconds=1))  # exhausts 2/2
     txt = p.render_status_table(p.status_snapshot())
     assert "gave up" in txt.lower() or "gave_up" in txt.lower()
 

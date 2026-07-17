@@ -86,6 +86,7 @@ _SCHEMA = """
         verdict       TEXT NOT NULL,
         checks_total  INTEGER NOT NULL DEFAULT 0,
         checks_failed INTEGER NOT NULL DEFAULT 0,
+        checks_errored INTEGER NOT NULL DEFAULT 0,
         detail_json   TEXT NOT NULL DEFAULT '[]',
         started_at    TEXT NOT NULL,
         finished_at   TEXT NOT NULL
@@ -127,6 +128,7 @@ class AnalyticsStore:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode = WAL;")
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             row = self._conn.execute(
                 "SELECT version FROM analytics_schema_version LIMIT 1"
             ).fetchone()
@@ -135,6 +137,20 @@ class AnalyticsStore:
                     "INSERT INTO analytics_schema_version(version) VALUES (?)",
                     (_SCHEMA_VERSION,),
                 )
+
+    def _migrate(self) -> None:
+        """Idempotent additive migrations for DBs created by an earlier
+        schema. `CREATE TABLE IF NOT EXISTS` doesn't add columns to an
+        existing table, so add-if-missing here."""
+        existing = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(quality_runs)")
+        }
+        if "checks_errored" not in existing:
+            self._conn.execute(
+                "ALTER TABLE quality_runs "
+                "ADD COLUMN checks_errored INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -476,6 +492,7 @@ class AnalyticsStore:
             "verdict": row["verdict"],
             "checks_total": row["checks_total"],
             "checks_failed": row["checks_failed"],
+            "checks_errored": row["checks_errored"],
             "assertions": json.loads(row["detail_json"]),
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
@@ -494,8 +511,9 @@ class AnalyticsStore:
             self._conn.execute(
                 "INSERT INTO quality_runs"
                 "(id, pipeline, run_id, table_name, schema_name, verdict, "
-                "checks_total, checks_failed, detail_json, started_at, finished_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "checks_total, checks_failed, checks_errored, detail_json, "
+                "started_at, finished_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     row_id,
                     outcome.pipeline,
@@ -505,6 +523,7 @@ class AnalyticsStore:
                     outcome.verdict,
                     outcome.checks_total,
                     outcome.checks_failed,
+                    outcome.checks_errored,
                     detail,
                     started,
                     finished,

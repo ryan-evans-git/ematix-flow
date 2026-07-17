@@ -269,7 +269,7 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
 
     due: list[str] = [
         sp.name for sp in p.list_pipelines()
-        if p.is_due(sp.schedule, now, args.interval)
+        if p.is_due(sp.schedule, now, args.interval, tz=sp.timezone)
     ]
     if not due:
         print(json.dumps({"ran": [], "failed": [], "skipped": []}, default=str))

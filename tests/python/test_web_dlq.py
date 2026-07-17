@@ -241,6 +241,17 @@ class TestReplay:
         client.post("/api/streams/events_stream/dlq/replay", json={})
         assert ("replay", ("events_stream", {"kind": "all"}, None)) in ops.calls
 
+    def test_replay_non_integer_max_attempts_400s(
+        self, client: TestClient, ops: FakeDlqOps
+    ):
+        # Regression: a non-numeric max_attempts used to reach int() bare
+        # and 500. It must be a clean 400.
+        r = client.post(
+            "/api/streams/events_stream/dlq/replay",
+            json={"selection": {"kind": "all"}, "max_attempts": "abc"},
+        )
+        assert r.status_code == 400
+
     def test_replay_requires_history_store(self, ops: FakeDlqOps):
         client = TestClient(create_app(dlq_ops=ops))
         r = client.post(

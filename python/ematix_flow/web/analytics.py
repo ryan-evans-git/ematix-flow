@@ -66,6 +66,15 @@ _DANGEROUS_SQL = re.compile(
     re.IGNORECASE,
 )
 
+# A DuckDB-style *replacement scan* reads a file/URL directly from table
+# position without any function token — `SELECT * FROM 'file.parquet'`,
+# `FROM 's3://…'`, `FROM '/etc/passwd'` — so the function denylist above
+# misses it entirely. A single-quoted string immediately after FROM/JOIN
+# is a path literal (double-quoted strings there are *identifiers*, not
+# paths, and stay allowed). String literals elsewhere (WHERE/SELECT) are
+# values, not tables, and are unaffected.
+_TABLE_POSITION_PATH = re.compile(r"\b(?:from|join)\s+'", re.IGNORECASE)
+
 # Wall-clock ceiling for a single query, overridable per deployment.
 DEFAULT_QUERY_TIMEOUT_S = 30.0
 
@@ -104,6 +113,25 @@ def _cache_put(key: tuple, value: dict, ttl: float) -> None:
 def clear_result_cache() -> None:
     with _CACHE_LOCK:
         _RESULT_CACHE.clear()
+
+
+# Matches `scheme://user:pass@host` credentials in any URL/DSN so a
+# driver error that echoes a connection string can't leak the password
+# back to the HTTP caller.
+_CREDS_IN_URL = re.compile(r"(://)[^/@\s]+(@)")
+
+
+def _sanitize_error(message: str, url: str | None = None) -> str:
+    """Redact secrets from an engine/driver error before it is returned
+    to the caller. Removes the datasource URL verbatim (it may embed
+    credentials — note ``Datasource.public_dict`` omits it for the same
+    reason) and strips ``user:pass@`` from any other URL the driver
+    echoes."""
+    out = message
+    if url:
+        out = out.replace(url, "<datasource>")
+    out = _CREDS_IN_URL.sub(r"\1<redacted>\2", out)
+    return out
 
 
 class QueryError(ValueError):
@@ -247,6 +275,12 @@ def guard_readonly(sql: str) -> str:
             f"'{token}' is not permitted here — filesystem / network / "
             "cross-database access is blocked for security"
         )
+    if _TABLE_POSITION_PATH.search(core):
+        raise QueryError(
+            "a path/URL string in table position (FROM/JOIN '…') is not "
+            "permitted here — filesystem / network access is blocked for "
+            "security"
+        )
     return core
 
 
@@ -340,7 +374,10 @@ def run_query(
     except QueryError:
         raise
     except Exception as exc:  # engine/connection error -> 400 for the caller
-        raise QueryError(str(exc)) from exc
+        # Never surface a raw driver error verbatim: it can embed the
+        # datasource DSN (with credentials). Redact before returning; the
+        # full detail is available server-side via the exception chain.
+        raise QueryError(_sanitize_error(str(exc), url)) from exc
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
     rows = result["rows"]

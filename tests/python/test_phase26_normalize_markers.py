@@ -335,6 +335,14 @@ def test_sql_substitutes_col_placeholder():
     assert sql(expr).to_sql("email") == expr.replace("col", "email")
 
 
+def test_sql_placeholder_is_whole_word_only():
+    # Regression: `col` inside a larger token must NOT be rewritten.
+    from ematix_flow.normalize import sql
+
+    assert sql("collate(col, 'C')").to_sql("email") == "collate(email, 'C')"
+    assert sql("col_count + col").to_sql("n") == "col_count + n"
+
+
 # --- derive ---------------------------------------------------------------
 
 

@@ -182,10 +182,13 @@ def summarize_window(
             "span_seconds": None,
         }
 
-    rows_in = (newest.rows_consumed - oldest.rows_consumed) / span
-    rows_out = (newest.rows_written - oldest.rows_written) / span
-    batch_rate = (newest.batches - oldest.batches) / span
-    error_rate = (newest.errors - oldest.errors) / span
+    # Counters are monotonic within a daemon lifetime. If the daemon
+    # restarted mid-window they can reset to a smaller value; clamp the
+    # delta to 0 rather than reporting a negative rate.
+    rows_in = max(0, newest.rows_consumed - oldest.rows_consumed) / span
+    rows_out = max(0, newest.rows_written - oldest.rows_written) / span
+    batch_rate = max(0, newest.batches - oldest.batches) / span
+    error_rate = max(0, newest.errors - oldest.errors) / span
     # Avg cycle time = how often a batch completes. Honest as a
     # "loop-cadence" metric; calling it "latency" would overclaim
     # (it includes idle waits between source polls). UI labels it
@@ -250,6 +253,11 @@ class StreamingStatsRecorder:
         self._w1 = window_1m_seconds
         self._w5 = window_5m_seconds
         self._samples: deque[_Sample] = deque(maxlen=max_samples)
+        # Guards _samples: the background thread appends while close()
+        # (main thread) reads. Without it, if the scrape thread outlives
+        # the 5s join, it can append mid-iteration → "deque mutated
+        # during iteration" out of close().
+        self._samples_lock = threading.Lock()
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -325,7 +333,8 @@ class StreamingStatsRecorder:
     def _maybe_scrape(self) -> None:
         sample = scrape_counters(self._metrics_url, self._pipeline_name)
         if sample is not None:
-            self._samples.append(sample)
+            with self._samples_lock:
+                self._samples.append(sample)
 
     # ---- record assembly ------------------------------------------
 
@@ -341,14 +350,19 @@ class StreamingStatsRecorder:
         }
 
     def _build_extras(self, *, now: float) -> dict[str, Any]:
-        latest = self._samples[-1] if self._samples else None
+        # Snapshot the deque under the lock, then compute off the copy —
+        # so a concurrent append from the scrape thread can't mutate the
+        # sequence mid-iteration.
+        with self._samples_lock:
+            samples = list(self._samples)
+        latest = samples[-1] if samples else None
         stats_1m = (
-            summarize_window(self._samples, now=now, window_seconds=self._w1)
+            summarize_window(samples, now=now, window_seconds=self._w1)
             if latest is not None
             else None
         )
         stats_5m = (
-            summarize_window(self._samples, now=now, window_seconds=self._w5)
+            summarize_window(samples, now=now, window_seconds=self._w5)
             if latest is not None
             else None
         )

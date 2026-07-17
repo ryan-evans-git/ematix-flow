@@ -58,6 +58,14 @@ class QualityDependencyMissing(QualityError):
     ``ematix-probe`` extra isn't installed."""
 
 
+class QualityUnrunnable(QualityError):
+    """Raised from the quality stage when a ``"fail"`` gate could not
+    actually run — the target connection kind is unsupported, or the
+    declared suite produced zero assertions. A hard gate that can't run
+    must not read as "passed"; this propagates so the run is recorded as
+    failed."""
+
+
 class QualityCheckFailed(QualityError):
     """Raised from the quality stage when expectations fail and the
     pipeline's ``on_quality_failure`` policy is ``"fail"``. Propagates
@@ -174,10 +182,18 @@ def parse_duration(value: str | int | float | timedelta) -> timedelta:
     like ``"90s"``, ``"15m"``, ``"6h"``, ``"2d"`` (or bare ``"3600"``
     for seconds).
     """
+    def _check_non_negative(td: timedelta) -> timedelta:
+        # A negative duration is never a valid SLA/freshness window — it
+        # would make evaluate_freshness report `breached` forever. Reject
+        # it here rather than silently storing it.
+        if td.total_seconds() < 0:
+            raise ValueError(f"duration must not be negative, got {value!r}")
+        return td
+
     if isinstance(value, timedelta):
-        return value
+        return _check_non_negative(value)
     if isinstance(value, (int, float)):
-        return timedelta(seconds=float(value))
+        return _check_non_negative(timedelta(seconds=float(value)))
     s = str(value).strip().lower()
     if not s:
         raise ValueError("empty duration")
@@ -185,14 +201,15 @@ def parse_duration(value: str | int | float | timedelta) -> timedelta:
     if s[-1] in units:
         num = s[:-1]
         try:
-            return timedelta(seconds=float(num) * units[s[-1]])
+            return _check_non_negative(timedelta(seconds=float(num) * units[s[-1]]))
         except ValueError as exc:
-            raise ValueError(f"invalid duration {value!r}") from exc
+            raise ValueError(f"invalid duration {value!r}: {exc}") from exc
     try:
-        return timedelta(seconds=float(s))
+        return _check_non_negative(timedelta(seconds=float(s)))
     except ValueError as exc:
         raise ValueError(
-            f"invalid duration {value!r}; use e.g. '6h', '30m', '2d', or seconds"
+            f"invalid duration {value!r}: {exc}; use e.g. '6h', '30m', "
+            "'2d', or seconds"
         ) from exc
 
 
@@ -261,7 +278,13 @@ class _TableView:
 
 
 def _reduce_verdict(assertions: Sequence[QualityAssertion]) -> str:
-    """pass/warn/fail from per-assertion verdicts (error → warn)."""
+    """empty/pass/warn/fail from per-assertion verdicts (error → warn).
+
+    An assertion set that is *empty* returns ``"empty"`` — NOT ``"pass"``
+    — so a run that checked nothing is never rendered as a green
+    checkmark. A green "pass" must mean "checks ran and all passed"."""
+    if not assertions:
+        return "empty"
     if any(a.verdict == "fail" for a in assertions):
         return "fail"
     if any(a.verdict == "error" for a in assertions):
@@ -370,6 +393,11 @@ def evaluate_freshness(
     never succeeded or the lag exceeds the SLA; ``warning`` in the last
     20% of the window; else ``healthy``."""
     now = now or datetime.now(UTC)
+    # Coerce a naive `now` to UTC (symmetric with `last_success` below),
+    # so a caller passing a naive datetime doesn't hit "can't subtract
+    # offset-naive and offset-aware datetimes".
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
     sla_delta = parse_duration(sla)
     sla_seconds = int(sla_delta.total_seconds())
 
@@ -656,6 +684,26 @@ def run_quality_stage(
             f"got {on_quality_failure!r}"
         )
 
+    # A gate can only run against a probe-readable connection. If quality
+    # was declared but the target kind is unsupported, a "fail" policy
+    # must fail loud rather than silently pass (its guarantee is void).
+    declared = (
+        target_cls is not None
+        or expectations is not None
+        or (freshness_column is not None and freshness_sla is not None)
+    )
+    if declared and source_for_connection(target_connection) is None:
+        kind = getattr(target_connection, "kind", "?")
+        msg = (
+            f"data-quality checks could not run for {pipeline_name!r}: "
+            f"target connection kind {kind!r} is not supported by "
+            "ematix-probe (supported: postgres, duckdb)"
+        )
+        if on_quality_failure == POLICY_FAIL:
+            raise QualityUnrunnable(msg)
+        logger.warning(msg)
+        return None
+
     outcome = run_expectations(
         target_connection=target_connection,
         pipeline_name=pipeline_name,
@@ -672,6 +720,20 @@ def run_quality_stage(
 
     run_id = sync_result.get("run_id") if sync_result else None
     _record_quality(outcome, run_id)
+
+    # A suite that asserted nothing is not a green pass. Under "fail" it
+    # is a misconfiguration that must be loud; under "warn" surface it.
+    if outcome.checks_total == 0:
+        msg = (
+            f"data-quality stage for {pipeline_name!r} produced no "
+            "assertions — nothing was checked"
+        )
+        if on_quality_failure == POLICY_FAIL:
+            raise QualityUnrunnable(msg)
+        logger.warning("%s (policy=%s)", msg, on_quality_failure)
+        if alert_on_warn:
+            _emit_alert("quality_failed", pipeline_name, msg)
+        return outcome
 
     if outcome.verdict == "fail":
         msg = (
