@@ -267,6 +267,10 @@ def create_app(
         version="0.4.0",
         docs_url="/api/docs",
         redoc_url=None,
+        # Keep the schema under /api/ so the bearer + RBAC middlewares
+        # (which only gate paths under /api/) cover it. The default
+        # /openapi.json would expose the full route map unauthenticated.
+        openapi_url="/api/openapi.json",
     )
 
     # Task #6: bearer-token middleware. Applied as an HTTP-level
@@ -764,6 +768,10 @@ def create_app(
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:  # type: ignore[unused-function]
+        # Clamp so a caller can't ask the history store for an unbounded
+        # row set (mirrors the quality-runs endpoint's 1–500 bound).
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
         if history is not None:
             records, total = history.list_runs(
                 pipeline=pipeline, status=status, limit=limit, offset=offset
