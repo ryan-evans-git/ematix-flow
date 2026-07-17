@@ -859,14 +859,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let label = format!("Q{n:02}");
         eprintln!("--- {label} ---");
 
-        // EXPLAIN_ONLY=1 — dump the distributed plan (logical + physical with
-        // network/stage boundaries) and skip execution. Diagnostic for the
-        // Q11/Q15 0-rows distributed correctness bug (SF100/DIST.1a).
+        // EXPLAIN_ONLY=1 — dump the plan (logical + physical) and skip
+        // execution. Default explains through the campaign's main ctx
+        // (distributed when peers are set — the Q11/Q15 0-rows
+        // SF100/DIST.1a diagnostic). EXPLAIN_ARM selects another arm's
+        // session, so plans can be DIFFED across arms on identical
+        // tables — the OOM.SF1000 instrument (same SQL, single leg
+        // 21.8 s vs twin arm >250 GB peak ⇒ suspected plan divergence):
+        //   EXPLAIN_ARM=twin   Σ.TW.1 native twin (requires peers)
+        //   EXPLAIN_ARM=mesh   forced-mesh arm     (requires peers)
+        //   EXPLAIN_ARM=bcast  mesh+broadcast arm  (requires peers)
+        //   unset/other        main ctx (distributed or NO_DISTRIBUTE)
         if std::env::var_os("EXPLAIN_ONLY").is_some() {
+            let arm = std::env::var("EXPLAIN_ARM").unwrap_or_default();
+            let explain_ctx: &SessionContext = match arm.as_str() {
+                "twin" => match twin_ctx.as_ref() {
+                    Some(t) => t,
+                    None => {
+                        eprintln!(
+                            "  EXPLAIN_ARM=twin but no twin ctx (need peers + twin routing) — skipping"
+                        );
+                        continue;
+                    }
+                },
+                "mesh" | "bcast" => match mesh_arms.as_ref() {
+                    Some((m, b)) => {
+                        if arm == "mesh" {
+                            m.as_ref()
+                        } else {
+                            b.as_ref()
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "  EXPLAIN_ARM={arm} but no mesh arms (need peers + memo) — skipping"
+                        );
+                        continue;
+                    }
+                },
+                _ => &ctx,
+            };
+            eprintln!(
+                "  explaining via arm: {}",
+                if arm.is_empty() { "main" } else { &arm }
+            );
             // Arm blooms so the dumped plan matches what a real run
-            // executes (Σ.MG.2 diagnostics).
-            emit_and_arm_blooms(emit_ctx.as_ref(), &sql, &bloom_slot).await;
-            match ctx.sql(&format!("EXPLAIN {sql}")).await {
+            // executes (Σ.MG.2 diagnostics). The twin doesn't consume
+            // embedded blooms (native sideband instead), matching the
+            // trial path's skip.
+            if arm != "twin" {
+                emit_and_arm_blooms(emit_ctx.as_ref(), &sql, &bloom_slot).await;
+            }
+            match explain_ctx.sql(&format!("EXPLAIN {sql}")).await {
                 Ok(df) => match df.collect().await {
                     Ok(batches) => {
                         match datafusion::arrow::util::pretty::pretty_format_batches(&batches) {
