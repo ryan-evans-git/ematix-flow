@@ -265,7 +265,12 @@ class _ColumnView:
 
 class _TableView:
     """Adapts a ``ManagedTable`` subclass to the probe's ``_TableLike``
-    protocol so ``probe_from_table`` can auto-derive not_null/unique."""
+    protocol so ``probe_from_table`` can auto-derive not_null/unique.
+
+    A multi-column primary key is surfaced through the per-column
+    ``primary_key`` flags (the probe groups them into one joint unique).
+    ``__unique_constraints__`` (declared composite natural keys) is
+    passed through so the probe can assert those groups too."""
 
     def __init__(self, table_cls: Any):
         self.__name__ = table_cls.__name__
@@ -274,6 +279,12 @@ class _TableView:
         self.columns = tuple(
             _ColumnView(col.name, col.nullable, col.primary_key)
             for _, col in table_cls._columns()
+        )
+        # Composite natural-key groups (each a tuple of column names).
+        # Surfaced so probe_from_table emits a joint `unique` per group;
+        # without this they were silently never checked.
+        self.__unique_constraints__ = tuple(
+            tuple(uc) for uc in getattr(table_cls, "__unique_constraints__", ()) or ()
         )
 
 

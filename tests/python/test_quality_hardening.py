@@ -104,6 +104,40 @@ def test_unsupported_connection_under_warn_returns_none(monkeypatch):
     assert out is None
 
 
+# ---- composite-key surfacing to the probe --------------------------
+def test_tableview_surfaces_pk_flags_and_unique_constraints():
+    """_TableView must pass the per-column primary_key flags (so the
+    probe groups a composite PK into one joint unique) AND the declared
+    __unique_constraints__ groups (previously dropped → never checked)."""
+
+    class _Col:
+        def __init__(self, name, nullable, primary_key):
+            self.name = name
+            self.nullable = nullable
+            self.primary_key = primary_key
+
+    class _OrderLine:
+        __name__ = "OrderLine"
+        __tablename__ = "order_lines"
+        __schema__ = "public"
+        __unique_constraints__ = (("order_id", "sku"),)
+
+        @classmethod
+        def _columns(cls):
+            return (
+                ("order_id", _Col("order_id", False, True)),
+                ("line_no", _Col("line_no", False, True)),
+                ("sku", _Col("sku", False, False)),
+            )
+
+    view = q._TableView(_OrderLine)
+    # Composite PK surfaced via per-column flags.
+    pk = tuple(c.name for c in view.columns if c.primary_key)
+    assert pk == ("order_id", "line_no")
+    # Declared natural key surfaced.
+    assert view.__unique_constraints__ == (("order_id", "sku"),)
+
+
 # ---- #5 checks_errored persisted -----------------------------------
 def test_store_persists_and_returns_checks_errored(tmp_path):
     pytest.importorskip("fastapi")  # store lives under web.*
