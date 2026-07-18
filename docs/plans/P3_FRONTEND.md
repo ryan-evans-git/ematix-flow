@@ -109,9 +109,39 @@ SQL text
   (division-of-sums, CASE), **`sql_q08.rs` — the flattened 8-table Q08 with
   self-joined nation, shares 1995 = 0.0344359 / 1996 = 0.0414855 (canonical
   SF-1 answer) at rel 1e-9**. 55 engine tests green.
-- Next: parallelize planned queries through the morsel driver / spilling
-  breakers; ORDER BY/LIMIT/HAVING; NULLs; more TPC-H queries (P4 begins);
-  re-home the Σ rules onto `BoundQuery`.
+- **P4 breadth (2026-07-18, `bada7eb4` + `9039641c` + `77754d4d`):
+  13 of 22 canonical TPC-H queries run engine-native from SQL** —
+  {Q1, Q3, Q4, Q5, Q6, Q08, Q10, Q11, Q12, Q14, Q16, Q18, Q19}, each read
+  verbatim from `examples/tpch/queries/*.sql` and gated vs independent
+  oracles (`tests/tpch_from_sql.rs`; results match canonical published SF-1
+  answers). Capabilities landed, each forced by a real query:
+  - typed group keys (Int/Float/Str, total-ordered), ORDER BY/LIMIT/HAVING;
+  - interval date arithmetic (day/month/year, civil round-trip), IN lists,
+    LIKE (greedy %/_ matcher);
+  - multi-table WHERE conjuncts → **post-join filters** at the root, with
+    binder **OR-factoring** (`(J∧A)∨(J∧B) → J∧(A∨B)`, Q19's shape);
+  - join **cycles** → spanning tree + residual post-join equalities (Q5),
+    tree edges chosen breadth-first in WHERE order;
+  - **uncorrelated subqueries**: recursive `bind_query`, executor pre-pass
+    substitutes `ScalarSub`→literal (Q11 HAVING threshold) and
+    `InSub`→materialized i64 `InSet` (Q18, Q16 NOT IN); agg-less IN-inner
+    SELECTs get set semantics via injected GROUP BY;
+  - `COUNT(DISTINCT)` (Q16); grouped HAVING over non-selected aggregates;
+  - **EXISTS decorrelation** (Q4): the equality-correlated EXISTS rewrites
+    at bind to the `IN` semijoin it is (set semantics — no row
+    multiplication).
+
+## Remaining to full TPC-H (then TPC-DS — P4 tail)
+
+- **Derived tables / FROM-subqueries** (Q7, Q9, Q13, Q15): materialize an
+  inner `QueryResult` as a scannable input for an outer query.
+- **Correlated scalar subqueries** (Q2, Q17, Q20, Q22): decorrelate to
+  grouped joins (avg/min per key).
+- **LEFT OUTER JOIN + NULL semantics** (Q13); `substring` (Q22);
+  richer EXISTS shapes (Q21's multi-condition correlations).
+- Then: parallelize planned queries through the morsel driver / spilling
+  breakers (the machinery exists); re-home the Σ rules onto `BoundQuery`;
+  date display formatting in results.
 
 ## Slice sequence (each independently gated, TDD)
 
