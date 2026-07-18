@@ -96,6 +96,13 @@ pub enum Expr {
         set: std::sync::Arc<std::collections::HashSet<i64>>,
         negated: bool,
     },
+    /// `SUBSTRING(<expr> FROM <start> [FOR <len>])` — 1-based, byte
+    /// positions (TPC-H strings are ASCII).
+    Substr {
+        expr: Box<Expr>,
+        from: i64,
+        len: Option<i64>,
+    },
 }
 
 /// A value produced during evaluation. Integer-family logical types
@@ -183,6 +190,17 @@ impl Expr {
             Expr::InSet { expr, set, negated } => {
                 Val::Bool(set.contains(&expr.eval_i64(chunk, row)) != *negated)
             }
+            Expr::Substr { expr, from, len } => match expr.eval(chunk, row) {
+                Val::Str(s) => {
+                    let start = ((*from - 1).max(0) as usize).min(s.len());
+                    let end = match len {
+                        Some(l) => (start + (*l).max(0) as usize).min(s.len()),
+                        None => s.len(),
+                    };
+                    Val::Str(&s[start..end])
+                }
+                other => panic!("SUBSTRING needs a string operand, got {other:?}"),
+            },
         }
     }
 

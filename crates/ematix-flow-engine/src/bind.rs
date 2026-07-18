@@ -25,7 +25,8 @@
 //! yet: `JOIN … ON` syntax, HAVING, ORDER BY / LIMIT (grouped output is
 //! key-sorted), NULLs, subqueries.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 
 use sqlparser::ast;
 use sqlparser::dialect::GenericDialect;
@@ -35,7 +36,7 @@ use crate::catalog::{Catalog, TableDef};
 use crate::expr::{BinaryOp, Expr, ScalarValue};
 use crate::logical::{
     AggExpr, AggFunc, BoundQuery, GroupExpr, JoinEdge, OrderByKey, OutputExpr, ScanColumn, Slot,
-    TableInput,
+    TableInput, TableSource,
 };
 use crate::vector::LogicalType;
 
@@ -48,7 +49,7 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<BoundQuery, String> {
     let ast::Statement::Query(query) = stmt else {
         return Err("only SELECT queries are supported".into());
     };
-    bind_query(query, catalog, false)
+    bind_query(query, catalog, false, &HashMap::new())
 }
 
 /// Bind one query level (the top level, or a subquery). `set_semantics`
@@ -56,11 +57,49 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<BoundQuery, String> {
 /// rewritten as GROUP BY its select items — membership only cares about the
 /// value SET, so the dedup is semantics-preserving (and gives the executor
 /// its grouped path).
+/// A CTE registry: name → (bound definition, output columns as
+/// (name, type)). CTE references materialize as derived tables.
+type CteMap = HashMap<String, (BoundQuery, Vec<(String, LogicalType)>)>;
+
 fn bind_query(
     query: &ast::Query,
     catalog: &Catalog,
     set_semantics: bool,
+    outer_ctes: &CteMap,
 ) -> Result<BoundQuery, String> {
+    // WITH: bind each CTE (earlier CTEs visible to later ones), extending
+    // the registry this query level sees.
+    let mut ctes: CteMap = outer_ctes.clone();
+    if let Some(with) = &query.with {
+        if with.recursive {
+            return Err("recursive CTEs are not yet supported".into());
+        }
+        for cte in &with.cte_tables {
+            let bq = bind_query(&cte.query, catalog, false, &ctes)?;
+            let tys = output_types(&bq);
+            let names: Vec<String> = if cte.alias.columns.is_empty() {
+                bq.output.iter().map(|o| o.name.clone()).collect()
+            } else {
+                cte.alias
+                    .columns
+                    .iter()
+                    .map(|c| c.name.value.clone())
+                    .collect()
+            };
+            if names.len() != tys.len() {
+                return Err(format!(
+                    "CTE '{}' column list arity mismatch",
+                    cte.alias.name.value
+                ));
+            }
+            ctes.insert(
+                cte.alias.name.value.clone(),
+                (bq, names.into_iter().zip(tys).collect()),
+            );
+        }
+    }
+    let ctes = &ctes;
+
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Err("only plain SELECT is supported (no set operations yet)".into());
     };
@@ -72,36 +111,21 @@ fn bind_query(
     }
     let mut b = Binder {
         catalog,
+        ctes,
         tables: Vec::new(),
         slots: Vec::new(),
         touched: BTreeSet::new(),
         subs: Vec::new(),
+        derived: Vec::new(),
+        views: Vec::new(),
+        extra_edges: Vec::new(),
+        pending_conjuncts: Vec::new(),
     };
     for twj in &select.from {
         if !twj.joins.is_empty() {
             return Err("JOIN … ON syntax is not yet supported (use comma joins + WHERE)".into());
         }
-        let ast::TableFactor::Table { name, alias, .. } = &twj.relation else {
-            return Err("only plain table names are supported in FROM".into());
-        };
-        let tname = name.to_string();
-        let def = catalog
-            .table(&tname)
-            .ok_or_else(|| format!("unknown table '{tname}'"))?;
-        let display = alias
-            .as_ref()
-            .map(|a| a.name.value.clone())
-            .unwrap_or_else(|| tname.clone());
-        if b.tables.iter().any(|t| t.display == display) {
-            return Err(format!(
-                "duplicate table name/alias '{display}' — alias one of them"
-            ));
-        }
-        b.tables.push(BoundTable {
-            display,
-            def,
-            used: Vec::new(),
-        });
+        b.add_from_item(&twj.relation)?;
     }
 
     // GROUP BY first (slot space) — SELECT items match against these. Keys
@@ -147,8 +171,20 @@ fn bind_query(
         group
     };
 
-    // SELECT: each item becomes a row-space output projection; aggregate
-    // calls inside it are extracted into `aggs`.
+    // SELECT. Three shapes:
+    // - aggregate/grouped: items are row-space projections, aggregate calls
+    //   extracted into `aggs`;
+    // - PLAIN ROW query (no aggregates, no GROUP BY): items bind in slot
+    //   space and the executor emits one output row per joined row — no
+    //   grouping, no dedup (Q2, Q15).
+    let plain_rows = !set_semantics
+        && group.is_empty()
+        && select.projection.iter().all(|it| match it {
+            ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                !contains_function(e)
+            }
+            _ => false,
+        });
     let mut aggs: Vec<AggExpr> = Vec::new();
     let mut output: Vec<OutputExpr> = Vec::new();
     for (idx, item) in select.projection.iter().enumerate() {
@@ -157,7 +193,11 @@ fn bind_query(
             ast::SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
             other => return Err(format!("unsupported select item: {other}")),
         };
-        let row_expr = b.bind_output(expr, &group, &mut aggs)?;
+        let row_expr = if plain_rows {
+            b.bind_scalar(expr)?
+        } else {
+            b.bind_output(expr, &group, &mut aggs)?
+        };
         let name = alias.unwrap_or_else(|| match expr {
             ast::Expr::Identifier(id) => id.value.clone(),
             ast::Expr::CompoundIdentifier(ids) => {
@@ -170,12 +210,8 @@ fn bind_query(
             name,
         });
     }
-    if aggs.is_empty() && group.is_empty() {
-        return Err(
-            "SELECT list must contain an aggregate or a GROUP BY (plain row queries are not \
-             yet supported)"
-                .into(),
-        );
+    if aggs.is_empty() && group.is_empty() && !plain_rows {
+        return Err("SELECT list must contain an aggregate, a GROUP BY, or plain columns".into());
     }
 
     // WHERE: split the conjunct tree, after **OR-factoring** — a top-level
@@ -189,11 +225,17 @@ fn bind_query(
     let mut filters: Vec<Vec<Expr>> = vec![Vec::new(); b.tables.len()];
     let mut edges: Vec<JoinEdge> = Vec::new();
     let mut post: Vec<Expr> = Vec::new();
-    if let Some(where_expr) = &select.selection {
-        let mut raw = Vec::new();
-        split_and(where_expr, &mut raw);
+    {
+        // Conjuncts inherited from inlined derived tables come first, then
+        // the outer WHERE.
+        let mut raw_owned: Vec<ast::Expr> = std::mem::take(&mut b.pending_conjuncts);
+        if let Some(where_expr) = &select.selection {
+            let mut raw = Vec::new();
+            split_and(where_expr, &mut raw);
+            raw_owned.extend(raw.into_iter().cloned());
+        }
         let mut conjuncts: Vec<ast::Expr> = Vec::new();
-        for conj in raw {
+        for conj in &raw_owned {
             factor_or(conj, &mut conjuncts);
         }
         for conj in &conjuncts {
@@ -204,21 +246,26 @@ fn bind_query(
             } = conj
             {
                 if let (Some(lp), Some(rp)) = (ident_parts(left), ident_parts(right)) {
-                    let a = b.resolve_parts(&lp)?;
-                    let bb = b.resolve_parts(&rp)?;
-                    let (ta, tb) = (b.slots[a].table, b.slots[bb].table);
-                    if ta != tb {
-                        let (ka, kb) = (b.slot_col(a), b.slot_col(bb));
-                        if !is_integer_family(ka.ty) || !is_integer_family(kb.ty) {
-                            return Err(format!(
-                                "join keys '{}' = '{}' must be integer-typed",
-                                ka.name, kb.name
-                            ));
+                    // A join edge needs BOTH sides to be real (non-view)
+                    // columns; view references fall through to expression
+                    // binding.
+                    if b.is_real_column(&lp) && b.is_real_column(&rp) {
+                        let a = b.resolve_parts(&lp)?;
+                        let bb = b.resolve_parts(&rp)?;
+                        let (ta, tb) = (b.slots[a].table, b.slots[bb].table);
+                        if ta != tb {
+                            let (ka, kb) = (b.slot_col(a), b.slot_col(bb));
+                            if !is_integer_family(ka.ty) || !is_integer_family(kb.ty) {
+                                return Err(format!(
+                                    "join keys '{}' = '{}' must be integer-typed",
+                                    ka.name, kb.name
+                                ));
+                            }
+                            edges.push(JoinEdge { a, b: bb });
+                            continue;
                         }
-                        edges.push(JoinEdge { a, b: bb });
-                        continue;
+                        // Same table ⇒ an ordinary filter; falls through.
                     }
-                    // Same table ⇒ an ordinary filter; falls through.
                 }
             }
             let (e, t) = b.bind_multi(conj)?;
@@ -233,6 +280,9 @@ fn bind_query(
             }
         }
     }
+    edges.append(&mut b.extra_edges);
+    // Decorrelation may have appended tables after `filters` was sized.
+    filters.resize(b.tables.len(), Vec::new());
     let post_filter = post.into_iter().reduce(and);
 
     // Every table must be reachable through join edges — a disconnected
@@ -320,7 +370,7 @@ fn bind_query(
         .zip(filters)
         .map(|(bt, fs)| TableInput {
             name: bt.display,
-            path: bt.def.path.clone(),
+            source: bt.source,
             projection: bt.used,
             filter: fs.into_iter().reduce(and),
         })
@@ -338,6 +388,7 @@ fn bind_query(
         order_by,
         limit,
         subqueries: b.subs,
+        derived: b.derived,
     })
 }
 
@@ -435,18 +486,36 @@ fn split_or<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Expr>) {
     }
 }
 
-/// One table in scope: its display name (alias-aware), definition, and the
-/// columns referenced so far (its scan projection, in first-use order).
-struct BoundTable<'a> {
+/// One table in scope: its display name (alias-aware), definition (owned —
+/// derived tables have synthetic defs), source, and the columns referenced
+/// so far (its scan projection, in first-use order).
+struct BoundTable {
     display: String,
-    def: &'a TableDef,
+    def: TableDef,
+    source: TableSource,
     used: Vec<ScanColumn>,
+}
+
+/// An inlined derived table (a plain select-project FROM-subquery): its
+/// alias and column-name → defining-AST-expression map. References to view
+/// columns bind by recursively binding the defining expression in the
+/// merged scope.
+struct ViewMap {
+    alias: String,
+    cols: Vec<(String, ast::Expr)>,
+}
+
+impl ViewMap {
+    fn get(&self, name: &str) -> Option<&ast::Expr> {
+        self.cols.iter().find(|(n, _)| n == name).map(|(_, e)| e)
+    }
 }
 
 /// Per-query binding state.
 struct Binder<'a> {
     catalog: &'a Catalog,
-    tables: Vec<BoundTable<'a>>,
+    ctes: &'a CteMap,
+    tables: Vec<BoundTable>,
     /// The global slot space: slot `s` = `(table, col-in-projection)`.
     slots: Vec<Slot>,
     /// Tables touched by the expression currently being bound (single-table
@@ -454,6 +523,15 @@ struct Binder<'a> {
     touched: BTreeSet<usize>,
     /// Subqueries bound so far (referenced by `Expr::ScalarSub` / `InSub`).
     subs: Vec<BoundQuery>,
+    /// Materialized derived queries (`TableSource::Derived` indices).
+    derived: Vec<BoundQuery>,
+    /// Inlined derived tables.
+    views: Vec<ViewMap>,
+    /// Join edges created outside the WHERE loop (correlated-scalar
+    /// decorrelation), merged into the query's edges.
+    extra_edges: Vec<JoinEdge>,
+    /// WHERE conjuncts inherited from inlined derived tables.
+    pending_conjuncts: Vec<ast::Expr>,
 }
 
 /// A partially-bound expression: either a real bound expression, or a
@@ -466,9 +544,183 @@ enum Bound {
 }
 
 impl Binder<'_> {
+    /// Register one FROM item: a catalog table, a CTE reference
+    /// (materialized), or a derived subquery (inlined when it is a plain
+    /// select-project; materialized when it aggregates).
+    fn add_from_item(&mut self, relation: &ast::TableFactor) -> Result<(), String> {
+        match relation {
+            ast::TableFactor::Table { name, alias, .. } => {
+                let tname = name.to_string();
+                let display = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| tname.clone());
+                if let Some((cte_bq, cols)) = self.ctes.get(&tname) {
+                    // CTE reference → materialized derived table.
+                    let idx = self.derived.len();
+                    self.derived.push(cte_bq.clone());
+                    let def = TableDef {
+                        path: PathBuf::new(),
+                        columns: cols
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (n, ty))| crate::catalog::ColumnDef {
+                                name: n.clone(),
+                                leaf: i,
+                                ty: *ty,
+                            })
+                            .collect(),
+                    };
+                    self.push_table(display, def, TableSource::Derived(idx))
+                } else {
+                    let def = self
+                        .catalog
+                        .table(&tname)
+                        .ok_or_else(|| format!("unknown table '{tname}'"))?
+                        .clone();
+                    let source = TableSource::Parquet(def.path.clone());
+                    self.push_table(display, def, source)
+                }
+            }
+            ast::TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let Some(alias) = alias else {
+                    return Err("FROM subqueries need an alias".into());
+                };
+                let ast::SetExpr::Select(inner) = subquery.body.as_ref() else {
+                    return Err("FROM subquery must be a plain SELECT".into());
+                };
+                let plain = matches!(
+                    &inner.group_by,
+                    ast::GroupByExpr::Expressions(g, m) if g.is_empty() && m.is_empty()
+                ) && inner.having.is_none()
+                    && subquery.order_by.is_none()
+                    && subquery.limit_clause.is_none()
+                    && inner.distinct.is_none()
+                    && inner.projection.iter().all(|it| match it {
+                        ast::SelectItem::UnnamedExpr(e)
+                        | ast::SelectItem::ExprWithAlias { expr: e, .. } => !contains_function(e),
+                        _ => false,
+                    });
+                if plain {
+                    // INLINE: merge its tables + WHERE into this scope, and
+                    // expose its select items as view columns.
+                    for twj in &inner.from {
+                        if !twj.joins.is_empty() {
+                            return Err("JOIN … ON syntax is not yet supported".into());
+                        }
+                        self.add_from_item(&twj.relation)?;
+                    }
+                    if let Some(w) = &inner.selection {
+                        let mut cs = Vec::new();
+                        split_and(w, &mut cs);
+                        self.pending_conjuncts.extend(cs.into_iter().cloned());
+                    }
+                    let mut cols = Vec::new();
+                    for (i, item) in inner.projection.iter().enumerate() {
+                        let (e, name) = match item {
+                            ast::SelectItem::ExprWithAlias { expr, alias } => {
+                                (expr, alias.value.clone())
+                            }
+                            ast::SelectItem::UnnamedExpr(e) => (
+                                e,
+                                match e {
+                                    ast::Expr::Identifier(id) => id.value.clone(),
+                                    ast::Expr::CompoundIdentifier(ids) => ids
+                                        .last()
+                                        .map(|x| x.value.clone())
+                                        .unwrap_or_else(|| format!("col{i}")),
+                                    _ => format!("col{i}"),
+                                },
+                            ),
+                            _ => unreachable!("checked plain above"),
+                        };
+                        cols.push((name, e.clone()));
+                    }
+                    self.views.push(ViewMap {
+                        alias: alias.name.value.clone(),
+                        cols,
+                    });
+                    Ok(())
+                } else {
+                    // MATERIALIZE: bind the aggregate inner as a derived
+                    // query with an inferred output schema.
+                    let bq = bind_query(subquery, self.catalog, false, self.ctes)?;
+                    let tys = output_types(&bq);
+                    let names: Vec<String> = if alias.columns.is_empty() {
+                        bq.output.iter().map(|o| o.name.clone()).collect()
+                    } else {
+                        alias.columns.iter().map(|c| c.name.value.clone()).collect()
+                    };
+                    if names.len() != tys.len() {
+                        return Err(format!(
+                            "derived table '{}' column list arity mismatch",
+                            alias.name.value
+                        ));
+                    }
+                    let idx = self.derived.len();
+                    self.derived.push(bq);
+                    let def = TableDef {
+                        path: PathBuf::new(),
+                        columns: names
+                            .into_iter()
+                            .zip(tys)
+                            .enumerate()
+                            .map(|(i, (n, ty))| crate::catalog::ColumnDef {
+                                name: n,
+                                leaf: i,
+                                ty,
+                            })
+                            .collect(),
+                    };
+                    self.push_table(alias.name.value.clone(), def, TableSource::Derived(idx))
+                }
+            }
+            other => Err(format!("unsupported FROM item: {other}")),
+        }
+    }
+
+    fn push_table(
+        &mut self,
+        display: String,
+        def: TableDef,
+        source: TableSource,
+    ) -> Result<(), String> {
+        if self.tables.iter().any(|t| t.display == display)
+            || self.views.iter().any(|v| v.alias == display)
+        {
+            return Err(format!(
+                "duplicate table name/alias '{display}' — alias one of them"
+            ));
+        }
+        self.tables.push(BoundTable {
+            display,
+            def,
+            source,
+            used: Vec::new(),
+        });
+        Ok(())
+    }
+
     fn slot_col(&self, s: usize) -> &ScanColumn {
         let Slot { table, col } = self.slots[s];
         &self.tables[table].used[col]
+    }
+
+    /// Is `parts` a plain column of a real (non-view) table in scope?
+    fn is_real_column(&self, parts: &[&str]) -> bool {
+        match parts {
+            [c] => {
+                self.views.iter().all(|v| v.get(c).is_none())
+                    && self.tables.iter().any(|t| t.def.column(c).is_some())
+            }
+            [tbl, c] => self
+                .tables
+                .iter()
+                .any(|t| t.display == *tbl && t.def.column(c).is_some()),
+            _ => false,
+        }
     }
 
     /// Resolve a (possibly qualified) column name to its global slot,
@@ -532,6 +784,19 @@ impl Binder<'_> {
         Ok(materialize(self.bind(e)?))
     }
 
+    /// Look a name up in the inlined-view maps (qualified by alias when
+    /// given). Returns a clone of the defining AST expression.
+    fn view_expr(&self, alias: Option<&str>, col: &str) -> Option<ast::Expr> {
+        match alias {
+            Some(a) => self
+                .views
+                .iter()
+                .find(|v| v.alias == a)
+                .and_then(|v| v.get(col).cloned()),
+            None => self.views.iter().find_map(|v| v.get(col).cloned()),
+        }
+    }
+
     /// Bind a WHERE conjunct and report which tables it touches — the
     /// routing signal: single-table conjuncts become that table's filter,
     /// multi-table conjuncts the post-join filter.
@@ -585,6 +850,146 @@ impl Binder<'_> {
         }
     }
 
+    /// Bind a table-free AST expression to a literal (substring bounds).
+    fn clone_free_literal(&mut self, e: &ast::Expr) -> Result<ScalarValue, String> {
+        match materialize(self.bind(e)?) {
+            Expr::Literal(v) => Ok(v),
+            other => Err(format!("expected a literal, got {other:?}")),
+        }
+    }
+
+    /// Try to decorrelate `(SELECT <agg expr> FROM … WHERE inner_col =
+    /// outer_col AND rest)` into a derived table `(SELECT inner_col,
+    /// <agg expr> FROM … WHERE rest GROUP BY inner_col)` joined to the
+    /// outer query on the correlation key; the subquery expression becomes
+    /// a reference to the derived value column. Returns `None` when the
+    /// subquery has no correlation (the uncorrelated path handles it).
+    fn try_decorrelate_scalar(&mut self, sq: &ast::Query) -> Result<Option<Bound>, String> {
+        let ast::SetExpr::Select(sel) = sq.body.as_ref() else {
+            return Ok(None);
+        };
+        // The inner tables' defs (plain catalog tables only).
+        let mut inner_defs: Vec<TableDef> = Vec::new();
+        for twj in &sel.from {
+            let ast::TableFactor::Table {
+                name, alias: None, ..
+            } = &twj.relation
+            else {
+                return Ok(None);
+            };
+            match self.catalog.table(&name.to_string()) {
+                Some(d) => inner_defs.push(d.clone()),
+                None => return Ok(None),
+            }
+        }
+        let inner_has = |c: &str| inner_defs.iter().any(|d| d.column(c).is_some());
+        let outer_has = |parts: &[&str]| match parts {
+            [c] => !inner_has(c) && self.tables.iter().any(|t| t.def.column(c).is_some()),
+            [tbl, c] => self
+                .tables
+                .iter()
+                .any(|t| t.display == *tbl && t.def.column(c).is_some()),
+            _ => false,
+        };
+
+        // Find THE correlation conjunct.
+        let mut conjuncts = Vec::new();
+        if let Some(w) = &sel.selection {
+            split_and(w, &mut conjuncts);
+        }
+        let mut corr: Option<(String, Vec<String>)> = None; // (inner col, outer parts)
+        let mut rest: Vec<ast::Expr> = Vec::new();
+        for conj in conjuncts {
+            if let ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } = conj
+            {
+                if let (Some(lp), Some(rp)) = (ident_parts(left), ident_parts(right)) {
+                    let pick = |ip: &[&str], op: &[&str]| -> Option<(String, Vec<String>)> {
+                        match ip {
+                            [c] if inner_has(c) && outer_has(op) => {
+                                Some((c.to_string(), op.iter().map(|x| x.to_string()).collect()))
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(found) = pick(&lp, &rp).or_else(|| pick(&rp, &lp)) {
+                        if corr.is_some() {
+                            return Err(
+                                "multiple correlated conditions in a scalar subquery are not \
+                                 yet supported"
+                                    .into(),
+                            );
+                        }
+                        corr = Some(found);
+                        continue;
+                    }
+                }
+            }
+            rest.push(conj.clone());
+        }
+        let Some((inner_col, outer_parts)) = corr else {
+            return Ok(None);
+        };
+        let [item] = sel.projection.as_slice() else {
+            return Err("a scalar subquery must select exactly one column".into());
+        };
+
+        // Rebuild the subquery decorrelated: SELECT inner_col, <item> FROM …
+        // WHERE rest GROUP BY inner_col.
+        let mut q2 = sq.clone();
+        let ast::SetExpr::Select(sel2) = q2.body.as_mut() else {
+            unreachable!("checked Select above");
+        };
+        let key_ident = ast::Expr::Identifier(ast::Ident::new(inner_col.clone()));
+        sel2.projection = vec![
+            ast::SelectItem::UnnamedExpr(key_ident.clone()),
+            item.clone(),
+        ];
+        sel2.group_by = ast::GroupByExpr::Expressions(vec![key_ident], Vec::new());
+        sel2.selection = rest.into_iter().reduce(|l, r| ast::Expr::BinaryOp {
+            left: Box::new(l),
+            op: ast::BinaryOperator::And,
+            right: Box::new(r),
+        });
+
+        let bq = bind_query(&q2, self.catalog, false, self.ctes)?;
+        let tys = output_types(&bq);
+        let idx = self.derived.len();
+        self.derived.push(bq);
+        let display = format!("__corr{idx}");
+        let def = TableDef {
+            path: PathBuf::new(),
+            columns: vec![
+                crate::catalog::ColumnDef {
+                    name: inner_col.clone(),
+                    leaf: 0,
+                    ty: tys[0],
+                },
+                crate::catalog::ColumnDef {
+                    name: "__val".into(),
+                    leaf: 1,
+                    ty: tys[1],
+                },
+            ],
+        };
+        self.push_table(display.clone(), def, TableSource::Derived(idx))?;
+
+        // Join outer_col = derived.key; the subquery's value is the derived
+        // value column.
+        let outer_ref: Vec<&str> = outer_parts.iter().map(|x| x.as_str()).collect();
+        let outer_slot = self.resolve_parts(&outer_ref)?;
+        let key_slot = self.resolve_parts(&[&display, &inner_col])?;
+        self.extra_edges.push(JoinEdge {
+            a: outer_slot,
+            b: key_slot,
+        });
+        let val_slot = self.resolve_parts(&[&display, "__val"])?;
+        Ok(Some(Bound::Expr(Expr::Column(val_slot))))
+    }
+
     /// Decorrelate a `[NOT] EXISTS (subquery)` of the simple TPC-H shape —
     /// one inner table whose WHERE holds exactly one correlation
     /// `inner_col = outer_col`, the rest inner-only filters — into the
@@ -608,7 +1013,8 @@ impl Binder<'_> {
         let def = self
             .catalog
             .table(&tname)
-            .ok_or_else(|| format!("unknown table '{tname}'"))?;
+            .ok_or_else(|| format!("unknown table '{tname}'"))?
+            .clone();
         let display = alias
             .as_ref()
             .map(|a| a.name.value.clone())
@@ -660,16 +1066,23 @@ impl Binder<'_> {
 
         // Bind the inner query directly: SELECT inner_col FROM t WHERE rest
         // GROUP BY inner_col (set semantics).
+        let source = TableSource::Parquet(def.path.clone());
         let mut inner = Binder {
             catalog: self.catalog,
+            ctes: self.ctes,
             tables: vec![BoundTable {
                 display,
                 def,
+                source,
                 used: Vec::new(),
             }],
             slots: Vec::new(),
             touched: BTreeSet::new(),
             subs: Vec::new(),
+            derived: Vec::new(),
+            views: Vec::new(),
+            extra_edges: Vec::new(),
+            pending_conjuncts: Vec::new(),
         };
         let key_slot = inner.resolve_parts(&[&inner_col])?;
         let mut inner_filters: Vec<Expr> = Vec::new();
@@ -680,7 +1093,7 @@ impl Binder<'_> {
         let bq = BoundQuery {
             tables: vec![TableInput {
                 name: inner.tables[0].display.clone(),
-                path: inner.tables[0].def.path.clone(),
+                source: inner.tables[0].source.clone(),
                 projection: inner.tables[0].used.clone(),
                 filter: inner_filters.into_iter().reduce(and),
             }],
@@ -699,6 +1112,7 @@ impl Binder<'_> {
             order_by: Vec::new(),
             limit: None,
             subqueries: inner.subs,
+            derived: inner.derived,
         };
         self.subs.push(bq);
         Ok(Bound::Expr(Expr::InSub {
@@ -751,11 +1165,27 @@ impl Binder<'_> {
     fn bind(&mut self, e: &ast::Expr) -> Result<Bound, String> {
         match e {
             ast::Expr::Identifier(id) => {
+                if let Some(e2) = self.view_expr(None, &id.value) {
+                    // A pass-through view column (`c_acctbal` defined as
+                    // itself) must resolve as the real column, not recurse.
+                    if !matches!(&e2, ast::Expr::Identifier(x) if x.value == id.value) {
+                        return self.bind(&e2);
+                    }
+                }
                 let s = self.resolve_parts(&[&id.value])?;
                 Ok(Bound::Expr(Expr::Column(s)))
             }
             ast::Expr::CompoundIdentifier(ids) => {
                 let parts: Vec<&str> = ids.iter().map(|i| i.value.as_str()).collect();
+                if let [tbl, c] = parts.as_slice() {
+                    if let Some(e2) = self.view_expr(Some(tbl), c) {
+                        if !matches!(&e2, ast::Expr::Identifier(x) if x.value == *c) {
+                            return self.bind(&e2);
+                        }
+                        let s = self.resolve_parts(&[c])?;
+                        return Ok(Bound::Expr(Expr::Column(s)));
+                    }
+                }
                 let s = self.resolve_parts(&parts)?;
                 Ok(Bound::Expr(Expr::Column(s)))
             }
@@ -900,9 +1330,40 @@ impl Binder<'_> {
                 }
                 Ok(Bound::Expr(binary(op, materialize(l), materialize(r))))
             }
+            ast::Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                let inner = materialize(self.bind(expr)?);
+                let mut lit_i64 = |e: &Option<Box<ast::Expr>>| -> Result<Option<i64>, String> {
+                    match e {
+                        None => Ok(None),
+                        Some(x) => match self.clone_free_literal(x)? {
+                            ScalarValue::Int64(v) => Ok(Some(v)),
+                            other => Err(format!("SUBSTRING bounds must be integers: {other:?}")),
+                        },
+                    }
+                };
+                let from = lit_i64(substring_from)?
+                    .ok_or("SUBSTRING requires a FROM position (so far)")?;
+                let len = lit_i64(substring_for)?;
+                Ok(Bound::Expr(Expr::Substr {
+                    expr: Box::new(inner),
+                    from,
+                    len,
+                }))
+            }
             ast::Expr::Exists { subquery, negated } => self.bind_exists(subquery, *negated),
             ast::Expr::Subquery(sq) => {
-                let bq = bind_query(sq, self.catalog, false)?;
+                // Correlated scalar (single equality correlation, the TPC-H
+                // shape) decorrelates into a grouped derived table joined on
+                // the correlation key; uncorrelated executes standalone.
+                if let Some(b) = self.try_decorrelate_scalar(sq)? {
+                    return Ok(b);
+                }
+                let bq = bind_query(sq, self.catalog, false, self.ctes)?;
                 if bq.output.len() != 1 {
                     return Err("a scalar subquery must select exactly one column".into());
                 }
@@ -915,7 +1376,7 @@ impl Binder<'_> {
                 negated,
             } => {
                 let bound = materialize(self.bind(expr)?);
-                let bq = bind_query(subquery, self.catalog, true)?;
+                let bq = bind_query(subquery, self.catalog, true, self.ctes)?;
                 if bq.output.len() != 1 {
                     return Err("an IN subquery must select exactly one column".into());
                 }
@@ -931,6 +1392,94 @@ impl Binder<'_> {
             }
             other => Err(format!("unsupported expression: {other}")),
         }
+    }
+}
+
+/// Infer the output column types of a bound query (row space =
+/// [group keys…, agg values…]) — the schema a materialized derived table
+/// exposes. Conservative: unknown shapes default to Float64.
+pub(crate) fn output_types(q: &BoundQuery) -> Vec<LogicalType> {
+    let key_tys: Vec<LogicalType> = q
+        .group
+        .iter()
+        .map(|g| infer_slot_type(q, &g.expr))
+        .collect();
+    q.output
+        .iter()
+        .map(|o| infer_row_type(q, &key_tys, &o.expr))
+        .collect()
+}
+
+fn infer_slot_type(q: &BoundQuery, e: &Expr) -> LogicalType {
+    match e {
+        Expr::Column(s) => {
+            let Slot { table, col } = q.slots[*s];
+            q.tables[table].projection[col].ty
+        }
+        Expr::Literal(v) => literal_type(v),
+        Expr::Binary { op, lhs, rhs } => {
+            binary_type(*op, infer_slot_type(q, lhs), infer_slot_type(q, rhs))
+        }
+        Expr::ExtractYear(_) => LogicalType::Int64,
+        Expr::Substr { .. } => LogicalType::Utf8,
+        Expr::Case { whens, .. } => whens
+            .first()
+            .map(|(_, v)| infer_slot_type(q, v))
+            .unwrap_or(LogicalType::Float64),
+        _ => LogicalType::Float64,
+    }
+}
+
+fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalType {
+    match e {
+        Expr::Column(i) => {
+            if *i < key_tys.len() {
+                key_tys[*i]
+            } else {
+                match q.aggs[*i - key_tys.len()].func {
+                    AggFunc::Count | AggFunc::CountDistinct => LogicalType::Int64,
+                    _ => LogicalType::Float64,
+                }
+            }
+        }
+        Expr::Literal(v) => literal_type(v),
+        Expr::Binary { op, lhs, rhs } => binary_type(
+            *op,
+            infer_row_type(q, key_tys, lhs),
+            infer_row_type(q, key_tys, rhs),
+        ),
+        Expr::ExtractYear(_) => LogicalType::Int64,
+        Expr::Substr { .. } => LogicalType::Utf8,
+        Expr::Case { whens, .. } => whens
+            .first()
+            .map(|(_, v)| infer_row_type(q, key_tys, v))
+            .unwrap_or(LogicalType::Float64),
+        _ => LogicalType::Float64,
+    }
+}
+
+fn literal_type(v: &ScalarValue) -> LogicalType {
+    match v {
+        ScalarValue::Int32(_) => LogicalType::Int32,
+        ScalarValue::Int64(_) => LogicalType::Int64,
+        ScalarValue::Date32(_) => LogicalType::Date32,
+        ScalarValue::Utf8(_) => LogicalType::Utf8,
+        _ => LogicalType::Float64,
+    }
+}
+
+fn binary_type(op: BinaryOp, l: LogicalType, r: LogicalType) -> LogicalType {
+    use BinaryOp::*;
+    match op {
+        Add | Sub | Mul => {
+            if is_integer_family(l) && is_integer_family(r) {
+                LogicalType::Int64
+            } else {
+                LogicalType::Float64
+            }
+        }
+        Div => LogicalType::Float64,
+        _ => LogicalType::Int64, // comparisons/logic used as keys: 0/1
     }
 }
 
@@ -980,7 +1529,8 @@ fn contains_function(e: &ast::Expr) -> bool {
             contains_function(expr) || contains_function(pattern)
         }
         ast::Expr::Extract { expr, .. } => contains_function(expr),
-        ast::Expr::Subquery(_) | ast::Expr::InSubquery { .. } => false,
+        ast::Expr::Subquery(_) | ast::Expr::InSubquery { .. } | ast::Expr::Exists { .. } => false,
+        ast::Expr::Substring { expr, .. } => contains_function(expr),
         ast::Expr::Case {
             conditions,
             else_result,
@@ -1004,7 +1554,9 @@ fn references_columns(e: &Expr) -> bool {
         Expr::ExtractYear(i) => references_columns(i),
         Expr::Like { expr, .. } => references_columns(expr),
         Expr::ScalarSub(_) => false,
-        Expr::InSub { expr, .. } | Expr::InSet { expr, .. } => references_columns(expr),
+        Expr::InSub { expr, .. } | Expr::InSet { expr, .. } | Expr::Substr { expr, .. } => {
+            references_columns(expr)
+        }
         Expr::Case { whens, else_ } => {
             whens
                 .iter()

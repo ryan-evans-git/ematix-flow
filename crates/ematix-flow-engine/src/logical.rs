@@ -39,13 +39,23 @@ pub struct Slot {
     pub col: usize,
 }
 
+/// Where a table's rows come from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableSource {
+    /// A parquet file on disk.
+    Parquet(PathBuf),
+    /// A materialized derived query — index into [`BoundQuery::derived`].
+    /// `ScanColumn::leaf` is the derived query's output-column position.
+    Derived(usize),
+}
+
 /// One table in the query: its scan plus its own filters (conjuncts that
 /// reference only this table's slots), pre-join.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableInput {
     /// Display name — the alias if one was given, else the table name.
     pub name: String,
-    pub path: PathBuf,
+    pub source: TableSource,
     pub projection: Vec<ScanColumn>,
     /// Slot-space predicate over this table's slots only.
     pub filter: Option<Expr>,
@@ -122,4 +132,7 @@ pub struct BoundQuery {
     /// [`Expr::InSub`] — executed first, then substituted as constants /
     /// membership sets.
     pub subqueries: Vec<BoundQuery>,
+    /// Materialized derived queries (CTEs, aggregate FROM-subqueries,
+    /// decorrelated scalars) referenced by [`TableSource::Derived`].
+    pub derived: Vec<BoundQuery>,
 }

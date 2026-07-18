@@ -87,6 +87,8 @@ fn catalog() -> Catalog {
         sf1("part"),
         &[
             ("p_partkey", 0, Int64),
+            ("p_name", 1, Utf8),
+            ("p_mfgr", 2, Utf8),
             ("p_brand", 3, Utf8),
             ("p_type", 4, Utf8),
             ("p_size", 5, Int32),
@@ -98,7 +100,11 @@ fn catalog() -> Catalog {
         sf1("supplier"),
         &[
             ("s_suppkey", 0, Int64),
+            ("s_name", 1, Utf8),
+            ("s_address", 2, Utf8),
             ("s_nationkey", 3, Int64),
+            ("s_phone", 4, Utf8),
+            ("s_acctbal", 5, Float64),
             ("s_comment", 6, Utf8),
         ],
     );
@@ -452,5 +458,107 @@ fn q04_order_priority_checking() {
     for (row, w) in r.rows.iter().zip(&want) {
         assert_eq!(s(&row[0]), w.0, "o_orderpriority");
         assert_eq!(i(&row[1]) as f64, w.1, "order_count");
+    }
+}
+
+#[test]
+fn q07_volume_shipping() {
+    let Some(r) = run("q07") else { return };
+    // Derived-table INLINING: the FROM-subquery's tables/filters merge into
+    // the outer scope; view columns (supp_nation, volume, l_year) bind by
+    // their defining expressions.
+    assert_eq!(r.rows.len(), 4);
+    let want = [
+        ("FRANCE", "GERMANY", 1995i64, 54639732.73359995f64),
+        ("FRANCE", "GERMANY", 1996, 54633083.30759997),
+        ("GERMANY", "FRANCE", 1995, 52531746.66969997),
+        ("GERMANY", "FRANCE", 1996, 52520549.02239985),
+    ];
+    for (row, w) in r.rows.iter().zip(&want) {
+        assert_eq!(s(&row[0]), w.0);
+        assert_eq!(s(&row[1]), w.1);
+        assert_eq!(i(&row[2]), w.2);
+        close(f(&row[3]), w.3, "revenue");
+    }
+}
+
+#[test]
+fn q09_product_type_profit() {
+    let Some(r) = run("q09") else { return };
+    // Inlining + COMPOSITE join keys (lineitem⋈partsupp on suppkey AND
+    // partkey — partsupp is only unique on the pair).
+    assert_eq!(r.rows.len(), 175);
+    let want = [
+        ("ALGERIA", 1998i64, 27136900.180300012f64),
+        ("ALGERIA", 1997, 48611833.496199995),
+        ("ALGERIA", 1996, 48285482.67820002),
+        ("ALGERIA", 1995, 44402273.59989995),
+    ];
+    for (row, w) in r.rows.iter().take(4).zip(&want) {
+        assert_eq!(s(&row[0]), w.0, "nation");
+        assert_eq!(i(&row[1]), w.1, "o_year");
+        close(f(&row[2]), w.2, "sum_profit");
+    }
+}
+
+#[test]
+fn q15_top_supplier() {
+    let Some(r) = run("q15") else { return };
+    // WITH (CTE) materialized as a derived table — referenced twice (FROM +
+    // the scalar max subquery). One top supplier at SF-1.
+    assert_eq!(r.rows.len(), 1);
+    let row = &r.rows[0];
+    assert_eq!(i(&row[0]), 8449, "s_suppkey");
+    assert_eq!(s(&row[1]), "Supplier#000008449", "s_name");
+    assert_eq!(s(&row[3]), "20-469-856-8873", "s_phone");
+    close(f(&row[4]), 1772627.2087, "total_revenue");
+}
+
+#[test]
+fn q17_small_quantity_order() {
+    let Some(r) = run("q17") else { return };
+    // Correlated scalar subquery (avg per part) decorrelated into a grouped
+    // derived table joined on the correlation key.
+    assert_eq!(r.rows.len(), 1);
+    close(f(&r.rows[0][0]), 348406.0542857138, "avg_yearly");
+}
+
+#[test]
+fn q02_minimum_cost_supplier() {
+    let Some(r) = run("q02") else { return };
+    // Correlated min over a 4-table subquery, decorrelated; 460 rows,
+    // ordered s_acctbal desc.
+    assert_eq!(r.rows.len(), 460);
+    let want = [
+        (9938.53f64, "Supplier#000005359", 185358i64),
+        (9937.84, "Supplier#000005969", 108438),
+        (9936.22, "Supplier#000005250", 249),
+    ];
+    for (row, w) in r.rows.iter().take(3).zip(&want) {
+        close(f(&row[0]), w.0, "s_acctbal");
+        assert_eq!(s(&row[1]), w.1, "s_name");
+        assert_eq!(i(&row[3]), w.2, "p_partkey");
+    }
+}
+
+#[test]
+fn q22_global_sales_opportunity() {
+    let Some(r) = run("q22") else { return };
+    // SUBSTRING (string group key through an inlined view), an uncorrelated
+    // avg threshold, and correlated NOT EXISTS.
+    assert_eq!(r.rows.len(), 7);
+    let want = [
+        ("13", 888i64, 6737713.989999999f64),
+        ("17", 861, 6460573.72),
+        ("18", 964, 7236687.400000014),
+        ("23", 892, 6701457.950000009),
+        ("29", 948, 7158866.629999997),
+        ("30", 909, 6808436.130000002),
+        ("31", 922, 6806670.179999986),
+    ];
+    for (row, w) in r.rows.iter().zip(&want) {
+        assert_eq!(s(&row[0]), w.0, "cntrycode");
+        assert_eq!(i(&row[1]), w.1, "numcust");
+        close(f(&row[2]), w.2, "totacctbal");
     }
 }

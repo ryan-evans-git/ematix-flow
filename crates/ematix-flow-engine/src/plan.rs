@@ -28,7 +28,7 @@ use ematix_parquet_io::ParquetFile;
 
 use crate::chunk::{DataChunk, Selection};
 use crate::expr::{Expr, ScalarValue, filter_expr, sum_expr_f64};
-use crate::logical::{AggFunc, BoundQuery, Slot, TableInput};
+use crate::logical::{AggFunc, BoundQuery, Slot, TableInput, TableSource};
 use crate::scan::{ColKind, scan_columns};
 use crate::scan_native::{NativeColKind, scan_row_groups};
 use crate::vector::{LogicalType, Vector};
@@ -130,9 +130,10 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
                 walk(rhs, f);
             }
             Expr::ExtractYear(i) => walk(i, f),
-            Expr::Like { expr, .. } | Expr::InSub { expr, .. } | Expr::InSet { expr, .. } => {
-                walk(expr, f)
-            }
+            Expr::Like { expr, .. }
+            | Expr::InSub { expr, .. }
+            | Expr::InSet { expr, .. }
+            | Expr::Substr { expr, .. } => walk(expr, f),
             Expr::Case { whens, else_ } => {
                 for (c, v) in whens {
                     walk(c, f);
@@ -175,9 +176,10 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
                 walk(rhs, f);
             }
             Expr::ExtractYear(i) => walk(i, f),
-            Expr::Like { expr, .. } | Expr::InSub { expr, .. } | Expr::InSet { expr, .. } => {
-                walk(expr, f)
-            }
+            Expr::Like { expr, .. }
+            | Expr::InSub { expr, .. }
+            | Expr::InSet { expr, .. }
+            | Expr::Substr { expr, .. } => walk(expr, f),
             Expr::Case { whens, else_ } => {
                 for (c, v) in whens {
                     walk(c, f);
@@ -214,11 +216,15 @@ struct Executor<'q> {
     q: &'q BoundQuery,
 }
 
-/// A processed dim subtree: join key → (match count, payload values aligned
-/// with `payload_slots`).
+/// The (parent_local_col, child_local_col) equi-join pairs linking a dim to
+/// its parent — several pairs form a composite key.
+type Links = Vec<(usize, usize)>;
+
+/// A processed dim subtree: (composite) join key → (match count, payload
+/// values aligned with `payload_slots`).
 struct DimResult {
     payload_slots: Vec<usize>,
-    map: HashMap<i64, (u64, Vec<ScalarValue>)>,
+    map: HashMap<Vec<i64>, (u64, Vec<ScalarValue>)>,
 }
 
 impl Executor<'_> {
@@ -240,12 +246,14 @@ impl Executor<'_> {
             }
             best.0
         };
-        // children[t] = (child_table, parent_local_key_col, child_local_key_col)
-        // A spanning tree over the join edges; an edge whose two tables are
-        // already connected (a join CYCLE, e.g. Q5's customer-nation =
-        // supplier-nation constraint) becomes a **residual equality**
-        // evaluated post-join at the root.
-        let mut children: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); n];
+        // children[t] = (child_table, links) where links are the
+        // (parent_local_col, child_local_col) pairs joining them — several
+        // pairs = a COMPOSITE key (Q9's lineitem⋈partsupp on suppkey AND
+        // partkey). A spanning tree over the join edges; an edge whose two
+        // tables are already connected through OTHER pairs (a join CYCLE,
+        // e.g. Q5's customer-nation = supplier-nation constraint) becomes a
+        // **residual equality** evaluated post-join at the root.
+        let mut children: Vec<Vec<(usize, Links)>> = vec![Vec::new(); n];
         let mut residual_eq: Vec<Expr> = Vec::new();
         {
             let mut seen = vec![false; n];
@@ -272,7 +280,23 @@ impl Executor<'_> {
                     };
                     used_edges[ei] = true;
                     seen[child.0] = true;
-                    children[t].push((child.0, parent_slot_col, child.1));
+                    // Absorb every other edge between this same pair into
+                    // one composite-key link.
+                    let mut links: Links = vec![(parent_slot_col, child.1)];
+                    for (ej, e2) in q.edges.iter().enumerate() {
+                        if used_edges[ej] {
+                            continue;
+                        }
+                        let (x, y) = (q.slots[e2.a], q.slots[e2.b]);
+                        if x.table == t && y.table == child.0 {
+                            links.push((x.col, y.col));
+                            used_edges[ej] = true;
+                        } else if y.table == t && x.table == child.0 {
+                            links.push((y.col, x.col));
+                            used_edges[ej] = true;
+                        }
+                    }
+                    children[t].push((child.0, links));
                     frontier.push_back(child.0);
                 }
             }
@@ -313,6 +337,13 @@ impl Executor<'_> {
         if let Some(p) = &post {
             collect_slots(p, &mut needed);
         }
+        if q.group.is_empty() && q.aggs.is_empty() {
+            // Plain row query: output projections are slot-space and
+            // evaluate at the root — their dim columns must attach too.
+            for o in &q.output {
+                collect_slots(&o.expr, &mut needed);
+            }
+        }
         needed.sort_unstable();
         needed.dedup();
 
@@ -321,8 +352,9 @@ impl Executor<'_> {
         for _ in 0..n {
             dim_results.push(None);
         }
-        for &(child, _, child_key) in &children[root] {
-            dim_results[child] = Some(self.build_dim(child, child_key, &children, &needed)?);
+        for (child, links) in &children[root] {
+            let child_cols: Vec<usize> = links.iter().map(|&(_, c)| c).collect();
+            dim_results[*child] = Some(self.build_dim(*child, &child_cols, &children, &needed)?);
         }
 
         // ---- Root: scan + filter, then per child narrow (with
@@ -333,13 +365,19 @@ impl Executor<'_> {
         for (chunk, sel) in chunks {
             let mut view = self.slot_view(root, &chunk);
             let mut sel = sel;
-            for &(child, parent_key, _) in &children[root] {
-                let dim = dim_results[child].as_ref().expect("dim built");
-                let key = Expr::Column(self.local_to_slot(root, parent_key));
+            for (child, links) in &children[root] {
+                let dim = dim_results[*child].as_ref().expect("dim built");
+                let keys: Vec<Expr> = links
+                    .iter()
+                    .map(|&(p, _)| Expr::Column(self.local_to_slot(root, p)))
+                    .collect();
+                let key_of = |view: &DataChunk, i: usize| -> Vec<i64> {
+                    keys.iter().map(|k| k.eval_i64(view, i)).collect()
+                };
                 // Narrow with multiplicity.
                 let mut out = Vec::new();
                 sel.for_each(|i| {
-                    if let Some((cnt, _)) = dim.map.get(&key.eval_i64(&view, i as usize)) {
+                    if let Some((cnt, _)) = dim.map.get(&key_of(&view, i as usize)) {
                         for _ in 0..*cnt {
                             out.push(i);
                         }
@@ -356,7 +394,7 @@ impl Executor<'_> {
                         }
                         let (_, pay) = dim
                             .map
-                            .get(&key.eval_i64(&view, i as usize))
+                            .get(&key_of(&view, i as usize))
                             .expect("row just matched");
                         row_vals.insert(i, pay.clone());
                     });
@@ -381,8 +419,27 @@ impl Executor<'_> {
             sels.push(sel);
         }
 
-        // ---- Aggregate, project, then HAVING → ORDER BY → LIMIT.
-        let (columns, mut rows) = self.aggregate(&view_chunks, &sels)?;
+        // ---- Aggregate (or plain-row projection), then HAVING → ORDER BY
+        // → LIMIT.
+        let (columns, mut rows) = if q.group.is_empty() && q.aggs.is_empty() {
+            // Plain row query: outputs are slot-space; one result row per
+            // surviving joined row.
+            let columns: Vec<String> = q.output.iter().map(|o| o.name.clone()).collect();
+            let mut rows = Vec::new();
+            for (chunk, sel) in view_chunks.iter().zip(&sels) {
+                sel.for_each(|i| {
+                    rows.push(
+                        q.output
+                            .iter()
+                            .map(|o| o.expr.eval_value(chunk, i as usize))
+                            .collect(),
+                    );
+                });
+            }
+            (columns, rows)
+        } else {
+            self.aggregate(&view_chunks, &sels)?
+        };
         if !q.order_by.is_empty() {
             rows.sort_by(|a, b| {
                 for k in &q.order_by {
@@ -402,12 +459,13 @@ impl Executor<'_> {
     }
 
     /// Recursively process dim table `t` (joined to its parent via its
-    /// local column `link_col`) into a key → (count, payloads) map.
+    /// local columns `link_cols` — a composite key when several) into a
+    /// key → (count, payloads) map.
     fn build_dim(
         &self,
         t: usize,
-        link_col: usize,
-        children: &[Vec<(usize, usize, usize)>],
+        link_cols: &[usize],
+        children: &[Vec<(usize, Links)>],
         needed: &[usize],
     ) -> Result<DimResult, String> {
         let q = self.q;
@@ -418,15 +476,17 @@ impl Executor<'_> {
             .filter(|&s| q.slots[s].table == t)
             .collect();
         // …plus every child's, bubbled up.
-        let mut child_results: Vec<(usize, DimResult)> = Vec::new(); // (parent-local key col, result)
-        for &(child, parent_key, child_key) in &children[t] {
-            let r = self.build_dim(child, child_key, children, needed)?;
+        // (parent-local key cols, result) per child.
+        let mut child_results: Vec<(Vec<usize>, DimResult)> = Vec::new();
+        for (child, links) in &children[t] {
+            let child_cols: Vec<usize> = links.iter().map(|&(_, c)| c).collect();
+            let r = self.build_dim(*child, &child_cols, children, needed)?;
             payload_slots.extend(r.payload_slots.iter().copied());
-            child_results.push((parent_key, r));
+            child_results.push((links.iter().map(|&(p, _)| p).collect(), r));
         }
 
         let has_payload = !payload_slots.is_empty();
-        let mut map: HashMap<i64, (u64, Vec<ScalarValue>)> = HashMap::new();
+        let mut map: HashMap<Vec<i64>, (u64, Vec<ScalarValue>)> = HashMap::new();
         let own_payload: Vec<usize> = payload_slots
             .iter()
             .copied()
@@ -435,7 +495,10 @@ impl Executor<'_> {
 
         for (chunk, sel) in self.filtered_chunks(t)? {
             let view = self.slot_view(t, &chunk);
-            let link = Expr::Column(self.local_to_slot(t, link_col));
+            let link: Vec<Expr> = link_cols
+                .iter()
+                .map(|&c| Expr::Column(self.local_to_slot(t, c)))
+                .collect();
             let mut err: Option<String> = None;
             sel.for_each(|i| {
                 if err.is_some() {
@@ -445,8 +508,11 @@ impl Executor<'_> {
                 // Probe each child; a miss drops the row, hits multiply.
                 let mut weight = 1u64;
                 let mut bubbled: Vec<(usize, Vec<ScalarValue>)> = Vec::new();
-                for (parent_key, r) in &child_results {
-                    let k = Expr::Column(self.local_to_slot(t, *parent_key)).eval_i64(&view, i);
+                for (parent_keys, r) in &child_results {
+                    let k: Vec<i64> = parent_keys
+                        .iter()
+                        .map(|&c| Expr::Column(self.local_to_slot(t, c)).eval_i64(&view, i))
+                        .collect();
                     match r.map.get(&k) {
                         None => {
                             weight = 0;
@@ -472,7 +538,7 @@ impl Executor<'_> {
                 for (_, block) in &bubbled {
                     pay.extend(block.iter().cloned());
                 }
-                let key = link.eval_i64(&view, i);
+                let key: Vec<i64> = link.iter().map(|l| l.eval_i64(&view, i)).collect();
                 match map.entry(key) {
                     std::collections::hash_map::Entry::Vacant(e) => {
                         e.insert((weight, pay));
@@ -480,8 +546,9 @@ impl Executor<'_> {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
                         if has_payload {
                             err = Some(format!(
-                                "duplicate join key {key} in table '{}' with payload columns — \
+                                "duplicate join key {:?} in table '{}' with payload columns — \
                                  not yet supported",
+                                e.key(),
                                 q.tables[t].name
                             ));
                         } else {
@@ -501,7 +568,15 @@ impl Executor<'_> {
     /// selection) pairs. Chunks are in the table's LOCAL column space.
     fn filtered_chunks(&self, t: usize) -> Result<Vec<(DataChunk, Selection)>, String> {
         let ti = &self.q.tables[t];
-        let chunks = scan_table(ti)?;
+        let chunks = match &ti.source {
+            TableSource::Parquet(_) => scan_table(ti)?,
+            TableSource::Derived(i) => {
+                // Materialize the derived query and expose its output
+                // columns as a one-chunk table.
+                let r = execute(&self.q.derived[*i])?;
+                vec![result_to_chunk(&r, ti)?]
+            }
+        };
         let mut out = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             let sel = match &ti.filter {
@@ -797,6 +872,9 @@ impl AggState {
 /// low-level reader (dimension tables); numeric-only scans use the native
 /// ematix-parquet path.
 fn scan_table(ti: &TableInput) -> Result<Vec<DataChunk>, String> {
+    let TableSource::Parquet(path) = &ti.source else {
+        unreachable!("derived sources are materialized by the executor");
+    };
     let has_strings = ti
         .projection
         .iter()
@@ -815,7 +893,7 @@ fn scan_table(ti: &TableInput) -> Result<Vec<DataChunk>, String> {
                 (c.name.as_str(), kind)
             })
             .collect();
-        scan_columns(&ti.path, &cols)
+        scan_columns(path, &cols)
     } else {
         let cols: Vec<(usize, NativeColKind)> = ti
             .projection
@@ -830,13 +908,84 @@ fn scan_table(ti: &TableInput) -> Result<Vec<DataChunk>, String> {
                 (c.leaf, kind)
             })
             .collect();
-        scan_row_groups(&ti.path, &cols)
+        scan_row_groups(path, &cols)
     }
+}
+
+/// Convert a materialized [`QueryResult`] into a chunk shaped like `ti`'s
+/// projection (`leaf` = the result's output-column position; values coerced
+/// to the declared type).
+fn result_to_chunk(r: &QueryResult, ti: &TableInput) -> Result<DataChunk, String> {
+    let nrows = r.rows.len();
+    let mut cols = Vec::with_capacity(ti.projection.len());
+    for c in &ti.projection {
+        let get = |row: usize| &r.rows[row][c.leaf];
+        let v = match c.ty {
+            LogicalType::Utf8 => {
+                let mut offsets = Vec::with_capacity(nrows + 1);
+                let mut data = Vec::new();
+                offsets.push(0u32);
+                for row in 0..nrows {
+                    match get(row) {
+                        ScalarValue::Utf8(s) => data.extend_from_slice(s.as_bytes()),
+                        other => {
+                            return Err(format!(
+                                "derived column '{}' expected Utf8, got {other:?}",
+                                c.name
+                            ));
+                        }
+                    }
+                    offsets.push(data.len() as u32);
+                }
+                Vector::utf8(offsets, data)
+            }
+            LogicalType::Float64 => {
+                let mut v = Vec::with_capacity(nrows);
+                for row in 0..nrows {
+                    v.push(match get(row) {
+                        ScalarValue::Float64(x) => *x,
+                        ScalarValue::Int64(x) => *x as f64,
+                        other => {
+                            return Err(format!(
+                                "derived column '{}' expected Float64, got {other:?}",
+                                c.name
+                            ));
+                        }
+                    });
+                }
+                Vector::f64(v)
+            }
+            _ => {
+                let mut v = Vec::with_capacity(nrows);
+                for row in 0..nrows {
+                    v.push(match get(row) {
+                        ScalarValue::Int64(x) => *x,
+                        ScalarValue::Int32(x) => *x as i64,
+                        ScalarValue::Date32(x) => *x as i64,
+                        other => {
+                            return Err(format!(
+                                "derived column '{}' expected an integer, got {other:?}",
+                                c.name
+                            ));
+                        }
+                    });
+                }
+                Vector::i64(v)
+            }
+        };
+        cols.push(v);
+    }
+    Ok(DataChunk::new(cols))
 }
 
 /// Total row count of a table's parquet file (footer metadata only).
 fn table_rows(ti: &TableInput) -> Result<u64, String> {
-    let f = ParquetFile::open(&ti.path).map_err(|e| format!("open {}: {e}", ti.path.display()))?;
+    let TableSource::Parquet(path) = &ti.source else {
+        // Derived inputs are aggregates of base tables — never the largest;
+        // rank them below any parquet table for root selection.
+        return Ok(0);
+    };
+    let f = ParquetFile::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let md = f.metadata().map_err(|e| format!("metadata: {e}"))?;
     Ok(md.row_groups.iter().map(|rg| rg.num_rows as u64).sum())
 }
@@ -899,7 +1048,9 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
         Expr::ExtractYear(i) => collect_slots(i, out),
         Expr::Like { expr, .. } => collect_slots(expr, out),
         Expr::ScalarSub(_) => {}
-        Expr::InSub { expr, .. } | Expr::InSet { expr, .. } => collect_slots(expr, out),
+        Expr::InSub { expr, .. } | Expr::InSet { expr, .. } | Expr::Substr { expr, .. } => {
+            collect_slots(expr, out)
+        }
         Expr::Case { whens, else_ } => {
             for (c, v) in whens {
                 collect_slots(c, out);
