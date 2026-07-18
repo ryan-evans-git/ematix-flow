@@ -62,7 +62,7 @@ fn q6_from_sql_equals_hand_built_kernel() {
 
     assert_eq!(result.columns, vec!["revenue".to_string()]);
     assert_eq!(result.rows.len(), 1, "scalar aggregate returns one row");
-    let &[ScalarValue::Float64(revenue)] = result.rows[0].as_slice() else {
+    let [ScalarValue::Float64(revenue)] = result.rows[0].as_slice() else {
         panic!("expected one f64 sum, got {:?}", result.rows[0]);
     };
 
@@ -70,7 +70,7 @@ fn q6_from_sql_equals_hand_built_kernel() {
     // association, same chunk order ⇒ the same f64, bit for bit.
     let hand = run_tpch_q6_native(&path).expect("hand kernel failed");
     assert_eq!(
-        revenue, hand.revenue,
+        *revenue, hand.revenue,
         "planned Q6 must equal the hand-built kernel exactly"
     );
 

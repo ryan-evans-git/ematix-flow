@@ -76,11 +76,11 @@ fn group_by_from_sql_matches_pyarrow_oracle() {
 
     // Rows arrive sorted by group key; each must match the oracle group.
     for (row, &(want_key, want_sum)) in result.rows.iter().zip(&ORACLE) {
-        let &[ScalarValue::Int64(key), ScalarValue::Float64(sum)] = row.as_slice() else {
+        let [ScalarValue::Int64(key), ScalarValue::Float64(sum)] = row.as_slice() else {
             panic!("expected (Int64 key, Float64 sum), got {row:?}");
         };
-        assert_eq!(key, want_key);
-        let rel = (sum - want_sum).abs() / want_sum;
+        assert_eq!(*key, want_key);
+        let rel = (*sum - want_sum).abs() / want_sum;
         assert!(
             rel < 1e-9,
             "group {key}: sum {sum} != oracle {want_sum} (rel {rel:.3e})"
@@ -96,6 +96,7 @@ fn group_key_binding_is_validated() {
         "lineitem",
         &path,
         &[
+            ("l_orderkey", 0, LogicalType::Int64),
             ("l_linenumber", 3, LogicalType::Int32),
             ("l_discount", 6, LogicalType::Float64),
         ],
@@ -103,7 +104,7 @@ fn group_key_binding_is_validated() {
 
     // A non-aggregate select item that is NOT in GROUP BY must error.
     let err = bind_sql(
-        "select l_linenumber, sum(l_discount) from lineitem group by l_discount",
+        "select l_linenumber, sum(l_discount) from lineitem group by l_orderkey",
         &catalog,
     )
     .unwrap_err();

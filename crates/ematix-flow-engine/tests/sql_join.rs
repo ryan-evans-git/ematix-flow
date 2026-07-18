@@ -84,11 +84,11 @@ fn join_with_unique_keys_from_sql() {
     );
     assert_eq!(result.rows.len(), 7);
     for (row, &(want_key, want_sum)) in result.rows.iter().zip(&ORACLE_A) {
-        let &[ScalarValue::Int64(key), ScalarValue::Float64(sum)] = row.as_slice() else {
+        let [ScalarValue::Int64(key), ScalarValue::Float64(sum)] = row.as_slice() else {
             panic!("expected (Int64, Float64), got {row:?}");
         };
-        assert_eq!(key, want_key);
-        let rel = (sum - want_sum).abs() / want_sum;
+        assert_eq!(*key, want_key);
+        let rel = (*sum - want_sum).abs() / want_sum;
         assert!(
             rel < 1e-9,
             "group {key}: {sum} != oracle {want_sum} (rel {rel:.3e})"
@@ -110,13 +110,13 @@ fn join_with_duplicate_keys_multiplies_rows() {
     let plan = bind_sql(sql, &catalog()).expect("bind failed");
     let result = execute(&plan).expect("execute failed");
 
-    let &[ScalarValue::Float64(sum)] = result.rows[0].as_slice() else {
+    let [ScalarValue::Float64(sum)] = result.rows[0].as_slice() else {
         panic!("expected one f64, got {:?}", result.rows[0]);
     };
     // pyarrow oracle: 1,134,436,101,880.19 over 6,001,215 weighted rows —
     // a membership-only (semijoin) implementation lands ~4× low.
     let want = 1134436101880.19_f64;
-    let rel = (sum - want).abs() / want;
+    let rel = (*sum - want).abs() / want;
     assert!(
         rel < 1e-9,
         "weighted sum {sum} != oracle {want} (rel {rel:.3e}) — \
@@ -125,23 +125,33 @@ fn join_with_duplicate_keys_multiplies_rows() {
 }
 
 #[test]
-fn cross_table_attribution_errors() {
-    let cat = catalog();
-    // An arithmetic expression mixing tables is not a join condition and
-    // not a single-table filter — must error, not mis-bind.
+fn cross_table_agg_arg_now_executes() {
+    if !sf1("lineitem").exists() || !sf1("orders").exists() {
+        eprintln!("SKIP cross_table_agg_arg_now_executes: SF1 data absent");
+        return;
+    }
+    // A cross-table aggregate argument — o_totalprice attaches to lineitem
+    // rows as a join payload. (This errored before payload joins landed.)
+    let sql = "select sum(l_extendedprice * o_totalprice) as x \
+               from lineitem, orders where l_orderkey = o_orderkey";
+    let plan = bind_sql(sql, &catalog()).expect("bind failed");
+    let result = execute(&plan).expect("execute failed");
+    let [ScalarValue::Float64(sum)] = result.rows[0].as_slice() else {
+        panic!("expected one f64, got {:?}", result.rows[0]);
+    };
+    let want = 4.661952830333407e16_f64; // pyarrow oracle
+    let rel = (*sum - want).abs() / want;
+    assert!(rel < 1e-9, "{sum} != oracle {want} (rel {rel:.3e})");
+}
+
+#[test]
+fn missing_join_condition_errors() {
+    // Two tables but no join condition must error, not cross-join.
     let err = bind_sql(
-        "select sum(l_extendedprice * o_totalprice) from lineitem, orders \
-         where l_orderkey = o_orderkey",
-        &cat,
+        "select sum(l_extendedprice) from lineitem, orders",
+        &catalog(),
     )
     .unwrap_err();
-    assert!(
-        err.contains("one table"),
-        "cross-table expression should error: {err}"
-    );
-
-    // Two tables but no join condition must error, not cross-join.
-    let err = bind_sql("select sum(l_extendedprice) from lineitem, orders", &cat).unwrap_err();
     assert!(
         err.to_lowercase().contains("join"),
         "missing join condition should error: {err}"

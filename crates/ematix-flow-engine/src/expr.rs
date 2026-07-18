@@ -1,28 +1,27 @@
 //! P3 expression layer: a bound, typed scalar/predicate expression IR and a
 //! tree-walking interpreter over the engine's [`DataChunk`].
 //!
-//! This is the general expression capability the engine lacked — until now
-//! every query's filter and aggregate arithmetic was hand-coded (Q6's
-//! `q6_over_chunks`, Q08's `Q08Agg`). A planned `Filter` narrows the deferred
-//! selection with [`filter_expr`]; a scalar `Aggregate` sums a numeric
-//! expression with [`sum_expr_f64`] — both driven by an [`Expr`] tree the
-//! binder (P3 slice 2) will build from SQL.
+//! This is the general expression capability the engine lacked — until P3
+//! every query's filter and aggregate arithmetic was hand-coded. A planned
+//! `Filter` narrows the deferred selection with [`filter_expr`]; aggregate
+//! arguments and output projections evaluate through [`Expr::eval_f64`] /
+//! [`Expr::eval_value`].
 //!
-//! **Bound** means columns are indices into the decoded chunk, not names —
-//! name/type resolution is the binder's job, so evaluation never touches a
-//! catalog. **Interpreted-first** (the program's stance): this walks the
-//! tree per row. Correct and simple; a vectorized / compiled evaluator is a
-//! labelled follow-on, and the hand-coded fast paths stay until the general
-//! path is measured against them.
+//! **Bound** means columns are indices (into a slot space or a result row —
+//! the binder decides which; see `logical.rs`), never names, so evaluation
+//! never touches a catalog. **Interpreted-first** (the program's stance):
+//! this walks the tree per row. Correct and simple; a vectorized / compiled
+//! evaluator is a labelled follow-on, and the hand-coded fast paths stay
+//! until the general path is measured against them.
+
+use std::sync::Arc;
 
 use crate::chunk::{DataChunk, Selection};
 use crate::pipeline::filter;
 use crate::vector::LogicalType;
 
-/// A literal scalar value. `Decimal` and `Utf8` join once the binder needs
-/// them (decimal constant-folding is a slice-2 concern); the evaluator today
-/// covers the numeric + boolean + date surface Q6 requires.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A literal scalar value.
+#[derive(Clone, Debug, PartialEq)]
 pub enum ScalarValue {
     Int32(i32),
     Int64(i64),
@@ -30,6 +29,7 @@ pub enum ScalarValue {
     /// Days since the Unix epoch — same encoding as [`LogicalType::Date32`].
     Date32(i32),
     Boolean(bool),
+    Utf8(Arc<str>),
 }
 
 /// A binary operator: arithmetic, comparison, or logical.
@@ -38,6 +38,9 @@ pub enum BinaryOp {
     Add,
     Sub,
     Mul,
+    /// Division always evaluates in `f64` (the TPC-H decimal-division
+    /// shapes); exact integer/decimal division is a labelled follow-on.
+    Div,
     Eq,
     NotEq,
     Lt,
@@ -48,7 +51,9 @@ pub enum BinaryOp {
     Or,
 }
 
-/// A bound expression tree. `Column(i)` reads the chunk's `i`-th column.
+/// A bound expression tree. `Column(i)` reads the evaluation context's
+/// `i`-th column (a table/global slot, or a result-row position — see
+/// `logical.rs` for the two spaces).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Column(usize),
@@ -58,25 +63,36 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// `EXTRACT(YEAR FROM <date expr>)` — Date32 days → calendar year.
+    ExtractYear(Box<Expr>),
+    /// `CASE WHEN c₁ THEN v₁ [WHEN c₂ THEN v₂ …] ELSE e END` (the `ELSE` is
+    /// required by the binder — no NULLs yet).
+    Case {
+        whens: Vec<(Expr, Expr)>,
+        else_: Box<Expr>,
+    },
 }
 
-/// A value produced during evaluation. Integer-family logical types (`Int32`,
-/// `Int64`, `Date32`) collapse to `Int(i64)`, so numeric promotion has one
-/// integer case and one float case.
+/// A value produced during evaluation. Integer-family logical types
+/// (`Int32`, `Int64`, `Date32`) collapse to `Int(i64)`, so numeric
+/// promotion has one integer case and one float case. Strings borrow from
+/// the chunk (or the expression's own literal).
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Val {
+enum Val<'a> {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Str(&'a str),
 }
 
-impl Val {
+impl Val<'_> {
     #[inline]
     fn as_f64(self) -> f64 {
         match self {
             Val::Int(i) => i as f64,
             Val::Float(f) => f,
             Val::Bool(b) => i64::from(b) as f64,
+            Val::Str(_) => panic!("string value in numeric context"),
         }
     }
 
@@ -92,7 +108,7 @@ impl Val {
 impl Expr {
     /// Evaluate this expression at `row` of `chunk`.
     #[inline]
-    fn eval(&self, chunk: &DataChunk, row: usize) -> Val {
+    fn eval<'e>(&'e self, chunk: &'e DataChunk, row: usize) -> Val<'e> {
         match self {
             Expr::Column(i) => {
                 let v = chunk.col(*i);
@@ -100,22 +116,33 @@ impl Expr {
                     LogicalType::Int32 | LogicalType::Date32 => Val::Int(v.as_i32()[row] as i64),
                     LogicalType::Int64 => Val::Int(v.as_i64()[row]),
                     LogicalType::Float64 => Val::Float(v.as_f64()[row]),
-                    LogicalType::Utf8 => {
-                        panic!("string columns are not yet supported in expr evaluation")
-                    }
+                    LogicalType::Utf8 => Val::Str(v.as_utf8().get(row)),
                 }
             }
-            Expr::Literal(s) => match *s {
-                ScalarValue::Int32(x) => Val::Int(x as i64),
-                ScalarValue::Int64(x) => Val::Int(x),
-                ScalarValue::Date32(x) => Val::Int(x as i64),
-                ScalarValue::Float64(x) => Val::Float(x),
-                ScalarValue::Boolean(b) => Val::Bool(b),
+            Expr::Literal(s) => match s {
+                ScalarValue::Int32(x) => Val::Int(*x as i64),
+                ScalarValue::Int64(x) => Val::Int(*x),
+                ScalarValue::Date32(x) => Val::Int(*x as i64),
+                ScalarValue::Float64(x) => Val::Float(*x),
+                ScalarValue::Boolean(b) => Val::Bool(*b),
+                ScalarValue::Utf8(s) => Val::Str(s),
             },
             Expr::Binary { op, lhs, rhs } => {
                 let l = lhs.eval(chunk, row);
                 let r = rhs.eval(chunk, row);
                 eval_binary(*op, l, r)
+            }
+            Expr::ExtractYear(e) => match e.eval(chunk, row) {
+                Val::Int(days) => Val::Int(year_of_days(days as i32) as i64),
+                other => panic!("EXTRACT(YEAR) needs a date operand, got {other:?}"),
+            },
+            Expr::Case { whens, else_ } => {
+                for (cond, val) in whens {
+                    if cond.eval(chunk, row).expect_bool() {
+                        return val.eval(chunk, row);
+                    }
+                }
+                else_.eval(chunk, row)
             }
         }
     }
@@ -135,8 +162,8 @@ impl Expr {
     }
 
     /// Evaluate an integer expression at `row` — the group-key path (keys
-    /// route through the engine's i64 hash aggregation). Panics on a float
-    /// or boolean result: the binder guarantees integer-family keys, so a
+    /// route through the engine's i64 hash aggregation). Panics on a
+    /// non-integer result: the binder guarantees integer-family keys, so a
     /// miss here is a wiring bug, not a data condition.
     #[inline]
     pub fn eval_i64(&self, chunk: &DataChunk, row: usize) -> i64 {
@@ -145,74 +172,95 @@ impl Expr {
             other => panic!("expected an integer group key, got {other:?}"),
         }
     }
+
+    /// Evaluate to a typed [`ScalarValue`] — the output-projection path,
+    /// preserving integer-ness (a passed-through group key stays `Int64`).
+    pub fn eval_value(&self, chunk: &DataChunk, row: usize) -> ScalarValue {
+        match self.eval(chunk, row) {
+            Val::Int(i) => ScalarValue::Int64(i),
+            Val::Float(f) => ScalarValue::Float64(f),
+            Val::Bool(b) => ScalarValue::Boolean(b),
+            Val::Str(s) => ScalarValue::Utf8(Arc::from(s)),
+        }
+    }
 }
 
 #[inline]
-fn eval_binary(op: BinaryOp, l: Val, r: Val) -> Val {
+fn eval_binary<'a>(op: BinaryOp, l: Val<'a>, r: Val<'a>) -> Val<'a> {
     use BinaryOp::*;
     match op {
-        Add | Sub | Mul => arith(op, l, r),
+        Add | Sub | Mul | Div => arith(op, l, r),
         Eq | NotEq | Lt | LtEq | Gt | GtEq => Val::Bool(compare(op, l, r)),
         And => Val::Bool(l.expect_bool() && r.expect_bool()),
         Or => Val::Bool(l.expect_bool() || r.expect_bool()),
     }
 }
 
-/// Arithmetic with numeric promotion: integer stays integer; any float
-/// operand promotes the whole operation to `f64`.
+/// Arithmetic with numeric promotion: integer stays integer (except `Div`,
+/// which always evaluates in `f64`); any float operand promotes the whole
+/// operation to `f64`.
 #[inline]
-fn arith(op: BinaryOp, l: Val, r: Val) -> Val {
+fn arith<'a>(op: BinaryOp, l: Val<'a>, r: Val<'a>) -> Val<'a> {
     use BinaryOp::*;
-    match (l, r) {
-        (Val::Int(a), Val::Int(b)) => Val::Int(match op {
+    if let (Val::Int(a), Val::Int(b), false) = (l, r, matches!(op, Div)) {
+        return Val::Int(match op {
             Add => a + b,
             Sub => a - b,
             Mul => a * b,
             _ => unreachable!("non-arithmetic op in arith()"),
-        }),
-        _ => {
-            let (a, b) = (l.as_f64(), r.as_f64());
-            Val::Float(match op {
-                Add => a + b,
-                Sub => a - b,
-                Mul => a * b,
-                _ => unreachable!("non-arithmetic op in arith()"),
-            })
-        }
+        });
     }
+    let (a, b) = (l.as_f64(), r.as_f64());
+    Val::Float(match op {
+        Add => a + b,
+        Sub => a - b,
+        Mul => a * b,
+        Div => a / b,
+        _ => unreachable!("non-arithmetic op in arith()"),
+    })
 }
 
 /// Comparison with the same promotion rule: both integer ⇒ exact integer
-/// compare; otherwise compare as `f64`.
+/// compare; strings compare as strings; otherwise compare as `f64`.
 #[inline]
-fn compare(op: BinaryOp, l: Val, r: Val) -> bool {
+fn compare(op: BinaryOp, l: Val<'_>, r: Val<'_>) -> bool {
     use BinaryOp::*;
     use std::cmp::Ordering;
-    match (l, r) {
-        (Val::Int(a), Val::Int(b)) => match op {
-            Eq => a == b,
-            NotEq => a != b,
-            Lt => a < b,
-            LtEq => a <= b,
-            Gt => a > b,
-            GtEq => a >= b,
-            _ => unreachable!("non-comparison op in compare()"),
-        },
-        _ => {
-            let (a, b) = (l.as_f64(), r.as_f64());
-            match op {
-                Eq => a == b,
-                NotEq => a != b,
-                // NaN-free in practice; partial_cmp keeps it total-order-safe.
-                _ => match a.partial_cmp(&b) {
-                    Some(Ordering::Less) => matches!(op, Lt | LtEq),
-                    Some(Ordering::Equal) => matches!(op, LtEq | GtEq),
-                    Some(Ordering::Greater) => matches!(op, Gt | GtEq),
-                    None => false,
-                },
-            }
+    let ord = match (l, r) {
+        (Val::Int(a), Val::Int(b)) => a.cmp(&b),
+        (Val::Str(a), Val::Str(b)) => a.cmp(b),
+        (Val::Str(_), _) | (_, Val::Str(_)) => {
+            panic!("cannot compare a string with a non-string")
         }
+        _ => match l.as_f64().partial_cmp(&r.as_f64()) {
+            Some(o) => o,
+            // NaN-free in practice; an unordered compare matches nothing.
+            None => return false,
+        },
+    };
+    match op {
+        Eq => ord == Ordering::Equal,
+        NotEq => ord != Ordering::Equal,
+        Lt => ord == Ordering::Less,
+        LtEq => ord != Ordering::Greater,
+        Gt => ord == Ordering::Greater,
+        GtEq => ord != Ordering::Less,
+        _ => unreachable!("non-comparison op in compare()"),
     }
+}
+
+/// Days since the Unix epoch → calendar year (proleptic Gregorian; the
+/// inverse direction of the binder's `days_from_civil`).
+fn year_of_days(days: i32) -> i32 {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i32 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    if m <= 2 { y + 1 } else { y }
 }
 
 /// Narrow `chunk`'s current selection to the rows satisfying boolean
@@ -261,5 +309,48 @@ mod tests {
         };
         assert!(and(&t, &t).eval_bool(&chunk, 0));
         assert!(!and(&t, &f).eval_bool(&chunk, 0));
+    }
+
+    #[test]
+    fn extract_year_inverts_days_from_civil() {
+        let chunk = DataChunk::new(vec![Vector::i32(
+            vec![0, 8766, 9131, 9495, 9496, 9861],
+            LogicalType::Date32,
+        )]);
+        let e = Expr::ExtractYear(Box::new(Expr::Column(0)));
+        let years: Vec<i64> = (0..6).map(|r| e.eval_i64(&chunk, r)).collect();
+        // 1970-01-01, 1994-01-01, 1995-01-01, 1995-12-31, 1996-01-01,
+        // 1996-12-31.
+        assert_eq!(years, vec![1970, 1994, 1995, 1995, 1996, 1996]);
+    }
+
+    #[test]
+    fn case_and_strings_and_division() {
+        let chunk = DataChunk::new(vec![
+            Vector::utf8(vec![0, 6, 12], b"BRAZILCANADA".to_vec()),
+            Vector::f64(vec![10.0, 20.0]),
+        ]);
+        // CASE WHEN col0 = 'BRAZIL' THEN col1 ELSE 0 END
+        let case = Expr::Case {
+            whens: vec![(
+                Expr::Binary {
+                    op: BinaryOp::Eq,
+                    lhs: Box::new(Expr::Column(0)),
+                    rhs: Box::new(Expr::Literal(ScalarValue::Utf8("BRAZIL".into()))),
+                },
+                Expr::Column(1),
+            )],
+            else_: Box::new(Expr::Literal(ScalarValue::Int64(0))),
+        };
+        assert_eq!(case.eval_f64(&chunk, 0), 10.0);
+        assert_eq!(case.eval_f64(&chunk, 1), 0.0);
+
+        // Division always evaluates f64, including int/int.
+        let div = Expr::Binary {
+            op: BinaryOp::Div,
+            lhs: Box::new(Expr::Literal(ScalarValue::Int64(7))),
+            rhs: Box::new(Expr::Literal(ScalarValue::Int64(2))),
+        };
+        assert_eq!(div.eval_f64(&chunk, 0), 3.5);
     }
 }
