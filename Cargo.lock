@@ -4091,6 +4091,9 @@ name = "ematix-flow-engine"
 version = "1.0.0"
 dependencies = [
  "ematix-flow-push",
+ "ematix-parquet-codec",
+ "ematix-parquet-format",
+ "ematix-parquet-io",
  "parquet 58.3.0",
 ]
 

@@ -21,3 +21,11 @@ parquet = { workspace = true }
 # engine clean-room. The engine adds its own `probe_narrow` operator over
 # the engine's `DataChunk` (see src/join.rs).
 ematix-flow-push = { path = "../ematix-flow-push" }
+# Native decode (DF-free, Arrow-free) — the ematix-parquet codec + IO
+# crates we own. `src/scan_native.rs` calls their masked-decode
+# primitives directly (the same ones core wraps via its bridge), so the
+# engine's real decode path keeps NO DataFusion dependency. Same 0.17
+# pin core uses, so Cargo.lock resolves to one version.
+ematix-parquet-codec = "0.17"
+ematix-parquet-format = "0.17"
+ematix-parquet-io = "0.17"

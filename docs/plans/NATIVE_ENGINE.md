@@ -202,6 +202,37 @@ standalone — then the work-stealing scheduler.
 
 ---
 
+## P2 progress
+
+**P2.1 — engine-native scan. DONE (2026-07-18).** `src/scan_native.rs` decodes
+row-group columns straight into engine `Vector`s via the ematix-parquet codec
+(`ParquetFile::open` + `read_column_{i64,i32,f64}_masked_into`) — the same
+primitives core wraps in its bridge, called directly so the engine keeps **no
+DataFusion dependency** in its decode path. Gate `tests/q6_native.rs`: the native
+decoder produces **bit-identical** Q6 results to the P0 stock-parquet decoder and
+matches the DuckDB SF-1 oracle (`native.revenue == stock.revenue == oracle`).
+Clippy-clean.
+
+**P2.2 — pipeline framework + engine-native Q08. DONE (2026-07-18).** `src/exec.rs`
+adds the engine's push execution framework: `PushOp` (stateless pipelined ops —
+e.g. `ProbeNarrowOp`), `Sink` (stateful breakers), and `run_scan_pipeline` — a
+row-group-parallel driver over the native scan (the generalization of P1's
+hand-loop; per-thread sinks merged by the caller). Gate `tests/driver_smoke.rs`.
+The Q08 GO/NO-GO harness now runs its push arm **entirely through the engine** —
+native scan → driver → `ProbeNarrowOp` → an engine `Sink` — with zero core
+`masked_decode` and zero DataFusion. Re-measured SF-10: **148.9 ms vs 191.8 ms
+production DF = −22.4%** (correctness == DF pull; leaner than P1's −13.6% crutch
+version). SF-10 single-query variance is ±5–10%, so read this as a solid GO, not a
+precise delta.
+
+Remaining P2: the **work-stealing morsel scheduler** (replace the driver's static
+`rg % nthreads` stride — the piece designed to be swapped), then spill + adaptive
+re-plan. Also pending: a *general* aggregate breaker (Q08's agg is still a
+query-specific `Sink` in the harness) and building dimension probe structures via
+engine pipelines (still SQL in the harness).
+
+---
+
 ## Open questions (yours — I have a recommendation on each)
 
 1. **Crate/repo.** *Recommend:* build as an in-repo workspace crate

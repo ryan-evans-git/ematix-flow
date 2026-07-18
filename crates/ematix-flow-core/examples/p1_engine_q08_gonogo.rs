@@ -1,9 +1,10 @@
 //! P1 GO/NO-GO — the clean-room native engine's whole-engine gate.
 //!
-//! Reproduces the PV.1 −16% Q08 result, but routes the push arm through
-//! the **`ematix-flow-engine`** crate's own `DataChunk` + `join::probe_narrow`
-//! (native vectors, deferred selection, no per-join `take`), decoding via
-//! ematix-parquet — versus the **current production DF pull pipeline**
+//! Reproduces the PV.1 −16% Q08 result, but routes the push arm ENTIRELY
+//! through the **`ematix-flow-engine`** crate: its native ematix-parquet
+//! scan → `exec::run_scan_pipeline` (RG-parallel) → `ProbeNarrowOp`
+//! (deferred selection, no per-join `take`) → an engine `Sink` — versus
+//! the **current production DF pull pipeline**
 //! (`ctx.sql(q08)` with the full preset rule chain), same process,
 //! interleaved. Both arms decode identically, so the delta is purely
 //! push-execution vs pull-execution.
@@ -25,12 +26,12 @@ use datafusion::arrow::array::{Float64Array, Int32Array, Int64Array, StringViewA
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
-use ematix_flow_core::ematix_parquet_bridge::{masked_decode_f64, masked_decode_i64, open_cached};
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 
 use ematix_flow_engine::chunk::DataChunk;
-use ematix_flow_engine::join::{ProbeStructure, choose, probe_narrow};
-use ematix_flow_engine::vector::Vector;
+use ematix_flow_engine::exec::{ProbeNarrowOp, PushOp, Sink, run_scan_pipeline};
+use ematix_flow_engine::join::{ProbeStructure, choose};
+use ematix_flow_engine::scan_native::NativeColKind;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -51,16 +52,6 @@ struct Probes {
     part: Arc<ProbeStructure>,     // p_partkey survivors (membership → DenseSet)
     orders: Arc<ProbeStructure>,   // o_orderkey -> year-bucket (0=1995,1=1996)
     supplier: Arc<ProbeStructure>, // s_suppkey -> is_brazil (1/0)
-}
-
-fn all_ones_mask(nrows: usize) -> Vec<u8> {
-    let nb = nrows.div_ceil(8);
-    let mut m = vec![0xFFu8; nb];
-    let rem = nrows % 8;
-    if rem != 0 {
-        m[nb - 1] = (1u8 << rem) - 1;
-    }
-    m
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -259,84 +250,83 @@ async fn build_probes(ctx: &SessionContext) -> Result<Probes, Box<dyn std::error
     })
 }
 
-/// Q08 hot path through the clean-room engine: per row group, decode 5
-/// columns into engine `Vector`s → `DataChunk` → `join::probe_narrow`
-/// (part semijoin, no materialization) → inline market-share agg using
-/// the orders/supplier payload probes. RG-parallel; per-thread accumulator
-/// merged at the end.
+/// Q08 hot path through the clean-room engine, end to end: the native
+/// scan feeds row-group morsels to `run_scan_pipeline`, which narrows on
+/// the part semijoin (`ProbeNarrowOp`, no materialization) and sums the
+/// market share in `Q08AggSink`. No core `masked_decode`, no DataFusion —
+/// the engine decodes and executes on its own; per-thread sinks merged here.
 fn engine_push_q08(
     lineitem: &std::path::Path,
     probes: &Probes,
     nthreads: usize,
 ) -> Result<[f64; 2], Box<dyn std::error::Error>> {
-    let file = open_cached(lineitem)?;
-    let md = file.metadata()?;
-    let n_rg = md.row_groups.len();
-    let totals = std::sync::Mutex::new([[0.0f64; 2]; 2]); // [year][0=total,1=brazil]
-    std::thread::scope(|scope| {
-        for t in 0..nthreads {
-            let file = Arc::clone(&file);
-            let md = &md;
-            let part = Arc::clone(&probes.part);
-            let orders = Arc::clone(&probes.orders);
-            let supplier = Arc::clone(&probes.supplier);
-            let totals = &totals;
-            scope.spawn(move || {
-                let mut local = [[0.0f64; 2]; 2];
-                let mut rg = t;
-                while rg < n_rg {
-                    let nrows = md.row_groups[rg].num_rows as usize;
-                    let mask = all_ones_mask(nrows);
-                    let pk = masked_decode_i64(&file, rg, C_PARTKEY, &mask).unwrap();
-                    let ok = masked_decode_i64(&file, rg, C_ORDERKEY, &mask).unwrap();
-                    let sk = masked_decode_i64(&file, rg, C_SUPPKEY, &mask).unwrap();
-                    let ep = masked_decode_f64(&file, rg, C_EXTPRICE, &mask).unwrap();
-                    let disc = masked_decode_f64(&file, rg, C_DISCOUNT, &mask).unwrap();
+    // Chunk cols: 0=partkey 1=orderkey 2=suppkey 3=extprice 4=discount.
+    let columns = [
+        (C_PARTKEY, NativeColKind::I64),
+        (C_ORDERKEY, NativeColKind::I64),
+        (C_SUPPKEY, NativeColKind::I64),
+        (C_EXTPRICE, NativeColKind::F64),
+        (C_DISCOUNT, NativeColKind::F64),
+    ];
+    // The 60M-row hot op: part semijoin narrow (no take); agg at the sink.
+    let ops: Vec<Box<dyn PushOp>> = vec![Box::new(ProbeNarrowOp {
+        key_col: 0,
+        probe: Arc::clone(&probes.part),
+    })];
+    let orders = Arc::clone(&probes.orders);
+    let supplier = Arc::clone(&probes.supplier);
+    let make_sink = || Q08AggSink {
+        orders: Arc::clone(&orders),
+        supplier: Arc::clone(&supplier),
+        acc: [[0.0; 2]; 2],
+    };
 
-                    // cols: 0=partkey 1=orderkey 2=suppkey 3=extprice 4=discount
-                    let chunk = DataChunk::new(vec![
-                        Vector::i64(pk),
-                        Vector::i64(ok),
-                        Vector::i64(sk),
-                        Vector::f64(ep),
-                        Vector::f64(disc),
-                    ]);
+    let sinks = run_scan_pipeline(lineitem, &columns, &ops, make_sink, nthreads)?;
 
-                    // The 60M-row hot op: part semijoin narrow, no take.
-                    let sel = probe_narrow(&chunk, 0, &part);
-
-                    let okc = chunk.col(1).as_i64();
-                    let skc = chunk.col(2).as_i64();
-                    let epc = chunk.col(3).as_f64();
-                    let dcc = chunk.col(4).as_f64();
-                    sel.for_each(|i| {
-                        let i = i as usize;
-                        // orders inner join: drop rows whose order isn't in
-                        // the AMERICA+date set; one lookup yields membership
-                        // and the year bucket.
-                        if let Some(bucket) = orders.payload(okc[i]) {
-                            let vol = epc[i] * (1.0 - dcc[i]);
-                            local[bucket as usize][0] += vol;
-                            if supplier.payload(skc[i]) == Some(1) {
-                                local[bucket as usize][1] += vol;
-                            }
-                        }
-                    });
-                    rg += nthreads;
-                }
-                let mut g = totals.lock().unwrap();
-                for y in 0..2 {
-                    g[y][0] += local[y][0];
-                    g[y][1] += local[y][1];
-                }
-            });
+    // Merge per-thread accumulators, then form the market shares.
+    let mut acc = [[0.0f64; 2]; 2];
+    for s in &sinks {
+        for y in 0..2 {
+            acc[y][0] += s.acc[y][0];
+            acc[y][1] += s.acc[y][1];
         }
-    });
-    let g = totals.into_inner().unwrap();
+    }
     Ok([
-        if g[0][0] > 0.0 { g[0][1] / g[0][0] } else { 0.0 },
-        if g[1][0] > 0.0 { g[1][1] / g[1][0] } else { 0.0 },
+        if acc[0][0] > 0.0 { acc[0][1] / acc[0][0] } else { 0.0 },
+        if acc[1][0] > 0.0 { acc[1][1] / acc[1][0] } else { 0.0 },
     ])
+}
+
+/// Terminal breaker: buckets surviving lineitem rows by orders→year and
+/// sums `extprice*(1-discount)`, splitting the BRAZIL share via the
+/// supplier payload. One instance per worker thread; merged in
+/// `engine_push_q08`.
+struct Q08AggSink {
+    orders: Arc<ProbeStructure>,
+    supplier: Arc<ProbeStructure>,
+    acc: [[f64; 2]; 2], // [year-bucket][0=total, 1=brazil]
+}
+
+impl Sink for Q08AggSink {
+    fn consume(&mut self, chunk: &DataChunk) {
+        // cols: 1=orderkey 2=suppkey 3=extprice 4=discount.
+        let ok = chunk.col(1).as_i64();
+        let sk = chunk.col(2).as_i64();
+        let ep = chunk.col(3).as_f64();
+        let disc = chunk.col(4).as_f64();
+        chunk.sel.for_each(|i| {
+            let i = i as usize;
+            // orders inner join: one payload lookup yields membership and
+            // the year bucket; supplier payload flags the BRAZIL share.
+            if let Some(bucket) = self.orders.payload(ok[i]) {
+                let vol = ep[i] * (1.0 - disc[i]);
+                self.acc[bucket as usize][0] += vol;
+                if self.supplier.payload(sk[i]) == Some(1) {
+                    self.acc[bucket as usize][1] += vol;
+                }
+            }
+        });
+    }
 }
 
 /// Run the real Q08 pull plan and extract `[share_1995, share_1996]`.
