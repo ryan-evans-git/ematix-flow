@@ -67,6 +67,8 @@ SF=1 (pass/fail matrix, not yet all-green); ADR merged.
 **Goal:** the aggregation shapes analysts use most, vectorized on the
 push engine (not a scalar DataFusion fallback).
 
+> **Full design:** [`PHASE_V2_S1_GROUPING_SETS.md`](PHASE_V2_S1_GROUPING_SETS.md).
+
 - **S1.1** RED parity tests for `GROUPING SETS`, `ROLLUP`, `CUBE`,
   `GROUPING()` against DuckDB (Q18, Q22, Q67, Q77).
 - **S1.2** Vectorized grouping-set aggregation kernel in the push engine.
