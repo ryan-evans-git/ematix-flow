@@ -14,10 +14,10 @@
 //! aggregation ([`crate::agg::HashAggregateSink`]) are the next slices —
 //! the operators already exist; the planner grows into them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::chunk::DataChunk;
-use crate::expr::{ScalarValue, filter_expr, sum_expr_f64};
+use crate::chunk::{DataChunk, Selection};
+use crate::expr::{Expr, ScalarValue, filter_expr, sum_expr_f64};
 use crate::logical::{AggFunc, LogicalPlan};
 use crate::scan_native::{NativeColKind, scan_row_groups};
 use crate::vector::LogicalType;
@@ -95,7 +95,7 @@ pub fn execute(plan: &LogicalPlan) -> Result<QueryResult, String> {
                 .collect();
             Ok(QueryResult { columns, rows })
         }
-        LogicalPlan::Filter { .. } | LogicalPlan::Scan { .. } => {
+        LogicalPlan::Filter { .. } | LogicalPlan::Scan { .. } | LogicalPlan::Join { .. } => {
             Err("top-level non-aggregate queries are not yet supported (P3)".into())
         }
     }
@@ -129,6 +129,47 @@ fn run_input(plan: &LogicalPlan) -> Result<(Vec<DataChunk>, Vec<crate::chunk::Se
                         sel,
                     };
                     filter_expr(&scoped, predicate)
+                })
+                .collect();
+            Ok((chunks, sels))
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            left_key,
+            right_key,
+        } => {
+            // Consume the right (dim) side into key → match-count. Counts —
+            // not a set — because inner-join semantics multiply: a left row
+            // joins once per matching right row.
+            let (rchunks, rsels) = run_input(right)?;
+            let rkey = Expr::Column(*right_key);
+            let mut counts: HashMap<i64, u32> = HashMap::new();
+            for (chunk, sel) in rchunks.iter().zip(&rsels) {
+                sel.for_each(|i| {
+                    *counts.entry(rkey.eval_i64(chunk, i as usize)).or_insert(0) += 1;
+                });
+            }
+
+            // Narrow the left (fact) side with multiplicity: keep a live row
+            // once per match by duplicating its selection index. Unique
+            // right keys ⇒ every count is 1 ⇒ this IS the engine's
+            // probe-narrow semijoin; duplicate keys stay correct.
+            let (chunks, sels) = run_input(left)?;
+            let lkey = Expr::Column(*left_key);
+            let sels = chunks
+                .iter()
+                .zip(sels)
+                .map(|(chunk, sel)| {
+                    let mut out = Vec::new();
+                    sel.for_each(|i| {
+                        if let Some(&c) = counts.get(&lkey.eval_i64(chunk, i as usize)) {
+                            for _ in 0..c {
+                                out.push(i);
+                            }
+                        }
+                    });
+                    Selection::Indices(out)
                 })
                 .collect();
             Ok((chunks, sels))

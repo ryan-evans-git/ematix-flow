@@ -64,6 +64,19 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         predicate: Expr,
     },
+    /// Inner equi-join where the **right side contributes no output
+    /// columns** — its columns appear only in its own filters. Rows flow
+    /// from `left` with true inner-join multiplicity: a left row is kept
+    /// once per matching right row (selection-index duplication), which
+    /// degenerates to a pure semijoin narrow when right keys are unique.
+    /// `left_key` / `right_key` are chunk positions in each side's own
+    /// scan projection. A payload-carrying join is the next slice.
+    Join {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        left_key: usize,
+        right_key: usize,
+    },
     /// Group by `group` and compute `aggs` over each group. An empty
     /// `group` is the scalar-aggregate case (one output row). Output
     /// columns are the group keys (in order) then the aggregates.

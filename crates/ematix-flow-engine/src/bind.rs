@@ -10,10 +10,18 @@
 //! below the stored `0.07`, silently dropping the whole 0.07 bucket (~1/3 of
 //! Q6's matches) — the `lib.rs:62` lesson, now owned by the binder.
 //!
-//! Scope grows slice by slice. Today: single table, `WHERE`, scalar
-//! aggregates (`sum`), `GROUP BY` expressions. Joins, plain projections,
-//! `ORDER BY`/`LIMIT` are labelled follow-ons — each unsupported construct
-//! errors by name rather than mis-binding.
+//! Multi-table (4b): FROM may list tables comma-style (the TPC-H canonical
+//! form); WHERE splits into conjuncts — an equality between columns of two
+//! different tables is a **join condition**, anything else must attribute to
+//! exactly one table and becomes that table's filter. SELECT / GROUP BY
+//! expressions must all attribute to one table (the fact side); the other
+//! table joins in key-only (its columns appear only in its own filters).
+//!
+//! Scope grows slice by slice; each unsupported construct errors by name
+//! rather than mis-binding. Not yet: `JOIN … ON` syntax, >2 tables,
+//! dim-payload columns in SELECT, ORDER BY / LIMIT, scalar functions.
+
+use std::collections::BTreeSet;
 
 use sqlparser::ast;
 use sqlparser::dialect::GenericDialect;
@@ -22,6 +30,7 @@ use sqlparser::parser::Parser;
 use crate::catalog::{Catalog, TableDef};
 use crate::expr::{BinaryOp, Expr, ScalarValue};
 use crate::logical::{AggExpr, AggFunc, GroupExpr, LogicalPlan, ScanColumn};
+use crate::vector::LogicalType;
 
 /// Parse `sql` and bind it against `catalog` into a typed plan.
 pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan, String> {
@@ -36,34 +45,51 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan, String> {
         return Err("only plain SELECT is supported (no set operations yet)".into());
     };
 
-    // FROM: exactly one table, no joins (joins are a later slice).
-    let [from] = select.from.as_slice() else {
-        return Err(format!(
-            "expected one FROM table, got {}",
-            select.from.len()
-        ));
-    };
-    if !from.joins.is_empty() {
-        return Err("JOIN is not yet supported (P3 slice 4)".into());
+    // FROM: comma-separated plain tables (the TPC-H canonical form).
+    if select.from.is_empty() {
+        return Err("a FROM clause is required".into());
     }
-    let ast::TableFactor::Table { name, .. } = &from.relation else {
-        return Err("only plain table names are supported in FROM".into());
-    };
-    let table_name = name.to_string();
-    let table = catalog
-        .table(&table_name)
-        .ok_or_else(|| format!("unknown table '{table_name}'"))?;
-
     let mut b = Binder {
-        table,
-        used: Vec::new(),
+        tables: Vec::new(),
+        touched: BTreeSet::new(),
     };
+    for twj in &select.from {
+        if !twj.joins.is_empty() {
+            return Err("JOIN … ON syntax is not yet supported (use comma joins + WHERE)".into());
+        }
+        let ast::TableFactor::Table { name, .. } = &twj.relation else {
+            return Err("only plain table names are supported in FROM".into());
+        };
+        let tname = name.to_string();
+        let def = catalog
+            .table(&tname)
+            .ok_or_else(|| format!("unknown table '{tname}'"))?;
+        b.tables.push(BoundTable {
+            name: tname,
+            def,
+            used: Vec::new(),
+        });
+    }
 
     // SELECT items first (so their arguments claim the first chunk
-    // positions), then GROUP BY, then WHERE — the scan projection is the
-    // referenced columns in first-use order. Non-aggregate items are group
-    // keys and must precede the aggregates (they are also the output-column
-    // order the executor produces).
+    // positions). Non-aggregate items are group keys and must precede the
+    // aggregates. Everything here must attribute to ONE table — the fact
+    // side.
+    let mut fact: Option<usize> = None;
+    let note_fact = |fact: &mut Option<usize>, t: Option<usize>| -> Result<(), String> {
+        match (t, *fact) {
+            (None, _) => Ok(()),
+            (Some(t), None) => {
+                *fact = Some(t);
+                Ok(())
+            }
+            (Some(t), Some(f)) if t == f => Ok(()),
+            (Some(_), Some(_)) => {
+                Err("SELECT / GROUP BY must reference exactly one table (so far)".into())
+            }
+        }
+    };
+
     let mut keys: Vec<GroupExpr> = Vec::new();
     let mut aggs: Vec<AggExpr> = Vec::new();
     for item in &select.projection {
@@ -73,14 +99,17 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan, String> {
             other => return Err(format!("unsupported select item: {other}")),
         };
         if matches!(expr, ast::Expr::Function(_)) {
-            aggs.push(b.bind_aggregate(expr, alias)?);
+            let (agg, t) = b.bind_aggregate(expr, alias)?;
+            note_fact(&mut fact, t)?;
+            aggs.push(agg);
         } else {
             if !aggs.is_empty() {
                 return Err("group keys must precede aggregates in SELECT (so far)".into());
             }
-            let bound = b.bind_scalar(expr)?;
-            let name = alias.unwrap_or_else(|| match &bound {
-                Expr::Column(i) => b.used[*i].name.clone(),
+            let (bound, t) = b.bind_single(expr)?;
+            note_fact(&mut fact, t)?;
+            let name = alias.unwrap_or_else(|| match (&bound, t) {
+                (Expr::Column(i), Some(t)) => b.tables[t].used[*i].name.clone(),
                 _ => format!("key{}", keys.len()),
             });
             keys.push(GroupExpr { expr: bound, name });
@@ -90,19 +119,23 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan, String> {
         return Err("SELECT list must contain at least one aggregate (so far)".into());
     }
 
+    // GROUP BY: the non-aggregate select items must BE the group keys, in
+    // order.
     let group_exprs = match &select.group_by {
-        ast::GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => exprs
-            .iter()
-            .map(|e| b.bind_scalar(e))
-            .collect::<Result<Vec<_>, _>>()?,
+        ast::GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => {
+            let mut out = Vec::new();
+            for e in exprs {
+                let (bound, t) = b.bind_single(e)?;
+                note_fact(&mut fact, t)?;
+                out.push(bound);
+            }
+            out
+        }
         ast::GroupByExpr::Expressions(..) => {
             return Err("GROUP BY modifiers (ROLLUP/CUBE/…) are not yet supported".into());
         }
         other => return Err(format!("unsupported GROUP BY form: {other:?}")),
     };
-    // The non-aggregate select items must BE the group keys, in order —
-    // anything else is either invalid SQL (a non-grouped column) or a
-    // reordering this slice doesn't support yet.
     if keys.len() != group_exprs.len() || keys.iter().zip(&group_exprs).any(|(k, g)| k.expr != *g) {
         let named = keys
             .iter()
@@ -113,6 +146,7 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan, String> {
             "non-aggregate select items [{named}] must match GROUP BY exprs in order"
         ));
     }
+    let fact = fact.ok_or("SELECT must reference a table column")?;
     // Group keys route through the i64 hash-agg path: integer-family
     // columns only (so far), checked here so execution can't mis-key.
     for k in &keys {
@@ -122,51 +156,108 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan, String> {
                 k.name
             ));
         };
-        if !matches!(
-            b.used[i].ty,
-            crate::vector::LogicalType::Int32
-                | crate::vector::LogicalType::Int64
-                | crate::vector::LogicalType::Date32
-        ) {
+        if !is_integer_family(b.tables[fact].used[i].ty) {
             return Err(format!(
                 "group key '{}' must be integer-typed (so far), is {:?}",
-                k.name, b.used[i].ty
+                k.name, b.tables[fact].used[i].ty
             ));
         }
     }
     let group = keys;
 
-    let predicate = select
-        .selection
-        .as_ref()
-        .map(|e| b.bind_scalar(e))
-        .transpose()?;
-
-    // Assemble Scan → Filter? → Aggregate.
-    let mut plan = LogicalPlan::Scan {
-        table: table_name,
-        path: table.path.clone(),
-        projection: b.used,
-    };
-    if let Some(predicate) = predicate {
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate,
-        };
+    // WHERE: split the conjunct tree. A `colA = colB` across two tables is
+    // a join condition; every other conjunct must attribute to one table
+    // and becomes that table's filter.
+    let mut filters: Vec<Vec<Expr>> = vec![Vec::new(); b.tables.len()];
+    let mut join_conds: Vec<(usize, usize, usize, usize)> = Vec::new(); // (tl, cl, tr, cr)
+    if let Some(where_expr) = &select.selection {
+        let mut conjuncts = Vec::new();
+        split_and(where_expr, &mut conjuncts);
+        for conj in conjuncts {
+            if let ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } = conj
+            {
+                if let (Some(ln), Some(rn)) = (as_ident(left), as_ident(right)) {
+                    let (tl, cl) = b.resolve(ln)?;
+                    let (tr, cr) = b.resolve(rn)?;
+                    if tl != tr {
+                        let (kl, kr) = (&b.tables[tl].used[cl], &b.tables[tr].used[cr]);
+                        if !is_integer_family(kl.ty) || !is_integer_family(kr.ty) {
+                            return Err(format!(
+                                "join keys '{}' = '{}' must be integer-typed",
+                                kl.name, kr.name
+                            ));
+                        }
+                        join_conds.push((tl, cl, tr, cr));
+                        continue;
+                    }
+                    // Same table ⇒ an ordinary filter; falls through.
+                }
+            }
+            let (e, t) = b.bind_single(conj)?;
+            let t = t.ok_or("constant WHERE predicates are not supported")?;
+            filters[t].push(e);
+        }
     }
+
+    // Assemble the input tree.
+    let input = match b.tables.len() {
+        1 => {
+            if !join_conds.is_empty() {
+                unreachable!("single-table query cannot have cross-table conditions");
+            }
+            table_plan(&b.tables[0], std::mem::take(&mut filters[0]))
+        }
+        2 => {
+            let dim = 1 - fact;
+            let [(tl, cl, _tr, cr)] = join_conds.as_slice() else {
+                return Err(format!(
+                    "expected exactly one join condition between the two tables, got {}",
+                    join_conds.len()
+                ));
+            };
+            let (left_key, right_key) = if *tl == fact { (*cl, *cr) } else { (*cr, *cl) };
+            // The dim side must contribute only its key — its other columns
+            // may appear only in its own filters (already guaranteed: any
+            // SELECT/GROUP reference to it would have failed fact
+            // attribution above).
+            let left = table_plan(&b.tables[fact], std::mem::take(&mut filters[fact]));
+            let right = table_plan(&b.tables[dim], std::mem::take(&mut filters[dim]));
+            LogicalPlan::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                left_key,
+                right_key,
+            }
+        }
+        n => return Err(format!("{n} tables are not yet supported (P3 4c)")),
+    };
+
     Ok(LogicalPlan::Aggregate {
-        input: Box::new(plan),
+        input: Box::new(input),
         group,
         aggs,
     })
 }
 
-/// Per-query binding state: the table being bound against and the columns
-/// referenced so far (the scan projection, in first-use order — bound
-/// `Expr::Column(i)` indexes into it).
-struct Binder<'a> {
-    table: &'a TableDef,
+/// One table in the query's scope, accumulating its referenced columns (the
+/// scan projection, in first-use order — that table's `Expr::Column(i)`
+/// space).
+struct BoundTable<'a> {
+    name: String,
+    def: &'a TableDef,
     used: Vec<ScanColumn>,
+}
+
+/// Per-query binding state.
+struct Binder<'a> {
+    tables: Vec<BoundTable<'a>>,
+    /// Tables touched by the expression currently being bound — how a bound
+    /// expression is attributed to (exactly) one table.
+    touched: BTreeSet<usize>,
 }
 
 /// A partially-bound expression: either a real bound expression, or a
@@ -179,32 +270,59 @@ enum Bound {
 }
 
 impl Binder<'_> {
-    /// Resolve `name` to its chunk position, extending the scan projection
-    /// on first use.
-    fn resolve(&mut self, name: &str) -> Result<usize, String> {
-        if let Some(i) = self.used.iter().position(|c| c.name == name) {
-            return Ok(i);
+    /// Resolve a column name to `(table, chunk position)`, extending that
+    /// table's scan projection on first use. Ambiguous names error.
+    fn resolve(&mut self, name: &str) -> Result<(usize, usize), String> {
+        let mut hit: Option<usize> = None;
+        for (t, bt) in self.tables.iter().enumerate() {
+            if bt.def.column(name).is_some() {
+                if let Some(prev) = hit {
+                    return Err(format!(
+                        "column '{name}' is ambiguous (in '{}' and '{}')",
+                        self.tables[prev].name, bt.name
+                    ));
+                }
+                hit = Some(t);
+            }
         }
-        let col = self
-            .table
-            .column(name)
-            .ok_or_else(|| format!("unknown column '{name}'"))?;
-        self.used.push(ScanColumn {
+        let t = hit.ok_or_else(|| format!("unknown column '{name}'"))?;
+        self.touched.insert(t);
+        let bt = &mut self.tables[t];
+        if let Some(i) = bt.used.iter().position(|c| c.name == name) {
+            return Ok((t, i));
+        }
+        let col = bt.def.column(name).expect("column just found");
+        bt.used.push(ScanColumn {
             name: col.name.clone(),
             leaf: col.leaf,
             ty: col.ty,
         });
-        Ok(self.used.len() - 1)
+        Ok((t, bt.used.len() - 1))
     }
 
-    /// Bind a scalar (non-aggregate) expression to a fully-materialized
-    /// [`Expr`].
-    fn bind_scalar(&mut self, e: &ast::Expr) -> Result<Expr, String> {
-        Ok(materialize(self.bind(e)?))
+    /// Bind a scalar expression that must attribute to at most one table.
+    /// Returns the bound expression and the table it references (`None` for
+    /// pure literals).
+    fn bind_single(&mut self, e: &ast::Expr) -> Result<(Expr, Option<usize>), String> {
+        self.touched.clear();
+        let bound = materialize(self.bind(e)?);
+        match self.touched.len() {
+            0 => Ok((bound, None)),
+            1 => Ok((bound, self.touched.first().copied())),
+            _ => Err(
+                "expression must reference exactly one table (cross-table expressions are \
+                 only supported as equi-join conditions)"
+                    .into(),
+            ),
+        }
     }
 
     /// Bind one SELECT item as an aggregate call (`sum(<expr>)`).
-    fn bind_aggregate(&mut self, e: &ast::Expr, alias: Option<String>) -> Result<AggExpr, String> {
+    fn bind_aggregate(
+        &mut self,
+        e: &ast::Expr,
+        alias: Option<String>,
+    ) -> Result<(AggExpr, Option<usize>), String> {
         let ast::Expr::Function(f) = e else {
             return Err(format!(
                 "select item must be an aggregate call (so far), got: {e}"
@@ -222,18 +340,25 @@ impl Binder<'_> {
         else {
             return Err(format!("aggregate '{fname}' takes exactly one argument"));
         };
-        Ok(AggExpr {
-            func,
-            arg: self.bind_scalar(arg)?,
-            alias,
-        })
+        let (bound, t) = self.bind_single(arg)?;
+        Ok((
+            AggExpr {
+                func,
+                arg: bound,
+                alias,
+            },
+            t,
+        ))
     }
 
     /// Bind an AST expression bottom-up, folding literal arithmetic in
     /// decimal.
     fn bind(&mut self, e: &ast::Expr) -> Result<Bound, String> {
         match e {
-            ast::Expr::Identifier(id) => Ok(Bound::Expr(Expr::Column(self.resolve(&id.value)?))),
+            ast::Expr::Identifier(id) => {
+                let (_, i) = self.resolve(&id.value)?;
+                Ok(Bound::Expr(Expr::Column(i)))
+            }
             ast::Expr::Nested(inner) => self.bind(inner),
             ast::Expr::Value(v) => match &v.value {
                 ast::Value::Number(s, _) => Ok(Bound::Dec(Dec::parse(s)?)),
@@ -254,9 +379,9 @@ impl Binder<'_> {
                 high,
             } => {
                 // Desugar: e BETWEEN lo AND hi  →  e >= lo AND e <= hi.
-                let bound = self.bind_scalar(expr)?;
-                let lo = self.bind_scalar(low)?;
-                let hi = self.bind_scalar(high)?;
+                let bound = materialize(self.bind(expr)?);
+                let lo = materialize(self.bind(low)?);
+                let hi = materialize(self.bind(high)?);
                 Ok(Bound::Expr(and(
                     binary(BinaryOp::GtEq, bound.clone(), lo),
                     binary(BinaryOp::LtEq, bound, hi),
@@ -287,6 +412,53 @@ impl Binder<'_> {
             other => Err(format!("unsupported expression: {other}")),
         }
     }
+}
+
+/// Build a table's input plan: its scan plus its own filters (AND-folded).
+fn table_plan(bt: &BoundTable, filters: Vec<Expr>) -> LogicalPlan {
+    let mut plan = LogicalPlan::Scan {
+        table: bt.name.clone(),
+        path: bt.def.path.clone(),
+        projection: bt.used.clone(),
+    };
+    if let Some(predicate) = filters.into_iter().reduce(and) {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate,
+        };
+    }
+    plan
+}
+
+/// Flatten an `AND` tree into its conjuncts (leaves kept in source order).
+fn split_and<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Expr>) {
+    if let ast::Expr::BinaryOp {
+        left,
+        op: ast::BinaryOperator::And,
+        right,
+    } = e
+    {
+        split_and(left, out);
+        split_and(right, out);
+    } else {
+        out.push(e);
+    }
+}
+
+/// A plain (possibly parenthesized) identifier, if that's all `e` is.
+fn as_ident(e: &ast::Expr) -> Option<&str> {
+    match e {
+        ast::Expr::Identifier(id) => Some(&id.value),
+        ast::Expr::Nested(inner) => as_ident(inner),
+        _ => None,
+    }
+}
+
+fn is_integer_family(ty: LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::Int32 | LogicalType::Int64 | LogicalType::Date32
+    )
 }
 
 /// Cast a partially-bound value to a real [`Expr`] — the decimal→leaf-type
