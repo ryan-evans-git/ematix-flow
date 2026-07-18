@@ -5,7 +5,13 @@ on the push/fused engine** today. Source: [`../V2_TARGET.md`](../V2_TARGET.md)
 §2.1; grounded by the `tpcds_dialect_audit` example and a code sweep for
 native operators (2026-07-18).
 
-## ✅ STATUS (2026-07-18) — S1–S3 resolved; TPC-DS 103/103 execute, 0 parity mismatches
+## ✅ ARC CLOSED (2026-07-18) — S1–S3 resolved; TPC-DS 103/103 execute, 0 parity mismatches; CI green
+
+**The v2 SQL-surface arc is closed.** Everything below is committed on `v2`
+(HEAD `1733f02e`) and the full workspace suite is **green in CI** (run
+29655408782: rust + static guards + cargo audit + license check + python
+3.11–3.14, all ✅). No S1–S3 follow-up work is open; the only remaining
+v2 SQL-surface work is *fusion/benchmark* (S6), tracked separately.
 
 The S1→S3 SQL-surface investigation is **complete**. The headline finding
 across all three sprints: DataFusion's SQL-surface operators are **already
