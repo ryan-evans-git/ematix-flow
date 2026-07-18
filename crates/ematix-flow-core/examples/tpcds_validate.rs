@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use ematix_flow_core::dialect::{translate, Dialect};
+use ematix_flow_core::dialect::{Dialect, translate};
 use ematix_flow_core::preset;
 use futures_util::TryStreamExt;
 
@@ -142,7 +142,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (n, stem)
     });
 
-    println!("=== TPC-DS validate (SF=1) — data: {} ===\n", data_dir.display());
+    println!(
+        "=== TPC-DS validate (SF=1) — data: {} ===\n",
+        data_dir.display()
+    );
 
     let mut results: BTreeMap<String, (Emat, Parity)> = BTreeMap::new();
     for path in &files {
@@ -227,7 +230,10 @@ enum RunErr {
 }
 
 async fn run_emat(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Result<usize, RunErr> {
-    let df = ctx.sql(sql).await.map_err(|e| RunErr::Plan(e.to_string()))?;
+    let df = ctx
+        .sql(sql)
+        .await
+        .map_err(|e| RunErr::Plan(e.to_string()))?;
     let stream = df
         .execute_stream()
         .await
