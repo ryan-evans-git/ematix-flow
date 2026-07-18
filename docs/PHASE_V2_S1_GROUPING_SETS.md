@@ -272,8 +272,22 @@ Do not gate S1's correctness exit on Π; gate it on "no OOM at SF=10 with
 | Story | What | Exit |
 |---|---|---|
 | **S1.1** ✅ | Plan-shape pin (`gs_plan_probe`, §4.0) + semantic contract tests (`tests/grouping_sets_semantics.rs`) + §3 `tpcds_validate` baseline | **DONE** — shape pinned (2 assumptions corrected); 3 semantic tests green on the shared session (incl. the data-NULL vs rolled-up-NULL gate); §3 queries q18/q22/q27/q36/q67/q77 all row-parity OK at SF1 |
-| **S1.2** | `FusedGroupingSetAggregateExec` + planner interception rule; `__grouping_id` + `GROUPING()`/`GROUPING_ID` projection | Q18/Q22/Q67/Q77 green SF=1 |
+| **S1.2** 🟡 | `FusedGroupingSetAggregateExec` + `InjectGroupingSetRule` (registered in `preset`); `__grouping_id` + `GROUPING()`/`GROUPING_ID` projection | **correctness DONE** — recognizer (8 tests) + operator with 3 end-to-end rule-parity tests (byte-identical to DF for ROLLUP/CUBE/GROUPING SETS) + semantic contract now routes through the operator; SF1 §3 parity via `tpcds_validate`. **Fused-accumulator (benchmark speed) is the follow-on** (see note). |
 | **S1.3** | Memory bound + `GS_MAX_SETS` + AQE partition-bump; Π spill hooks stubbed | no OOM SF=10; parity SF=10 |
+
+**S1.2 what's fused vs delegated (honest scope).** The operator lands
+Model A's **single child scan** (the design's key win over DF's
+expand-then-aggregate, which pushes `n_sets ×` the rows through the
+accumulator): it materialises the child once and runs one aggregate per
+set over the shared batches, stitching rolled-up NULLs + the
+`__grouping_id` literal into DF's `Final` schema. **Per-set aggregation
+currently delegates to DataFusion's vectorized `AggregateExec`, not the
+ematix `FusedAggregateExec` kernels** — so correctness + the single-scan
+shape are in, but the fused-accumulator upgrade that wins the S6
+benchmark is an explicit follow-on, gated by the vectorization-proof
+micro-bench (§5). `EMAT_GROUPING_SETS_FUSED=0` opts back to DF's native
+grouping-set path. The child materialisation is the memory pressure S1.3
+must bound/spill at SF≥10.
 
 **S1.1 note on RED-ness.** The §3 queries and the semantic contract are
 already *correct* on stock DataFusion (the S1 gap is fused *execution*,

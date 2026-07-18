@@ -389,7 +389,13 @@ pub fn with_optimizer_rules_overridden(
         builder = builder
             .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
             .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-            .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
+            .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
+            // v2 S1.2 (Phase GS): native grouping-set aggregate. Disjoint
+            // from the above (matches only multi-set + __grouping_id), so it
+            // never contends with the single-group fused rules.
+            .with_physical_optimizer_rule(Arc::new(
+                crate::fused_grouping_set_agg::InjectGroupingSetRule,
+            ));
     }
     if o.swap_semi_join_build {
         builder = builder.with_physical_optimizer_rule(Arc::new(
@@ -695,6 +701,7 @@ pub const PRODUCTION_PHYSICAL_RULE_NAMES: &[&str] = &[
     "ematix_flow_enable_dict_group_count",
     "ematix_flow_inject_filter_multi_agg",
     "ematix_flow_inject_filter_sum",
+    "ematix_flow_inject_grouping_set",
     "swap_semi_join_build_side",
     "ematix_flow_force_collect_left_semi_bounded_build",
     "ematix_flow_sampled_join_side",

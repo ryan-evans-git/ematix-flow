@@ -21,11 +21,29 @@
 //! in the next slice; until then nothing is rewired, so this is inert on
 //! the query path.
 
+use std::any::Any;
+use std::fmt;
 use std::sync::Arc;
 
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::arrow::array::{ArrayRef, RecordBatch, UInt64Array, new_null_array};
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{DataFusionError, Result as DfResult};
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::execution::TaskContext;
 use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
-use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties,
+    SendableRecordBatchStream, collect,
+};
+use futures_util::stream;
 
 /// Default cap on the number of grouping sets we take over natively — the
 /// CUBE blow-up guard (`CUBE(k)` = 2^k sets). Above this the recognizer
@@ -166,6 +184,382 @@ pub fn recognize_grouping_set(agg: &AggregateExec) -> Option<RecognizedGroupingS
     })
 }
 
+/// Native single-pass grouping-set aggregate operator (Model A, §4.1).
+///
+/// Replaces DataFusion's whole `Final → Repartition → Partial` grouping-set
+/// stack. Scans the (expensive) child **once**, materialises it, then runs a
+/// vectorized aggregate per set over the shared cached batches, and stitches
+/// each set's groups into DF's `Final` output schema — rolled-up columns set
+/// to typed NULL, the `__grouping_id` literal filled in per §4.0. The top
+/// `ProjectionExec` DF already planned (GROUPING()/GROUPING_ID bit-extraction)
+/// then consumes the output unchanged.
+///
+/// **What is fused today:** the single-child-scan (Model A's key win over
+/// DF's expand-then-aggregate, which pushes `n_sets ×` the rows through the
+/// accumulator). Per-set aggregation currently delegates to DataFusion's
+/// vectorized `AggregateExec`; swapping that for the ematix fused
+/// accumulators (the `FusedAggregateExec` kernels) is the documented S1
+/// follow-on gated by the vectorization-proof micro-bench (§5). Correctness
+/// and the single-scan shape land first.
+///
+/// **Memory:** materialising the child is bounded by the child size; the
+/// `GS_MAX_SETS` cap plus S1.3's live-group bound/spill hooks address SF≥10.
+#[derive(Debug)]
+pub struct FusedGroupingSetAggregateExec {
+    /// The child below DF's `Partial` node — scanned once.
+    input: Arc<dyn ExecutionPlan>,
+    /// Group-column universe (expr + alias), `c0` = high grouping-id bit.
+    universe: Vec<(Arc<dyn PhysicalExpr>, String)>,
+    /// Per-set null-masks (`true` = rolled up), verbatim from DF (§4.0).
+    set_masks: Vec<Vec<bool>>,
+    /// Aggregate expressions, computed per set.
+    aggs: Vec<Arc<AggregateFunctionExpr>>,
+    /// DF's `Final`-node output schema — the drop-in target:
+    /// `[universe…, __grouping_id, agg_finals…]`.
+    output_schema: SchemaRef,
+    /// Index of the `__grouping_id` field in `output_schema` (= universe len).
+    gid_idx: usize,
+    properties: Arc<PlanProperties>,
+}
+
+impl FusedGroupingSetAggregateExec {
+    /// Build the operator. `output_schema` must be DF's grouping-set `Final`
+    /// node schema so the downstream projection resolves unchanged; the
+    /// `__grouping_id` field is located by name.
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        recognized: RecognizedGroupingSet,
+        output_schema: SchemaRef,
+    ) -> DfResult<Self> {
+        let gid_idx = output_schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == GROUPING_ID_COL)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "grouping-set Final schema has no `{GROUPING_ID_COL}` column: {:?}",
+                    output_schema
+                ))
+            })?;
+        // The universe columns must be exactly the fields before __grouping_id.
+        if gid_idx != recognized.universe.len() {
+            return Err(DataFusionError::Internal(format!(
+                "grouping-set schema mismatch: {} universe cols but __grouping_id at index {gid_idx}",
+                recognized.universe.len()
+            )));
+        }
+        let eq = EquivalenceProperties::new(output_schema.clone());
+        let properties = Arc::new(PlanProperties::new(
+            eq,
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ));
+        Ok(Self {
+            input,
+            universe: recognized.universe,
+            set_masks: recognized.set_masks,
+            aggs: recognized.aggs,
+            output_schema,
+            gid_idx,
+            properties,
+        })
+    }
+
+    fn grouping_id_of(&self, set_idx: usize) -> u64 {
+        grouping_id_for_mask(&self.set_masks[set_idx], self.universe.len())
+    }
+}
+
+/// The synthetic grouping-id column DF carries on grouping-set aggregates.
+pub const GROUPING_ID_COL: &str = "__grouping_id";
+
+impl DisplayAs for FusedGroupingSetAggregateExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "FusedGroupingSetAggregateExec: sets={}, universe={}, aggs={}",
+            self.set_masks.len(),
+            self.universe.len(),
+            self.aggs.len()
+        )
+    }
+}
+
+impl ExecutionPlan for FusedGroupingSetAggregateExec {
+    fn name(&self) -> &str {
+        "FusedGroupingSetAggregateExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    /// Collect the child once into a single partition so the per-set
+    /// aggregates share one materialisation (Model A single-scan).
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let input = children.pop().ok_or_else(|| {
+            DataFusionError::Internal("FusedGroupingSetAggregateExec needs exactly 1 child".into())
+        })?;
+        Ok(Arc::new(Self {
+            input,
+            universe: self.universe.clone(),
+            set_masks: self.set_masks.clone(),
+            aggs: self.aggs.clone(),
+            output_schema: self.output_schema.clone(),
+            gid_idx: self.gid_idx,
+            properties: self.properties.clone(),
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "FusedGroupingSetAggregateExec emits only partition 0, got {partition}"
+            )));
+        }
+        let input = self.input.clone();
+        let universe = self.universe.clone();
+        let set_masks = self.set_masks.clone();
+        let aggs = self.aggs.clone();
+        let output_schema = self.output_schema.clone();
+        let gid_idx = self.gid_idx;
+        let gids: Vec<u64> = (0..set_masks.len())
+            .map(|i| self.grouping_id_of(i))
+            .collect();
+
+        let schema_for_adapter = output_schema.clone();
+        let fut = async move {
+            // 1. Materialise the child ONCE (the single scan). Input is
+            //    coalesced to one partition by required_input_distribution.
+            let child_schema = input.schema();
+            let batches = collect(input, context.clone()).await?;
+            let source = MemorySourceConfig::try_new_exec(&[batches], child_schema, None)?;
+
+            // 2. One vectorized aggregate per set over the shared source.
+            let mut out: Vec<RecordBatch> = Vec::with_capacity(set_masks.len());
+            for (set_idx, mask) in set_masks.iter().enumerate() {
+                let present: Vec<usize> = mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, rolled)| (!*rolled).then_some(i))
+                    .collect();
+                let group_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = present
+                    .iter()
+                    .map(|&i| (Arc::clone(&universe[i].0), universe[i].1.clone()))
+                    .collect();
+                let group_by = PhysicalGroupBy::new_single(group_exprs);
+                let per_set: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
+                    AggregateMode::Single,
+                    group_by,
+                    aggs.clone(),
+                    vec![None; aggs.len()],
+                    source.clone(),
+                    source.schema(),
+                )?);
+                let res = collect(per_set, context.clone()).await?;
+                for rb in &res {
+                    out.push(stitch_set(
+                        rb,
+                        &output_schema,
+                        &present,
+                        gid_idx,
+                        gids[set_idx],
+                    )?);
+                }
+            }
+
+            Ok::<Vec<RecordBatch>, DataFusionError>(out)
+        };
+
+        // Flatten the Vec<RecordBatch> future into a batch stream. Both
+        // arms yield the same Vec<DfResult<RecordBatch>> so the stream has a
+        // single concrete type.
+        use futures_util::StreamExt;
+        let batch_stream = stream::once(fut).flat_map(|res| {
+            let items: Vec<DfResult<RecordBatch>> = match res {
+                Ok(batches) => batches.into_iter().map(Ok).collect(),
+                Err(e) => vec![Err(e)],
+            };
+            stream::iter(items)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema_for_adapter,
+            batch_stream,
+        )))
+    }
+}
+
+/// Stitch one set's aggregate result (`rb`, schema `[present…, aggs…]`) into
+/// the grouping-set `Final` `output_schema` (`[universe…, __grouping_id,
+/// aggs…]`): present universe columns pass through in universe order,
+/// rolled-up ones become typed NULL, `__grouping_id` is the set's literal id.
+fn stitch_set(
+    rb: &RecordBatch,
+    output_schema: &SchemaRef,
+    present: &[usize],
+    gid_idx: usize,
+    gid: u64,
+) -> DfResult<RecordBatch> {
+    let rows = rb.num_rows();
+    let n_universe = gid_idx; // universe fills [0, gid_idx)
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+
+    // universe columns 0..n_universe, in the full universe order.
+    for j in 0..n_universe {
+        let field_ty = output_schema.field(j).data_type();
+        match present.iter().position(|&p| p == j) {
+            // present: the k-th present column is rb.column(k).
+            Some(k) => {
+                let src = rb.column(k);
+                let col = if src.data_type() == field_ty {
+                    Arc::clone(src)
+                } else {
+                    cast(src, field_ty)?
+                };
+                cols.push(col);
+            }
+            // rolled up: typed NULL for every row.
+            None => cols.push(new_null_array(field_ty, rows)),
+        }
+    }
+
+    // __grouping_id literal, cast to the Final schema's id type.
+    let gid_ty = output_schema.field(gid_idx).data_type();
+    let gid_arr: ArrayRef = Arc::new(UInt64Array::from(vec![gid; rows]));
+    cols.push(cast(&gid_arr, gid_ty)?);
+
+    // aggregate columns: rb columns after the present keys, cast to target.
+    let n_present = present.len();
+    for out_idx in (gid_idx + 1)..output_schema.fields().len() {
+        let src = rb.column(n_present + (out_idx - gid_idx - 1));
+        let field_ty = output_schema.field(out_idx).data_type();
+        let col = if src.data_type() == field_ty {
+            Arc::clone(src)
+        } else {
+            cast(src, field_ty)?
+        };
+        cols.push(col);
+    }
+
+    RecordBatch::try_new(output_schema.clone(), cols)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+/// Find the first multi-set `AggregateExec` (`groups().len() > 1`) in the
+/// subtree — DF's input-reading Partial/Single grouping-set node.
+fn find_multiset_partial(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
+    if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() {
+        if agg.group_expr().groups().len() > 1 {
+            return Some(agg);
+        }
+    }
+    for c in plan.children() {
+        if let Some(found) = find_multiset_partial(c) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// `PhysicalOptimizerRule` that replaces DataFusion's grouping-set
+/// `Final → Repartition → Partial` stack with the native
+/// [`FusedGroupingSetAggregateExec`] (Phase GS, §4.3). Matches the `Final`
+/// grouping-set node (its group key carries `__grouping_id`), recognizes the
+/// multi-set `Partial` beneath it, and — subject to the recognizer's decline
+/// gates (opt-out, `GS_MAX_SETS`) — swaps in the operator over the Partial's
+/// child, preserving the `Final` output schema so the projection above is
+/// untouched. Non-grouping-set aggregates never match (disjoint by the
+/// `__grouping_id` + multi-set requirement), so ordinary plans are unchanged.
+#[derive(Debug, Default)]
+pub struct InjectGroupingSetRule;
+
+impl PhysicalOptimizerRule for InjectGroupingSetRule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let result = plan.transform_down(|node| match try_replace_grouping_set(&node)? {
+            Some(new) => Ok(Transformed::yes(new)),
+            None => Ok(Transformed::no(node)),
+        })?;
+        Ok(result.data)
+    }
+
+    fn name(&self) -> &str {
+        "ematix_flow_inject_grouping_set"
+    }
+
+    fn schema_check(&self) -> bool {
+        // The operator reproduces DF's Final output schema exactly, so the
+        // schema must be preserved end-to-end — keep the check on.
+        true
+    }
+}
+
+/// If `node` is a grouping-set `Final` aggregate with a recognizable
+/// multi-set `Partial` beneath it, return the [`FusedGroupingSetAggregateExec`]
+/// replacement; else `None`.
+fn try_replace_grouping_set(
+    node: &Arc<dyn ExecutionPlan>,
+) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+    let Some(final_agg) = node.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    // Only the Final re-aggregation phase carries the assembled
+    // `[cols…, __grouping_id]` group key we key the replacement on.
+    if !matches!(
+        final_agg.mode(),
+        AggregateMode::Final | AggregateMode::FinalPartitioned
+    ) {
+        return Ok(None);
+    }
+    let is_grouping_set = final_agg
+        .group_expr()
+        .expr()
+        .iter()
+        .any(|(_, name)| name == GROUPING_ID_COL);
+    if !is_grouping_set {
+        return Ok(None);
+    }
+
+    // Find + recognize the multi-set Partial beneath this Final.
+    let Some(partial) = find_multiset_partial(node) else {
+        return Ok(None);
+    };
+    let Some(recognized) = recognize_grouping_set(partial) else {
+        return Ok(None); // declined (opt-out / GS_MAX_SETS / unsupported)
+    };
+    // The operator scans the Partial's single child once.
+    let child = partial.children();
+    let [input] = child.as_slice() else {
+        return Ok(None);
+    };
+    let op =
+        FusedGroupingSetAggregateExec::try_new(Arc::clone(input), recognized, final_agg.schema())?;
+    Ok(Some(Arc::new(op)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,8 +595,13 @@ mod tests {
 
     // ---- recognizer against real DF53 physical plans ----
 
+    /// A **plain** DataFusion session (no ematix rules — importantly not
+    /// `preset::session_context`, which now installs `InjectGroupingSetRule`
+    /// and would swap the Partial node out before these tests see it). This
+    /// gives DF's raw grouping-set stack to recognize, and pure-DF execution
+    /// as the parity reference.
     async fn ctx() -> SessionContext {
-        let ctx = crate::preset::session_context();
+        let ctx = SessionContext::new();
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Utf8, true),
             Field::new("b", DataType::Utf8, true),
@@ -251,6 +650,83 @@ mod tests {
             .create_physical_plan()
             .await
             .unwrap()
+    }
+
+    /// Collect a plan and render every row as a `|`-joined string via arrow's
+    /// type-generic formatter (handles all types + nulls), sorted so the
+    /// comparison is order-independent.
+    async fn sorted_rows(plan: Arc<dyn ExecutionPlan>, ctx: &SessionContext) -> Vec<String> {
+        use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        let opts = FormatOptions::default();
+        let mut rows = Vec::new();
+        for b in &batches {
+            let fmts: Vec<ArrayFormatter> = b
+                .columns()
+                .iter()
+                .map(|c| ArrayFormatter::try_new(c, &opts).unwrap())
+                .collect();
+            for r in 0..b.num_rows() {
+                let cells: Vec<String> = fmts.iter().map(|f| f.value(r).to_string()).collect();
+                rows.push(cells.join("|"));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    fn plan_str(plan: &Arc<dyn ExecutionPlan>) -> String {
+        format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        )
+    }
+
+    /// End-to-end parity: applying `InjectGroupingSetRule` to a real DF
+    /// grouping-set plan (a) actually installs the operator, and (b) produces
+    /// byte-identical results to DataFusion's own grouping-set execution.
+    async fn assert_rule_parity(sql: &str) {
+        let _guard = crate::flags::EMAT_ENV_TEST_LOCK.lock().await;
+        let ctx = ctx().await;
+        let df_plan = physical(&ctx, sql).await;
+        let df_rows = sorted_rows(df_plan.clone(), &ctx).await;
+
+        let optimized = InjectGroupingSetRule
+            .optimize(df_plan, &ConfigOptions::default())
+            .unwrap();
+        assert!(
+            plan_str(&optimized).contains("FusedGroupingSetAggregateExec"),
+            "rule must install the operator; plan was:\n{}",
+            plan_str(&optimized)
+        );
+        let op_rows = sorted_rows(optimized, &ctx).await;
+
+        assert_eq!(
+            op_rows, df_rows,
+            "operator diverged from DataFusion for `{sql}`"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_parity_rollup() {
+        assert_rule_parity(
+            "SELECT a, b, grouping(a) ga, grouping(b) gb, sum(v) s \
+             FROM t GROUP BY ROLLUP(a, b)",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rule_parity_cube() {
+        assert_rule_parity("SELECT a, b, sum(v) s FROM t GROUP BY CUBE(a, b)").await;
+    }
+
+    #[tokio::test]
+    async fn rule_parity_explicit_sets_with_grand_total() {
+        assert_rule_parity("SELECT a, b, sum(v) s FROM t GROUP BY GROUPING SETS ((a, b), (a), ())")
+            .await;
     }
 
     #[tokio::test]
