@@ -23,14 +23,16 @@
 //! (`exec.rs`) and the planner grows into them next.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 
 use ematix_parquet_io::ParquetFile;
 
 use crate::chunk::{DataChunk, Selection};
 use crate::expr::{Expr, ScalarValue, filter_expr, sum_expr_f64};
 use crate::logical::{AggFunc, BoundQuery, Slot, TableInput, TableSource};
-use crate::scan::{ColKind, scan_columns};
-use crate::scan_native::{NativeColKind, scan_row_groups};
+use crate::scan::{ColKind, StockScan};
+use crate::scan_native::{NativeColKind, decode_row_group};
+use crate::sched::MorselQueue;
 use crate::vector::{LogicalType, Vector};
 
 /// A query result: named columns, row-major values.
@@ -44,12 +46,24 @@ pub struct QueryResult {
 /// (recursively), then substitute into the outer query as constants /
 /// membership sets before the main pipeline runs.
 pub fn execute(q: &BoundQuery) -> Result<QueryResult, String> {
+    // Worker count: EMAT_ENGINE_THREADS overrides; default = all cores.
+    // Results are BIT-IDENTICAL at any thread count — each row group's
+    // partial is computed independently and partials merge in row-group
+    // order, so parallelism changes wall-clock, never the answer.
+    let nthreads = std::env::var("EMAT_ENGINE_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
     if q.subqueries.is_empty() {
-        return Executor { q }.run();
+        return Executor { q, nthreads }.run();
     }
     let mut q2 = q.clone();
     resolve_subqueries(&mut q2)?;
-    Executor { q: &q2 }.run()
+    Executor { q: &q2, nthreads }.run()
 }
 
 /// Execute every subquery and substitute its result into the outer query's
@@ -214,17 +228,106 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
 
 struct Executor<'q> {
     q: &'q BoundQuery,
+    nthreads: usize,
 }
 
 /// The (parent_local_col, child_local_col) equi-join pairs linking a dim to
 /// its parent — several pairs form a composite key.
 type Links = Vec<(usize, usize)>;
 
+/// A dim map keyed by the join key — specialized for the ubiquitous
+/// single-column key (no per-row `Vec` allocation on probe or build);
+/// composite keys use slice-keyed lookups (`Vec<i64>: Borrow<[i64]>`), so
+/// probing never allocates either way.
+enum DimMap {
+    Single(HashMap<i64, (u64, Vec<ScalarValue>)>),
+    Multi(HashMap<Vec<i64>, (u64, Vec<ScalarValue>)>),
+}
+
+impl DimMap {
+    #[inline]
+    fn get(&self, k: &[i64]) -> Option<&(u64, Vec<ScalarValue>)> {
+        match self {
+            DimMap::Single(m) => m.get(&k[0]),
+            DimMap::Multi(m) => m.get(k),
+        }
+    }
+}
+
 /// A processed dim subtree: (composite) join key → (match count, payload
 /// values aligned with `payload_slots`).
 struct DimResult {
     payload_slots: Vec<usize>,
-    map: HashMap<Vec<i64>, (u64, Vec<ScalarValue>)>,
+    map: DimMap,
+}
+
+/// One row group's aggregation partial — merged in row-group order, which
+/// keeps results deterministic and (for the scalar-SUM path) bit-identical
+/// to the sequential execution at any thread count.
+enum RgOut {
+    Scalar(Vec<AggState>),
+    Grouped(BTreeMap<Vec<GroupKey>, Vec<AggState>>),
+    Rows(Vec<Vec<ScalarValue>>),
+}
+
+/// Shared, read-only context for per-row-group root processing.
+struct RootCtx<'a> {
+    root: usize,
+    children: &'a [(usize, Links, bool)],
+    dims: &'a [Option<DimResult>],
+    post: &'a Option<Expr>,
+    matched_cols: &'a HashMap<usize, usize>,
+    filter: &'a Option<Expr>,
+}
+
+/// Where a table's row groups come from.
+enum RootSrc {
+    /// A materialized derived input (single chunk).
+    One(Vec<DataChunk>),
+    /// The native ematix-parquet path (numeric scans; `&file` is shared
+    /// lock-free across workers).
+    Native {
+        file: Box<ParquetFile>,
+        cols: Vec<(usize, NativeColKind)>,
+        nrows: Vec<usize>,
+    },
+    /// The stock low-level reader (string-bearing scans; each worker opens
+    /// its own handle).
+    Stock {
+        path: std::path::PathBuf,
+        cols: Vec<(String, ColKind)>,
+        n_rg: usize,
+    },
+}
+
+impl RootSrc {
+    fn n_rg(&self) -> usize {
+        match self {
+            RootSrc::One(c) => c.len(),
+            RootSrc::Native { nrows, .. } => nrows.len(),
+            RootSrc::Stock { n_rg, .. } => *n_rg,
+        }
+    }
+
+    /// Worker-local stock reader for string-bearing scans (None otherwise).
+    fn open_local_stock(&self) -> Result<Option<StockScan>, String> {
+        match self {
+            RootSrc::Stock { path, cols, .. } => {
+                let refs: Vec<(&str, ColKind)> =
+                    cols.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+                Ok(Some(StockScan::open(path, &refs)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn decode(&self, rg: usize, local_stock: Option<&StockScan>) -> Result<DataChunk, String> {
+        match self {
+            RootSrc::One(chunks) => Ok(chunks[rg].clone()),
+            RootSrc::Native { file, cols, nrows } => decode_row_group(file, rg, nrows[rg], cols),
+            RootSrc::Stock { .. } => local_stock.expect("stock reader").decode_rg(rg),
+        }
+    }
 }
 
 impl Executor<'_> {
@@ -366,113 +469,110 @@ impl Executor<'_> {
             dim_results[*child] = Some(self.build_dim(*child, &child_cols, &children, &needed)?);
         }
 
-        // ---- Root: scan + filter, then per child narrow (with
-        // multiplicity) and attach payload columns.
-        let chunks = self.filtered_chunks(root)?;
-        let mut view_chunks: Vec<DataChunk> = Vec::with_capacity(chunks.len());
-        let mut sels: Vec<Selection> = Vec::with_capacity(chunks.len());
-        // For each LEFT child, the view gains a synthetic matched-flag
-        // column (1/0 per row) appended past the slot space; CountMatched
-        // aggregates read it via this table→column map (same layout every
-        // chunk — children iterate in a fixed order).
+        // ---- Root: MORSEL-PARALLEL per row group. Each worker decodes a
+        // row group, applies the root filter, probes/attaches the dim
+        // subtrees, evaluates the post-join predicate, and aggregates a
+        // per-RG partial. Partials merge in ROW-GROUP ORDER, so the result
+        // is deterministic — and bit-identical to sequential — at any
+        // thread count.
+        let ti = &q.tables[root];
+        // Matched-flag columns (LEFT children) append past the slot space
+        // in child order — a fixed layout every chunk.
         let mut matched_cols: HashMap<usize, usize> = HashMap::new();
-        for (chunk, sel) in chunks {
-            let mut view = self.slot_view(root, &chunk);
-            let mut sel = sel;
-            let nrows = chunk.cols.first().map_or(0, |c| c.len());
-            for (child, links, left) in &children[root] {
-                let dim = dim_results[*child].as_ref().expect("dim built");
-                let keys: Vec<Expr> = links
-                    .iter()
-                    .map(|&(p, _)| Expr::Column(self.local_to_slot(root, p)))
-                    .collect();
-                let key_of = |view: &DataChunk, i: usize| -> Vec<i64> {
-                    keys.iter().map(|k| k.eval_i64(view, i)).collect()
-                };
-                // Narrow with multiplicity; a LEFT child keeps misses once.
-                let mut out = Vec::new();
-                let mut matched: Vec<i64> = if *left { vec![0; nrows] } else { Vec::new() };
-                sel.for_each(|i| match dim.map.get(&key_of(&view, i as usize)) {
-                    Some((cnt, _)) => {
-                        for _ in 0..*cnt {
-                            out.push(i);
-                        }
-                        if *left {
-                            matched[i as usize] = 1;
-                        }
-                    }
-                    None if *left => out.push(i),
-                    None => {}
-                });
-                sel = Selection::Indices(out);
-                // Attach the subtree's payload slots as full-length columns
-                // (LEFT misses take type defaults — 0 / 0.0 / "").
-                if !dim.payload_slots.is_empty() {
-                    let mut row_vals: HashMap<u32, Vec<ScalarValue>> = HashMap::new();
-                    sel.for_each(|i| {
-                        if row_vals.contains_key(&i) {
-                            return;
-                        }
-                        match dim.map.get(&key_of(&view, i as usize)) {
-                            Some((_, pay)) => {
-                                row_vals.insert(i, pay.clone());
-                            }
-                            None => {
-                                debug_assert!(*left, "non-left miss survived narrowing");
-                                let defaults = dim
-                                    .payload_slots
-                                    .iter()
-                                    .map(|&sl| default_value(self.slot_ty(sl)))
-                                    .collect();
-                                row_vals.insert(i, defaults);
-                            }
-                        }
-                    });
-                    for (j, &slot) in dim.payload_slots.iter().enumerate() {
-                        let ty = self.slot_ty(slot);
-                        view.cols[slot] = build_column(ty, nrows, |row| {
-                            row_vals.get(&(row as u32)).map(|v| v[j].clone())
-                        });
-                    }
-                }
+        {
+            let mut next = q.slots.len();
+            for (child, _, left) in &children[root] {
                 if *left {
-                    matched_cols.insert(*child, view.cols.len());
-                    view.cols.push(Vector::i64(matched));
+                    matched_cols.insert(*child, next);
+                    next += 1;
                 }
             }
-            // Post-join predicate (multi-table conjuncts + cycle
-            // residuals): evaluated once every payload is attached.
-            if let Some(p) = &post {
-                let scoped = DataChunk {
-                    cols: view.cols.clone(),
-                    sel,
-                };
-                sel = filter_expr(&scoped, p);
-            }
-            view_chunks.push(view);
-            sels.push(sel);
         }
+        let ctx = RootCtx {
+            root,
+            children: &children[root],
+            dims: &dim_results,
+            post: &post,
+            matched_cols: &matched_cols,
+            filter: &ti.filter,
+        };
 
-        // ---- Aggregate (or plain-row projection), then HAVING → ORDER BY
-        // → LIMIT.
+        let src = self.table_src(root)?;
+        let n_rg = src.n_rg();
+
+        let outputs: Mutex<Vec<Option<RgOut>>> = Mutex::new((0..n_rg).map(|_| None).collect());
+        let queue = MorselQueue::new(n_rg);
+        let nworkers = self.nthreads.clamp(1, n_rg.max(1));
+        let (src_ref, ctx_ref, queue_ref, out_ref) = (&src, &ctx, &queue, &outputs);
+        std::thread::scope(|scope| -> Result<(), String> {
+            let mut handles = Vec::with_capacity(nworkers);
+            for _ in 0..nworkers {
+                handles.push(scope.spawn(move || -> Result<(), String> {
+                    // String-bearing scans open a worker-local reader (the
+                    // footer parse is cheap; no shared-reader locking).
+                    let local_stock = src_ref.open_local_stock()?;
+                    while let Some(rg) = queue_ref.next() {
+                        let chunk = src_ref.decode(rg, local_stock.as_ref())?;
+                        let out = self.process_root_rg(chunk, ctx_ref)?;
+                        out_ref.lock().expect("lock")[rg] = Some(out);
+                    }
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                h.join()
+                    .map_err(|_| "worker thread panicked".to_string())??;
+            }
+            Ok(())
+        })?;
+
+        // ---- Merge partials in row-group order, then HAVING → ORDER BY →
+        // LIMIT.
+        let outputs = outputs.into_inner().expect("no poisoned lock");
         let (columns, mut rows) = if q.group.is_empty() && q.aggs.is_empty() {
-            // Plain row query: outputs are slot-space; one result row per
-            // surviving joined row.
             let columns: Vec<String> = q.output.iter().map(|o| o.name.clone()).collect();
             let mut rows = Vec::new();
-            for (chunk, sel) in view_chunks.iter().zip(&sels) {
-                sel.for_each(|i| {
-                    rows.push(
-                        q.output
-                            .iter()
-                            .map(|o| o.expr.eval_value(chunk, i as usize))
-                            .collect(),
-                    );
-                });
+            for out in outputs.into_iter().flatten() {
+                if let RgOut::Rows(mut r) = out {
+                    rows.append(&mut r);
+                }
             }
             (columns, rows)
         } else {
-            self.aggregate(&view_chunks, &sels, &matched_cols)?
+            let mut groups: BTreeMap<Vec<GroupKey>, Vec<AggState>> = BTreeMap::new();
+            for out in outputs.into_iter().flatten() {
+                match out {
+                    RgOut::Scalar(states) => {
+                        let entry = groups
+                            .entry(Vec::new())
+                            .or_insert_with(|| vec![AggState::default(); q.aggs.len()]);
+                        for (a, b) in entry.iter_mut().zip(&states) {
+                            a.merge(b);
+                        }
+                    }
+                    RgOut::Grouped(map) => {
+                        for (k, states) in map {
+                            match groups.entry(k) {
+                                std::collections::btree_map::Entry::Vacant(e) => {
+                                    e.insert(states);
+                                }
+                                std::collections::btree_map::Entry::Occupied(mut e) => {
+                                    for (a, b) in e.get_mut().iter_mut().zip(&states) {
+                                        a.merge(b);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    RgOut::Rows(_) => unreachable!("plain-row handled above"),
+                }
+            }
+            // A scalar aggregate over zero surviving row groups still
+            // yields one (default) row — matching sequential semantics.
+            if groups.is_empty() && q.group.is_empty() {
+                groups.insert(Vec::new(), vec![AggState::default(); q.aggs.len()]);
+            }
+            self.finalize_groups(groups)?
         };
         if !q.order_by.is_empty() {
             rows.sort_by(|a, b| {
@@ -527,20 +627,36 @@ impl Executor<'_> {
         }
 
         let has_payload = !payload_slots.is_empty();
-        let mut map: HashMap<Vec<i64>, (u64, Vec<ScalarValue>)> = HashMap::new();
+        let mut map = if link_cols.len() == 1 {
+            DimMap::Single(HashMap::new())
+        } else {
+            DimMap::Multi(HashMap::new())
+        };
         let own_payload: Vec<usize> = payload_slots
             .iter()
             .copied()
             .filter(|&s| q.slots[s].table == t)
             .collect();
+        // Pre-resolve key slots; probe/build keys fill a reused scratch
+        // buffer (zero per-row allocation).
+        let link_slots: Vec<usize> = link_cols
+            .iter()
+            .map(|&c| self.local_to_slot(t, c))
+            .collect();
+        let child_key_slots: Vec<Vec<usize>> = child_results
+            .iter()
+            .map(|(parent_keys, _)| {
+                parent_keys
+                    .iter()
+                    .map(|&c| self.local_to_slot(t, c))
+                    .collect()
+            })
+            .collect();
 
         for (chunk, sel) in self.filtered_chunks(t)? {
             let view = self.slot_view(t, &chunk);
-            let link: Vec<Expr> = link_cols
-                .iter()
-                .map(|&c| Expr::Column(self.local_to_slot(t, c)))
-                .collect();
             let mut err: Option<String> = None;
+            let mut kbuf: Vec<i64> = Vec::with_capacity(8);
             sel.for_each(|i| {
                 if err.is_some() {
                     return;
@@ -548,13 +664,13 @@ impl Executor<'_> {
                 let i = i as usize;
                 // Probe each child; a miss drops the row, hits multiply.
                 let mut weight = 1u64;
-                let mut bubbled: Vec<(usize, Vec<ScalarValue>)> = Vec::new();
-                for (parent_keys, r) in &child_results {
-                    let k: Vec<i64> = parent_keys
-                        .iter()
-                        .map(|&c| Expr::Column(self.local_to_slot(t, c)).eval_i64(&view, i))
-                        .collect();
-                    match r.map.get(&k) {
+                let mut bubbled: Vec<&Vec<ScalarValue>> = Vec::new();
+                for (slots, (_, r)) in child_key_slots.iter().zip(&child_results) {
+                    kbuf.clear();
+                    for &sl in slots {
+                        kbuf.push(Expr::Column(sl).eval_i64(&view, i));
+                    }
+                    match r.map.get(&kbuf) {
                         None => {
                             weight = 0;
                             break;
@@ -562,7 +678,7 @@ impl Executor<'_> {
                         Some((cnt, pay)) => {
                             weight *= cnt;
                             if !r.payload_slots.is_empty() {
-                                bubbled.push((bubbled.len(), pay.clone()));
+                                bubbled.push(pay);
                             }
                         }
                     }
@@ -576,26 +692,50 @@ impl Executor<'_> {
                 for &s in &own_payload {
                     pay.push(Expr::Column(s).eval_value(&view, i));
                 }
-                for (_, block) in &bubbled {
+                for block in &bubbled {
                     pay.extend(block.iter().cloned());
                 }
-                let key: Vec<i64> = link.iter().map(|l| l.eval_i64(&view, i)).collect();
-                match map.entry(key) {
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert((weight, pay));
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        if has_payload {
-                            err = Some(format!(
-                                "duplicate join key {:?} in table '{}' with payload columns — \
-                                 not yet supported",
-                                e.key(),
-                                q.tables[t].name
-                            ));
-                        } else {
-                            e.get_mut().0 += weight;
+                kbuf.clear();
+                for &sl in &link_slots {
+                    kbuf.push(Expr::Column(sl).eval_i64(&view, i));
+                }
+                use std::collections::hash_map::Entry;
+                let dup = match &mut map {
+                    DimMap::Single(m) => match m.entry(kbuf[0]) {
+                        Entry::Vacant(e) => {
+                            e.insert((weight, pay));
+                            false
                         }
-                    }
+                        Entry::Occupied(mut e) => {
+                            if has_payload {
+                                true
+                            } else {
+                                e.get_mut().0 += weight;
+                                false
+                            }
+                        }
+                    },
+                    DimMap::Multi(m) => match m.entry(kbuf.clone()) {
+                        Entry::Vacant(e) => {
+                            e.insert((weight, pay));
+                            false
+                        }
+                        Entry::Occupied(mut e) => {
+                            if has_payload {
+                                true
+                            } else {
+                                e.get_mut().0 += weight;
+                                false
+                            }
+                        }
+                    },
+                };
+                if dup {
+                    err = Some(format!(
+                        "duplicate join key {kbuf:?} in table '{}' with payload columns — \
+                         not yet supported",
+                        q.tables[t].name
+                    ));
                 }
             });
             if let Some(e) = err {
@@ -605,31 +745,121 @@ impl Executor<'_> {
         Ok(DimResult { payload_slots, map })
     }
 
+    /// Build a table's row-group source (materialized / native / stock).
+    fn table_src(&self, t: usize) -> Result<RootSrc, String> {
+        let q = self.q;
+        let ti = &q.tables[t];
+        Ok(match &ti.source {
+            TableSource::Derived(i) => {
+                let r = execute(&q.derived[*i])?;
+                RootSrc::One(vec![result_to_chunk(&r, ti)?])
+            }
+            TableSource::Parquet(path) => {
+                let has_strings = ti
+                    .projection
+                    .iter()
+                    .any(|c| matches!(c.ty, LogicalType::Utf8));
+                if has_strings {
+                    let cols: Vec<(String, ColKind)> = ti
+                        .projection
+                        .iter()
+                        .map(|c| {
+                            let kind = match c.ty {
+                                LogicalType::Utf8 => ColKind::Utf8,
+                                LogicalType::Int64 => ColKind::I64,
+                                LogicalType::Float64 => ColKind::F64,
+                                LogicalType::Int32 | LogicalType::Date32 => ColKind::I32(c.ty),
+                            };
+                            (c.name.clone(), kind)
+                        })
+                        .collect();
+                    let refs: Vec<(&str, ColKind)> =
+                        cols.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+                    let n_rg = StockScan::open(path, &refs)?.n_row_groups();
+                    RootSrc::Stock {
+                        path: path.clone(),
+                        cols,
+                        n_rg,
+                    }
+                } else {
+                    let cols: Vec<(usize, NativeColKind)> = ti
+                        .projection
+                        .iter()
+                        .map(|c| {
+                            let kind = match c.ty {
+                                LogicalType::Int32 | LogicalType::Date32 => {
+                                    NativeColKind::I32(c.ty)
+                                }
+                                LogicalType::Int64 => NativeColKind::I64,
+                                LogicalType::Float64 => NativeColKind::F64,
+                                LogicalType::Utf8 => unreachable!("string scans routed above"),
+                            };
+                            (c.leaf, kind)
+                        })
+                        .collect();
+                    let file = ParquetFile::open(path)
+                        .map_err(|e| format!("open {}: {e}", path.display()))?;
+                    let nrows: Vec<usize> = {
+                        let md = file.metadata().map_err(|e| format!("metadata: {e}"))?;
+                        md.row_groups
+                            .iter()
+                            .map(|rg| rg.num_rows as usize)
+                            .collect()
+                    };
+                    RootSrc::Native {
+                        file: Box::new(file),
+                        cols,
+                        nrows,
+                    }
+                }
+            }
+        })
+    }
+
     /// Scan table `t` and apply its own filter, yielding (chunk, live
-    /// selection) pairs. Chunks are in the table's LOCAL column space.
+    /// selection) pairs in row-group order. Decode + filter run
+    /// MORSEL-PARALLEL per row group (the dim-side scans — e.g. Q08's 15M
+    /// orders — were the sequential tail once the root went parallel).
     fn filtered_chunks(&self, t: usize) -> Result<Vec<(DataChunk, Selection)>, String> {
         let ti = &self.q.tables[t];
-        let chunks = match &ti.source {
-            TableSource::Parquet(_) => scan_table(ti)?,
-            TableSource::Derived(i) => {
-                // Materialize the derived query and expose its output
-                // columns as a one-chunk table.
-                let r = execute(&self.q.derived[*i])?;
-                vec![result_to_chunk(&r, ti)?]
+        let src = self.table_src(t)?;
+        let n_rg = src.n_rg();
+        let outputs: Mutex<Vec<Option<(DataChunk, Selection)>>> =
+            Mutex::new((0..n_rg).map(|_| None).collect());
+        let queue = MorselQueue::new(n_rg);
+        let nworkers = self.nthreads.clamp(1, n_rg.max(1));
+        let (src_ref, queue_ref, out_ref) = (&src, &queue, &outputs);
+        std::thread::scope(|scope| -> Result<(), String> {
+            let mut handles = Vec::with_capacity(nworkers);
+            for _ in 0..nworkers {
+                handles.push(scope.spawn(move || -> Result<(), String> {
+                    let local_stock = src_ref.open_local_stock()?;
+                    while let Some(rg) = queue_ref.next() {
+                        let chunk = src_ref.decode(rg, local_stock.as_ref())?;
+                        let sel = match &ti.filter {
+                            None => chunk.sel.clone(),
+                            Some(pred) => {
+                                let view = self.slot_view(t, &chunk);
+                                filter_expr(&view, pred)
+                            }
+                        };
+                        out_ref.lock().expect("lock")[rg] = Some((chunk, sel));
+                    }
+                    Ok(())
+                }));
             }
-        };
-        let mut out = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            let sel = match &ti.filter {
-                None => chunk.sel.clone(),
-                Some(pred) => {
-                    let view = self.slot_view(t, &chunk);
-                    filter_expr(&view, pred)
-                }
-            };
-            out.push((chunk, sel));
-        }
-        Ok(out)
+            for h in handles {
+                h.join()
+                    .map_err(|_| "worker thread panicked".to_string())??;
+            }
+            Ok(())
+        })?;
+        Ok(outputs
+            .into_inner()
+            .expect("no poisoned lock")
+            .into_iter()
+            .map(|o| o.expect("every row group decoded"))
+            .collect())
     }
 
     /// Arrange a table-local chunk into the global slot space: this table's
@@ -667,72 +897,161 @@ impl Executor<'_> {
         self.q.tables[table].projection[col].ty
     }
 
-    /// Grouped / scalar aggregation over slot-space chunks, then the output
-    /// projection over the per-group result rows.
-    fn aggregate(
-        &self,
-        chunks: &[DataChunk],
-        sels: &[Selection],
-        matched_cols: &HashMap<usize, usize>,
-    ) -> Result<(Vec<String>, Vec<Vec<ScalarValue>>), String> {
+    /// Process one root row group end-to-end: slot view → root filter →
+    /// per-child probe/attach (scratch keys, zero per-row allocation) →
+    /// post-join predicate → this RG's aggregation partial.
+    fn process_root_rg(&self, chunk: DataChunk, ctx: &RootCtx) -> Result<RgOut, String> {
         let q = self.q;
-        let nkeys = q.group.len();
-
-        // key tuple → per-agg accumulator state.
-        let mut groups: BTreeMap<Vec<GroupKey>, Vec<AggState>> = BTreeMap::new();
-        if nkeys == 0 {
-            // Scalar aggregate: keep SUM's per-chunk partial association
-            // (what makes the Q6 gate bit-identical to the hand kernel).
-            let mut states = vec![AggState::default(); q.aggs.len()];
-            for (chunk, sel) in chunks.iter().zip(sels) {
-                for (j, agg) in q.aggs.iter().enumerate() {
-                    match agg.func {
-                        AggFunc::Sum => states[j].sum += sum_expr_f64(chunk, sel, &agg.arg),
-                        AggFunc::Count => states[j].count += sel.len() as u64,
-                        AggFunc::CountMatched(t) => {
-                            let flags = chunk.col(matched_cols[&t]).as_i64();
-                            sel.for_each(|i| states[j].count += flags[i as usize] as u64);
+        let mut view = self.slot_view(ctx.root, &chunk);
+        let mut sel = match ctx.filter {
+            None => chunk.sel.clone(),
+            Some(pred) => filter_expr(&view, pred),
+        };
+        let nrows = chunk.cols.first().map_or(0, |c| c.len());
+        let mut kbuf: Vec<i64> = Vec::with_capacity(8);
+        for (child, links, left) in ctx.children {
+            let dim = ctx.dims[*child].as_ref().expect("dim built");
+            let key_slots: Vec<usize> = links
+                .iter()
+                .map(|&(p, _)| self.local_to_slot(ctx.root, p))
+                .collect();
+            // Narrow with multiplicity; a LEFT child keeps misses once.
+            let mut out = Vec::new();
+            let mut matched: Vec<i64> = if *left { vec![0; nrows] } else { Vec::new() };
+            sel.for_each(|i| {
+                kbuf.clear();
+                for &sl in &key_slots {
+                    kbuf.push(Expr::Column(sl).eval_i64(&view, i as usize));
+                }
+                match dim.map.get(&kbuf) {
+                    Some((cnt, _)) => {
+                        for _ in 0..*cnt {
+                            out.push(i);
                         }
-                        AggFunc::CountDistinct => sel.for_each(|i| {
-                            states[j]
-                                .distinct
-                                .insert(agg.arg.eval_i64(chunk, i as usize));
-                        }),
-                        _ => {
-                            sel.for_each(|i| states[j].update(agg.arg.eval_f64(chunk, i as usize)))
+                        if *left {
+                            matched[i as usize] = 1;
                         }
                     }
+                    None if *left => out.push(i),
+                    None => {}
                 }
-            }
-            groups.insert(Vec::new(), states);
-        } else {
-            for (chunk, sel) in chunks.iter().zip(sels) {
+            });
+            sel = Selection::Indices(out);
+            // Attach the subtree's payload slots as full-length columns
+            // (LEFT misses take type defaults — 0 / 0.0 / "").
+            if !dim.payload_slots.is_empty() {
+                let mut row_vals: HashMap<u32, Vec<ScalarValue>> = HashMap::new();
                 sel.for_each(|i| {
-                    let i = i as usize;
-                    let key: Vec<GroupKey> = q
-                        .group
-                        .iter()
-                        .map(|g| GroupKey::from(g.expr.eval_value(chunk, i)))
-                        .collect();
-                    let states = groups
-                        .entry(key)
-                        .or_insert_with(|| vec![AggState::default(); q.aggs.len()]);
-                    for (j, agg) in q.aggs.iter().enumerate() {
-                        match agg.func {
-                            AggFunc::Count => states[j].count += 1,
-                            AggFunc::CountMatched(t) => {
-                                states[j].count += chunk.col(matched_cols[&t]).as_i64()[i] as u64;
-                            }
-                            AggFunc::CountDistinct => {
-                                states[j].distinct.insert(agg.arg.eval_i64(chunk, i));
-                            }
-                            _ => states[j].update(agg.arg.eval_f64(chunk, i)),
+                    if row_vals.contains_key(&i) {
+                        return;
+                    }
+                    kbuf.clear();
+                    for &sl in &key_slots {
+                        kbuf.push(Expr::Column(sl).eval_i64(&view, i as usize));
+                    }
+                    match dim.map.get(&kbuf) {
+                        Some((_, pay)) => {
+                            row_vals.insert(i, pay.clone());
+                        }
+                        None => {
+                            debug_assert!(*left, "non-left miss survived narrowing");
+                            let defaults = dim
+                                .payload_slots
+                                .iter()
+                                .map(|&sl| default_value(self.slot_ty(sl)))
+                                .collect();
+                            row_vals.insert(i, defaults);
                         }
                     }
                 });
+                for (j, &slot) in dim.payload_slots.iter().enumerate() {
+                    let ty = self.slot_ty(slot);
+                    view.cols[slot] = build_column(ty, nrows, |row| {
+                        row_vals.get(&(row as u32)).map(|v| v[j].clone())
+                    });
+                }
+            }
+            if *left {
+                debug_assert_eq!(ctx.matched_cols[child], view.cols.len());
+                view.cols.push(Vector::i64(matched));
             }
         }
+        // Post-join predicate (multi-table conjuncts + cycle residuals).
+        if let Some(p) = ctx.post {
+            let scoped = DataChunk {
+                cols: view.cols.clone(),
+                sel,
+            };
+            sel = filter_expr(&scoped, p);
+        }
 
+        // ---- This RG's aggregation partial.
+        if q.group.is_empty() && q.aggs.is_empty() {
+            let mut rows = Vec::new();
+            sel.for_each(|i| {
+                rows.push(
+                    q.output
+                        .iter()
+                        .map(|o| o.expr.eval_value(&view, i as usize))
+                        .collect(),
+                );
+            });
+            return Ok(RgOut::Rows(rows));
+        }
+        if q.group.is_empty() {
+            let mut states = vec![AggState::default(); q.aggs.len()];
+            for (j, agg) in q.aggs.iter().enumerate() {
+                match agg.func {
+                    AggFunc::Sum => states[j].sum += sum_expr_f64(&view, &sel, &agg.arg),
+                    AggFunc::Count => states[j].count += sel.len() as u64,
+                    AggFunc::CountMatched(t) => {
+                        let flags = view.col(ctx.matched_cols[&t]).as_i64();
+                        sel.for_each(|i| states[j].count += flags[i as usize] as u64);
+                    }
+                    AggFunc::CountDistinct => sel.for_each(|i| {
+                        states[j]
+                            .distinct
+                            .insert(agg.arg.eval_i64(&view, i as usize));
+                    }),
+                    _ => sel.for_each(|i| states[j].update(agg.arg.eval_f64(&view, i as usize))),
+                }
+            }
+            return Ok(RgOut::Scalar(states));
+        }
+        let mut groups: BTreeMap<Vec<GroupKey>, Vec<AggState>> = BTreeMap::new();
+        sel.for_each(|i| {
+            let i = i as usize;
+            let key: Vec<GroupKey> = q
+                .group
+                .iter()
+                .map(|g| GroupKey::from(g.expr.eval_value(&view, i)))
+                .collect();
+            let states = groups
+                .entry(key)
+                .or_insert_with(|| vec![AggState::default(); q.aggs.len()]);
+            for (j, agg) in q.aggs.iter().enumerate() {
+                match agg.func {
+                    AggFunc::Count => states[j].count += 1,
+                    AggFunc::CountMatched(t) => {
+                        states[j].count += view.col(ctx.matched_cols[&t]).as_i64()[i] as u64;
+                    }
+                    AggFunc::CountDistinct => {
+                        states[j].distinct.insert(agg.arg.eval_i64(&view, i));
+                    }
+                    _ => states[j].update(agg.arg.eval_f64(&view, i)),
+                }
+            }
+        });
+        Ok(RgOut::Grouped(groups))
+    }
+
+    /// Merged groups → the row-space chunk → HAVING → output projection.
+    fn finalize_groups(
+        &self,
+        groups: BTreeMap<Vec<GroupKey>, Vec<AggState>>,
+    ) -> Result<(Vec<String>, Vec<Vec<ScalarValue>>), String> {
+        let q = self.q;
+        let nkeys = q.group.len();
         // ---- Build the row-space chunk [keys…, agg values…] with typed
         // key columns (Int / Float / Utf8, from the key values themselves).
         let ngroups = groups.len();
@@ -893,6 +1212,21 @@ impl Default for AggState {
 }
 
 impl AggState {
+    /// Merge another partial into this one (row-group-order folding). SUM
+    /// adds partials — with a fixed merge order this reproduces the
+    /// sequential per-chunk association exactly.
+    fn merge(&mut self, o: &AggState) {
+        self.sum += o.sum;
+        self.count += o.count;
+        if o.min < self.min {
+            self.min = o.min;
+        }
+        if o.max > self.max {
+            self.max = o.max;
+        }
+        self.distinct.extend(o.distinct.iter().copied());
+    }
+
     #[inline]
     fn update(&mut self, v: f64) {
         self.sum += v;
@@ -915,50 +1249,6 @@ impl AggState {
             AggFunc::CountDistinct => self.distinct.len() as f64,
             AggFunc::CountMatched(_) => self.count as f64,
         }
-    }
-}
-
-/// Scan a table by its projection. Strings route through the stock
-/// low-level reader (dimension tables); numeric-only scans use the native
-/// ematix-parquet path.
-fn scan_table(ti: &TableInput) -> Result<Vec<DataChunk>, String> {
-    let TableSource::Parquet(path) = &ti.source else {
-        unreachable!("derived sources are materialized by the executor");
-    };
-    let has_strings = ti
-        .projection
-        .iter()
-        .any(|c| matches!(c.ty, LogicalType::Utf8));
-    if has_strings {
-        let cols: Vec<(&str, ColKind)> = ti
-            .projection
-            .iter()
-            .map(|c| {
-                let kind = match c.ty {
-                    LogicalType::Utf8 => ColKind::Utf8,
-                    LogicalType::Int64 => ColKind::I64,
-                    LogicalType::Float64 => ColKind::F64,
-                    LogicalType::Int32 | LogicalType::Date32 => ColKind::I32(c.ty),
-                };
-                (c.name.as_str(), kind)
-            })
-            .collect();
-        scan_columns(path, &cols)
-    } else {
-        let cols: Vec<(usize, NativeColKind)> = ti
-            .projection
-            .iter()
-            .map(|c| {
-                let kind = match c.ty {
-                    LogicalType::Int32 | LogicalType::Date32 => NativeColKind::I32(c.ty),
-                    LogicalType::Int64 => NativeColKind::I64,
-                    LogicalType::Float64 => NativeColKind::F64,
-                    LogicalType::Utf8 => unreachable!("string scans routed above"),
-                };
-                (c.leaf, kind)
-            })
-            .collect();
-        scan_row_groups(path, &cols)
     }
 }
 

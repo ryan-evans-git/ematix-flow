@@ -37,7 +37,8 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
-    let data = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../examples/tpch/data/{sf}"));
+    let data =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../examples/tpch/data/{sf}"));
     let t = |name: &str| data.join(format!("{name}.parquet"));
 
     use LogicalType::*;
@@ -108,5 +109,8 @@ fn main() {
         println!("trial {i}: {ms:.1} ms ({} rows)", r.rows.len());
     }
     times.sort_by(|a, b| a.total_cmp(b));
-    println!("planned Q08 {sf}: median {:.1} ms over {trials} trials", times[trials / 2]);
+    println!(
+        "planned Q08 {sf}: median {:.1} ms over {trials} trials",
+        times[trials / 2]
+    );
 }

@@ -30,34 +30,71 @@ pub enum ColKind {
     Utf8,
 }
 
+/// A stock-parquet scan handle exposing **per-row-group** decode — what the
+/// executor's morsel-parallel driver needs for string-bearing scans (each
+/// worker opens its own handle; the footer parse is cheap).
+pub struct StockScan {
+    reader: SerializedFileReader<File>,
+    columns: Vec<(String, ColKind)>,
+    leaf_of: Vec<usize>,
+}
+
+impl StockScan {
+    /// Open `path` and resolve `columns` (by leaf name) to leaf indices.
+    pub fn open(path: &Path, columns: &[(&str, ColKind)]) -> Result<Self, String> {
+        let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let reader = SerializedFileReader::new(file).map_err(|e| format!("parquet open: {e}"))?;
+        let descr = reader.metadata().file_metadata().schema_descr();
+        let mut leaf_of = Vec::with_capacity(columns.len());
+        for (name, _) in columns {
+            let idx = (0..descr.num_columns())
+                .find(|&i| descr.column(i).name() == *name)
+                .ok_or_else(|| format!("column {name} not found in {}", path.display()))?;
+            leaf_of.push(idx);
+        }
+        Ok(StockScan {
+            reader,
+            columns: columns.iter().map(|&(n, k)| (n.to_string(), k)).collect(),
+            leaf_of,
+        })
+    }
+
+    pub fn n_row_groups(&self) -> usize {
+        self.reader.metadata().num_row_groups()
+    }
+
+    /// Decode one row group into a [`DataChunk`] (column order = the open
+    /// order).
+    pub fn decode_rg(&self, rg: usize) -> Result<DataChunk, String> {
+        decode_stock_rg(&self.reader, &self.columns, &self.leaf_of, rg)
+    }
+}
+
 /// Decode `columns` (by leaf name) from every row group, yielding one
 /// [`DataChunk`] per row group. Column order within each chunk matches
 /// the order of `columns`.
 pub fn scan_columns(path: &Path, columns: &[(&str, ColKind)]) -> Result<Vec<DataChunk>, String> {
-    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let reader = SerializedFileReader::new(file).map_err(|e| format!("parquet open: {e}"))?;
-    let meta = reader.metadata();
-    let descr = meta.file_metadata().schema_descr();
+    let scan = StockScan::open(path, columns)?;
+    (0..scan.n_row_groups())
+        .map(|rg| scan.decode_rg(rg))
+        .collect()
+}
 
-    // Resolve each requested name to its leaf-column index.
-    let mut leaf_of = Vec::with_capacity(columns.len());
-    for (name, _) in columns {
-        let idx = (0..descr.num_columns())
-            .find(|&i| descr.column(i).name() == *name)
-            .ok_or_else(|| format!("column {name} not found in {}", path.display()))?;
-        leaf_of.push(idx);
-    }
-
-    let n_rg = meta.num_row_groups();
-    let mut chunks = Vec::with_capacity(n_rg);
-    for rg in 0..n_rg {
+fn decode_stock_rg(
+    reader: &SerializedFileReader<File>,
+    columns: &[(String, ColKind)],
+    leaf_of: &[usize],
+    rg: usize,
+) -> Result<DataChunk, String> {
+    {
         let rg_reader = reader
             .get_row_group(rg)
             .map_err(|e| format!("row group {rg}: {e}"))?;
         let rows = rg_reader.metadata().num_rows() as usize;
 
         let mut cols = Vec::with_capacity(columns.len());
-        for (ci, &(name, kind)) in columns.iter().enumerate() {
+        for (ci, (name, kind)) in columns.iter().enumerate() {
+            let kind = *kind;
             let cr = rg_reader
                 .get_column_reader(leaf_of[ci])
                 .map_err(|e| format!("col reader {name}: {e}"))?;
@@ -137,7 +174,6 @@ pub fn scan_columns(path: &Path, columns: &[(&str, ColKind)]) -> Result<Vec<Data
             };
             cols.push(vector);
         }
-        chunks.push(DataChunk::new(cols));
+        Ok(DataChunk::new(cols))
     }
-    Ok(chunks)
 }
