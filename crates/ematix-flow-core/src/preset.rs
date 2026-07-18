@@ -48,8 +48,8 @@
 use std::sync::Arc;
 
 use datafusion::common::Result as DfResult;
-use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::prelude::SessionContext;
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use crate::dict_aggregate_rule::EnableDictGroupCountRule;
@@ -117,6 +117,47 @@ use crate::shared_subtree_exec::SharedSubtreeRegistry;
 /// and keep the returned `Arc<SharedSubtreeRegistry>` handle.
 pub fn with_optimizer_rules(builder: SessionStateBuilder) -> SessionStateBuilder {
     with_optimizer_rules_and_registry(builder).0
+}
+
+/// Build a [`SessionContext`] with the full ematix optimiser chain and
+/// DataFusion's default features installed — the ONE canonical
+/// constructor that both the SQL path and the v2 `ematix.frame` DataFrame
+/// surface ([`crate::frame`]) call.
+///
+/// Because every surface builds its `LogicalPlan` on the state this
+/// produces, a DataFrame-built plan gets byte-identical optimiser /
+/// physical / mesh treatment to a `ctx.sql()` plan — they merge at
+/// `SessionState::create_physical_plan` → `FlowQueryPlanner`. This is the
+/// v2 S0.1 shared-plan guarantee (see
+/// `docs/ADR_V2_SHARED_LOGICAL_PLAN.md`). Callers that assemble the
+/// builder inline instead of calling this risk drifting the two surfaces
+/// apart; prefer this constructor.
+///
+/// Use [`session_context_with_config`] for a custom `SessionConfig`.
+pub fn session_context() -> SessionContext {
+    session_context_with_config(SessionConfig::new())
+}
+
+/// [`session_context`] with an explicit [`SessionConfig`] (e.g. a tuned
+/// `target_partitions`).
+pub fn session_context_with_config(config: SessionConfig) -> SessionContext {
+    SessionContext::new_with_state(session_state_with_config(config))
+}
+
+/// The [`SessionState`] behind [`session_context`], for callers that need
+/// to build the `SessionContext` themselves.
+pub fn session_state() -> SessionState {
+    session_state_with_config(SessionConfig::new())
+}
+
+/// [`session_state`] with an explicit [`SessionConfig`].
+pub fn session_state_with_config(config: SessionConfig) -> SessionState {
+    with_optimizer_rules(
+        SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features(),
+    )
+    .build()
 }
 
 /// Same as [`with_optimizer_rules`], but also returns the

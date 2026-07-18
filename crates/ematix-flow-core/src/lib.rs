@@ -6,6 +6,9 @@ pub mod backend;
 pub mod cdc;
 pub mod ddl;
 pub mod delta_backend;
+/// v2 S0.1 — `ematix.frame` DataFrame lowering seam onto the shared
+/// session (`preset::session_context`). See `docs/ADR_V2_SHARED_LOGICAL_PLAN.md`.
+pub mod frame;
 /// Central `EMAT_*` env-flag accessors + active-config dump (see `docs/EMAT_FLAGS.md`).
 pub mod flags;
 /// Σ.AI.6 bounded-by-default DataFusion memory pool (`EMAT_MEM_POOL_FRACTION`).

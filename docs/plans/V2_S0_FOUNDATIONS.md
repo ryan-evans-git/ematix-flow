@@ -45,7 +45,7 @@ yet all-green); S0.4 ADR merged.
 
 | Story | What | Status | Notes |
 |---|---|---|---|
-| **S0.1** | Shared logical plan (SQL + DataFrame → same `LogicalPlan`) | 📐 design done | Map complete; design in [`../ADR_V2_SHARED_LOGICAL_PLAN.md`](../ADR_V2_SHARED_LOGICAL_PLAN.md). Next: `preset::session_context()` constructor + stub frame lowering + plan-identity demo. Low engine risk — no architectural blocker found. |
+| **S0.1** | Shared logical plan (SQL + DataFrame → same `LogicalPlan`) | ✅ done | `preset::session_context()`/`session_state()` shared constructors + `frame` module (lowering seam) + **plan-identity gate GREEN** (2 shapes: filter+agg, filter+project — frame ≡ SQL optimized plan). CLI `run_shard` consolidated onto the shared constructor; streaming path scoped out (recorded in the ADR). [`../ADR_V2_SHARED_LOGICAL_PLAN.md`](../ADR_V2_SHARED_LOGICAL_PLAN.md). |
 | **S0.2** | TPC-DS data (`dsdgen`) + `tpcds_validate` harness, CI SF=1 behind a flag | ⬜ todo | Mirror `tpch_validate` / `scripts/bench/` |
 | **S0.3** | SQL-surface gap audit → tracked items (from V2_TARGET §2.1) | ⬜ todo | Land as a checklist doc on `v2` (not GH issues — repo is kept issue-light) |
 | **S0.4** | Decide open questions → ADR (namespace, laziness, index depth) | ✅ done | Decided 2026-07-18: `ematix.frame`, lazy-by-default, **index-light core** (revised from strict — positional alignment, Polars-style). [`../ADR_V2_DATAFRAME_API.md`](../ADR_V2_DATAFRAME_API.md). |
@@ -61,12 +61,15 @@ semantics live in the S7 `ematix.pandas` shim + `.to_pandas()`, opt-in.
 
 ## Immediate next actions
 
-1. Land the S0.1 architecture map → write the shared-plan design as an
-   ADR + a stub demo (a trivial frame op and its SQL equivalent produce
-   identical optimized plans).
-2. Get owner decisions on the S0.4 open questions; write the ADR.
-3. Stand up `tpcds_validate` (S0.2) — data-gen + oracle harness.
-4. Write the S0.3 SQL-surface gap checklist.
+1. ~~S0.1 shared-plan constructor + stub frame + plan-identity demo.~~ ✅
+2. ~~S0.4 owner decisions + ADR.~~ ✅ (index-light revision landed.)
+3. **S0.2** — stand up `tpcds_validate`: `dsdgen` data-gen + oracle
+   harness (row-parity vs DuckDB), CI SF=1 behind a feature flag.
+4. **S0.3** — write the SQL-surface gap checklist from `V2_TARGET.md`
+   §2.1 (grouping sets / window / set-ops / decorrelation), pinned to
+   the TPC-DS queries that need each.
+5. Grow the `frame` stub toward S4 only as later stories need it — S0
+   keeps it minimal (it exists to prove the seam, not to be the API).
 
 ## Open questions (S0.4) — RESOLVED 2026-07-18
 

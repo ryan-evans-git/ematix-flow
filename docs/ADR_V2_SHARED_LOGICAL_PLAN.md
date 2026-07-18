@@ -73,11 +73,16 @@ Concretely, S0.1 delivers:
    `DataFrame::into_optimized_plan()` output). This is the gate that
    unblocks Track B.
 
-4. **Reconcile the streaming bypass.** Decide + document whether
-   `transform.rs:328` adopts the shared preset or is explicitly scoped
-   out of the shared-plan guarantee for v2. (Streaming per-batch SQL has
-   different constraints; a scoped-out decision is acceptable if
-   recorded.)
+4. **Streaming bypass — scoped OUT for v2 (decided).**
+   `transform.rs:328` (the per-batch streaming `LazySqlTransform`) keeps
+   its plain `SessionContext::new()` and is **explicitly not covered** by
+   the shared-plan guarantee. Rationale: the ematix rule chain (bloom
+   sidebands, fused aggregates, join-reorder) is tuned for large
+   analytical scans, and re-planning it per streaming batch would add
+   overhead for no benefit on small batches. The shared-plan guarantee
+   covers **batch/analytical** queries — which is exactly the DataFrame
+   API and TPC-DS surface. Revisit only if a streaming workload is shown
+   to want the analytical chain.
 
 `FlowQueryPlanner::rewrite` (`flow_query_planner.rs:62`) already operates
 on a bare optimized `LogicalPlan` and assumes nothing about SQL

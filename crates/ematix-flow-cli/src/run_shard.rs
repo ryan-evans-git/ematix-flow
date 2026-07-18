@@ -22,8 +22,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_ipc::writer::FileWriter as ArrowIpcWriter;
-use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::ematix_fast_parquet_multi::EmatixFastParquetMultiTableProvider;
 use ematix_flow_core::preset;
@@ -79,13 +77,11 @@ pub async fn execute_work_unit(wu: &WorkUnit) -> Result<WorkUnitMetrics, RunShar
     // this change the CLI ran with vanilla DataFusion — losing
     // Σ.Q.L10 LeftSemi pushdown, Σ.Q.L1b RobinHood SUM, Σ.Q.L9
     // bloom sideband, and the Σ.D/Σ.E/Σ.G inject rules.
-    let state = preset::with_optimizer_rules(
-        SessionStateBuilder::new()
-            .with_config(SessionConfig::new())
-            .with_default_features(),
-    )
-    .build();
-    let ctx = SessionContext::new_with_state(state);
+    // v2 S0.1: use the canonical shared constructor so a CLI shard's SQL
+    // plans run through the exact same SessionState as the `ematix.frame`
+    // DataFrame surface — no per-caller drift (see
+    // docs/ADR_V2_SHARED_LOGICAL_PLAN.md).
+    let ctx = preset::session_context();
 
     // ---- 3. Register input tables ----
     let decode_start = Instant::now();
