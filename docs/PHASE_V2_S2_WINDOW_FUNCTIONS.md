@@ -124,21 +124,34 @@ breakdown that bear on the build decision:
   is ≈ 0.8 s of summed compute → order ~100 ms of q51's 359 ms wall. One
   query, not a headline.
 
-**Decision status (2026-07-18): DEFER the q51 operator — parked as a
-characterized candidate.** The "confirm at SF10 first" step is done and
-positive, but the informed call is *not to build now*: the addressable
-kernel win is ~57% (the sort feeding the window is 13.4% and a window
-operator wouldn't remove it), i.e. order ~100 ms on a single ~360 ms
-non-headline query — too little to justify a bespoke `Decimal128`
-cumulative operator plus its A/B/maintenance burden, especially given S1's
-lesson that bespoke operators often lose to DF's vectorized paths.
+**Decision status (2026-07-18): BUILT + SHIPPED — the operator WINS.**
+Initially deferred as a bounded ~60 ms estimate, then (on request) a
+prototype was built and A/B'd at SF10. The estimate was **too
+conservative**: DF's `BoundedWindowAggExec`, though single-pass
+algorithmically, carries heavy per-row overhead (generic `WindowExpr`
+dispatch, frame-bound machinery, `ScalarValue` boxing, Arrow builders). A
+tight streaming i128 running-accumulator beats it decisively.
 
-q51 stays fully characterized here: `win_gate_probe` reproduces the
-hotspot at any scale via `TPCDS_DATA_DIR`, and §5 records exactly how to
-build it. **Re-open the build only if the S6 benchmark shows q51
-materially dragging the aggregate score.** The SF10 TPC-DS data generated
-for this confirmation was removed afterward (disk hygiene); regenerate
-with `tpcds_generate --sf 10` if S2.5 is ever unparked.
+**q51 SF10 A/B (`q51_ab`, EMAT_WINDOW_FUSED toggle, 9 warm iters):**
+
+| | DF-native | fused | verdict |
+|---|---:|---:|---|
+| median wall | 349–496 ms | 212–287 ms | **1.65–1.73× (−137 to −209 ms)** |
+| correctness | — | 100 rows **identical** | row-for-row parity |
+
+Shipped: `crates/ematix-flow-core/src/fused_cumulative_window.rs` —
+`FusedCumulativeWindowExec` + `InjectCumulativeWindowRule`, **default-on**
+(kill-switch `EMAT_WINDOW_FUSED=0`), scoped by a strict recognizer
+(`InputOrderMode::Sorted`, single `Int64` partition key, cumulative
+`ROWS UNBOUNDED PRECEDING → CURRENT ROW`, `sum`/`max` over scale-2
+`Decimal128`). It fires on **q51 only** across TPC-DS; full
+`tpcds_validate` with it on shows **zero diff** vs baseline (q51 still
+parity-OK). Guards: hermetic parity unit test (fused == DF, incl.
+NULL-skipping) + `q51_ab` as the standing A/B benchmark. This is the first
+S1–S3 native operator to **beat** DF — contrast the S1 grouping-set
+operator (1.8× slower, reverted): the difference is real per-row
+constant-factor overhead in DF's generic bounded-window path that a
+frame-specialized kernel removes.
 
 ---
 

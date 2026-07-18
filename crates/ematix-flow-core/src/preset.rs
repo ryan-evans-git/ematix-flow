@@ -609,6 +609,14 @@ pub fn with_optimizer_rules_overridden(
     // boost (morsel down-payment, 2026-06-20), which is independent of the
     // three walkers — so keep the planner installed when that lever is on even
     // if all three walkers are disabled.
+    // v2 S2.5 prototype (2026-07-18): fused cumulative-window operator,
+    // gated on EMAT_WINDOW_FUSED=1 (dormant otherwise, read at plan time).
+    // Registered as a physical rule so it runs after DF's EnforceSorting —
+    // the sorted-mode BoundedWindowAggExec it rewrites is already in place.
+    // A/B-only until it proves it beats DF-native on q51 (else reverted).
+    builder = builder.with_physical_optimizer_rule(Arc::new(
+        crate::fused_cumulative_window::InjectCumulativeWindowRule,
+    ));
     let flow_qp_on = o.flow_query_planner
         && (["EMAT_AGG_SEMI", "EMAT_DIM_PUSH", "EMAT_REORDER_QP"]
             .iter()
@@ -702,6 +710,8 @@ pub const PRODUCTION_PHYSICAL_RULE_NAMES: &[&str] = &[
     "ematix_flow_clustered_single_phase_agg",
     "ematix_flow_enable_robin_hood_sum_f64",
     "ematix_flow_enable_runtime_bloom_sideband",
+    // v2 S2.5 prototype — dormant unless EMAT_WINDOW_FUSED=1 (A/B only).
+    "ematix_cumulative_window",
 ];
 
 /// The production preset's custom LOGICAL optimizer rules, by name, in

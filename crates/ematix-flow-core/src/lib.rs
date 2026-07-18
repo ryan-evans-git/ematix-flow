@@ -172,6 +172,8 @@ pub mod fused_aggregate;
 // `InjectFusedQ{6,1}Rule` family which build it from raw SQL plans
 // (Σ.G.3d retired the intermediate FusedFilterSumExec lift).
 pub mod fused_aggregate_exec;
+// v2 S2.5 prototype: fused cumulative-window operator (q51 A/B).
+pub mod fused_cumulative_window;
 // Σ.G.2e-1: `FilterSumSpec` — first runtime-configured `AggregateSpec`
 // impl. JIT-only single-bucket SUM over an AND-chain of (col ⊕ literal)
 // clauses. Substrate for `InjectFilterSumRule` (Σ.G.2e-2), which lifts
