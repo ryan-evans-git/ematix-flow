@@ -8,6 +8,7 @@
 //! - **P2** (in progress) gives the engine its own native decode
 //!   (`scan_native`, DF-free) and generalizes the operators.
 
+pub mod agg;
 pub mod chunk;
 pub mod exec;
 pub mod join;
@@ -15,6 +16,7 @@ pub mod pipeline;
 pub mod scan;
 pub mod scan_native;
 pub mod sched;
+pub mod spill;
 pub mod vector;
 
 use std::path::Path;

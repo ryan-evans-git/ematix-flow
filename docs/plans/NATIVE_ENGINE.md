@@ -251,10 +251,36 @@ stresses; expect it clearer at SF-100 or under a noisy box. What P2.3 *proves* i
 the correctness invariant (exactly-once dispensing) and no regression — scheduling
 is now dynamic without touching the operators or the sink.
 
-Remaining P2: **spill** (a hash-join/agg correct beyond RAM) + **adaptive re-plan**
-at breakers. Also pending, orthogonal to scheduling: a *general* aggregate breaker
-(Q08's agg is still a query-specific `Sink` in the harness) and building dimension
-probe structures via engine pipelines (still SQL in the harness).
+**P2.4 — spill kill-gate. DONE (2026-07-18).** The engine's first breaker that
+stays correct beyond a memory budget. `src/spill.rs` = `PartitionSpill`, a
+std-only (no `tempfile` dep — clean-room intact) temp-dir-backed store of
+fixed-width `(i64,i64)` records, one append file per partition, lazily created and
+RAII-removed. `src/agg.rs` = `SpillableSumAgg`, a **GRACE partitioned** hash
+aggregate: radix-partition by `hash(key)` so every occurrence of a key lands in one
+partition → each partition aggregates independently (union is complete, no key
+split) and its group map holds only ≈ groups/npart entries → it fits even when the
+whole table didn't. On budget overflow it flushes every partition buffer to disk
+(spill-all); at finish it aggregates each partition from its in-memory remainder +
+streamed-back spill run (one partition's map ever resident).
+
+Kill-gate `tests/spill_agg.rs` picks `SUM(i64) GROUP BY i64` deliberately — exact
+and order-independent, so the spill path's changed summation order **cannot** alter
+the answer: with a 64 KiB budget over 1 M rows, **999 424 of 1 000 000 rows spilled
+through disk** yet the result is **bit-identical** to the unbudgeted in-memory run
+(same groups, same sums). That is the honest proof the mechanism moves every row
+exactly once. Std-only, 14 engine tests green, clippy + fmt clean.
+
+Scope kept narrow on purpose (prove cheap): f64 measures (revenue) are correct only
+up to FP re-association across the changed order — standard for a spilling
+aggregate — so an f64 variant is a labelled follow-on, not the exactness gate; and
+this aggregate is **single-threaded** — per-worker parallel spill + a merge phase,
+and reusing `PartitionSpill` for the hash-**join** build side, are the next steps.
+
+Remaining P2: **adaptive re-plan** at breakers; parallel spill + spilling join
+build (reuse `PartitionSpill`). Also pending, orthogonal: promote `SpillableSumAgg`
+into a general aggregate breaker wired through the driver (Q08's agg is still a
+query-specific `Sink` in the harness) and building dimension probes via engine
+pipelines (still SQL in the harness).
 
 ---
 
