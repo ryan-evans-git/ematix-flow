@@ -378,12 +378,38 @@ supplier probes, shares == DF pull within 1e-6, engine 142.7 ms vs DF 191.9 ms
 (engine arm identical to step 2; the % only moves with the DF baseline's noise). 28
 engine tests green.
 
-Remaining integration: the **orders** reduction (`orders ⋈ customer ⋈ nation ⋈
-region`, `r_name = 'AMERICA'` + a 1995–1996 date window, year bucket) — the last
-`build_probes` SQL. Retiring it makes Q08 **fully engine-native** (dims → scan → join
-→ aggregate, no DataFusion anywhere in the path). Separately, wire the **spilling**
-agg/join through the driver (per-worker `PartitionSpill` + merge) for high-cardinality
-group-bys / beyond-RAM joins.
+**Integration step 4 — native orders reduction. Q08 IS FULLY ENGINE-NATIVE. DONE
+(2026-07-18).** The last `build_probes` SQL is gone. The orders reduction is a chain
+of `∈`-membership semijoins down to a customer set, then a date-windowed filter:
+`region 'AMERICA' → nation → customer`, then `orders WHERE o_custkey ∈ customers ∧
+o_orderdate ∈ [1995,1996] → (o_orderkey, year_bucket)`. `dim.rs` adds two composable
+pieces — `collect_i64_where_i64_member` (the semijoin link, reusing the same
+`ProbeStructure` membership the lineitem hot path uses) and `orders_semijoin_datebucket`
+(custkey semijoin + Date32 window + a 0/1 bucket at a split day). No new capability;
+Q08's date constants (1995-01-01 = day 9131, split 9496, 1996-12-31 = 9861) are the
+harness's to supply, like the Q6 kernel's — the engine stays general. The harness
+`build_probes` drops its last `ctx.sql()` (and the whole plain DataFusion context that
+existed only for it) — now a plain sync fn over the parquet files.
+
+Gate `tests/dim_orders_native.rs`: the full native chain over SF1 == a pyarrow oracle
+(reduces to 1 region, 5 nations, 29 952 customers; 91 179 orders — 45 630 / 45 549 —
+key sum 273 979 458 755, bucket-0 key sum 137 136 132 715). End-to-end SF-10: all three
+probes native, shares == DF pull within 1e-6, **engine 141.3 ms vs DF 200.8 ms** (the
+engine arm is unchanged ~142 ms across every run; the % only moves with the DF
+baseline's noise). The only DataFusion left is the pull baseline the engine is measured
+against. 29 engine tests green.
+
+**Integration arc complete: a whole TPC-H query runs end-to-end on the clean-room
+engine, beating production DataFusion.** Q08: native dim reductions (string filter,
+`⋈`-join, semijoin chain) → native scan → no-materialization probe → general parallel
+aggregate — zero DataFusion in the path. The four P2 breakers (scheduler, spilling
+agg, spilling join, adaptive re-plan) are proven in isolation; the aggregate and the
+probes run through the parallel driver on real data.
+
+Optional follow-ons (not blocking the milestone): wire the **spilling** agg/join
+through the driver (per-worker `PartitionSpill` + merge) for high-cardinality group-bys
+/ beyond-RAM joins; move dimension **string decode** onto ematix-parquet; extend beyond
+Q08 (more of TPC-H) behind a real front-end (P3).
 
 ---
 

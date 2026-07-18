@@ -1,26 +1,27 @@
 //! Native dimension-table reductions — building Q08's probe inputs without
-//! DataFusion.
+//! DataFusion. With these, Q08 is **fully engine-native**: dims → scan →
+//! join → aggregate, no DataFusion anywhere in the path.
 //!
-//! Q08's 60M-row hot path (the lineitem probe) is already engine-native;
-//! the last DataFusion dependency is the small-table reductions that
-//! produce the probe key/payload lists (`build_probes` in the harness).
-//! These decode via the P0 stock-parquet low-level reader — the dimension
-//! tables are tiny, so the fast ematix-parquet path (for the numeric hot
-//! scans) isn't needed, and it keeps string decode off the sibling codec
-//! for now.
+//! The dimension tables are tiny, so these decode via the P0 stock-parquet
+//! low-level reader (the fast ematix-parquet path is for the numeric hot
+//! scans, and stock parquet handles BYTE_ARRAY strings the sibling codec
+//! doesn't yet). Three reductions, each composing the engine's own pieces:
 //!
-//! First reduction: the part semijoin key set — a scan plus one
-//! string-equality filter, no joins. The supplier (a join + string flag)
-//! and orders (a 4-way join + date window + year bucket) reductions build
-//! on this string capability plus the engine's join operators, and are
-//! follow-ons.
+//! - **part** ([`collect_i64_keys_where_str_eq`]) — a scan + one
+//!   string-equality filter (`p_partkey WHERE p_type = …`).
+//! - **supplier** ([`supplier_nation_flag`]) — `supplier ⋈ nation` on the
+//!   engine's [`AdaptiveHashJoin`], carrying the `n_name` flag.
+//! - **orders** ([`collect_i64_where_i64_member`] ×2 +
+//!   [`orders_semijoin_datebucket`]) — a region→nation→customer `∈`-membership
+//!   semijoin chain, then a date-windowed filter with a year bucket.
 
 use std::path::Path;
 
 use crate::adaptive::AdaptiveHashJoin;
 use crate::chunk::DataChunk;
+use crate::join::choose;
 use crate::scan::{ColKind, scan_columns};
-use crate::vector::Vector;
+use crate::vector::{LogicalType, Vector};
 
 /// `SELECT key_col FROM <path> WHERE str_col = needle`: collect the i64
 /// `key_col` of every row whose Utf8 `str_col` equals `needle`. The
@@ -98,4 +99,80 @@ pub fn supplier_nation_flag(
     })
     .map_err(|e| e.to_string())?;
     Ok((suppkeys, flags))
+}
+
+/// Semijoin reduction: `SELECT collect_col FROM <path> WHERE filter_col IN
+/// members` — collect the i64 `collect_col` of every row whose i64
+/// `filter_col` is a member of `members`. Membership uses the engine's
+/// adaptive probe structure (dense byte-set vs hash). The chain link in a
+/// dimension reduction — e.g. Q08's `n_nationkey WHERE n_regionkey ∈
+/// {AMERICA}` and `c_custkey WHERE c_nationkey ∈ {AMERICA nations}`.
+pub fn collect_i64_where_i64_member(
+    path: &Path,
+    collect_col: &str,
+    filter_col: &str,
+    members: &[i64],
+) -> Result<Vec<i64>, String> {
+    let probe = choose(members, None);
+    let chunks = scan_columns(
+        path,
+        &[(collect_col, ColKind::I64), (filter_col, ColKind::I64)],
+    )?;
+    let mut out = Vec::new();
+    for chunk in &chunks {
+        let c = chunk.col(0).as_i64();
+        let f = chunk.col(1).as_i64();
+        chunk.sel.for_each(|i| {
+            let i = i as usize;
+            if probe.contains(f[i]) {
+                out.push(c[i]);
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// Q08's orders reduction: `(o_orderkey, year_bucket)` for every order whose
+/// `cust_col` is in `member_custkeys` (the AMERICA-region customers) and
+/// whose Date32 `date_col` is in `[date_lo, date_hi]` (days since epoch).
+/// `year_bucket` is 0 below `split_day` and 1 at/above it — Q08's 1995 vs
+/// 1996 split. Composes a custkey semijoin with a date-window filter;
+/// returns `(orderkeys, buckets)` for a payload-carrying `choose`.
+#[allow(clippy::too_many_arguments)]
+pub fn orders_semijoin_datebucket(
+    orders_path: &Path,
+    member_custkeys: &[i64],
+    key_col: &str,
+    cust_col: &str,
+    date_col: &str,
+    date_lo: i32,
+    date_hi: i32,
+    split_day: i32,
+) -> Result<(Vec<i64>, Vec<i64>), String> {
+    let probe = choose(member_custkeys, None);
+    let chunks = scan_columns(
+        orders_path,
+        &[
+            (key_col, ColKind::I64),
+            (cust_col, ColKind::I64),
+            (date_col, ColKind::I32(LogicalType::Date32)),
+        ],
+    )?;
+    let mut keys = Vec::new();
+    let mut buckets = Vec::new();
+    for chunk in &chunks {
+        let ok = chunk.col(0).as_i64();
+        let ck = chunk.col(1).as_i64();
+        let od = chunk.col(2).as_i32();
+        chunk.sel.for_each(|i| {
+            let i = i as usize;
+            let d = od[i];
+            // Date window first (cheap), then the custkey semijoin.
+            if (date_lo..=date_hi).contains(&d) && probe.contains(ck[i]) {
+                keys.push(ok[i]);
+                buckets.push(i64::from(d >= split_day));
+            }
+        });
+    }
+    Ok((keys, buckets))
 }

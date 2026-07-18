@@ -77,10 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new_with_state(builder.build());
     register_all(&ctx, &data_dir)?;
 
-    // Plain context for the dim-build SQL (helper queries need no rules).
-    let ctx_plain =
-        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(14));
-    register_all(&ctx_plain, &data_dir)?;
+    // The dim probes are built natively now (no DataFusion), so the pull
+    // context `ctx` is the only DataFusion here — the Q08 baseline.
     let q08 = std::fs::read_to_string(data_dir.join("../../queries/q08.sql"))
         .or_else(|_| std::fs::read_to_string("examples/tpch/queries/q08.sql"))?;
 
@@ -91,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ---- warmup + correctness (engine shares must equal the DF pull result) ----
-    let probes = build_probes(&ctx_plain, &data_dir).await?;
+    let probes = build_probes(&data_dir)?;
     eprintln!(
         "probes: part={} orders={} supplier={}",
         probes.part.kind(),
@@ -127,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pull.push(t.elapsed().as_secs_f64() * 1000.0);
 
         // dims rebuilt each trial (fair: the pull plan rebuilds them too).
-        let p = build_probes(&ctx_plain, &data_dir).await?;
+        let p = build_probes(&data_dir)?;
         let t = Instant::now();
         let _ = engine_push_q08(&lineitem_path, &p, nthreads)?;
         engine.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -180,14 +178,12 @@ fn register_all(
     Ok(())
 }
 
-/// Build the three Q08 dimension reductions, then hand them to the adaptive
-/// `choose` selector. The part reduction is built **natively** (engine
-/// string decode + filter, no DataFusion); supplier and orders still use SQL
-/// (they need joins + a date window — the follow-on native builds).
-async fn build_probes(
-    ctx: &SessionContext,
-    data_dir: &std::path::Path,
-) -> Result<Probes, Box<dyn std::error::Error>> {
+/// Build all three Q08 dimension reductions **natively** — engine string
+/// decode, `∈`-membership semijoins, and the engine's own adaptive hash join
+/// — then hand them to the `choose` selector. **Zero DataFusion**: part is a
+/// string filter, supplier a `⋈ nation` join, orders a region→nation→
+/// customer semijoin chain plus a date-windowed filter.
+fn build_probes(data_dir: &std::path::Path) -> Result<Probes, Box<dyn std::error::Error>> {
     // part survivors (p_type filter) — NATIVE: the engine's own string
     // decode + equality filter over part.parquet, zero DataFusion.
     let part_keys = ematix_flow_engine::dim::collect_i64_keys_where_str_eq(
@@ -203,36 +199,41 @@ async fn build_probes(
         &data_dir.join("nation.parquet"),
         "BRAZIL",
     )?;
-    // orders -> year-bucket (AMERICA region + date window).
-    let mut ord_keys: Vec<i64> = Vec::new();
-    let mut ord_pay: Vec<i64> = Vec::new();
-    for b in &ctx
-        .sql(
-            "SELECT o.o_orderkey, extract(year FROM o.o_orderdate) AS y \
-             FROM orders o \
-             JOIN customer c ON o.o_custkey = c.c_custkey \
-             JOIN nation n ON c.c_nationkey = n.n_nationkey \
-             JOIN region r ON n.n_regionkey = r.r_regionkey \
-             WHERE r.r_name = 'AMERICA' \
-               AND o.o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'",
-        )
-        .await?
-        .collect()
-        .await?
-    {
-        let ok = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let yr_i32 = b.column(1).as_any().downcast_ref::<Int32Array>();
-        let yr_i64 = b.column(1).as_any().downcast_ref::<Int64Array>();
-        for i in 0..ok.len() {
-            let y = match (yr_i32, yr_i64) {
-                (Some(a), _) => a.value(i) as i64,
-                (_, Some(a)) => a.value(i),
-                _ => continue,
-            };
-            ord_keys.push(ok.value(i));
-            ord_pay.push(if y == 1995 { 0 } else { 1 });
-        }
-    }
+    // orders -> year-bucket (AMERICA region + 1995-96 date window) — NATIVE:
+    // a region → nation → customer semijoin chain, then a date-windowed
+    // filter on orders. This was Q08's LAST DataFusion dependency; the whole
+    // query is now engine-native, dims through aggregate.
+    //
+    // Date32 days since epoch: 1995-01-01 = 9131, 1996-01-01 = 9496 (year
+    // split), 1996-12-31 = 9861 (the Q6 kernel's 1995-01-01 = 9131).
+    let america_regions = ematix_flow_engine::dim::collect_i64_keys_where_str_eq(
+        &data_dir.join("region.parquet"),
+        "r_regionkey",
+        "r_name",
+        "AMERICA",
+    )?;
+    let america_nations = ematix_flow_engine::dim::collect_i64_where_i64_member(
+        &data_dir.join("nation.parquet"),
+        "n_nationkey",
+        "n_regionkey",
+        &america_regions,
+    )?;
+    let america_custs = ematix_flow_engine::dim::collect_i64_where_i64_member(
+        &data_dir.join("customer.parquet"),
+        "c_custkey",
+        "c_nationkey",
+        &america_nations,
+    )?;
+    let (ord_keys, ord_pay) = ematix_flow_engine::dim::orders_semijoin_datebucket(
+        &data_dir.join("orders.parquet"),
+        &america_custs,
+        "o_orderkey",
+        "o_custkey",
+        "o_orderdate",
+        9131,
+        9861,
+        9496,
+    )?;
 
     Ok(Probes {
         part: Arc::new(choose(&part_keys, None)),
