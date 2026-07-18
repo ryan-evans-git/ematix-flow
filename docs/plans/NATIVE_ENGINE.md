@@ -272,9 +272,10 @@ exactly once. Std-only, 14 engine tests green, clippy + fmt clean.
 
 Scope kept narrow on purpose (prove cheap): f64 measures (revenue) are correct only
 up to FP re-association across the changed order — standard for a spilling
-aggregate — so an f64 variant is a labelled follow-on, not the exactness gate; and
-this aggregate is **single-threaded** — per-worker parallel spill + a merge phase,
-and reusing `PartitionSpill` for the hash-**join** build side, are the next steps.
+aggregate — so an f64 variant is a labelled follow-on, not the exactness gate. The
+aggregate was single-threaded here; **its parallel face landed in the parallel-spill
+wiring step below**, and `PartitionSpill` is reused for the hash-**join** build side
+in P2.5.
 
 **P2.5 — spilling hash-join build. DONE (2026-07-18).** Extends spill to the
 engine's headline win (the Q08 join path). `src/hashjoin.rs` = `SpillableHashJoin`,
@@ -406,9 +407,26 @@ aggregate — zero DataFusion in the path. The four P2 breakers (scheduler, spil
 agg, spilling join, adaptive re-plan) are proven in isolation; the aggregate and the
 probes run through the parallel driver on real data.
 
-Optional follow-ons (not blocking the milestone): wire the **spilling** agg/join
-through the driver (per-worker `PartitionSpill` + merge) for high-cardinality group-bys
-/ beyond-RAM joins; move dimension **string decode** onto ematix-parquet; extend beyond
+**Parallel-spill wiring — DONE (2026-07-18).** The spilling aggregate (P2.4) was
+proven single-threaded; this runs it through the row-group-parallel driver so a
+high-cardinality group-by stays correct **beyond RAM *and* parallel**. `SpillingSumSink`
+(`src/agg.rs`) is a `Sink` adapter: one `SpillableSumAgg` per worker, each with its own
+`PartitionSpill`; the driver's infallible `Sink::consume` stashes any disk error and
+surfaces it at merge. The payoff is `SpillableSumAgg::merge` — a single **bounded**
+per-partition pass across all workers: because every occurrence of a key routes to the
+same partition index in *every* worker (all share `part_of`), one partition is finished
+across all workers with a single group map (the union of the workers' partition-`p` data
+is exactly the keys hashing to `p`, complete and disjoint), so the merge holds only
+≈ groups/npart entries at a time — the same envelope as the single-threaded aggregate,
+never the whole result set. `finish()` is now just the single-worker case of `merge()`.
+Kill-gate `tests/spill_agg_parallel.rs`: `SUM(l_partkey) GROUP BY l_orderkey` over SF-1
+lineitem (6 M rows, 1.5 M distinct orderkeys) through the parallel driver — a 1 MiB
+budget forces every worker to spill, and the merged result is **bit-identical** to a
+plain in-memory hashmap oracle (and to the no-spill parallel run). 30 engine tests green.
+
+Optional follow-ons (not blocking the milestone): wire the **spilling hash-join**
+through the driver (it needs the two-input build→probe driver the single-input
+aggregate doesn't); move dimension **string decode** onto ematix-parquet; extend beyond
 Q08 (more of TPC-H) behind a real front-end (P3).
 
 ---
