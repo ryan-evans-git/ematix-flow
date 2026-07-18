@@ -158,12 +158,22 @@ SQL text
   `count(distinct s)`/`min(s)`/`__m=1` derived table LEFT-joined on k, with
   `EXISTS ⟺ __m=1 ∧ (cd≥2 ∨ ms≠s)` and `NOT EXISTS ⟺ __m=0 ∨ (cd=1 ∧ ms=s)`.
 
+- **Parallel planned executor (2026-07-18, `7d3766d2`): planned Q08 SF-10
+  7000 ms → 836 ms (8.4×).** Morsel-parallel root pipeline (per-RG partials
+  merged in row-group order — deterministic at any thread count; the Q6
+  bit-equality gate passes parallel), morsel-parallel dim scans, and
+  zero-allocation probes (`DimMap` single-key specialization +
+  scratch-slice lookups; single-threaded alone 7000→5347 ms). Full
+  measured ladder in the commit. All 22 gates green under the parallel
+  executor. Remaining ~6× to the hand-built 141 ms arm: sequential dim
+  MAP BUILDING (15M single-threaded inserts), per-row interpreted
+  expression eval, payload attach — the named next levers.
+
 ## Next (P4 tail → P5/P6)
 
-- **Parallelize planned queries** through the morsel driver / spilling
-  breakers (the machinery exists and is proven; the planned path is
-  sequential+interpreted) — then benchmark planned-Q08 vs the hand-built
-  −29.6% arm to measure and close the interpreter gap.
+- Close the remaining planned-vs-hand-built gap: parallel/sharded dim map
+  builds, `ProbeStructure` fast path for key-only dims, vectorized
+  expression eval, allocation-free payload attach.
 - **TPC-DS breadth** through the same front-end.
 - Re-home the Σ rules onto `BoundQuery`; CTE result sharing (Q15
   materializes twice); NULL semantics beyond the outer-join stand-ins;
