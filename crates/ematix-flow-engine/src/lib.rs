@@ -13,6 +13,7 @@ pub mod agg;
 pub mod chunk;
 pub mod dim;
 pub mod exec;
+pub mod expr;
 pub mod hashjoin;
 pub mod join;
 pub mod pipeline;
