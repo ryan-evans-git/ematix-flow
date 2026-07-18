@@ -61,11 +61,14 @@ pub struct TableInput {
     pub filter: Option<Expr>,
 }
 
-/// An equi-join edge: the two global slots equated by `a = b`.
+/// An equi-join edge: the two global slots equated by `a = b`. For a LEFT
+/// OUTER join, `preserved` names the table whose rows survive without a
+/// match (the executor roots the join tree there).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JoinEdge {
     pub a: usize,
     pub b: usize,
+    pub preserved: Option<usize>,
 }
 
 /// A group key (slot space).
@@ -93,6 +96,10 @@ pub enum AggFunc {
     Avg,
     /// `COUNT(DISTINCT <int expr>)`.
     CountDistinct,
+    /// `COUNT(<col of a LEFT-joined table>)` — counts only row occurrences
+    /// where that table matched (the no-NULL engine's outer-join counting;
+    /// unmatched preserved rows contribute 0).
+    CountMatched(usize),
 }
 
 /// One SELECT output: an expression in **row space** (`Column(i)` = the

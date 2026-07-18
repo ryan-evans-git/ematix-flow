@@ -120,12 +120,13 @@ fn bind_query(
         views: Vec::new(),
         extra_edges: Vec::new(),
         pending_conjuncts: Vec::new(),
+        left_tables: BTreeSet::new(),
     };
     for twj in &select.from {
-        if !twj.joins.is_empty() {
-            return Err("JOIN … ON syntax is not yet supported (use comma joins + WHERE)".into());
-        }
         b.add_from_item(&twj.relation)?;
+        for join in &twj.joins {
+            b.add_join(join)?;
+        }
     }
 
     // GROUP BY first (slot space) — SELECT items match against these. Keys
@@ -228,17 +229,19 @@ fn bind_query(
     {
         // Conjuncts inherited from inlined derived tables come first, then
         // the outer WHERE.
-        let mut raw_owned: Vec<ast::Expr> = std::mem::take(&mut b.pending_conjuncts);
+        let mut raw_owned: Vec<(ast::Expr, bool)> = std::mem::take(&mut b.pending_conjuncts);
         if let Some(where_expr) = &select.selection {
             let mut raw = Vec::new();
             split_and(where_expr, &mut raw);
-            raw_owned.extend(raw.into_iter().cloned());
+            raw_owned.extend(raw.into_iter().cloned().map(|c| (c, false)));
         }
-        let mut conjuncts: Vec<ast::Expr> = Vec::new();
-        for conj in &raw_owned {
-            factor_or(conj, &mut conjuncts);
+        let mut conjuncts: Vec<(ast::Expr, bool)> = Vec::new();
+        for (conj, from_on) in &raw_owned {
+            let mut factored = Vec::new();
+            factor_or(conj, &mut factored);
+            conjuncts.extend(factored.into_iter().map(|c| (c, *from_on)));
         }
-        for conj in &conjuncts {
+        for (conj, from_on) in &conjuncts {
             if let ast::Expr::BinaryOp {
                 left,
                 op: ast::BinaryOperator::Eq,
@@ -261,7 +264,11 @@ fn bind_query(
                                     ka.name, kb.name
                                 ));
                             }
-                            edges.push(JoinEdge { a, b: bb });
+                            edges.push(JoinEdge {
+                                a,
+                                b: bb,
+                                preserved: None,
+                            });
                             continue;
                         }
                         // Same table ⇒ an ordinary filter; falls through.
@@ -273,6 +280,12 @@ fn bind_query(
                 Attribution::None => {
                     return Err(format!(
                         "constant WHERE predicate '{conj}' is not supported"
+                    ));
+                }
+                Attribution::Single(t) if b.left_tables.contains(&t) && !from_on => {
+                    return Err(format!(
+                        "WHERE condition '{conj}' on a LEFT JOIN's right side is not yet \
+                         supported (it would change the join to INNER)"
                     ));
                 }
                 Attribution::Single(t) => filters[t].push(e),
@@ -530,8 +543,12 @@ struct Binder<'a> {
     /// Join edges created outside the WHERE loop (correlated-scalar
     /// decorrelation), merged into the query's edges.
     extra_edges: Vec<JoinEdge>,
-    /// WHERE conjuncts inherited from inlined derived tables.
-    pending_conjuncts: Vec<ast::Expr>,
+    /// WHERE conjuncts inherited from inlined derived tables and JOIN…ON
+    /// clauses; the bool marks ON-origin (exempt from the LEFT-side WHERE
+    /// guard — ON conditions are pre-join filters by definition).
+    pending_conjuncts: Vec<(ast::Expr, bool)>,
+    /// Tables joined via LEFT OUTER (their rows may be unmatched).
+    left_tables: BTreeSet<usize>,
 }
 
 /// A partially-bound expression: either a real bound expression, or a
@@ -615,7 +632,8 @@ impl Binder<'_> {
                     if let Some(w) = &inner.selection {
                         let mut cs = Vec::new();
                         split_and(w, &mut cs);
-                        self.pending_conjuncts.extend(cs.into_iter().cloned());
+                        self.pending_conjuncts
+                            .extend(cs.into_iter().cloned().map(|c| (c, false)));
                     }
                     let mut cols = Vec::new();
                     for (i, item) in inner.projection.iter().enumerate() {
@@ -679,6 +697,81 @@ impl Binder<'_> {
             }
             other => Err(format!("unsupported FROM item: {other}")),
         }
+    }
+
+    /// Register an explicit `JOIN … ON` clause. INNER joins route their ON
+    /// conjuncts exactly like WHERE conjuncts; LEFT OUTER joins mark the
+    /// joined table left-preserved: its edge remembers the preserved side,
+    /// single-table ON conditions on the joined table become its pre-join
+    /// filter (correct outer-join semantics), and conditions on the
+    /// preserved side error (they are not WHERE filters).
+    fn add_join(&mut self, join: &ast::Join) -> Result<(), String> {
+        let (on, left) = match &join.join_operator {
+            ast::JoinOperator::Inner(ast::JoinConstraint::On(e))
+            | ast::JoinOperator::Join(ast::JoinConstraint::On(e)) => (e, false),
+            ast::JoinOperator::LeftOuter(ast::JoinConstraint::On(e)) => (e, true),
+            other => return Err(format!("unsupported join: {other:?}")),
+        };
+        let ntables_before = self.tables.len();
+        self.add_from_item(&join.relation)?;
+        if self.tables.len() != ntables_before + 1 {
+            return Err("a joined relation must be a single table".into());
+        }
+        let new_t = ntables_before;
+        if left {
+            self.left_tables.insert(new_t);
+        }
+        let mut conjuncts = Vec::new();
+        split_and(on, &mut conjuncts);
+        for conj in conjuncts {
+            if let ast::Expr::BinaryOp {
+                left: l,
+                op: ast::BinaryOperator::Eq,
+                right: r,
+            } = conj
+            {
+                if let (Some(lp), Some(rp)) = (ident_parts(l), ident_parts(r)) {
+                    if self.is_real_column(&lp) && self.is_real_column(&rp) {
+                        let a = self.resolve_parts(&lp)?;
+                        let bb = self.resolve_parts(&rp)?;
+                        let (ta, tb) = (self.slots[a].table, self.slots[bb].table);
+                        if ta != tb {
+                            let preserved = if left {
+                                Some(if ta == new_t { tb } else { ta })
+                            } else {
+                                None
+                            };
+                            self.extra_edges.push(JoinEdge {
+                                a,
+                                b: bb,
+                                preserved,
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Non-equi ON conjunct: must belong to the joined table (its
+            // pre-join filter under LEFT semantics).
+            let (e, attr) = self.bind_multi(conj)?;
+            match attr {
+                Attribution::Single(t) if t == new_t => {
+                    self.pending_conjuncts.push((conj.clone(), true));
+                    let _ = e; // re-bound in the WHERE pass
+                }
+                _ if !left => {
+                    self.pending_conjuncts.push((conj.clone(), true));
+                    let _ = e;
+                }
+                _ => {
+                    return Err(format!(
+                        "ON condition '{conj}' on a LEFT JOIN's preserved side is not yet \
+                         supported"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn push_table(
@@ -988,6 +1081,7 @@ impl Binder<'_> {
             self.extra_edges.push(JoinEdge {
                 a: outer_slot,
                 b: key_slot,
+                preserved: None,
             });
         }
         let val_slot = self.resolve_parts(&[&display, "__val"])?;
@@ -1024,49 +1118,70 @@ impl Binder<'_> {
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| tname.clone());
 
-        // Split the inner WHERE: find THE correlation conjunct.
+        // Split the inner WHERE: find the correlation conjuncts — one
+        // equality (the join key) and optionally one INEQUALITY (`<>` on
+        // another outer column, Q21's shape).
         let mut conjuncts = Vec::new();
         if let Some(w) = &select.selection {
             split_and(w, &mut conjuncts);
         }
-        let mut correlation: Option<(String, usize)> = None; // (inner col, outer slot)
+        let mut eq_corr: Option<(String, usize)> = None; // (inner col, outer slot)
+        let mut neq_corr: Option<(String, usize)> = None;
         let mut inner_conjuncts: Vec<&ast::Expr> = Vec::new();
         for conj in conjuncts {
-            if let ast::Expr::BinaryOp {
-                left,
-                op: ast::BinaryOperator::Eq,
-                right,
-            } = conj
-            {
-                if let (Some(lp), Some(rp)) = (ident_parts(left), ident_parts(right)) {
-                    // Unqualified single-part names only (TPC-H's shape).
-                    let inner_of = |parts: &[&str]| match parts {
-                        [c] if def.column(c).is_some() => Some(c.to_string()),
-                        _ => None,
-                    };
-                    match (inner_of(&lp), inner_of(&rp)) {
-                        (Some(ic), None) | (None, Some(ic)) => {
-                            let outer = if inner_of(&lp).is_some() { &rp } else { &lp };
-                            let slot = self.resolve_parts(outer)?;
-                            if correlation.is_some() {
-                                return Err(
-                                    "multiple correlated conditions in EXISTS are not yet \
-                                     supported"
-                                        .into(),
-                                );
+            if let ast::Expr::BinaryOp { left, op, right } = conj {
+                if matches!(op, ast::BinaryOperator::Eq | ast::BinaryOperator::NotEq) {
+                    if let (Some(lp), Some(rp)) = (ident_parts(left), ident_parts(right)) {
+                        // Inner columns may be qualified by the EXISTS
+                        // table's alias (`l2.l_suppkey`).
+                        let inner_of = |parts: &[&str]| match parts {
+                            [c] if def.column(c).is_some() => Some(c.to_string()),
+                            [t, c] if *t == display && def.column(c).is_some() => {
+                                Some(c.to_string())
                             }
-                            correlation = Some((ic, slot));
-                            continue;
+                            _ => None,
+                        };
+                        match (inner_of(&lp), inner_of(&rp)) {
+                            (Some(ic), None) | (None, Some(ic)) => {
+                                let outer = if inner_of(&lp).is_some() { &rp } else { &lp };
+                                let slot = self.resolve_parts(outer)?;
+                                let target = if matches!(op, ast::BinaryOperator::Eq) {
+                                    &mut eq_corr
+                                } else {
+                                    &mut neq_corr
+                                };
+                                if target.is_some() {
+                                    return Err(
+                                        "multiple correlated conditions of the same kind in \
+                                         EXISTS are not yet supported"
+                                            .into(),
+                                    );
+                                }
+                                *target = Some((ic, slot));
+                                continue;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
             inner_conjuncts.push(conj);
         }
-        let Some((inner_col, outer_slot)) = correlation else {
+        let Some((inner_col, outer_slot)) = eq_corr else {
             return Err("uncorrelated EXISTS is not yet supported".into());
         };
+        if let Some((ineq_col, outer_s_slot)) = neq_corr {
+            return self.bind_exists_counted(
+                def,
+                display,
+                inner_col,
+                outer_slot,
+                ineq_col,
+                outer_s_slot,
+                inner_conjuncts,
+                negated,
+            );
+        }
 
         // Bind the inner query directly: SELECT inner_col FROM t WHERE rest
         // GROUP BY inner_col (set semantics).
@@ -1087,6 +1202,7 @@ impl Binder<'_> {
             views: Vec::new(),
             extra_edges: Vec::new(),
             pending_conjuncts: Vec::new(),
+            left_tables: BTreeSet::new(),
         };
         let key_slot = inner.resolve_parts(&[&inner_col])?;
         let mut inner_filters: Vec<Expr> = Vec::new();
@@ -1126,6 +1242,169 @@ impl Binder<'_> {
         }))
     }
 
+    /// The count-based rewrite for EXISTS with an inequality correlation
+    /// (Q21's `l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <>
+    /// l1.l_suppkey`): a derived table computes, per join key,
+    /// `count(distinct s)` and `min(s)` plus a constant matched marker
+    /// `__m = 1`, and LEFT-joins to the outer query so misses read `__m=0`.
+    /// Then
+    ///   EXISTS      ⟺ `__m = 1 AND (cd ≥ 2 OR ms <> outer_s)`
+    ///   NOT EXISTS  ⟺ `__m = 0 OR (cd = 1 AND ms = outer_s)`
+    /// — "some row with this key has a different s" reduced to counting
+    /// distinct s values (cd ≥ 1 whenever matched, so cd = 1 means the only
+    /// s is `ms`).
+    #[allow(clippy::too_many_arguments)]
+    fn bind_exists_counted(
+        &mut self,
+        def: TableDef,
+        display: String,
+        inner_col: String,
+        outer_slot: usize,
+        ineq_col: String,
+        outer_s_slot: usize,
+        inner_conjuncts: Vec<&ast::Expr>,
+        negated: bool,
+    ) -> Result<Bound, String> {
+        let source = TableSource::Parquet(def.path.clone());
+        let mut inner = Binder {
+            catalog: self.catalog,
+            ctes: self.ctes,
+            tables: vec![BoundTable {
+                display,
+                def,
+                source,
+                used: Vec::new(),
+            }],
+            slots: Vec::new(),
+            touched: BTreeSet::new(),
+            subs: Vec::new(),
+            derived: Vec::new(),
+            views: Vec::new(),
+            extra_edges: Vec::new(),
+            pending_conjuncts: Vec::new(),
+            left_tables: BTreeSet::new(),
+        };
+        let key_slot = inner.resolve_parts(&[&inner_col])?;
+        let s_slot = inner.resolve_parts(&[&ineq_col])?;
+        let key_ty = inner.slot_col(key_slot).ty;
+        let mut inner_filters: Vec<Expr> = Vec::new();
+        for conj in inner_conjuncts {
+            let (e, _) = inner.bind_multi(conj)?;
+            inner_filters.push(e);
+        }
+        let bq = BoundQuery {
+            tables: vec![TableInput {
+                name: inner.tables[0].display.clone(),
+                source: inner.tables[0].source.clone(),
+                projection: inner.tables[0].used.clone(),
+                filter: inner_filters.into_iter().reduce(and),
+            }],
+            edges: Vec::new(),
+            slots: inner.slots,
+            post_filter: None,
+            group: vec![GroupExpr {
+                expr: Expr::Column(key_slot),
+            }],
+            aggs: vec![
+                AggExpr {
+                    func: AggFunc::CountDistinct,
+                    arg: Expr::Column(s_slot),
+                },
+                AggExpr {
+                    func: AggFunc::Min,
+                    arg: Expr::Column(s_slot),
+                },
+            ],
+            having: None,
+            output: vec![
+                OutputExpr {
+                    expr: Expr::Column(0),
+                    name: inner_col.clone(),
+                },
+                OutputExpr {
+                    expr: Expr::Literal(ScalarValue::Int64(1)),
+                    name: "__m".into(),
+                },
+                OutputExpr {
+                    expr: Expr::Column(1),
+                    name: "__cd".into(),
+                },
+                OutputExpr {
+                    expr: Expr::Column(2),
+                    name: "__ms".into(),
+                },
+            ],
+            order_by: Vec::new(),
+            limit: None,
+            subqueries: inner.subs,
+            derived: inner.derived,
+        };
+        let idx = self.derived.len();
+        self.derived.push(bq);
+        let dname = format!("__ex{idx}");
+        let ddef = TableDef {
+            path: PathBuf::new(),
+            columns: vec![
+                crate::catalog::ColumnDef {
+                    name: inner_col.clone(),
+                    leaf: 0,
+                    ty: key_ty,
+                },
+                crate::catalog::ColumnDef {
+                    name: "__m".into(),
+                    leaf: 1,
+                    ty: LogicalType::Int64,
+                },
+                crate::catalog::ColumnDef {
+                    name: "__cd".into(),
+                    leaf: 2,
+                    ty: LogicalType::Int64,
+                },
+                crate::catalog::ColumnDef {
+                    name: "__ms".into(),
+                    leaf: 3,
+                    ty: LogicalType::Float64,
+                },
+            ],
+        };
+        self.push_table(dname.clone(), ddef, TableSource::Derived(idx))?;
+
+        // LEFT edge outer.k = derived.k, preserved = the outer side.
+        let preserved = self.slots[outer_slot].table;
+        let dkey = self.resolve_parts(&[&dname, &inner_col])?;
+        self.extra_edges.push(JoinEdge {
+            a: outer_slot,
+            b: dkey,
+            preserved: Some(preserved),
+        });
+        let m = Expr::Column(self.resolve_parts(&[&dname, "__m"])?);
+        let cd = Expr::Column(self.resolve_parts(&[&dname, "__cd"])?);
+        let ms = Expr::Column(self.resolve_parts(&[&dname, "__ms"])?);
+        let outer_s = Expr::Column(outer_s_slot);
+        let lit = |v: i64| Expr::Literal(ScalarValue::Int64(v));
+
+        let pred = if !negated {
+            // __m = 1 AND (cd >= 2 OR ms <> outer_s)
+            and(
+                binary(BinaryOp::Eq, m, lit(1)),
+                or(
+                    binary(BinaryOp::GtEq, cd, lit(2)),
+                    binary(BinaryOp::NotEq, ms, outer_s),
+                ),
+            )
+        } else {
+            // __m = 0 OR (cd = 1 AND ms = outer_s)
+            or(
+                binary(BinaryOp::Eq, m, lit(0)),
+                and(
+                    binary(BinaryOp::Eq, cd, lit(1)),
+                    binary(BinaryOp::Eq, ms, outer_s),
+                ),
+            )
+        };
+        Ok(Bound::Expr(pred))
+    }
+
     /// Bind an aggregate call: `sum/count/min/max/avg(<expr>)` or
     /// `count(*)`.
     fn bind_aggregate(&mut self, e: &ast::Expr) -> Result<AggExpr, String> {
@@ -1161,6 +1440,20 @@ impl Binder<'_> {
             }
             _ => return Err(format!("aggregate '{fname}' takes exactly one argument")),
         };
+        // A COUNT over a LEFT-joined table's column counts only matched
+        // occurrences (the engine has no NULLs; unmatched preserved rows
+        // contribute 0). The column itself is not needed as a payload.
+        if func == AggFunc::Count {
+            if let Expr::Column(slot) = arg {
+                let t = self.slots[slot].table;
+                if self.left_tables.contains(&t) {
+                    return Ok(AggExpr {
+                        func: AggFunc::CountMatched(t),
+                        arg: Expr::Literal(ScalarValue::Int64(1)),
+                    });
+                }
+            }
+        }
         Ok(AggExpr { func, arg })
     }
 
@@ -1441,7 +1734,9 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
                 key_tys[*i]
             } else {
                 match q.aggs[*i - key_tys.len()].func {
-                    AggFunc::Count | AggFunc::CountDistinct => LogicalType::Int64,
+                    AggFunc::Count | AggFunc::CountDistinct | AggFunc::CountMatched(_) => {
+                        LogicalType::Int64
+                    }
                     _ => LogicalType::Float64,
                 }
             }

@@ -65,7 +65,9 @@ fn catalog() -> Catalog {
             ("o_totalprice", 3, Float64),
             ("o_orderdate", 4, Date32),
             ("o_orderpriority", 5, Utf8),
+            ("o_orderstatus", 2, Utf8),
             ("o_shippriority", 7, Int32),
+            ("o_comment", 8, Utf8),
         ],
     );
     c.register_table(
@@ -578,5 +580,48 @@ fn q20_potential_part_promotion() {
     for (row, w) in r.rows.iter().take(3).zip(&want) {
         assert_eq!(s(&row[0]), w.0, "s_name");
         assert_eq!(s(&row[1]), w.1, "s_address");
+    }
+}
+
+#[test]
+fn q13_customer_distribution() {
+    let Some(r) = run("q13") else { return };
+    // LEFT OUTER JOIN ... ON with an extra ON filter, inside a materialized
+    // derived table; count(o_orderkey) counts matched orders only, so the
+    // 50,005 customers with no qualifying orders land in the c_count=0
+    // group. Canonical SF-1 head rows.
+    assert_eq!(r.rows.len(), 42);
+    let want = [
+        (0i64, 50005i64),
+        (9, 6641),
+        (10, 6532),
+        (11, 6014),
+        (8, 5937),
+    ];
+    for (row, w) in r.rows.iter().take(5).zip(&want) {
+        assert_eq!(i(&row[0]), w.0, "c_count");
+        assert_eq!(i(&row[1]), w.1, "custdist");
+    }
+}
+
+#[test]
+fn q21_suppliers_kept_waiting() {
+    let Some(r) = run("q21") else { return };
+    // Multi-condition correlated EXISTS / NOT EXISTS (same orderkey,
+    // different suppkey) via the count-based rewrite: per-order
+    // count(distinct supp) / min(supp) derived tables LEFT-joined on
+    // orderkey, with a matched marker column. 411 Saudi suppliers,
+    // canonical SF-1 head.
+    assert_eq!(r.rows.len(), 411);
+    let want = [
+        ("Supplier#000002829", 20i64),
+        ("Supplier#000005808", 18),
+        ("Supplier#000000262", 17),
+        ("Supplier#000000496", 17),
+        ("Supplier#000002160", 17),
+    ];
+    for (row, w) in r.rows.iter().take(5).zip(&want) {
+        assert_eq!(s(&row[0]), w.0, "s_name");
+        assert_eq!(i(&row[1]), w.1, "numwait");
     }
 }

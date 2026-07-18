@@ -234,7 +234,13 @@ impl Executor<'_> {
         // ---- Orient the join graph into a tree rooted at the largest
         // table (edges validated connected at bind time).
         let n = q.tables.len();
-        let root = if n == 1 {
+        // A LEFT OUTER join forces the root to the preserved table (its
+        // unmatched rows must flow through); otherwise root at the largest
+        // table by parquet row count.
+        let forced = q.edges.iter().find_map(|e| e.preserved);
+        let root = if let Some(r) = forced {
+            r
+        } else if n == 1 {
             0
         } else {
             let mut best = (0usize, 0u64);
@@ -253,7 +259,9 @@ impl Executor<'_> {
         // tables are already connected through OTHER pairs (a join CYCLE,
         // e.g. Q5's customer-nation = supplier-nation constraint) becomes a
         // **residual equality** evaluated post-join at the root.
-        let mut children: Vec<Vec<(usize, Links)>> = vec![Vec::new(); n];
+        // (child_table, links, left) — left marks a LEFT OUTER child whose
+        // misses keep the root row (once) instead of dropping it.
+        let mut children: Vec<Vec<(usize, Links, bool)>> = vec![Vec::new(); n];
         let mut residual_eq: Vec<Expr> = Vec::new();
         {
             let mut seen = vec![false; n];
@@ -296,7 +304,8 @@ impl Executor<'_> {
                             used_edges[ej] = true;
                         }
                     }
-                    children[t].push((child.0, links));
+                    let is_left = q.edges[ei].preserved.is_some();
+                    children[t].push((child.0, links, is_left));
                     frontier.push_back(child.0);
                 }
             }
@@ -352,7 +361,7 @@ impl Executor<'_> {
         for _ in 0..n {
             dim_results.push(None);
         }
-        for (child, links) in &children[root] {
+        for (child, links, _) in &children[root] {
             let child_cols: Vec<usize> = links.iter().map(|&(_, c)| c).collect();
             dim_results[*child] = Some(self.build_dim(*child, &child_cols, &children, &needed)?);
         }
@@ -362,10 +371,16 @@ impl Executor<'_> {
         let chunks = self.filtered_chunks(root)?;
         let mut view_chunks: Vec<DataChunk> = Vec::with_capacity(chunks.len());
         let mut sels: Vec<Selection> = Vec::with_capacity(chunks.len());
+        // For each LEFT child, the view gains a synthetic matched-flag
+        // column (1/0 per row) appended past the slot space; CountMatched
+        // aggregates read it via this table→column map (same layout every
+        // chunk — children iterate in a fixed order).
+        let mut matched_cols: HashMap<usize, usize> = HashMap::new();
         for (chunk, sel) in chunks {
             let mut view = self.slot_view(root, &chunk);
             let mut sel = sel;
-            for (child, links) in &children[root] {
+            let nrows = chunk.cols.first().map_or(0, |c| c.len());
+            for (child, links, left) in &children[root] {
                 let dim = dim_results[*child].as_ref().expect("dim built");
                 let keys: Vec<Expr> = links
                     .iter()
@@ -374,29 +389,44 @@ impl Executor<'_> {
                 let key_of = |view: &DataChunk, i: usize| -> Vec<i64> {
                     keys.iter().map(|k| k.eval_i64(view, i)).collect()
                 };
-                // Narrow with multiplicity.
+                // Narrow with multiplicity; a LEFT child keeps misses once.
                 let mut out = Vec::new();
-                sel.for_each(|i| {
-                    if let Some((cnt, _)) = dim.map.get(&key_of(&view, i as usize)) {
+                let mut matched: Vec<i64> = if *left { vec![0; nrows] } else { Vec::new() };
+                sel.for_each(|i| match dim.map.get(&key_of(&view, i as usize)) {
+                    Some((cnt, _)) => {
                         for _ in 0..*cnt {
                             out.push(i);
                         }
+                        if *left {
+                            matched[i as usize] = 1;
+                        }
                     }
+                    None if *left => out.push(i),
+                    None => {}
                 });
                 sel = Selection::Indices(out);
-                // Attach the subtree's payload slots as full-length columns.
+                // Attach the subtree's payload slots as full-length columns
+                // (LEFT misses take type defaults — 0 / 0.0 / "").
                 if !dim.payload_slots.is_empty() {
-                    let nrows = chunk.cols.first().map_or(0, |c| c.len());
                     let mut row_vals: HashMap<u32, Vec<ScalarValue>> = HashMap::new();
                     sel.for_each(|i| {
                         if row_vals.contains_key(&i) {
                             return;
                         }
-                        let (_, pay) = dim
-                            .map
-                            .get(&key_of(&view, i as usize))
-                            .expect("row just matched");
-                        row_vals.insert(i, pay.clone());
+                        match dim.map.get(&key_of(&view, i as usize)) {
+                            Some((_, pay)) => {
+                                row_vals.insert(i, pay.clone());
+                            }
+                            None => {
+                                debug_assert!(*left, "non-left miss survived narrowing");
+                                let defaults = dim
+                                    .payload_slots
+                                    .iter()
+                                    .map(|&sl| default_value(self.slot_ty(sl)))
+                                    .collect();
+                                row_vals.insert(i, defaults);
+                            }
+                        }
                     });
                     for (j, &slot) in dim.payload_slots.iter().enumerate() {
                         let ty = self.slot_ty(slot);
@@ -404,6 +434,10 @@ impl Executor<'_> {
                             row_vals.get(&(row as u32)).map(|v| v[j].clone())
                         });
                     }
+                }
+                if *left {
+                    matched_cols.insert(*child, view.cols.len());
+                    view.cols.push(Vector::i64(matched));
                 }
             }
             // Post-join predicate (multi-table conjuncts + cycle
@@ -438,7 +472,7 @@ impl Executor<'_> {
             }
             (columns, rows)
         } else {
-            self.aggregate(&view_chunks, &sels)?
+            self.aggregate(&view_chunks, &sels, &matched_cols)?
         };
         if !q.order_by.is_empty() {
             rows.sort_by(|a, b| {
@@ -465,7 +499,7 @@ impl Executor<'_> {
         &self,
         t: usize,
         link_cols: &[usize],
-        children: &[Vec<(usize, Links)>],
+        children: &[Vec<(usize, Links, bool)>],
         needed: &[usize],
     ) -> Result<DimResult, String> {
         let q = self.q;
@@ -478,7 +512,14 @@ impl Executor<'_> {
         // …plus every child's, bubbled up.
         // (parent-local key cols, result) per child.
         let mut child_results: Vec<(Vec<usize>, DimResult)> = Vec::new();
-        for (child, links) in &children[t] {
+        for (child, links, left) in &children[t] {
+            if *left {
+                return Err(
+                    "LEFT JOIN below another join is not yet supported (the preserved side \
+                     must be the root)"
+                        .into(),
+                );
+            }
             let child_cols: Vec<usize> = links.iter().map(|&(_, c)| c).collect();
             let r = self.build_dim(*child, &child_cols, children, needed)?;
             payload_slots.extend(r.payload_slots.iter().copied());
@@ -632,6 +673,7 @@ impl Executor<'_> {
         &self,
         chunks: &[DataChunk],
         sels: &[Selection],
+        matched_cols: &HashMap<usize, usize>,
     ) -> Result<(Vec<String>, Vec<Vec<ScalarValue>>), String> {
         let q = self.q;
         let nkeys = q.group.len();
@@ -647,6 +689,10 @@ impl Executor<'_> {
                     match agg.func {
                         AggFunc::Sum => states[j].sum += sum_expr_f64(chunk, sel, &agg.arg),
                         AggFunc::Count => states[j].count += sel.len() as u64,
+                        AggFunc::CountMatched(t) => {
+                            let flags = chunk.col(matched_cols[&t]).as_i64();
+                            sel.for_each(|i| states[j].count += flags[i as usize] as u64);
+                        }
                         AggFunc::CountDistinct => sel.for_each(|i| {
                             states[j]
                                 .distinct
@@ -674,6 +720,9 @@ impl Executor<'_> {
                     for (j, agg) in q.aggs.iter().enumerate() {
                         match agg.func {
                             AggFunc::Count => states[j].count += 1,
+                            AggFunc::CountMatched(t) => {
+                                states[j].count += chunk.col(matched_cols[&t]).as_i64()[i] as u64;
+                            }
                             AggFunc::CountDistinct => {
                                 states[j].distinct.insert(agg.arg.eval_i64(chunk, i));
                             }
@@ -693,7 +742,7 @@ impl Executor<'_> {
         }
         for (j, agg) in q.aggs.iter().enumerate() {
             match agg.func {
-                AggFunc::Count => cols.push(Vector::i64(
+                AggFunc::Count | AggFunc::CountMatched(_) => cols.push(Vector::i64(
                     groups.values().map(|st| st[j].count as i64).collect(),
                 )),
                 AggFunc::CountDistinct => cols.push(Vector::i64(
@@ -864,6 +913,7 @@ impl AggState {
             AggFunc::Max => self.max,
             AggFunc::Avg => self.sum / self.count as f64,
             AggFunc::CountDistinct => self.distinct.len() as f64,
+            AggFunc::CountMatched(_) => self.count as f64,
         }
     }
 }
@@ -1033,6 +1083,15 @@ fn build_column(
             }
             Vector::i64(v)
         }
+    }
+}
+
+/// The type default a LEFT-join miss attaches (the no-NULL engine's stand-in).
+fn default_value(ty: LogicalType) -> ScalarValue {
+    match ty {
+        LogicalType::Utf8 => ScalarValue::Utf8("".into()),
+        LogicalType::Float64 => ScalarValue::Float64(0.0),
+        _ => ScalarValue::Int64(0),
     }
 }
 
