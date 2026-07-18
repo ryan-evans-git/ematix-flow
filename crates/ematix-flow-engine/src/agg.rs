@@ -17,10 +17,13 @@
 //!
 //! Scope (kill-gate): `SUM(i64) GROUP BY i64` — exact and
 //! order-independent, so the spill and no-spill paths are **bit-identical**
-//! (what `tests/spill_agg.rs` asserts). Deliberately narrow follow-ons:
-//! f64 measures (revenue) are correct only up to FP re-association across
-//! the changed summation order — standard for a spilling aggregate — and a
-//! per-worker parallel spill + merge (this aggregate is single-threaded).
+//! (what `tests/spill_agg.rs` asserts). The parallel face is
+//! [`SpillingSumSink`]: one aggregate per worker with its own spill files,
+//! combined by the bounded cross-worker [`merge`](SpillableSumAgg::merge)
+//! (proven at SF-1 scale by `tests/spill_agg_parallel.rs`). The one
+//! deliberately narrow follow-on left: f64 measures (revenue) are correct
+//! only up to FP re-association across the changed summation order —
+//! standard for a spilling aggregate.
 
 use std::collections::HashMap;
 use std::io;
@@ -128,26 +131,116 @@ impl SpillableSumAgg {
 
     /// Aggregate every partition (in-memory remainder + streamed-back spill
     /// run) and return the `(key, sum)` pairs sorted by key. Consumes the
-    /// aggregate. Peak memory is one partition's group map.
-    pub fn finish(mut self) -> io::Result<Vec<(i64, i64)>> {
+    /// aggregate. Peak memory is one partition's group map. The
+    /// single-worker case of [`merge`](Self::merge).
+    pub fn finish(self) -> io::Result<Vec<(i64, i64)>> {
+        Self::merge(vec![self])
+    }
+
+    /// Merge several partitioned aggregates that share the same partitioning
+    /// — e.g. one per worker from [`run_scan_pipeline`](crate::exec) — into
+    /// the final `(key, sum)` result, sorted by key. Consumes them, draining
+    /// each one's spill runs.
+    ///
+    /// **Bounded, and that is the whole point.** Because every occurrence of
+    /// a key routes to the same partition index in *every* aggregate (all
+    /// share [`part_of`]), a partition can be finished across all workers
+    /// with a single group map: the union of the workers' partition-`p` data
+    /// is exactly the rows of the keys that hash to `p`, complete and
+    /// disjoint from other partitions. So a parallel high-cardinality
+    /// group-by holds only ≈ groups/npart entries at a time — the same
+    /// memory envelope as the single-threaded aggregate, never the whole
+    /// result set.
+    pub fn merge(mut aggs: Vec<Self>) -> io::Result<Vec<(i64, i64)>> {
+        let Some(first) = aggs.first() else {
+            return Ok(Vec::new());
+        };
+        let npart = first.npart;
+        debug_assert!(
+            aggs.iter().all(|a| a.npart == npart),
+            "merged aggregates must share the same partition count"
+        );
         let mut out: Vec<(i64, i64)> = Vec::new();
-        for p in 0..self.npart {
-            if self.keys[p].is_empty() && !self.spill.has_spill(p) {
-                continue;
-            }
+        for p in 0..npart {
             let mut map: HashMap<i64, i64> = HashMap::new();
-            for (k, v) in self.keys[p].iter().zip(&self.vals[p]) {
-                *map.entry(*k).or_insert(0) += *v;
-            }
-            if self.spill.has_spill(p) {
-                self.spill.drain_partition(p, |k, v| {
-                    *map.entry(k).or_insert(0) += v;
-                })?;
+            for agg in &mut aggs {
+                for (k, v) in agg.keys[p].iter().zip(&agg.vals[p]) {
+                    *map.entry(*k).or_insert(0) += *v;
+                }
+                if agg.spill.has_spill(p) {
+                    agg.spill.drain_partition(p, |k, v| {
+                        *map.entry(k).or_insert(0) += v;
+                    })?;
+                }
             }
             out.extend(map);
         }
         out.sort_unstable_by_key(|&(k, _)| k);
         Ok(out)
+    }
+}
+
+/// A [`Sink`] adapter that drives a **per-worker** [`SpillableSumAgg`]
+/// through [`run_scan_pipeline`](crate::exec::run_scan_pipeline): one
+/// instance per worker thread, each spilling to its *own* [`PartitionSpill`],
+/// then combined by [`merge`](Self::merge) in a single bounded per-partition
+/// pass. This is how a high-cardinality `SUM(i64) GROUP BY i64` stays correct
+/// beyond RAM *and* runs row-group-parallel — the driver-level face of the
+/// spilling aggregate, behind the same one-sink-per-worker + merge contract
+/// as the in-memory [`HashAggregateSink`].
+///
+/// The key/value columns are fixed positions in the decoded chunk. The
+/// driver's [`Sink::consume`] is infallible, so a disk error is stashed and
+/// surfaced at [`merge`](Self::merge) rather than panicking a worker thread.
+pub struct SpillingSumSink {
+    agg: SpillableSumAgg,
+    key_col: usize,
+    val_col: usize,
+    err: Option<io::Error>,
+}
+
+impl SpillingSumSink {
+    /// A per-worker spilling aggregate: `budget_bytes` in-memory ceiling,
+    /// `2^part_bits` partitions, grouping by decoded-chunk column `key_col`
+    /// and summing column `val_col`.
+    pub fn new(budget_bytes: usize, part_bits: u32, key_col: usize, val_col: usize) -> Self {
+        Self {
+            agg: SpillableSumAgg::new(budget_bytes, part_bits),
+            key_col,
+            val_col,
+            err: None,
+        }
+    }
+
+    /// Rows this worker has spilled to disk so far (0 if it stayed in budget).
+    pub fn spilled_records(&self) -> u64 {
+        self.agg.spilled_records()
+    }
+
+    /// Combine the per-worker sinks into the final `(key, sum)` result,
+    /// sorted by key. Surfaces the first disk error any worker hit during
+    /// consumption, then runs the bounded cross-worker GRACE merge
+    /// ([`SpillableSumAgg::merge`]).
+    pub fn merge(sinks: Vec<Self>) -> io::Result<Vec<(i64, i64)>> {
+        let mut aggs = Vec::with_capacity(sinks.len());
+        for s in sinks {
+            if let Some(e) = s.err {
+                return Err(e);
+            }
+            aggs.push(s.agg);
+        }
+        SpillableSumAgg::merge(aggs)
+    }
+}
+
+impl Sink for SpillingSumSink {
+    fn consume(&mut self, chunk: &DataChunk) {
+        if self.err.is_some() {
+            return; // already failed; stop touching the disk.
+        }
+        if let Err(e) = self.agg.consume(chunk, self.key_col, self.val_col) {
+            self.err = Some(e);
+        }
     }
 }
 
@@ -170,9 +263,11 @@ pub trait AggBinding<const N: usize>: Send + Sync {
 /// one-per-worker, each accumulating into its own map; the caller sums them
 /// with [`merge`](Self::merge). Holds `N` running f64 sums per group.
 ///
-/// In-memory today (Q08's group cardinality is tiny — two years); wiring
-/// the [`PartitionSpill`] path in for high-cardinality group-bys is a
-/// follow-on, behind this same `Sink` + `merge` interface.
+/// In-memory, general over `N` f64 measures and an arbitrary key/measure
+/// binding (Q08's group cardinality is tiny — two years). Its spilling
+/// sibling for high-cardinality, exact-integer group-bys is
+/// [`SpillingSumSink`], behind this same one-sink-per-worker + `merge`
+/// contract.
 pub struct HashAggregateSink<const N: usize, B: AggBinding<N>> {
     binding: std::sync::Arc<B>,
     map: HashMap<i64, [f64; N]>,
