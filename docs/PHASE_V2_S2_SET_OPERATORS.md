@@ -86,24 +86,25 @@ lands on ematix's accelerated join/agg path" — which it does.
 - **`UNION` / `UNION ALL`** — widespread (20+ queries); lowers to
   `InterleaveExec` / `UnionExec`, a concatenation, never a hotspot.
 
-## 2. SETOP deliverables — parity coverage + guards (the whole phase)
+## 2. SETOP deliverables — parity coverage + guards — ✅ DONE (2026-07-18)
 
-Mirrors the window WIN.1–3 pattern; no operator.
+Mirrors the window WIN.1–3 pattern; no operator. All three landed in
+`crates/ematix-flow-core/tests/set_operators_semantics.rs` (6 tests, pass).
 
-- **SETOP.1 — semantic contract tests** (hermetic, CI-safe, mirror
-  `window_functions_semantics.rs`): on `preset::session_context()`, pin
-  `INTERSECT` = distinct rows in *both* inputs (dedup, so duplicates
-  collapse), `EXCEPT` = distinct rows in the first not the second, and a
-  large literal `IN (…)` membership. The dedup contract is the one most
-  likely to catch a wrong lowering.
-- **SETOP.2 — parity in `tpcds_validate`**: confirm q8/q14a/q14b/q38/q87
-  (+ the union/IN q33/q56/q60) are `PASS parity=OK` vs DuckDB at SF1.
-- **SETOP.3 — plan-shape pin** (extend `setop_probe` or a hermetic test):
-  assert `INTERSECT` → semi-join + aggregate, `EXCEPT` → anti-join +
-  aggregate, and a ~400-element `IN` → a single `InList` (**not** an
-  OR-chain / not N joins). This guards against a DF upgrade that regresses
-  the lowering — e.g. stops using join lowering, or expands `IN` to ORs —
-  which *would* create a real gap.
+- **SETOP.1 — semantic contract tests** ✅ on `preset::session_context()`:
+  `INTERSECT` = distinct rows in *both* inputs (duplicate 3s in both
+  collapse to one → `{3,4}`), `EXCEPT` = distinct rows in the first not
+  the second (`{1,2}`), and a literal `IN (…)` = membership that *keeps*
+  duplicates (`{2,3,3,4}`). The dedup-vs-membership contrast is the guard
+  most likely to catch a wrong lowering.
+- **SETOP.2 — parity in `tpcds_validate`** ✅ all 8 `PASS parity=OK` vs
+  DuckDB at SF1: q8 (5), q14a (100), q14b (100), q33 (100), q38 (1), q56
+  (100), q60 (100), q87 (1).
+- **SETOP.3 — plan-shape pin** ✅ hermetic assertions: `INTERSECT` →
+  contains `Semi` + `AggregateExec`, no `IntersectExec`; `EXCEPT` →
+  `Anti` + `AggregateExec`; literal `IN` → no `HashJoinExec` / no
+  `UnionExec` (stays a single filter, no OR-chain / no N-join blowup).
+  Guards against a DF upgrade that regresses the lowering.
 
 ## 3. Optional confirmation (not a build)
 
@@ -116,14 +117,16 @@ joins that must hit these same rules). If that check ever shows the rules
 *not* firing on set-op-derived joins, that is a targeted rule-predicate
 fix (extend the mode guard), still not an operator.
 
-## 4. Exit criteria
+## 4. Exit criteria — ✅ MET (2026-07-18)
 
-- SETOP.1–3 shipped: the 8 queries parity-clean at SF1; contract tests +
-  plan pin in place.
-- Gap doc rows 3 & 6 updated to "DF-native retained — lowers to ematix's
-  accelerated semi/anti-join + aggregate path," with the `[ALL]` and
-  large-IN scope corrections.
-- No operator built (unless the §3 confirmation surprises us).
+- ✅ SETOP.1–3 shipped: the 8 queries parity-clean at SF1; 6 hermetic
+  contract + plan-pin tests in place.
+- ✅ Gap doc rows 3 & 6 updated to "DF-native retained — lowers to
+  ematix's accelerated semi/anti-join + aggregate path," with the `[ALL]`
+  and large-IN scope corrections.
+- ✅ No operator built — the §3 confirmation (ematix's dedicated semi/anti
+  rules exist) held; the optional EXPLAIN "do they fire on q38/q87"
+  check is deferred to when it can share machinery with S3.
 
 The sprint plan's "all listed queries native + parity at SF=1" is met by
 parity + the confirmation that the lowering is already ematix-accelerated.
