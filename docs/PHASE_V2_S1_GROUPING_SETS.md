@@ -102,6 +102,46 @@ Q18/Q22/Q67/Q77 are the S1 exit gate; Q27/Q36 pull in `GROUPING()` /
 
 ## 4. Design
 
+### 4.0 Pinned DF53 physical shape (S1.1 — risk retired)
+
+Before any kernel (§7 risk "DF's grouping-set physical shape"), the
+`gs_plan_probe` example
+([`../crates/ematix-flow-core/examples/gs_plan_probe.rs`](../crates/ematix-flow-core/examples/gs_plan_probe.rs))
+dumped the real DF53 physical plan for `ROLLUP`/`CUBE`/`GROUPING SETS`
+over a hermetic in-memory table. Three facts are now **pinned** (two
+corrected earlier assumptions in this doc):
+
+DF lowers every grouping-set form to a two-phase hash aggregate:
+
+```
+ProjectionExec ( GROUPING()/GROUPING_ID → bit-extraction over __grouping_id )
+  AggregateExec mode=FinalPartitioned  gby=[<cols…>, __grouping_id]   ← single mask; __grouping_id is an ORDINARY key here
+    RepartitionExec Hash([<cols…>, __grouping_id])
+      AggregateExec mode=Partial  gby=[(set0…),(set1…),…]             ← THE multi-set node (groups().len() > 1)
+        <child>
+```
+
+1. **The multi-set node is the `Partial` AggregateExec.** `groups().len()
+   > 1` appears only there; the `Final` node re-aggregates partials with a
+   single mask, treating `__grouping_id` as a normal group key. **Rule
+   target = the Partial node** (replace the whole Partial→Repartition→Final
+   stack with `FusedGroupingSetAggregateExec` emitting the final
+   `[<cols…>, __grouping_id, <aggs…>]` schema; DF's top Projection then
+   works unchanged).
+2. **Mask polarity — `true` = column ABSENT (rolled up), not present.**
+   CUBE(a,b) → masks `[false,false]`=(a,b), `[true,false]`=(NULL,b),
+   `[false,true]`=(a,NULL), `[true,true]`=(NULL,NULL). So
+   `present(i) == !mask[i]`. *(Corrects §4.2's earlier "indices of present
+   cols" framing.)*
+3. **`__grouping_id` bit convention — leftmost group col is the HIGH
+   bit.** For universe `[c0..c_{n-1}]`, column `i` occupies bit `n-1-i`;
+   bit = 1 ⟺ that column is rolled up. So
+   `__grouping_id(set) = Σ_{i : mask[i]==true} 2^(n-1-i)`. DF's projection
+   reads `grouping(c0)` as `__grouping_id & 2 >> 1`, `grouping(c1)` as
+   `& 1`, etc. **We must emit exactly this integer** — then
+   `GROUPING()`/`GROUPING_ID` come for free from DF's already-planned
+   projection; never recompute them from "is the value NULL?".
+
 ### 4.1 Execution model — chosen: single-pass, multi-table
 
 Two candidate models:
@@ -139,10 +179,10 @@ Structurally a thin orchestrator over the existing accumulator core:
 ```
 FusedGroupingSetAggregateExec
 ├── group_cols:  Vec<PhysicalExpr>        // the full column universe {a,b,c}
-├── sets:        Vec<Vec<usize>>          // each set = indices into group_cols
+├── set_masks:   Vec<Vec<bool>>           // DF's masks verbatim; mask[i]==true ⇒ col i ROLLED UP (§4.0)
 ├── aggs:        Vec<AggExpr>             // reused from the fused path
-├── tables:      Vec<GroupHashTable>      // one per set, existing vectorized accumulators
-└── grouping_id_of(set_idx) -> u64        // precomputed bitmask per set
+├── tables:      Vec<GroupHashTable>      // one per set, keyed on the PRESENT cols (!mask[i])
+└── grouping_id_of(set_idx) -> u64        // Σ_{mask[i]} 2^(n-1-i), DF's exact convention (§4.0)
 ```
 
 Execution per input batch (single pass):
@@ -166,12 +206,16 @@ bookkeeping, not new arithmetic kernels.
 
 A physical optimizer rule (mirroring the existing fused rules) that:
 
-1. Matches a DataFusion `AggregateExec` whose `PhysicalGroupBy` has
-   `groups.len() > 1` (i.e. grouping sets) **and** whose aggregates are
-   all in the fused-recognizer's supported set.
-2. Reads the per-set null-masks from `PhysicalGroupBy.groups` → the
-   `sets` index lists; reads DF's `__grouping_id` wiring so our column
-   lines up with what downstream `GROUPING()`/ORDER BY expects.
+1. Matches the **`Partial`** `AggregateExec` whose `PhysicalGroupBy` has
+   `groups().len() > 1` (i.e. grouping sets — §4.0 confirms the multi-set
+   node is the Partial, not the Final) **and** whose aggregates are all in
+   the fused-recognizer's supported set. The rule replaces the whole
+   Partial→Repartition→Final stack so the emitted schema
+   (`[<cols…>, __grouping_id, <aggs…>]`) feeds DF's top Projection intact.
+2. Reads the per-set null-masks from `PhysicalGroupBy.groups()` verbatim
+   (mask polarity per §4.0: `true` = rolled up); emits `__grouping_id`
+   with DF's exact bit convention so downstream `GROUPING()`/ORDER BY line
+   up with no recomputation.
 3. If `sets.len() > GS_MAX_SETS` **or** any aggregate is unsupported →
    **decline** (leave DF's exec in place). Correctness-first: we only
    take over shapes we can prove parity on.
@@ -227,9 +271,19 @@ Do not gate S1's correctness exit on Π; gate it on "no OOM at SF=10 with
 
 | Story | What | Exit |
 |---|---|---|
-| **S1.1** | `tpcds_validate` oracle for §3 queries + semantic unit tests (RED) | tests exist, red |
+| **S1.1** ✅ | Plan-shape pin (`gs_plan_probe`, §4.0) + semantic contract tests (`tests/grouping_sets_semantics.rs`) + §3 `tpcds_validate` baseline | **DONE** — shape pinned (2 assumptions corrected); 3 semantic tests green on the shared session (incl. the data-NULL vs rolled-up-NULL gate); §3 queries q18/q22/q27/q36/q67/q77 all row-parity OK at SF1 |
 | **S1.2** | `FusedGroupingSetAggregateExec` + planner interception rule; `__grouping_id` + `GROUPING()`/`GROUPING_ID` projection | Q18/Q22/Q67/Q77 green SF=1 |
 | **S1.3** | Memory bound + `GS_MAX_SETS` + AQE partition-bump; Π spill hooks stubbed | no OOM SF=10; parity SF=10 |
+
+**S1.1 note on RED-ness.** The §3 queries and the semantic contract are
+already *correct* on stock DataFusion (the S1 gap is fused *execution*,
+not results), so those tests are GREEN now — they pin the exact result
+set S1.2's operator must reproduce. The genuinely RED test — "the plan
+runs on `FusedGroupingSetAggregateExec`, not DF's generic
+`AggregateExec`" — needs the operator's type to exist, so it is written
+first in **S1.2** (RED → green as the operator lands), together with the
+`EMAT_GROUPING_SETS_FUSED=0` fallback-parity and vectorization-proof
+tests from §5.
 
 Q27/Q36 (`GROUPING()`/`GROUPING_ID` in output/order) ride S1.2's id
 plumbing; if Q67's rollup→window interplay slips, it hands off to S2
@@ -239,11 +293,12 @@ plumbing; if Q67's rollup→window interplay slips, it hands off to S2
 
 ## 7. Risks
 
-- **DF's grouping-set physical shape.** The whole interception hinges on
-  reading `PhysicalGroupBy.groups` + `__grouping_id` exactly as DF 53
-  emits them. **S1.1 must dump a real plan first** and pin the shape
-  before S1.2 — if DF changed the representation, the rule adapts here,
-  not mid-kernel.
+- **DF's grouping-set physical shape.** ✅ **RETIRED (S1.1).** The
+  `gs_plan_probe` example pinned the exact DF53 shape — see §4.0. Net
+  corrections: the multi-set node is the `Partial` (not `Final`); mask
+  bit `true` = column *rolled up* (not present); `__grouping_id` puts the
+  leftmost group col in the high bit. The interception rule and operator
+  are designed against these pinned facts.
 - **CUBE blow-up.** `GS_MAX_SETS` is a real cap; document it and log when
   we decline, so "TPC-DS runs native" doesn't quietly mean "except the
   wide cubes."
