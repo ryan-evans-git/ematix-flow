@@ -897,7 +897,9 @@ impl Binder<'_> {
         if let Some(w) = &sel.selection {
             split_and(w, &mut conjuncts);
         }
-        let mut corr: Option<(String, Vec<String>)> = None; // (inner col, outer parts)
+        // One or more correlation equalities (Q20 correlates on partkey AND
+        // suppkey — the derived table groups by the composite key).
+        let mut corr: Vec<(String, Vec<String>)> = Vec::new(); // (inner col, outer parts)
         let mut rest: Vec<ast::Expr> = Vec::new();
         for conj in conjuncts {
             if let ast::Expr::BinaryOp {
@@ -916,23 +918,16 @@ impl Binder<'_> {
                         }
                     };
                     if let Some(found) = pick(&lp, &rp).or_else(|| pick(&rp, &lp)) {
-                        if corr.is_some() {
-                            return Err(
-                                "multiple correlated conditions in a scalar subquery are not \
-                                 yet supported"
-                                    .into(),
-                            );
-                        }
-                        corr = Some(found);
+                        corr.push(found);
                         continue;
                     }
                 }
             }
             rest.push(conj.clone());
         }
-        let Some((inner_col, outer_parts)) = corr else {
+        if corr.is_empty() {
             return Ok(None);
-        };
+        }
         let [item] = sel.projection.as_slice() else {
             return Err("a scalar subquery must select exactly one column".into());
         };
@@ -943,12 +938,16 @@ impl Binder<'_> {
         let ast::SetExpr::Select(sel2) = q2.body.as_mut() else {
             unreachable!("checked Select above");
         };
-        let key_ident = ast::Expr::Identifier(ast::Ident::new(inner_col.clone()));
-        sel2.projection = vec![
-            ast::SelectItem::UnnamedExpr(key_ident.clone()),
-            item.clone(),
-        ];
-        sel2.group_by = ast::GroupByExpr::Expressions(vec![key_ident], Vec::new());
+        let key_idents: Vec<ast::Expr> = corr
+            .iter()
+            .map(|(c, _)| ast::Expr::Identifier(ast::Ident::new(c.clone())))
+            .collect();
+        sel2.projection = key_idents
+            .iter()
+            .map(|k| ast::SelectItem::UnnamedExpr(k.clone()))
+            .chain([item.clone()])
+            .collect();
+        sel2.group_by = ast::GroupByExpr::Expressions(key_idents, Vec::new());
         sel2.selection = rest.into_iter().reduce(|l, r| ast::Expr::BinaryOp {
             left: Box::new(l),
             op: ast::BinaryOperator::And,
@@ -960,32 +959,37 @@ impl Binder<'_> {
         let idx = self.derived.len();
         self.derived.push(bq);
         let display = format!("__corr{idx}");
+        let mut columns: Vec<crate::catalog::ColumnDef> = corr
+            .iter()
+            .enumerate()
+            .map(|(i, (c, _))| crate::catalog::ColumnDef {
+                name: c.clone(),
+                leaf: i,
+                ty: tys[i],
+            })
+            .collect();
+        columns.push(crate::catalog::ColumnDef {
+            name: "__val".into(),
+            leaf: corr.len(),
+            ty: tys[corr.len()],
+        });
         let def = TableDef {
             path: PathBuf::new(),
-            columns: vec![
-                crate::catalog::ColumnDef {
-                    name: inner_col.clone(),
-                    leaf: 0,
-                    ty: tys[0],
-                },
-                crate::catalog::ColumnDef {
-                    name: "__val".into(),
-                    leaf: 1,
-                    ty: tys[1],
-                },
-            ],
+            columns,
         };
         self.push_table(display.clone(), def, TableSource::Derived(idx))?;
 
-        // Join outer_col = derived.key; the subquery's value is the derived
-        // value column.
-        let outer_ref: Vec<&str> = outer_parts.iter().map(|x| x.as_str()).collect();
-        let outer_slot = self.resolve_parts(&outer_ref)?;
-        let key_slot = self.resolve_parts(&[&display, &inner_col])?;
-        self.extra_edges.push(JoinEdge {
-            a: outer_slot,
-            b: key_slot,
-        });
+        // Join outer keys = derived keys (a composite link when several);
+        // the subquery's value is the derived value column.
+        for (inner_col, outer_parts) in &corr {
+            let outer_ref: Vec<&str> = outer_parts.iter().map(|x| x.as_str()).collect();
+            let outer_slot = self.resolve_parts(&outer_ref)?;
+            let key_slot = self.resolve_parts(&[&display, inner_col])?;
+            self.extra_edges.push(JoinEdge {
+                a: outer_slot,
+                b: key_slot,
+            });
+        }
         let val_slot = self.resolve_parts(&[&display, "__val"])?;
         Ok(Some(Bound::Expr(Expr::Column(val_slot))))
     }

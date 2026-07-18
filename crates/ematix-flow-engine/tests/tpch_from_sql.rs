@@ -562,3 +562,21 @@ fn q22_global_sales_opportunity() {
         close(f(&row[2]), w.2, "totacctbal");
     }
 }
+
+#[test]
+fn q20_potential_part_promotion() {
+    let Some(r) = run("q20") else { return };
+    // Nested IN-subqueries + a scalar subquery correlated on TWO keys
+    // (partkey AND suppkey) — decorrelated into a composite-key derived
+    // join inside the IN-subquery. 186 Canadian suppliers.
+    assert_eq!(r.rows.len(), 186);
+    let want = [
+        ("Supplier#000000020", "iybAE,RmTymrZVYaFZva2SH,j"),
+        ("Supplier#000000091", "YV45D7TkfdQanOOZ7q9QxkyGUapU1oOWU6q3"),
+        ("Supplier#000000205", "rF uV8d0JNEk"),
+    ];
+    for (row, w) in r.rows.iter().take(3).zip(&want) {
+        assert_eq!(s(&row[0]), w.0, "s_name");
+        assert_eq!(s(&row[1]), w.1, "s_address");
+    }
+}
