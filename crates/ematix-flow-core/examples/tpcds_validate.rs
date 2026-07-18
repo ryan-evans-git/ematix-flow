@@ -72,8 +72,8 @@ enum Emat {
 
 /// Oracle-side row-parity verdict.
 enum Parity {
-    Match(i64),
-    Mismatch { emat: usize, duck: i64 },
+    Match,
+    Mismatch { duck: i64 },
     OracleSkip(String),
     Unchecked, // ematix itself failed — nothing to compare
 }
@@ -166,19 +166,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Oracle: run the SAME translated SQL on DuckDB, compare row count.
         let parity = match (&emat, &translated) {
             (Emat::Pass { rows }, Some(df_sql)) => match duck_count(&duck, df_sql) {
-                Ok(duck_rows) if duck_rows == *rows as i64 => Parity::Match(duck_rows),
-                Ok(duck_rows) => Parity::Mismatch {
-                    emat: *rows,
-                    duck: duck_rows,
-                },
+                Ok(duck_rows) if duck_rows == *rows as i64 => Parity::Match,
+                Ok(duck_rows) => Parity::Mismatch { duck: duck_rows },
                 Err(e) => Parity::OracleSkip(e),
             },
             _ => Parity::Unchecked,
         };
 
         let line = match (&emat, &parity) {
-            (Emat::Pass { rows }, Parity::Match(_)) => format!("PASS  rows={rows}  parity=OK"),
-            (Emat::Pass { rows }, Parity::Mismatch { duck, .. }) => {
+            (Emat::Pass { rows }, Parity::Match) => format!("PASS  rows={rows}  parity=OK"),
+            (Emat::Pass { rows }, Parity::Mismatch { duck }) => {
                 format!("PASS  rows={rows}  parity=MISMATCH(duck={duck})")
             }
             (Emat::Pass { rows }, Parity::OracleSkip(e)) => {
@@ -201,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .count();
     let parity_ok = results
         .values()
-        .filter(|(_, p)| matches!(p, Parity::Match(_)))
+        .filter(|(_, p)| matches!(p, Parity::Match))
         .count();
     let parity_mismatch = results
         .values()
