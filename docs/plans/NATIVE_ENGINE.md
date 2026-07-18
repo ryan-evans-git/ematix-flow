@@ -363,12 +363,27 @@ the same 60M-row lineitem semijoin and Q08 shares still equal DF pull within 1e-
 (so the native set matches DF's), at **142.7 ms vs 197.7 ms = −27.8%** — unchanged
 (the dim-build runs before the timed section). 27 engine tests green.
 
-Remaining integration: the **supplier** (a join + a string flag) and **orders** (a
-4-way join + date window + year bucket) native reductions — reusing `Storage::Utf8`
-plus the engine's join operators — retire the last two `build_probes` SQL queries,
-making Q08 fully engine-native (dims → scan → join → aggregate). Separately, wire the
-**spilling** agg/join through the driver (per-worker `PartitionSpill` + merge) for
-high-cardinality group-bys / beyond-RAM joins.
+**Integration step 3 — native supplier reduction, on the engine's own join. DONE
+(2026-07-18).** The supplier reduction is genuinely a join — `supplier ⋈ nation` on
+nationkey, carrying the nation's `n_name = 'BRAZIL'` flag as payload — so
+`dim.rs::supplier_nation_flag` builds it on the engine's **own** `AdaptiveHashJoin`
+(the first time a join operator runs on real TPC-H data, beyond its synthetic gates):
+project nation to `(n_nationkey, name==needle ? 1 : 0)` via the step-2 string
+primitive, build (25 rows — the adaptive join keeps it in memory), probe with supplier
+(`s_nationkey → s_suppkey`), emit `(s_suppkey, flag)`. No new capability — it composes
+P2.6's join with step-2's string decode. Gate `tests/dim_supplier_native.rs`: SF1
+supplier+nation == a pyarrow oracle (all 10 000 suppliers, suppkey sum 50 005 000, 397
+flagged BRAZIL, brazil-key checksum 1 940 760). End-to-end SF-10: native part **and**
+supplier probes, shares == DF pull within 1e-6, engine 142.7 ms vs DF 191.9 ms
+(engine arm identical to step 2; the % only moves with the DF baseline's noise). 28
+engine tests green.
+
+Remaining integration: the **orders** reduction (`orders ⋈ customer ⋈ nation ⋈
+region`, `r_name = 'AMERICA'` + a 1995–1996 date window, year bucket) — the last
+`build_probes` SQL. Retiring it makes Q08 **fully engine-native** (dims → scan → join
+→ aggregate, no DataFusion anywhere in the path). Separately, wire the **spilling**
+agg/join through the driver (per-worker `PartitionSpill` + merge) for high-cardinality
+group-bys / beyond-RAM joins.
 
 ---
 

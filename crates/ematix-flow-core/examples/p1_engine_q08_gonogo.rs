@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::arrow::array::{Float64Array, Int32Array, Int64Array, StringViewArray};
+use datafusion::arrow::array::{Float64Array, Int32Array, Int64Array};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
@@ -196,23 +196,13 @@ async fn build_probes(
         "p_type",
         "ECONOMY ANODIZED STEEL",
     )?;
-    // supplier -> is_brazil.
-    let mut sup_keys: Vec<i64> = Vec::new();
-    let mut sup_pay: Vec<i64> = Vec::new();
-    for b in &ctx
-        .sql("SELECT s.s_suppkey, n.n_name FROM supplier s JOIN nation n ON s.s_nationkey = n.n_nationkey")
-        .await?
-        .collect()
-        .await?
-    {
-        let sk = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let nm = b.column(1).as_any().downcast_ref::<StringViewArray>();
-        for i in 0..sk.len() {
-            let is_br = nm.map(|a| a.value(i) == "BRAZIL").unwrap_or(false);
-            sup_keys.push(sk.value(i));
-            sup_pay.push(if is_br { 1 } else { 0 });
-        }
-    }
+    // supplier -> is_brazil — NATIVE: supplier ⋈ nation on the engine's
+    // adaptive hash join (n_name = 'BRAZIL' flag as payload), zero DataFusion.
+    let (sup_keys, sup_pay) = ematix_flow_engine::dim::supplier_nation_flag(
+        &data_dir.join("supplier.parquet"),
+        &data_dir.join("nation.parquet"),
+        "BRAZIL",
+    )?;
     // orders -> year-bucket (AMERICA region + date window).
     let mut ord_keys: Vec<i64> = Vec::new();
     let mut ord_pay: Vec<i64> = Vec::new();
