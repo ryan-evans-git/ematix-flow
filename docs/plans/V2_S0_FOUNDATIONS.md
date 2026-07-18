@@ -48,15 +48,16 @@ yet all-green); S0.4 ADR merged.
 | **S0.1** | Shared logical plan (SQL + DataFrame → same `LogicalPlan`) | 📐 design done | Map complete; design in [`../ADR_V2_SHARED_LOGICAL_PLAN.md`](../ADR_V2_SHARED_LOGICAL_PLAN.md). Next: `preset::session_context()` constructor + stub frame lowering + plan-identity demo. Low engine risk — no architectural blocker found. |
 | **S0.2** | TPC-DS data (`dsdgen`) + `tpcds_validate` harness, CI SF=1 behind a flag | ⬜ todo | Mirror `tpch_validate` / `scripts/bench/` |
 | **S0.3** | SQL-surface gap audit → tracked items (from V2_TARGET §2.1) | ⬜ todo | Land as a checklist doc on `v2` (not GH issues — repo is kept issue-light) |
-| **S0.4** | Decide open questions → ADR (namespace, laziness, index depth) | ✅ done | Decided 2026-07-18: `ematix.frame`, lazy-by-default, **strict pandas index**. [`../ADR_V2_DATAFRAME_API.md`](../ADR_V2_DATAFRAME_API.md). ⚠ strict index makes M2 heavier — budget it in S4/S5. |
+| **S0.4** | Decide open questions → ADR (namespace, laziness, index depth) | ✅ done | Decided 2026-07-18: `ematix.frame`, lazy-by-default, **index-light core** (revised from strict — positional alignment, Polars-style). [`../ADR_V2_DATAFRAME_API.md`](../ADR_V2_DATAFRAME_API.md). |
 
 Legend: ⬜ todo · ⏳ in progress · 🔬 investigating · 📐 design done · ✅ done
 
-**S0.4 landed a scope flag:** strict pandas index (owner's call over the
-lighter option) adds a real index layer to M2 (S4/S5) — alignment,
-`MultiIndex`, index preservation through transforms. Budget it into the
-S4/S5 estimates; re-open with the owner if it threatens the M2 timeline
-at the S4 midpoint (per the ADR's revisit trigger).
+**S0.4 positioning:** ematix.frame is a *faster alternative to pandas*,
+not an exact syntax/semantics match. Index-light core keeps DataFrame
+plans byte-identical to SQL (protects the S0.1 gate) and avoids the
+alignment-join tax. The one behavioral delta to document loudly (S5.5):
+binary ops align **positionally**, not by label. Faithful-pandas index
+semantics live in the S7 `ematix.pandas` shim + `.to_pandas()`, opt-in.
 
 ## Immediate next actions
 
@@ -74,5 +75,7 @@ Decisions recorded in [`../ADR_V2_DATAFRAME_API.md`](../ADR_V2_DATAFRAME_API.md)
 - **DataFrame namespace:** `ematix.frame`.
 - **Default laziness:** lazy-by-default (terminal op executes through the
   shared plan; eager mode opt-in).
-- **pandas index model:** **strict pandas index** — full compatibility
-  (alignment, `MultiIndex`), accepted as a heavier M2 investment.
+- **pandas index model:** **index-light core** (revised from strict
+  same day) — optional positional `RangeIndex`, positional alignment,
+  no label/`MultiIndex` in core. Faithful-pandas via the S7 shim +
+  `.to_pandas()`. Goal = faster-than-pandas, not exact match.
