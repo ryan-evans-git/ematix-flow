@@ -92,6 +92,54 @@ bespoke operator, and it ships only under the A/B-or-revert bar (§5).
 **Net:** WIN.1–WIN.3 (parity coverage, §4) proceed unconditionally; the
 gap doc row 2 → "DF-native retained for 8/9; q51 a scoped candidate."
 
+### SF10 confirmation (2026-07-18) — q51 stays window-bound at scale
+
+Re-ran the gate over SF=10 (the benchmark scale) before committing to any
+build (`TPCDS_DATA_DIR=examples/tpcds/data/sf10 win_gate_probe`):
+
+| query | wall (ms) | window share | gate | vs SF1 |
+|---|---:|---:|:---:|---|
+| q36 | 85.7 | 0.5% | shut | ↓ |
+| q44 | 139.2 | 2.1% | shut | ≈ |
+| q49 | 146.2 | 0.0% | shut | ≈ |
+| **q51** | **358.8** | **58.5%** | **OPEN** | share ↓ from 77.8% |
+| q53 | 59.8 | 1.8% | shut | ↓ |
+| q63 | 59.7 | 0.2% | shut | ≈ |
+| q67 | 1069.8 | 3.8% | shut | slowest query; window abs. 368 ms but join-bound |
+| q70 | 89.7 | 0.0% | shut | ≈ |
+| q86 | 19.4 | 0.2% | shut | ≈ |
+
+**8/9 stay shut at scale** — confirms the post-aggregation structure (§1b)
+holds; DF-native is retained for them. **q51 stays OPEN** (window compute
+1.69 s as its input grew ~500k → 4.6M rows). Two refinements from the SF10
+breakdown that bear on the build decision:
+
+- The kernel is still the single dominant cost — the two big
+  `BoundedWindowAggExec` ops are **1.66 s (57.4%)**; but the **SortExec
+  feeding them grew to 387 ms (13.4%)** (was 4.9% at SF1). So at benchmark
+  scale a meaningful slice of q51's "window region" is the *sort*, which a
+  window operator would not remove — the addressable kernel win is ~57%,
+  not ~78%.
+- The upside is real but bounded: even eliminating half the kernel compute
+  is ≈ 0.8 s of summed compute → order ~100 ms of q51's 359 ms wall. One
+  query, not a headline.
+
+**Decision status (2026-07-18): DEFER the q51 operator — parked as a
+characterized candidate.** The "confirm at SF10 first" step is done and
+positive, but the informed call is *not to build now*: the addressable
+kernel win is ~57% (the sort feeding the window is 13.4% and a window
+operator wouldn't remove it), i.e. order ~100 ms on a single ~360 ms
+non-headline query — too little to justify a bespoke `Decimal128`
+cumulative operator plus its A/B/maintenance burden, especially given S1's
+lesson that bespoke operators often lose to DF's vectorized paths.
+
+q51 stays fully characterized here: `win_gate_probe` reproduces the
+hotspot at any scale via `TPCDS_DATA_DIR`, and §5 records exactly how to
+build it. **Re-open the build only if the S6 benchmark shows q51
+materially dragging the aggregate score.** The SF10 TPC-DS data generated
+for this confirmation was removed afterward (disk hygiene); regenerate
+with `tpcds_generate --sf 10` if S2.5 is ever unparked.
+
 ---
 
 ## 1. What TPC-DS actually exercises (audited 2026-07-18)
@@ -210,32 +258,38 @@ for the record:
 
 ---
 
-## 4. S2 deliverables that are unconditional (regardless of the gate)
+## 4. S2 deliverables that are unconditional (regardless of the gate) — ✅ DONE
 
-These ship no matter what the measurement says — they are the honest
-floor of "window functions are covered."
+These ship no matter what the measurement says — the honest floor of
+"window functions are covered." **All three landed 2026-07-18.**
 
-- **WIN.1 — semantic contract tests** (mirror S1.1's hermetic style,
-  `crates/ematix-flow-core/tests/`): a tiny in-memory table, asserting
-  observable results of `RANK` (partitioned + global, ties → equal rank
-  with gap), whole-partition `AVG`, and cumulative `SUM` on
-  `preset::session_context()`. Hermetic, CI-safe, no TPC-DS data. These
-  are the standing regression guard and would equally guard any future
-  operator.
-- **WIN.2 — parity in `tpcds_validate`**: confirm all 9 window queries
-  are `PASS parity=OK` at SF=1 (row-count vs DuckDB), and specifically
-  that q36/q70/q86 (window-over-grouping-set) are clean. This is a
-  harness/coverage task, not new engine code.
-- **WIN.3 — plan-shape pin**: an `EXPLAIN`-dumping example (mirror
-  `gs_plan_probe.rs`) recording which DF window operator each shape lands
-  on, so a future DF upgrade that changes the shape is caught.
+- **WIN.1 — semantic contract tests** ✅
+  `crates/ematix-flow-core/tests/window_functions_semantics.rs` (mirrors
+  S1.1's hermetic style): asserts `RANK` (partitioned + global, ties →
+  equal rank *with a gap*, and per-partition reset), whole-partition
+  `AVG` broadcast (q53/q63 shape), and cumulative `SUM` running-total +
+  partition reset (q51 shape) on `preset::session_context()`. Hermetic,
+  CI-safe, no TPC-DS data. **4 tests, pass.**
+- **WIN.2 — parity in `tpcds_validate`** ✅ all 9 window queries
+  `PASS parity=OK` at SF=1 (row-count vs DuckDB), including the
+  window-over-grouping-set trio: q36 (100), q44 (10), q49 (34), q51
+  (100), q53 (100), q63 (100), q67 (100), q70 (3), q86 (100).
+- **WIN.3 — plan-shape pin** ✅ two hermetic assertions in the same test
+  file: the cumulative `ROWS` frame lowers to `BoundedWindowAggExec`
+  `mode=[Sorted]` (q51), the whole-partition frame to `WindowAggExec`
+  (q53/q63) — so a DF upgrade that changes the operator is caught. The
+  `win_gate_probe` example additionally dumps the full window shapes over
+  real data (SF1/SF10, recorded in §Gate Verdict). **6 window tests total,
+  pass.**
 
-## 5. S2 operator — AUTHORIZED ONLY IF §3 GATE OPENS
+## 5. S2 operator — gate OPENED for q51, but build is DEFERRED (see verdict)
 
-If and only if a query clears the §3 threshold, build a vectorized
-window operator **scoped to the frame shape that cleared it** (expected:
-cumulative `ROWS UNBOUNDED PRECEDING → CURRENT ROW`, q51). Requirements
-learned from S1:
+The §3 gate opened for q51, but the informed decision (SF10 confirmation
+above) is to **defer** the build as a bounded, single-query win. This
+section stands as the ready-to-execute recipe if q51 is ever unparked
+(e.g. S6 shows it dragging the score). Build a vectorized window operator
+**scoped to the frame shape that cleared it** (cumulative
+`ROWS UNBOUNDED PRECEDING → CURRENT ROW`). Requirements learned from S1:
 
 - **A/B toggle from day one** (`EMAT_WINDOW_FUSED` tri-state, read fresh
   at plan time) so the operator is benchmarked against DF-native in a
