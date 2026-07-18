@@ -27,9 +27,10 @@
 //! tells the user exactly what to rewrite.
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
-    ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
-    TableFactor, TableWithJoins, VisitMut, VisitorMut, WildcardAdditionalOptions,
+    BinaryOperator, CastKind, DataType, ExactNumberInfo, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
+    Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins, Value,
+    VisitMut, VisitorMut, WildcardAdditionalOptions,
 };
 use sqlparser::dialect::DatabricksDialect;
 use sqlparser::parser::Parser;
@@ -140,6 +141,37 @@ impl VisitorMut for FunctionRenamer {
             && let Some(new_name) = remap_function_name(&func.name)
         {
             func.name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(new_name))]);
+        }
+
+        // Spark `/` is TRUE division — `int / int` yields a DOUBLE (e.g.
+        // `3 / 2` = 1.5). DataFusion does INTEGER division on integer
+        // operands (`3 / 2` = 1), which silently truncates and changes
+        // results: TPC-DS q34/q73's `hd_dep_count / hd_vehicle_count > 1.2`
+        // filter dropped rows the Spark/DuckDB semantics keep (176 vs 223,
+        // 0 vs 1). Force Spark semantics by casting the left operand of
+        // every `/` to DOUBLE, so DataFusion does float division. The
+        // DuckDB oracle runs the SAME translated SQL, so this is
+        // parity-safe (both engines evaluate the identical double
+        // division). Spark uses `div` for integer division — untouched.
+        if let Expr::BinaryOp { left, op, .. } = expr
+            && *op == BinaryOperator::Divide
+            && !matches!(
+                left.as_ref(),
+                Expr::Cast {
+                    data_type: DataType::Double(_),
+                    ..
+                }
+            )
+        {
+            let taken =
+                std::mem::replace(left.as_mut(), Expr::Value(Value::Null.with_empty_span()));
+            **left = Expr::Cast {
+                kind: CastKind::Cast,
+                expr: Box::new(taken),
+                data_type: DataType::Double(ExactNumberInfo::None),
+                array: false,
+                format: None,
+            };
         }
 
         std::ops::ControlFlow::Continue(())

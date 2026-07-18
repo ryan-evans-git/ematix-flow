@@ -351,3 +351,43 @@ fn spark_tpch_q6_passes_through() {
     assert!(!out.is_empty());
     assert!(out.to_lowercase().contains("lineitem"));
 }
+
+// --- true division (Spark `/` is float division) -------------------
+
+/// Spark `/` is TRUE division: `int / int` yields a DOUBLE (`3 / 2` =
+/// 1.5). DataFusion does INTEGER division on integer operands (`3 / 2`
+/// = 1), silently truncating — which changed TPC-DS q34/q73 results
+/// (filtered rows out). The translator casts the left operand of every
+/// `/` to DOUBLE so DataFusion evaluates float division.
+#[test]
+fn spark_division_forces_true_division() {
+    let out = spark_to_df("SELECT a / b FROM t").to_uppercase();
+    assert!(
+        out.contains("CAST") && out.contains("DOUBLE"),
+        "Spark `/` must cast to DOUBLE for true division; got: {out}"
+    );
+}
+
+/// Nested / chained divisions each get the cast — `a / b / c` must not
+/// leave an inner integer division truncating.
+#[test]
+fn spark_division_chain_all_cast() {
+    let out = spark_to_df("SELECT a / b / c FROM t").to_uppercase();
+    // Two divisions → two DOUBLE casts.
+    assert_eq!(
+        out.matches("DOUBLE").count(),
+        2,
+        "each `/` in a chain must be cast to DOUBLE; got: {out}"
+    );
+}
+
+/// An operand already cast to DOUBLE is not re-wrapped (idempotent).
+#[test]
+fn spark_division_already_double_not_rewrapped() {
+    let out = spark_to_df("SELECT CAST(a AS DOUBLE) / b FROM t").to_uppercase();
+    assert_eq!(
+        out.matches("DOUBLE").count(),
+        1,
+        "an existing DOUBLE cast must not be double-wrapped; got: {out}"
+    );
+}
