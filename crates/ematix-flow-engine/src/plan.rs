@@ -40,10 +40,174 @@ pub struct QueryResult {
     pub rows: Vec<Vec<ScalarValue>>,
 }
 
-/// Execute a bound query on the engine.
+/// Execute a bound query on the engine. Uncorrelated subqueries run first
+/// (recursively), then substitute into the outer query as constants /
+/// membership sets before the main pipeline runs.
 pub fn execute(q: &BoundQuery) -> Result<QueryResult, String> {
-    let exec = Executor { q };
-    exec.run()
+    if q.subqueries.is_empty() {
+        return Executor { q }.run();
+    }
+    let mut q2 = q.clone();
+    resolve_subqueries(&mut q2)?;
+    Executor { q: &q2 }.run()
+}
+
+/// Execute every subquery and substitute its result into the outer query's
+/// expressions: `ScalarSub(i)` → the computed literal, `InSub(i)` → a
+/// materialized [`Expr::InSet`].
+fn resolve_subqueries(q: &mut BoundQuery) -> Result<(), String> {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let subs = std::mem::take(&mut q.subqueries);
+    let mut scalars: Vec<Option<ScalarValue>> = vec![None; subs.len()];
+    let mut sets: Vec<Option<Arc<HashSet<i64>>>> = vec![None; subs.len()];
+
+    // Which index is used how (a sub could in principle be used both ways).
+    let mut want_scalar = vec![false; subs.len()];
+    let mut want_set = vec![false; subs.len()];
+    visit_query_exprs(q, &mut |e| match e {
+        Expr::ScalarSub(i) => want_scalar[*i] = true,
+        Expr::InSub { sub, .. } => want_set[*sub] = true,
+        _ => {}
+    });
+
+    for (i, sub) in subs.iter().enumerate() {
+        if !want_scalar[i] && !want_set[i] {
+            continue;
+        }
+        let r = execute(sub)?; // recursion handles subs-of-subs
+        if want_scalar[i] {
+            let [row] = r.rows.as_slice() else {
+                return Err(format!(
+                    "scalar subquery returned {} rows (want 1)",
+                    r.rows.len()
+                ));
+            };
+            scalars[i] = Some(row[0].clone());
+        }
+        if want_set[i] {
+            let mut set = HashSet::with_capacity(r.rows.len());
+            for row in &r.rows {
+                match &row[0] {
+                    ScalarValue::Int64(v) => set.insert(*v),
+                    ScalarValue::Int32(v) => set.insert(*v as i64),
+                    ScalarValue::Date32(v) => set.insert(*v as i64),
+                    other => {
+                        return Err(format!("IN subquery must yield integers (got {other:?})"));
+                    }
+                };
+            }
+            sets[i] = Some(Arc::new(set));
+        }
+    }
+
+    rewrite_query_exprs(q, &mut |e| match e {
+        Expr::ScalarSub(i) => {
+            *e = Expr::Literal(scalars[*i].clone().expect("scalar computed"));
+        }
+        Expr::InSub { expr, sub, negated } => {
+            *e = Expr::InSet {
+                expr: std::mem::replace(expr, Box::new(Expr::Column(0))),
+                set: sets[*sub].clone().expect("set computed"),
+                negated: *negated,
+            };
+        }
+        _ => {}
+    });
+    Ok(())
+}
+
+/// Visit every expression in a query (filters, post-filter, group keys, agg
+/// args, having, outputs) — read-only.
+fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
+    fn walk(e: &Expr, f: &mut impl FnMut(&Expr)) {
+        f(e);
+        match e {
+            Expr::Column(_) | Expr::Literal(_) | Expr::ScalarSub(_) => {}
+            Expr::Binary { lhs, rhs, .. } => {
+                walk(lhs, f);
+                walk(rhs, f);
+            }
+            Expr::ExtractYear(i) => walk(i, f),
+            Expr::Like { expr, .. } | Expr::InSub { expr, .. } | Expr::InSet { expr, .. } => {
+                walk(expr, f)
+            }
+            Expr::Case { whens, else_ } => {
+                for (c, v) in whens {
+                    walk(c, f);
+                    walk(v, f);
+                }
+                walk(else_, f);
+            }
+        }
+    }
+    for t in &q.tables {
+        if let Some(p) = &t.filter {
+            walk(p, f);
+        }
+    }
+    if let Some(p) = &q.post_filter {
+        walk(p, f);
+    }
+    for g in &q.group {
+        walk(&g.expr, f);
+    }
+    for a in &q.aggs {
+        walk(&a.arg, f);
+    }
+    if let Some(h) = &q.having {
+        walk(h, f);
+    }
+    for o in &q.output {
+        walk(&o.expr, f);
+    }
+}
+
+/// Rewrite every expression in a query bottom-up (children first, then the
+/// node itself — so a substitution sees resolved children).
+fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
+    fn walk(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
+        match e {
+            Expr::Column(_) | Expr::Literal(_) | Expr::ScalarSub(_) => {}
+            Expr::Binary { lhs, rhs, .. } => {
+                walk(lhs, f);
+                walk(rhs, f);
+            }
+            Expr::ExtractYear(i) => walk(i, f),
+            Expr::Like { expr, .. } | Expr::InSub { expr, .. } | Expr::InSet { expr, .. } => {
+                walk(expr, f)
+            }
+            Expr::Case { whens, else_ } => {
+                for (c, v) in whens {
+                    walk(c, f);
+                    walk(v, f);
+                }
+                walk(else_, f);
+            }
+        }
+        f(e);
+    }
+    for t in &mut q.tables {
+        if let Some(p) = &mut t.filter {
+            walk(p, f);
+        }
+    }
+    if let Some(p) = &mut q.post_filter {
+        walk(p, f);
+    }
+    for g in &mut q.group {
+        walk(&mut g.expr, f);
+    }
+    for a in &mut q.aggs {
+        walk(&mut a.arg, f);
+    }
+    if let Some(h) = &mut q.having {
+        walk(h, f);
+    }
+    for o in &mut q.output {
+        walk(&mut o.expr, f);
+    }
 }
 
 struct Executor<'q> {
@@ -408,6 +572,11 @@ impl Executor<'_> {
                     match agg.func {
                         AggFunc::Sum => states[j].sum += sum_expr_f64(chunk, sel, &agg.arg),
                         AggFunc::Count => states[j].count += sel.len() as u64,
+                        AggFunc::CountDistinct => sel.for_each(|i| {
+                            states[j]
+                                .distinct
+                                .insert(agg.arg.eval_i64(chunk, i as usize));
+                        }),
                         _ => {
                             sel.for_each(|i| states[j].update(agg.arg.eval_f64(chunk, i as usize)))
                         }
@@ -430,6 +599,9 @@ impl Executor<'_> {
                     for (j, agg) in q.aggs.iter().enumerate() {
                         match agg.func {
                             AggFunc::Count => states[j].count += 1,
+                            AggFunc::CountDistinct => {
+                                states[j].distinct.insert(agg.arg.eval_i64(chunk, i));
+                            }
                             _ => states[j].update(agg.arg.eval_f64(chunk, i)),
                         }
                     }
@@ -448,6 +620,12 @@ impl Executor<'_> {
             match agg.func {
                 AggFunc::Count => cols.push(Vector::i64(
                     groups.values().map(|st| st[j].count as i64).collect(),
+                )),
+                AggFunc::CountDistinct => cols.push(Vector::i64(
+                    groups
+                        .values()
+                        .map(|st| st[j].distinct.len() as i64)
+                        .collect(),
                 )),
                 _ => cols.push(Vector::f64(
                     groups.values().map(|st| st[j].finalize(agg.func)).collect(),
@@ -574,6 +752,8 @@ struct AggState {
     count: u64,
     min: f64,
     max: f64,
+    /// Distinct integer values (only fed by `COUNT(DISTINCT …)`).
+    distinct: std::collections::HashSet<i64>,
 }
 
 impl Default for AggState {
@@ -583,6 +763,7 @@ impl Default for AggState {
             count: 0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
+            distinct: std::collections::HashSet::new(),
         }
     }
 }
@@ -607,6 +788,7 @@ impl AggState {
             AggFunc::Min => self.min,
             AggFunc::Max => self.max,
             AggFunc::Avg => self.sum / self.count as f64,
+            AggFunc::CountDistinct => self.distinct.len() as f64,
         }
     }
 }
@@ -716,6 +898,8 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
         }
         Expr::ExtractYear(i) => collect_slots(i, out),
         Expr::Like { expr, .. } => collect_slots(expr, out),
+        Expr::ScalarSub(_) => {}
+        Expr::InSub { expr, .. } | Expr::InSet { expr, .. } => collect_slots(expr, out),
         Expr::Case { whens, else_ } => {
             for (c, v) in whens {
                 collect_slots(c, out);

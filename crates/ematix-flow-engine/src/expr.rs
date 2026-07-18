@@ -78,6 +78,24 @@ pub enum Expr {
         pattern: String,
         negated: bool,
     },
+    /// An unresolved scalar subquery — index into
+    /// [`BoundQuery::subqueries`](crate::logical::BoundQuery). The executor
+    /// substitutes the computed constant before evaluation; evaluating one
+    /// directly is a wiring bug.
+    ScalarSub(usize),
+    /// An unresolved `[NOT] IN (<subquery>)` — substituted with [`Expr::InSet`]
+    /// at execution.
+    InSub {
+        expr: Box<Expr>,
+        sub: usize,
+        negated: bool,
+    },
+    /// A materialized integer membership test (from an IN-subquery).
+    InSet {
+        expr: Box<Expr>,
+        set: std::sync::Arc<std::collections::HashSet<i64>>,
+        negated: bool,
+    },
 }
 
 /// A value produced during evaluation. Integer-family logical types
@@ -159,6 +177,12 @@ impl Expr {
                 Val::Str(s) => Val::Bool(like_match(s.as_bytes(), pattern.as_bytes()) != *negated),
                 other => panic!("LIKE needs a string operand, got {other:?}"),
             },
+            Expr::ScalarSub(_) | Expr::InSub { .. } => {
+                panic!("unresolved subquery in evaluation — executor substitution missed it")
+            }
+            Expr::InSet { expr, set, negated } => {
+                Val::Bool(set.contains(&expr.eval_i64(chunk, row)) != *negated)
+            }
         }
     }
 

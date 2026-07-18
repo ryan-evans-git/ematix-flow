@@ -48,6 +48,19 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<BoundQuery, String> {
     let ast::Statement::Query(query) = stmt else {
         return Err("only SELECT queries are supported".into());
     };
+    bind_query(query, catalog, false)
+}
+
+/// Bind one query level (the top level, or a subquery). `set_semantics`
+/// marks an IN-subquery: an aggregate-less, group-less inner SELECT is then
+/// rewritten as GROUP BY its select items — membership only cares about the
+/// value SET, so the dedup is semantics-preserving (and gives the executor
+/// its grouped path).
+fn bind_query(
+    query: &ast::Query,
+    catalog: &Catalog,
+    set_semantics: bool,
+) -> Result<BoundQuery, String> {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Err("only plain SELECT is supported (no set operations yet)".into());
     };
@@ -58,9 +71,11 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<BoundQuery, String> {
         return Err("a FROM clause is required".into());
     }
     let mut b = Binder {
+        catalog,
         tables: Vec::new(),
         slots: Vec::new(),
         touched: BTreeSet::new(),
+        subs: Vec::new(),
     };
     for twj in &select.from {
         if !twj.joins.is_empty() {
@@ -107,6 +122,31 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<BoundQuery, String> {
         other => return Err(format!("unsupported GROUP BY form: {other:?}")),
     };
 
+    // An aggregate-less, group-less IN-subquery SELECT becomes GROUP BY its
+    // items (set semantics — see fn docs).
+    let group: Vec<GroupExpr> = if group.is_empty()
+        && set_semantics
+        && select.projection.iter().all(|it| match it {
+            ast::SelectItem::UnnamedExpr(e) => !contains_function(e),
+            ast::SelectItem::ExprWithAlias { expr, .. } => !contains_function(expr),
+            _ => false,
+        }) {
+        let mut g = Vec::new();
+        for item in &select.projection {
+            let (ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. }) =
+                item
+            else {
+                unreachable!("checked above");
+            };
+            g.push(GroupExpr {
+                expr: b.bind_scalar(e)?,
+            });
+        }
+        g
+    } else {
+        group
+    };
+
     // SELECT: each item becomes a row-space output projection; aggregate
     // calls inside it are extracted into `aggs`.
     let mut aggs: Vec<AggExpr> = Vec::new();
@@ -130,8 +170,12 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<BoundQuery, String> {
             name,
         });
     }
-    if aggs.is_empty() {
-        return Err("SELECT list must contain at least one aggregate (so far)".into());
+    if aggs.is_empty() && group.is_empty() {
+        return Err(
+            "SELECT list must contain an aggregate or a GROUP BY (plain row queries are not \
+             yet supported)"
+                .into(),
+        );
     }
 
     // WHERE: split the conjunct tree, after **OR-factoring** — a top-level
@@ -293,6 +337,7 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<BoundQuery, String> {
         output,
         order_by,
         limit,
+        subqueries: b.subs,
     })
 }
 
@@ -400,12 +445,15 @@ struct BoundTable<'a> {
 
 /// Per-query binding state.
 struct Binder<'a> {
+    catalog: &'a Catalog,
     tables: Vec<BoundTable<'a>>,
     /// The global slot space: slot `s` = `(table, col-in-projection)`.
     slots: Vec<Slot>,
     /// Tables touched by the expression currently being bound (single-table
     /// attribution for filters).
     touched: BTreeSet<usize>,
+    /// Subqueries bound so far (referenced by `Expr::ScalarSub` / `InSub`).
+    subs: Vec<BoundQuery>,
 }
 
 /// A partially-bound expression: either a real bound expression, or a
@@ -526,6 +574,7 @@ impl Binder<'_> {
                 Ok(Expr::Column(group.len() + aggs.len() - 1))
             }
             ast::Expr::Nested(inner) => self.bind_output(inner, group, aggs),
+            ast::Expr::Subquery(_) => Ok(materialize(self.bind(e)?)),
             ast::Expr::BinaryOp { left, op, right } => {
                 let op = bind_op(op)?;
                 let l = self.bind_output(left, group, aggs)?;
@@ -553,6 +602,11 @@ impl Binder<'_> {
         };
         let ast::FunctionArguments::List(args) = &f.args else {
             return Err(format!("aggregate '{fname}' needs an argument list"));
+        };
+        let func = match (func, args.duplicate_treatment) {
+            (f, None) => f,
+            (AggFunc::Count, Some(ast::DuplicateTreatment::Distinct)) => AggFunc::CountDistinct,
+            (_, Some(dt)) => return Err(format!("unsupported {dt} in aggregate '{fname}'")),
         };
         let arg = match args.args.as_slice() {
             [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)] => {
@@ -723,6 +777,31 @@ impl Binder<'_> {
                 }
                 Ok(Bound::Expr(binary(op, materialize(l), materialize(r))))
             }
+            ast::Expr::Subquery(sq) => {
+                let bq = bind_query(sq, self.catalog, false)?;
+                if bq.output.len() != 1 {
+                    return Err("a scalar subquery must select exactly one column".into());
+                }
+                self.subs.push(bq);
+                Ok(Bound::Expr(Expr::ScalarSub(self.subs.len() - 1)))
+            }
+            ast::Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                let bound = materialize(self.bind(expr)?);
+                let bq = bind_query(subquery, self.catalog, true)?;
+                if bq.output.len() != 1 {
+                    return Err("an IN subquery must select exactly one column".into());
+                }
+                self.subs.push(bq);
+                Ok(Bound::Expr(Expr::InSub {
+                    expr: Box::new(bound),
+                    sub: self.subs.len() - 1,
+                    negated: *negated,
+                }))
+            }
             ast::Expr::Function(_) => {
                 Err("aggregate calls are only allowed in the SELECT list (so far)".into())
             }
@@ -777,6 +856,7 @@ fn contains_function(e: &ast::Expr) -> bool {
             contains_function(expr) || contains_function(pattern)
         }
         ast::Expr::Extract { expr, .. } => contains_function(expr),
+        ast::Expr::Subquery(_) | ast::Expr::InSubquery { .. } => false,
         ast::Expr::Case {
             conditions,
             else_result,
@@ -799,6 +879,8 @@ fn references_columns(e: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } => references_columns(lhs) || references_columns(rhs),
         Expr::ExtractYear(i) => references_columns(i),
         Expr::Like { expr, .. } => references_columns(expr),
+        Expr::ScalarSub(_) => false,
+        Expr::InSub { expr, .. } | Expr::InSet { expr, .. } => references_columns(expr),
         Expr::Case { whens, else_ } => {
             whens
                 .iter()

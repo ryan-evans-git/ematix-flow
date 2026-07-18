@@ -96,7 +96,21 @@ fn catalog() -> Catalog {
     c.register_table(
         "supplier",
         sf1("supplier"),
-        &[("s_suppkey", 0, Int64), ("s_nationkey", 3, Int64)],
+        &[
+            ("s_suppkey", 0, Int64),
+            ("s_nationkey", 3, Int64),
+            ("s_comment", 6, Utf8),
+        ],
+    );
+    c.register_table(
+        "partsupp",
+        sf1("partsupp"),
+        &[
+            ("ps_partkey", 0, Int64),
+            ("ps_suppkey", 1, Int64),
+            ("ps_availqty", 2, Int32),
+            ("ps_supplycost", 3, Float64),
+        ],
     );
     c.register_table(
         "nation",
@@ -125,7 +139,7 @@ fn canonical(qname: &str) -> Option<String> {
 /// Bind + execute a canonical query, or None (skip) if data/files absent.
 fn run(qname: &str) -> Option<QueryResult> {
     let tables = [
-        "lineitem", "orders", "customer", "part", "supplier", "nation", "region",
+        "lineitem", "orders", "customer", "part", "supplier", "nation", "region", "partsupp",
     ];
     if tables.iter().any(|t| !sf1(t).exists()) {
         eprintln!("SKIP {qname}: SF1 data absent");
@@ -349,4 +363,75 @@ fn q19_discounted_revenue() {
     // three OR branches; the residue evaluates post-join. 121 rows.
     assert_eq!(r.rows.len(), 1);
     close(f(&r.rows[0][0]), 3083843.0578, "revenue");
+}
+
+#[test]
+fn q11_important_stock() {
+    let Some(r) = run("q11") else { return };
+    // Scalar subquery in HAVING (the 0.0001 threshold), value desc.
+    assert_eq!(r.rows.len(), 1048);
+    let want = [
+        (129760i64, 17538456.86f64),
+        (166726, 16503353.92),
+        (191287, 16474801.969999999),
+    ];
+    for (row, w) in r.rows.iter().take(3).zip(&want) {
+        assert_eq!(i(&row[0]), w.0, "ps_partkey");
+        close(f(&row[1]), w.1, "value");
+    }
+}
+
+#[test]
+fn q16_parts_supplier_relationship() {
+    let Some(r) = run("q16") else { return };
+    // NOT IN (subquery), NOT LIKE, int IN-list, count(distinct), 4-key
+    // ORDER BY (fully deterministic).
+    assert_eq!(r.rows.len(), 18314);
+    let want = [
+        ("Brand#41", "MEDIUM BRUSHED TIN", 3i64, 28i64),
+        ("Brand#54", "STANDARD BRUSHED COPPER", 14, 27),
+        ("Brand#11", "STANDARD BRUSHED TIN", 23, 24),
+        ("Brand#11", "STANDARD BURNISHED BRASS", 36, 24),
+    ];
+    for (row, w) in r.rows.iter().take(4).zip(&want) {
+        assert_eq!(s(&row[0]), w.0, "p_brand");
+        assert_eq!(s(&row[1]), w.1, "p_type");
+        assert_eq!(i(&row[2]), w.2, "p_size");
+        assert_eq!(i(&row[3]), w.3, "supplier_cnt");
+    }
+}
+
+#[test]
+fn q18_large_volume_customer() {
+    let Some(r) = run("q18") else { return };
+    // IN (grouped HAVING subquery) -> membership set; payload chain
+    // customer->orders; 57 qualifying orders.
+    assert_eq!(r.rows.len(), 57);
+    let want = [
+        (
+            "Customer#000128120",
+            128120i64,
+            4722021i64,
+            8862i64,
+            544089.09f64,
+            323.0f64,
+        ),
+        (
+            "Customer#000144617",
+            144617,
+            3043270,
+            9904,
+            530604.44,
+            317.0,
+        ),
+        ("Customer#000013940", 13940, 2232932, 9964, 522720.61, 304.0),
+    ];
+    for (row, w) in r.rows.iter().take(3).zip(&want) {
+        assert_eq!(s(&row[0]), w.0, "c_name");
+        assert_eq!(i(&row[1]), w.1, "c_custkey");
+        assert_eq!(i(&row[2]), w.2, "o_orderkey");
+        assert_eq!(i(&row[3]), w.3, "o_orderdate");
+        close(f(&row[4]), w.4, "o_totalprice");
+        close(f(&row[5]), w.5, "sum_qty");
+    }
 }

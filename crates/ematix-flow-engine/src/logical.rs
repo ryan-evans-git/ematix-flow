@@ -81,6 +81,8 @@ pub enum AggFunc {
     Min,
     Max,
     Avg,
+    /// `COUNT(DISTINCT <int expr>)`.
+    CountDistinct,
 }
 
 /// One SELECT output: an expression in **row space** (`Column(i)` = the
@@ -116,4 +118,8 @@ pub struct BoundQuery {
     pub output: Vec<OutputExpr>,
     pub order_by: Vec<OrderByKey>,
     pub limit: Option<usize>,
+    /// Uncorrelated subqueries referenced by [`Expr::ScalarSub`] /
+    /// [`Expr::InSub`] — executed first, then substituted as constants /
+    /// membership sets.
+    pub subqueries: Vec<BoundQuery>,
 }
