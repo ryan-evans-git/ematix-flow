@@ -225,6 +225,31 @@ fn try_rewrite(plan: &LogicalPlan) -> Option<LogicalPlan> {
     let _ = dim_on_right; // suppress unused warning
     let result = new_fact_side;
 
+    // S3 correctness guard (decorr, 2026-07-18): this rewrite REPLACES the
+    // original Inner Join node, so `result` must still expose every column
+    // that join's output did — a parent operator may reference one. The
+    // splice threads dim columns through, but on the correlated-subquery
+    // shape (TPC-DS q10/q16/q69/q94) a Mark/Semi join *above* this join
+    // reads an outer column (e.g. `c.c_current_addr_sk`) that the spliced
+    // projections drop, and physical planning then fails with FieldNotFound
+    // ("No field named c.c_current_addr_sk"). When the rewrite would drop
+    // any original output column, decline it — DataFusion plans the
+    // unrewritten shape correctly. (The Σ.AD Q10 *win* is TPC-H Q10, a
+    // schema-preserving shape, so it is unaffected.)
+    let result_schema = result.schema();
+    let dropped: Vec<Column> = plan
+        .schema()
+        .iter()
+        .map(|(qual, f)| Column::new(qual.cloned(), f.name()))
+        .filter(|c| result_schema.index_of_column(c).is_err())
+        .collect();
+    if !dropped.is_empty() {
+        if crate::flags::present("EMAT_SIGMA_AD_DEBUG") {
+            eprintln!("[Σ.AD] declined rewrite — would drop {dropped:?} from output schema");
+        }
+        return None;
+    }
+
     if crate::flags::present("EMAT_SIGMA_AD_DEBUG") {
         eprintln!(
             "[Σ.AD] rewrote outer join on ({}.{} = {}.{}); pushed down to {}",

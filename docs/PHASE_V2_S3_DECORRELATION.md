@@ -16,6 +16,40 @@ correlated-subquery queries that vanilla DataFusion executes fine.
 
 ---
 
+## ✅ RESOLVED (2026-07-18) — culprit fixed, 5 queries recovered, 0 regressions
+
+Bisected (`decorr_bisect` → env-var narrowing) to a single sub-step: the
+**dim-join pushdown** (`dim_join_pushdown.rs`, `FlowQueryPlanner`
+`dim_push`). When it splices a filtered-dim Inner join down into the fact
+chain, the rewrite REPLACES the join node but drops an outer column
+(`c.c_current_addr_sk`) that a correlated `EXISTS`/Mark join *above* it
+still references → `FieldNotFound` at physical planning. The rule's own
+comments already flagged this exact hazard; its guards were incomplete for
+the correlated-subquery shape.
+
+**Fix (S3.2):** a schema-preservation guard in `try_rewrite` — if the
+rewritten subtree's schema drops any column of the original join's output,
+decline the rewrite (DataFusion plans the unrewritten shape correctly).
+Surgical: the intended TPC-H Q07/Q10 rewrites are schema-preserving, so
+they still fire (`predicate_allows_q10_shape`,
+`rewrite_preserves_q10_result_sf10` still pass); the rule name is
+unchanged, so `production_chain_matches_pinned_names` + the twin test stay
+green.
+
+**Validated (S3.3):** full `tpcds_validate` before/after — ematix
+executes **97/103 → 102/103**, row-parity **89 → 91**, MISMATCH unchanged
+(2). **Five** queries recovered — the four probed (q10/q16/q69/q94) **plus
+a bonus q95** that had the same bug — and **no query regressed** (q30
+PLAN_FAIL, q34/q73 MISMATCH are identical pre- and post-fix, pre-existing).
+
+**Guard (S3.4):** `tests/decorrelation_semantics.rs` — a hermetic
+q10-shaped correlated-`EXISTS`-over-dim-join on `preset::session_context()`
+that reproduces the exact trigger; both tests **fail on the pre-fix code
+and pass with the fix** (verified by stash-and-rebuild). CI-safe, no data.
+`decorr_probe` remains the data-gated end-to-end guard.
+
+---
+
 ## ✅ VERDICT (2026-07-18) — S3 is a rule-regression fix, not a decorrelation pass
 
 Two findings from `examples/decorr_probe.rs`, both the opposite of what
