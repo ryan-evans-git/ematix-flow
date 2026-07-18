@@ -424,10 +424,36 @@ lineitem (6 M rows, 1.5 M distinct orderkeys) through the parallel driver — a 
 budget forces every worker to spill, and the merged result is **bit-identical** to a
 plain in-memory hashmap oracle (and to the no-spill parallel run). 30 engine tests green.
 
-Optional follow-ons (not blocking the milestone): wire the **spilling hash-join**
-through the driver (it needs the two-input build→probe driver the single-input
-aggregate doesn't); move dimension **string decode** onto ematix-parquet; extend beyond
-Q08 (more of TPC-H) behind a real front-end (P3).
+**Two-input build→probe driver — DONE (2026-07-18).** The parallel face of the spilling
+hash-join (P2.5). `run_join_pipeline` (`src/exec.rs`) scans the build side and the probe
+side **each in parallel** (native decode, morsel-balanced) into per-worker joins, then
+runs the bounded cross-worker `SpillableHashJoin::merge`, emitting every matched
+`(key, build_pay, probe_pay)`; it returns `JoinRunStats` (build/probe rows spilled) as
+honest evidence the beyond-RAM path ran. A private `scan_side` helper factors the
+one-scan-into-per-worker-joins spine so the two scans don't duplicate the
+file/metadata/morsel logic. The correctness core is `merge`: a per-worker *independent*
+join would be **wrong** — a key's build row (decoded by one build-scan worker) and its
+probe rows (decoded by some probe-scan worker) land in different joins and would never
+meet. `merge` fixes it the GRACE way: every occurrence of a key routes to the same
+partition index in *every* join (all share `part_of`), so partition `p` is finished
+across all workers at once — one hash table from **every** join's partition-`p` build
+rows, probed by **every** join's partition-`p` probe rows; the union is exactly the rows
+whose key hashes to `p`, complete and disjoint, so no pair is missed or split. Peak
+memory stays one partition's build table (probe streamed) — beyond-RAM as before. Build
+and probe scan into *separate* per-worker joins (one side fed each) and are unioned by
+`merge`, sidestepping shared-mutable joins across two `thread::scope` regions; `run()` is
+now the single-join case of `merge()`. Kill-gate `tests/spill_join_parallel.rs`: `orders
+⋈ lineitem` on orderkey over SF-1, both sides scanned in parallel — match count ==
+6,001,215 (structural invariant: every lineitem joins its one parent order); an
+order-independent checksum (count + per-column sums) == a plain in-memory hashmap oracle
+at both a huge budget (0 spilled) and a 4 MiB per-worker budget (both sides spill across
+workers). 31 engine tests green. **Every P2 breaker now runs parallel end-to-end.**
+
+Optional follow-ons (not blocking the milestone): move dimension **string decode** onto
+ematix-parquet; extend beyond Q08 (more of TPC-H) behind a real front-end (P3);
+narrower join follow-ons — multi-column payloads, recursive re-partition for a single
+build partition that overflows (key skew), and a partition-parallel merge (join the
+partitions concurrently, not just decode).
 
 ---
 
