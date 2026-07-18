@@ -31,10 +31,10 @@ So v2's SQL-surface work is mostly **"pull onto the push engine," not
 |---|---------|---------------------------|:---:|---|:---:|
 | 1 | `GROUPING SETS` / `ROLLUP` / `CUBE` + `GROUPING()` / `GROUPING_ID` | Q18, Q22, Q27, Q36, Q67, Q77, Q80 | ✅ | ✅ **DF-native retained** — a native operator was built + measured **1.8× slower** and reverted (2026-07-18); DF's grouping-set exec is single-scan + vectorized. | ~~S1~~ done (no-op) |
 | 2 | Window functions — TPC-DS uses only `RANK` + `SUM`/`AVG` windows (audit 2026-07-18); **not** `RANGE`/named/`DENSE_RANK`/`NTILE`/`LEAD`/`LAG` | Q36, Q44, Q49, Q51, Q53, Q63, Q67, Q70, Q86 | ✅ | ✅ **DF-native retained for 8/9** — gate measured (`win_gate_probe`, 2026-07-18): window compute is <9% for 8 queries. **q51 OPEN** (77.8% — cumulative `ROWS` over ~500k rows): a scoped operator is a candidate, not obligatory. Scope: [`../PHASE_V2_S2_WINDOW_FUNCTIONS.md`](../PHASE_V2_S2_WINDOW_FUNCTIONS.md). | **S2** |
-| 3 | `INTERSECT` / `EXCEPT` (+ `ALL`) | Q8, Q14, Q38, Q87 | ✅ | ❌ **no native set-op operator** → DataFusion built-in (semi/anti-join lowering) | **S2** |
+| 3 | `INTERSECT` / `EXCEPT` (no `ALL` in TPC-DS) | Q8, Q14a/b, Q38, Q87 | ✅ | ✅ **DF-native retained** — probe (`setop_probe`, 2026-07-18) shows no dedicated set-op operator: `INTERSECT`→semi-join+agg, `EXCEPT`→anti-join+agg, which land on ematix's **most-developed** join path (dedicated semi/anti rules + bloom on Semi/Anti). No operator/rule gap. Scope: [`../PHASE_V2_S2_SET_OPERATORS.md`](../PHASE_V2_S2_SET_OPERATORS.md). | **S2** |
 | 4 | Correlated + `EXISTS`/`NOT EXISTS` subqueries at depth | Q10, Q35, Q41 | ✅ (DF decorrelates) | ⚠ **DataFusion's built-in decorrelation** — no ematix pass; works, but the resulting joins may not hit ematix's reorder/bloom rules well | **S3** |
 | 5 | Recursive CTEs | (out-of-suite; common in analytics) | ✅ | ⚠ DataFusion `RecursiveQueryExec` — generic | **S3** |
-| 6 | Large `IN`-lists / `UNION`-heavy set pipelines | Q33, Q56, Q60 | ✅ | ⚠ generic; verify no planning blowup at scale | **S2** |
+| 6 | Large literal `IN`-list (**q8, ~400 elems**; q33/56/60 are UNION+`IN(SELECT)`, not large literal) | Q8 (+ Q33/56/60 unions) | ✅ | ✅ **DF-native retained** — q8's ~400-elem `IN` lowers to a single `InList` membership node (no OR-chain blowup, verified `setop_probe` 2026-07-18); UNIONs → `InterleaveExec`. Scope: [`../PHASE_V2_S2_SET_OPERATORS.md`](../PHASE_V2_S2_SET_OPERATORS.md). | **S2** |
 
 Legend: ✅ yes · ❌ no (gap) · ⚠ works but not ematix-native / needs verification.
 

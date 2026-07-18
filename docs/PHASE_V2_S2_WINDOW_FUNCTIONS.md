@@ -305,14 +305,16 @@ is already vectorized and the input is tiny (§1b).
 
 ---
 
-## 6. Set operators + large IN (S2.3) — separate sub-arc
+## 6. Set operators + large IN (S2.3) — separate sub-arc — ✅ SCOPED
 
-`INTERSECT` / `EXCEPT [ALL]` (Q8/Q14/Q38/Q87) and large-`IN`
-(Q33/Q56/Q60) are the other half of the sprint-plan's S2. They are
-**independent of the window work** and lower-leverage (the gap doc ranks
-them #3, "correctness is there, fusion upside smaller"). Scope them the
-same measurement-first way in a companion pass; do not block the window
-gate on them. Left as a stub here until the window gate is resolved.
+Moved to its own doc:
+[`PHASE_V2_S2_SET_OPERATORS.md`](PHASE_V2_S2_SET_OPERATORS.md). Verdict
+(2026-07-18, `setop_probe`): **no operator gap and no rule gap** —
+`INTERSECT`/`EXCEPT` lower to semi/anti-join + aggregate (no dedicated
+set-op operator exists), landing on ematix's most-developed join path
+(dedicated semi/anti rules + bloom); the q8 ~400-element `IN` lowers to a
+single `InList`, no OR-chain. Same outcome as grouping sets and 8/9
+windows: parity coverage (SETOP.1–3), not an operator.
 
 ---
 
