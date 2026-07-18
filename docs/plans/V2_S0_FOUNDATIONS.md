@@ -47,7 +47,7 @@ yet all-green); S0.4 ADR merged.
 |---|---|---|---|
 | **S0.1** | Shared logical plan (SQL + DataFrame → same `LogicalPlan`) | ✅ done | `preset::session_context()`/`session_state()` shared constructors + `frame` module (lowering seam) + **plan-identity gate GREEN** (2 shapes: filter+agg, filter+project — frame ≡ SQL optimized plan). CLI `run_shard` consolidated onto the shared constructor; streaming path scoped out (recorded in the ADR). [`../ADR_V2_SHARED_LOGICAL_PLAN.md`](../ADR_V2_SHARED_LOGICAL_PLAN.md). |
 | **S0.2** | TPC-DS data (`dsdgen`) + `tpcds_validate` harness, CI SF=1 behind a flag | ⬜ todo | Mirror `tpch_validate` / `scripts/bench/` |
-| **S0.3** | SQL-surface gap audit → tracked items (from V2_TARGET §2.1) | ⬜ todo | Land as a checklist doc on `v2` (not GH issues — repo is kept issue-light) |
+| **S0.3** | SQL-surface gap audit → tracked items (from V2_TARGET §2.1) | ✅ done | [`V2_SQL_SURFACE_GAPS.md`](V2_SQL_SURFACE_GAPS.md). Key finding: all 99 TPC-DS *plan* via DataFusion today — the gap is **native/fused execution** (grouping sets→S1, window+set-ops→S2, decorrelation→S3), not correctness. |
 | **S0.4** | Decide open questions → ADR (namespace, laziness, index depth) | ✅ done | Decided 2026-07-18: `ematix.frame`, lazy-by-default, **index-light core** (revised from strict — positional alignment, Polars-style). [`../ADR_V2_DATAFRAME_API.md`](../ADR_V2_DATAFRAME_API.md). |
 
 Legend: ⬜ todo · ⏳ in progress · 🔬 investigating · 📐 design done · ✅ done
