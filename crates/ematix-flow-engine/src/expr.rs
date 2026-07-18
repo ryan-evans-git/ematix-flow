@@ -133,6 +133,18 @@ impl Expr {
     pub fn eval_bool(&self, chunk: &DataChunk, row: usize) -> bool {
         self.eval(chunk, row).expect_bool()
     }
+
+    /// Evaluate an integer expression at `row` — the group-key path (keys
+    /// route through the engine's i64 hash aggregation). Panics on a float
+    /// or boolean result: the binder guarantees integer-family keys, so a
+    /// miss here is a wiring bug, not a data condition.
+    #[inline]
+    pub fn eval_i64(&self, chunk: &DataChunk, row: usize) -> i64 {
+        match self.eval(chunk, row) {
+            Val::Int(i) => i,
+            other => panic!("expected an integer group key, got {other:?}"),
+        }
+    }
 }
 
 #[inline]

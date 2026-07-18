@@ -14,6 +14,8 @@
 //! aggregation ([`crate::agg::HashAggregateSink`]) are the next slices —
 //! the operators already exist; the planner grows into them.
 
+use std::collections::BTreeMap;
+
 use crate::chunk::DataChunk;
 use crate::expr::{ScalarValue, filter_expr, sum_expr_f64};
 use crate::logical::{AggFunc, LogicalPlan};
@@ -33,31 +35,65 @@ pub struct QueryResult {
 pub fn execute(plan: &LogicalPlan) -> Result<QueryResult, String> {
     match plan {
         LogicalPlan::Aggregate { input, group, aggs } => {
-            if !group.is_empty() {
-                return Err("GROUP BY execution is not yet supported (P3 slice 4)".into());
-            }
             let (chunks, sels) = run_input(input)?;
 
-            // Scalar aggregate: one accumulator per agg, per-chunk partials
-            // added in chunk order (the hand-kernel association).
-            let mut acc = vec![0.0_f64; aggs.len()];
-            for (chunk, sel) in chunks.iter().zip(&sels) {
-                for (j, agg) in aggs.iter().enumerate() {
-                    match agg.func {
-                        AggFunc::Sum => acc[j] += sum_expr_f64(chunk, sel, &agg.arg),
+            let agg_names = |offset: usize| {
+                aggs.iter().enumerate().map(move |(j, a)| {
+                    a.alias
+                        .clone()
+                        .unwrap_or_else(|| format!("col{}", offset + j))
+                })
+            };
+
+            if group.is_empty() {
+                // Scalar aggregate: one accumulator per agg, per-chunk
+                // partials added in chunk order (the hand-kernel
+                // association — what makes the Q6 gate bit-exact).
+                let mut acc = vec![0.0_f64; aggs.len()];
+                for (chunk, sel) in chunks.iter().zip(&sels) {
+                    for (j, agg) in aggs.iter().enumerate() {
+                        match agg.func {
+                            AggFunc::Sum => acc[j] += sum_expr_f64(chunk, sel, &agg.arg),
+                        }
                     }
                 }
+                return Ok(QueryResult {
+                    columns: agg_names(0).collect(),
+                    rows: vec![acc.into_iter().map(ScalarValue::Float64).collect()],
+                });
             }
 
-            let columns = aggs
+            // Grouped aggregate: hash-accumulate per key tuple. A BTreeMap
+            // keys the groups AND yields deterministic key-sorted output.
+            let mut map: BTreeMap<Vec<i64>, Vec<f64>> = BTreeMap::new();
+            for (chunk, sel) in chunks.iter().zip(&sels) {
+                sel.for_each(|i| {
+                    let i = i as usize;
+                    let key: Vec<i64> = group.iter().map(|g| g.expr.eval_i64(chunk, i)).collect();
+                    let acc = map.entry(key).or_insert_with(|| vec![0.0; aggs.len()]);
+                    for (j, agg) in aggs.iter().enumerate() {
+                        match agg.func {
+                            AggFunc::Sum => acc[j] += agg.arg.eval_f64(chunk, i),
+                        }
+                    }
+                });
+            }
+
+            let columns = group
                 .iter()
-                .enumerate()
-                .map(|(j, a)| a.alias.clone().unwrap_or_else(|| format!("col{j}")))
+                .map(|g| g.name.clone())
+                .chain(agg_names(group.len()))
                 .collect();
-            Ok(QueryResult {
-                columns,
-                rows: vec![acc.into_iter().map(ScalarValue::Float64).collect()],
-            })
+            let rows = map
+                .into_iter()
+                .map(|(key, acc)| {
+                    key.into_iter()
+                        .map(ScalarValue::Int64)
+                        .chain(acc.into_iter().map(ScalarValue::Float64))
+                        .collect()
+                })
+                .collect();
+            Ok(QueryResult { columns, rows })
         }
         LogicalPlan::Filter { .. } | LogicalPlan::Scan { .. } => {
             Err("top-level non-aggregate queries are not yet supported (P3)".into())

@@ -24,6 +24,15 @@ pub struct ScanColumn {
     pub ty: LogicalType,
 }
 
+/// A named group key, e.g. the `l_linenumber` in `SELECT l_linenumber,
+/// sum(…) … GROUP BY l_linenumber`. The name is the output column label
+/// (alias, or the column's own name).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupExpr {
+    pub expr: Expr,
+    pub name: String,
+}
+
 /// An aggregate call, e.g. `sum(l_extendedprice * l_discount) as revenue`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AggExpr {
@@ -56,10 +65,11 @@ pub enum LogicalPlan {
         predicate: Expr,
     },
     /// Group by `group` and compute `aggs` over each group. An empty
-    /// `group` is the scalar-aggregate case (one output row).
+    /// `group` is the scalar-aggregate case (one output row). Output
+    /// columns are the group keys (in order) then the aggregates.
     Aggregate {
         input: Box<LogicalPlan>,
-        group: Vec<Expr>,
+        group: Vec<GroupExpr>,
         aggs: Vec<AggExpr>,
     },
 }

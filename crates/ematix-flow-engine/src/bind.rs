@@ -21,7 +21,7 @@ use sqlparser::parser::Parser;
 
 use crate::catalog::{Catalog, TableDef};
 use crate::expr::{BinaryOp, Expr, ScalarValue};
-use crate::logical::{AggExpr, AggFunc, LogicalPlan, ScanColumn};
+use crate::logical::{AggExpr, AggFunc, GroupExpr, LogicalPlan, ScanColumn};
 
 /// Parse `sql` and bind it against `catalog` into a typed plan.
 pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan, String> {
@@ -59,23 +59,38 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan, String> {
         used: Vec::new(),
     };
 
-    // SELECT items first (so aggregate arguments claim the first chunk
+    // SELECT items first (so their arguments claim the first chunk
     // positions), then GROUP BY, then WHERE — the scan projection is the
-    // referenced columns in first-use order.
-    let mut aggs = Vec::new();
+    // referenced columns in first-use order. Non-aggregate items are group
+    // keys and must precede the aggregates (they are also the output-column
+    // order the executor produces).
+    let mut keys: Vec<GroupExpr> = Vec::new();
+    let mut aggs: Vec<AggExpr> = Vec::new();
     for item in &select.projection {
         let (expr, alias) = match item {
             ast::SelectItem::UnnamedExpr(e) => (e, None),
             ast::SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
             other => return Err(format!("unsupported select item: {other}")),
         };
-        aggs.push(b.bind_aggregate(expr, alias)?);
+        if matches!(expr, ast::Expr::Function(_)) {
+            aggs.push(b.bind_aggregate(expr, alias)?);
+        } else {
+            if !aggs.is_empty() {
+                return Err("group keys must precede aggregates in SELECT (so far)".into());
+            }
+            let bound = b.bind_scalar(expr)?;
+            let name = alias.unwrap_or_else(|| match &bound {
+                Expr::Column(i) => b.used[*i].name.clone(),
+                _ => format!("key{}", keys.len()),
+            });
+            keys.push(GroupExpr { expr: bound, name });
+        }
     }
     if aggs.is_empty() {
         return Err("SELECT list must contain at least one aggregate (so far)".into());
     }
 
-    let group = match &select.group_by {
+    let group_exprs = match &select.group_by {
         ast::GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => exprs
             .iter()
             .map(|e| b.bind_scalar(e))
@@ -85,6 +100,41 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<LogicalPlan, String> {
         }
         other => return Err(format!("unsupported GROUP BY form: {other:?}")),
     };
+    // The non-aggregate select items must BE the group keys, in order —
+    // anything else is either invalid SQL (a non-grouped column) or a
+    // reordering this slice doesn't support yet.
+    if keys.len() != group_exprs.len() || keys.iter().zip(&group_exprs).any(|(k, g)| k.expr != *g) {
+        let named = keys
+            .iter()
+            .map(|k| k.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "non-aggregate select items [{named}] must match GROUP BY exprs in order"
+        ));
+    }
+    // Group keys route through the i64 hash-agg path: integer-family
+    // columns only (so far), checked here so execution can't mis-key.
+    for k in &keys {
+        let Expr::Column(i) = k.expr else {
+            return Err(format!(
+                "group key '{}' must be a plain column (so far)",
+                k.name
+            ));
+        };
+        if !matches!(
+            b.used[i].ty,
+            crate::vector::LogicalType::Int32
+                | crate::vector::LogicalType::Int64
+                | crate::vector::LogicalType::Date32
+        ) {
+            return Err(format!(
+                "group key '{}' must be integer-typed (so far), is {:?}",
+                k.name, b.used[i].ty
+            ));
+        }
+    }
+    let group = keys;
 
     let predicate = select
         .selection
