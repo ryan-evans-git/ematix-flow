@@ -20,6 +20,7 @@ pub mod hashjoin;
 pub mod join;
 pub mod logical;
 pub mod pipeline;
+pub mod plan;
 pub mod scan;
 pub mod scan_native;
 pub mod sched;
