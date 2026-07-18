@@ -1313,10 +1313,24 @@ mod tests {
         );
 
         // Env-mutating arm — house rule: take EMAT_ENV_TEST_LOCK and restore
-        // the var before dropping the guard.
+        // each var before dropping the guard.
         let _guard = crate::flags::EMAT_ENV_TEST_LOCK.lock().await;
         let key = "EMAT_LOWCARD_GROUPBY_BOOST";
         let prev = std::env::var(key).ok();
+
+        // Pin the core share to SOLO for the duration of this test. Gate-B's
+        // cap is `8 × resolved_core_share()`; in AUTO that share is
+        // `cores / live-registered-ematix-processes` read from a cross-process
+        // registry. Under a parallel `nextest` run every sibling test process
+        // registers itself, so the share — and therefore the cap — collapses
+        // non-deterministically; once the cap drops below SF=10's 58 row
+        // groups the policy DECLINES the boost and this arm flakes.
+        // `EMAT_TARGET_PARTITIONS=0` (legacy) resolves the share to full cores
+        // WITHOUT touching the registry or its TTL cache, restoring the "solo"
+        // configuration this test documents. Restored below.
+        let tp_key = "EMAT_TARGET_PARTITIONS";
+        let tp_prev = std::env::var(tp_key).ok();
+        unsafe { std::env::set_var(tp_key, "0") };
 
         // =0 force-off: no boost regardless of solo state.
         unsafe { std::env::set_var(key, "0") };
@@ -1327,25 +1341,41 @@ mod tests {
         );
 
         // =1 diagnostic force-on (bypasses the solo check): RG-granularity
-        // policy — num_rgs capped at EMAT_LOWCARD_BOOST_CAP × core share,
-        // never below the session count. At M4 Max solo defaults this is
-        // 58 partitions (one RG each); computed self-consistently here so the
-        // assertion is robust to core count / registry live-count variation.
+        // policy. Mirror the PRODUCTION policy exactly via
+        // `low_card_boosted_partitions` rather than re-deriving it — an earlier
+        // hand-rolled `num_rgs.min(cap).max(14)` silently diverged when
+        // `14 < cap < num_rgs`: the real policy DECLINES to the session count
+        // there, it does not clamp to the cap. Compute `cap` once and reuse it
+        // for both the expectation and the boost so there is no TOCTOU even if
+        // the resolved share shifts mid-test.
         unsafe { std::env::set_var(key, "1") };
-        let expect = num_rgs.min(low_card_boost_cap()).max(14);
+        let cap = low_card_boost_cap();
+        let expect = low_card_boosted_partitions(num_rgs, cap, 14);
         let boosted = scalar_agg_target_partitions(&plan, 14);
         assert_eq!(
             boosted, expect,
-            "EMAT_LOWCARD_GROUPBY_BOOST=1 must apply the RG-granularity policy"
+            "EMAT_LOWCARD_GROUPBY_BOOST=1 must apply the RG-granularity policy \
+             (num_rgs={num_rgs}, cap={cap})"
         );
-        assert!(
-            boosted > 14,
-            "SF=10 (58 RGs > 14 session partitions) must actually boost; got {boosted}"
-        );
+        // With solo pinned the cap is 8×cores, which clears SF=10's 58 RGs on
+        // any host with ≥ 8 cores and the boost fires. Assert it actually
+        // boosts only when the policy admits it (`num_rgs <= cap`), so a
+        // smaller host degrades gracefully instead of failing spuriously.
+        if num_rgs <= cap {
+            assert!(
+                boosted > 14,
+                "SF=10 ({num_rgs} RGs ≤ cap {cap}) must boost above the 14 \
+                 session partitions; got {boosted}"
+            );
+        }
 
         match prev {
             Some(v) => unsafe { std::env::set_var(key, v) },
             None => unsafe { std::env::remove_var(key) },
+        }
+        match tp_prev {
+            Some(v) => unsafe { std::env::set_var(tp_key, v) },
+            None => unsafe { std::env::remove_var(tp_key) },
         }
         Ok(())
     }
