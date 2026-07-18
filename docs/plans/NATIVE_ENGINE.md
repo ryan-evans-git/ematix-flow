@@ -133,7 +133,7 @@ state = clean-room.**
 | **P0 substrate spike** | Vector format + one pipeline: **Q6 end-to-end** — native decode → native vectors → push filter → push sum → native result. No Arrow, no DF. | Matches DuckDB Q6; per-thread throughput ≥ current DF path. *(Correctness + spine — not a perf-win proof; Q6 is decode-bound.)* |
 | **P1 — the thesis** | Hash-agg (**Q1**) + hash-join (**Q3/Q8**) as pipeline breakers with morsel parallelism. | **Reproduce the −16% push win vs the DF pull path on Q08 at correctness parity. This is GO/NO-GO for the whole engine.** |
 | **P2** | Work-stealing scheduler + buffer manager + spill + adaptive re-plan at breakers. | No regression on P1; a spilling hash-join correct beyond RAM. |
-| **P3** | Front-end: binder + owned logical IR + physical planner; port Σ rules. | Arbitrary TPC-H SQL plans onto the engine (not hand-built pipelines). |
+| **P3** *(IN PROGRESS)* | Front-end: binder + owned logical IR + physical planner; port Σ rules. Design + slices: `docs/plans/P3_FRONTEND.md`. | Arbitrary TPC-H SQL plans onto the engine (not hand-built pipelines). |
 | **P4** | Surface expansion: TPC-H 22/22 → TPC-DS → windows / grouping-sets / subqueries. | 22/22 then 103/103 differential-match the oracle. |
 | **P5** | Interop boundary: Arrow export, pandas / Flight / ADBC on the native engine. | Zero-copy Arrow export parity with today. |
 | **P6** | Strangler cutover; DF fallback → zero; drop the DF dependency. | Clean-room achieved; full surface on native engine. |
