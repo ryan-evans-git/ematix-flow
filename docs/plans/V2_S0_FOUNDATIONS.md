@@ -45,12 +45,18 @@ yet all-green); S0.4 ADR merged.
 
 | Story | What | Status | Notes |
 |---|---|---|---|
-| **S0.1** | Shared logical plan (SQL + DataFrame → same `LogicalPlan`) | 🔬 mapping | Architecture map in flight (the linchpin — nothing in Track B starts until its demo is green) |
+| **S0.1** | Shared logical plan (SQL + DataFrame → same `LogicalPlan`) | 📐 design done | Map complete; design in [`../ADR_V2_SHARED_LOGICAL_PLAN.md`](../ADR_V2_SHARED_LOGICAL_PLAN.md). Next: `preset::session_context()` constructor + stub frame lowering + plan-identity demo. Low engine risk — no architectural blocker found. |
 | **S0.2** | TPC-DS data (`dsdgen`) + `tpcds_validate` harness, CI SF=1 behind a flag | ⬜ todo | Mirror `tpch_validate` / `scripts/bench/` |
 | **S0.3** | SQL-surface gap audit → tracked items (from V2_TARGET §2.1) | ⬜ todo | Land as a checklist doc on `v2` (not GH issues — repo is kept issue-light) |
-| **S0.4** | Decide open questions → ADR (namespace, laziness, index depth) | ⏳ deciding | Blocks S0.1 shape + S4; awaiting owner calls, then adr-writer |
+| **S0.4** | Decide open questions → ADR (namespace, laziness, index depth) | ✅ done | Decided 2026-07-18: `ematix.frame`, lazy-by-default, **strict pandas index**. [`../ADR_V2_DATAFRAME_API.md`](../ADR_V2_DATAFRAME_API.md). ⚠ strict index makes M2 heavier — budget it in S4/S5. |
 
-Legend: ⬜ todo · ⏳ in progress · 🔬 investigating · ✅ done
+Legend: ⬜ todo · ⏳ in progress · 🔬 investigating · 📐 design done · ✅ done
+
+**S0.4 landed a scope flag:** strict pandas index (owner's call over the
+lighter option) adds a real index layer to M2 (S4/S5) — alignment,
+`MultiIndex`, index preservation through transforms. Budget it into the
+S4/S5 estimates; re-open with the owner if it threatens the M2 timeline
+at the S4 midpoint (per the ADR's revisit trigger).
 
 ## Immediate next actions
 
@@ -61,13 +67,12 @@ Legend: ⬜ todo · ⏳ in progress · 🔬 investigating · ✅ done
 3. Stand up `tpcds_validate` (S0.2) — data-gen + oracle harness.
 4. Write the S0.3 SQL-surface gap checklist.
 
-## Open questions (S0.4 — needs owner sign-off)
+## Open questions (S0.4) — RESOLVED 2026-07-18
 
-- **DataFrame namespace:** `ematix.frame` (explicit) vs a top-level
-  first-class surface. The `import ematix.pandas as pd` shim (S7) is
-  separate either way.
-- **Default laziness:** lazy-by-default (build a plan, execute on a
-  terminal op — matches the engine + Polars) vs eager (pandas notebook
-  feel).
-- **pandas index model depth:** ship a lightweight optional index and
-  document the delta, vs invest in strict-pandas-index compatibility.
+Decisions recorded in [`../ADR_V2_DATAFRAME_API.md`](../ADR_V2_DATAFRAME_API.md):
+
+- **DataFrame namespace:** `ematix.frame`.
+- **Default laziness:** lazy-by-default (terminal op executes through the
+  shared plan; eager mode opt-in).
+- **pandas index model:** **strict pandas index** — full compatibility
+  (alignment, `MultiIndex`), accepted as a heavier M2 investment.
