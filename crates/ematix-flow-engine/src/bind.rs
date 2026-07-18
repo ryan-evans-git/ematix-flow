@@ -585,6 +585,129 @@ impl Binder<'_> {
         }
     }
 
+    /// Decorrelate a `[NOT] EXISTS (subquery)` of the simple TPC-H shape —
+    /// one inner table whose WHERE holds exactly one correlation
+    /// `inner_col = outer_col`, the rest inner-only filters — into the
+    /// semijoin `outer_col [NOT] IN (SELECT inner_col FROM inner WHERE
+    /// rest)`, riding the IN-subquery machinery (set semantics = EXISTS's
+    /// at-least-one). Richer correlation shapes error by name.
+    fn bind_exists(&mut self, subquery: &ast::Query, negated: bool) -> Result<Bound, String> {
+        let ast::SetExpr::Select(select) = subquery.body.as_ref() else {
+            return Err("EXISTS subquery must be a plain SELECT".into());
+        };
+        let [from] = select.from.as_slice() else {
+            return Err("EXISTS subquery must have exactly one FROM table (so far)".into());
+        };
+        if !from.joins.is_empty() {
+            return Err("JOIN inside EXISTS is not yet supported".into());
+        }
+        let ast::TableFactor::Table { name, alias, .. } = &from.relation else {
+            return Err("EXISTS FROM must be a plain table".into());
+        };
+        let tname = name.to_string();
+        let def = self
+            .catalog
+            .table(&tname)
+            .ok_or_else(|| format!("unknown table '{tname}'"))?;
+        let display = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| tname.clone());
+
+        // Split the inner WHERE: find THE correlation conjunct.
+        let mut conjuncts = Vec::new();
+        if let Some(w) = &select.selection {
+            split_and(w, &mut conjuncts);
+        }
+        let mut correlation: Option<(String, usize)> = None; // (inner col, outer slot)
+        let mut inner_conjuncts: Vec<&ast::Expr> = Vec::new();
+        for conj in conjuncts {
+            if let ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } = conj
+            {
+                if let (Some(lp), Some(rp)) = (ident_parts(left), ident_parts(right)) {
+                    // Unqualified single-part names only (TPC-H's shape).
+                    let inner_of = |parts: &[&str]| match parts {
+                        [c] if def.column(c).is_some() => Some(c.to_string()),
+                        _ => None,
+                    };
+                    match (inner_of(&lp), inner_of(&rp)) {
+                        (Some(ic), None) | (None, Some(ic)) => {
+                            let outer = if inner_of(&lp).is_some() { &rp } else { &lp };
+                            let slot = self.resolve_parts(outer)?;
+                            if correlation.is_some() {
+                                return Err(
+                                    "multiple correlated conditions in EXISTS are not yet \
+                                     supported"
+                                        .into(),
+                                );
+                            }
+                            correlation = Some((ic, slot));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            inner_conjuncts.push(conj);
+        }
+        let Some((inner_col, outer_slot)) = correlation else {
+            return Err("uncorrelated EXISTS is not yet supported".into());
+        };
+
+        // Bind the inner query directly: SELECT inner_col FROM t WHERE rest
+        // GROUP BY inner_col (set semantics).
+        let mut inner = Binder {
+            catalog: self.catalog,
+            tables: vec![BoundTable {
+                display,
+                def,
+                used: Vec::new(),
+            }],
+            slots: Vec::new(),
+            touched: BTreeSet::new(),
+            subs: Vec::new(),
+        };
+        let key_slot = inner.resolve_parts(&[&inner_col])?;
+        let mut inner_filters: Vec<Expr> = Vec::new();
+        for conj in inner_conjuncts {
+            let (e, _) = inner.bind_multi(conj)?;
+            inner_filters.push(e);
+        }
+        let bq = BoundQuery {
+            tables: vec![TableInput {
+                name: inner.tables[0].display.clone(),
+                path: inner.tables[0].def.path.clone(),
+                projection: inner.tables[0].used.clone(),
+                filter: inner_filters.into_iter().reduce(and),
+            }],
+            edges: Vec::new(),
+            slots: inner.slots,
+            post_filter: None,
+            group: vec![GroupExpr {
+                expr: Expr::Column(key_slot),
+            }],
+            aggs: Vec::new(),
+            having: None,
+            output: vec![OutputExpr {
+                expr: Expr::Column(0),
+                name: inner_col,
+            }],
+            order_by: Vec::new(),
+            limit: None,
+            subqueries: inner.subs,
+        };
+        self.subs.push(bq);
+        Ok(Bound::Expr(Expr::InSub {
+            expr: Box::new(Expr::Column(outer_slot)),
+            sub: self.subs.len() - 1,
+            negated,
+        }))
+    }
+
     /// Bind an aggregate call: `sum/count/min/max/avg(<expr>)` or
     /// `count(*)`.
     fn bind_aggregate(&mut self, e: &ast::Expr) -> Result<AggExpr, String> {
@@ -777,6 +900,7 @@ impl Binder<'_> {
                 }
                 Ok(Bound::Expr(binary(op, materialize(l), materialize(r))))
             }
+            ast::Expr::Exists { subquery, negated } => self.bind_exists(subquery, *negated),
             ast::Expr::Subquery(sq) => {
                 let bq = bind_query(sq, self.catalog, false)?;
                 if bq.output.len() != 1 {

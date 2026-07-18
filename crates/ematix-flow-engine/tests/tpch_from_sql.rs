@@ -435,3 +435,22 @@ fn q18_large_volume_customer() {
         close(f(&row[5]), w.5, "sum_qty");
     }
 }
+
+#[test]
+fn q04_order_priority_checking() {
+    let Some(r) = run("q04") else { return };
+    // EXISTS decorrelated to a semijoin membership set. Canonical SF-1
+    // published answer.
+    assert_eq!(r.rows.len(), 5);
+    let want = [
+        ("1-URGENT", 10594.0f64),
+        ("2-HIGH", 10476.0),
+        ("3-MEDIUM", 10410.0),
+        ("4-NOT SPECIFIED", 10556.0),
+        ("5-LOW", 10487.0),
+    ];
+    for (row, w) in r.rows.iter().zip(&want) {
+        assert_eq!(s(&row[0]), w.0, "o_orderpriority");
+        assert_eq!(i(&row[1]) as f64, w.1, "order_count");
+    }
+}
