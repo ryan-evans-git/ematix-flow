@@ -276,11 +276,35 @@ aggregate — so an f64 variant is a labelled follow-on, not the exactness gate;
 this aggregate is **single-threaded** — per-worker parallel spill + a merge phase,
 and reusing `PartitionSpill` for the hash-**join** build side, are the next steps.
 
-Remaining P2: **adaptive re-plan** at breakers; parallel spill + spilling join
-build (reuse `PartitionSpill`). Also pending, orthogonal: promote `SpillableSumAgg`
-into a general aggregate breaker wired through the driver (Q08's agg is still a
-query-specific `Sink` in the harness) and building dimension probes via engine
-pipelines (still SQL in the harness).
+**P2.5 — spilling hash-join build. DONE (2026-07-18).** Extends spill to the
+engine's headline win (the Q08 join path). `src/hashjoin.rs` = `SpillableHashJoin`,
+a **GRACE hash join**: both sides radix-partition by the *same* `part_of` hash, so a
+build row and a probe row sharing a key always land in the same partition → each
+partition joins independently, union is the complete join, only one partition's
+build hash table resident (peak ≈ build-rows/npart — what lets it run when the whole
+build side wouldn't fit). On overflow the fed side flushes to disk; at `run()` each
+partition builds its table from the build remainder + streamed spill run, then
+probes with the probe remainder + streamed spill run, emitting every matched
+`(key, build_pay, probe_pay)` — probe side never fully materialized. Reuses
+`PartitionSpill` verbatim (its `(i64,i64)` record *is* `(key, payload)`).
+
+Handles what a semijoin can't: **multi-match** (dup build keys → `key → Vec<pay>`)
+and **inner-join drop** (unmatched probe keys vanish). Refactor: `part_of` moved to
+`spill.rs` as the single shared partition-routing primitive, so build/probe/agg
+route identically — the co-partitioning invariant now has one source of truth.
+Kill-gate `tests/spill_join.rs`: multi-match + half the probe keys unmatched; a
+256 KiB budget spills **24 576/40 000 build + 200 000/200 000 probe rows to disk**
+(build keeps a resident remainder, so the join merges spilled + resident) yet the
+match multiset is **bit-identical** to the in-memory join and matches an independent
+pair-count formula (200 000). Std-only, 17 engine tests green, clippy + fmt clean.
+Follow-ons: multi-column payloads, recursive re-partition for a single overflowing
+build partition (key skew), per-worker parallel partitioning + merge.
+
+Remaining P2: **adaptive re-plan** at breakers (the last P2 capability); parallel
+spill (per-worker `PartitionSpill` + merge) wiring `SpillableSumAgg`/`SpillableHashJoin`
+through the driver. Also pending, orthogonal: promote the aggregate into a general
+breaker retiring Q08's query-specific `Sink`, and building dimension probes via
+engine pipelines (still SQL in the harness).
 
 ---
 

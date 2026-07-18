@@ -26,19 +26,10 @@ use std::collections::HashMap;
 use std::io;
 
 use crate::chunk::{DataChunk, Selection};
-use crate::spill::PartitionSpill;
+use crate::spill::{PartitionSpill, part_of};
 
 /// Bytes per buffered/spilled row (i64 key + i64 val).
 const REC_BYTES: usize = 16;
-
-/// Route a key to a partition via Fibonacci hashing, taking the top
-/// `part_bits` bits (multiplicative hashing's high bits mix best).
-/// Requires `1 <= part_bits <= 63`.
-#[inline]
-fn part_of(key: i64, part_bits: u32) -> usize {
-    let h = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> (64 - part_bits)) as usize
-}
 
 /// A `SUM(val) GROUP BY key` aggregate over i64 columns that spills to disk
 /// once its in-memory buffers exceed `budget_bytes`.
@@ -163,16 +154,6 @@ impl SpillableSumAgg {
 mod tests {
     use super::*;
     use crate::vector::Vector;
-
-    #[test]
-    fn part_of_stays_in_range() {
-        for bits in 1..=16u32 {
-            let npart = 1usize << bits;
-            for key in [-9_i64, -1, 0, 1, 2, 7, 1234, i64::MAX, i64::MIN] {
-                assert!(part_of(key, bits) < npart);
-            }
-        }
-    }
 
     #[test]
     fn in_memory_sum_group_by_is_correct() {

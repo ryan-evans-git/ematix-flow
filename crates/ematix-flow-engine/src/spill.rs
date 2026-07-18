@@ -23,6 +23,18 @@ static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Bytes per spilled record: i64 key + i64 value, little-endian.
 const REC_BYTES: usize = 16;
 
+/// Route a key to one of `2^part_bits` partitions via Fibonacci hashing —
+/// the top `part_bits` bits of the multiplicative hash (its best-mixed
+/// bits). Every partitioned breaker routes through this one function, so a
+/// key's rows always co-locate: both sides of a join land in the same
+/// partition, and the aggregate keeps a key whole. Requires
+/// `1 <= part_bits <= 63`.
+#[inline]
+pub fn part_of(key: i64, part_bits: u32) -> usize {
+    let h = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> (64 - part_bits)) as usize
+}
+
 /// A partitioned, disk-backed overflow store. One append-only file per
 /// partition; group-locality is the caller's contract (all rows of a key
 /// route to one partition), so a partition can later be aggregated
@@ -175,5 +187,15 @@ mod tests {
         s.append(0, &[], &[]).unwrap();
         assert!(!s.has_spill(0));
         assert_eq!(s.spilled_records(), 0);
+    }
+
+    #[test]
+    fn part_of_stays_in_range() {
+        for bits in 1..=16u32 {
+            let npart = 1usize << bits;
+            for key in [-9_i64, -1, 0, 1, 2, 7, 1234, i64::MAX, i64::MIN] {
+                assert!(part_of(key, bits) < npart);
+            }
+        }
     }
 }

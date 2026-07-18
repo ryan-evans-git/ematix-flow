@@ -11,6 +11,7 @@
 pub mod agg;
 pub mod chunk;
 pub mod exec;
+pub mod hashjoin;
 pub mod join;
 pub mod pipeline;
 pub mod scan;
