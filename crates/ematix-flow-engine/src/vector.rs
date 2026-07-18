@@ -23,6 +23,7 @@ pub enum LogicalType {
     Float64,
     Int32,
     Int64,
+    Utf8,
 }
 
 /// Physical storage. Flat, densely-packed, `Arc`-backed buffers.
@@ -37,6 +38,14 @@ pub enum Storage {
     I32(Arc<Vec<i32>>),
     I64(Arc<Vec<i64>>),
     F64(Arc<Vec<f64>>),
+    /// UTF-8 strings, Arrow-style: row `i` is `data[offsets[i]..offsets[i+1]]`;
+    /// `offsets` has `nrows + 1` entries. For dimension-table decode (the
+    /// string predicates in Q08's probe builds); the hot numeric scans stay
+    /// flat. One buffer, no per-string allocation.
+    Utf8 {
+        offsets: Arc<Vec<u32>>,
+        data: Arc<Vec<u8>>,
+    },
 }
 
 /// A typed column: logical type + physical storage + optional validity
@@ -78,11 +87,26 @@ impl Vector {
         }
     }
 
+    /// Wrap a UTF-8 string column: `offsets` (`nrows + 1` entries) into a
+    /// single `data` byte buffer. Row `i` is `data[offsets[i]..offsets[i+1]]`.
+    pub fn utf8(offsets: Vec<u32>, data: Vec<u8>) -> Self {
+        debug_assert!(!offsets.is_empty(), "utf8 offsets need nrows+1 entries");
+        Vector {
+            logical: LogicalType::Utf8,
+            storage: Storage::Utf8 {
+                offsets: Arc::new(offsets),
+                data: Arc::new(data),
+            },
+            validity: None,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match &self.storage {
             Storage::I32(v) => v.len(),
             Storage::I64(v) => v.len(),
             Storage::F64(v) => v.len(),
+            Storage::Utf8 { offsets, .. } => offsets.len().saturating_sub(1),
         }
     }
 
@@ -117,5 +141,42 @@ impl Vector {
             Storage::F64(v) => v,
             _ => panic!("as_f64 on non-F64 vector"),
         }
+    }
+
+    /// Borrow the string column as a [`Utf8View`]. Panics if storage is not
+    /// Utf8. The view hoists the storage match out of a per-row loop, then
+    /// `get(i)` returns row `i` as `&str`.
+    #[inline]
+    pub fn as_utf8(&self) -> Utf8View<'_> {
+        match &self.storage {
+            Storage::Utf8 { offsets, data } => Utf8View { offsets, data },
+            _ => panic!("as_utf8 on non-Utf8 vector"),
+        }
+    }
+}
+
+/// A borrowed view over a [`Storage::Utf8`] column: offsets + one byte
+/// buffer, with `get(i) -> &str`.
+pub struct Utf8View<'a> {
+    offsets: &'a [u32],
+    data: &'a [u8],
+}
+
+impl<'a> Utf8View<'a> {
+    /// Row `i` as a string slice. Panics on a non-UTF-8 byte range (a
+    /// decode/wiring bug — TPC-H string columns are ASCII).
+    #[inline]
+    pub fn get(&self, i: usize) -> &'a str {
+        let s = self.offsets[i] as usize;
+        let e = self.offsets[i + 1] as usize;
+        std::str::from_utf8(&self.data[s..e]).expect("parquet BYTE_ARRAY not valid UTF-8")
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

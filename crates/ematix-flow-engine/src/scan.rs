@@ -11,6 +11,7 @@ use std::fs::File;
 use std::path::Path;
 
 use parquet::column::reader::ColumnReader;
+use parquet::data_type::ByteArray;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 use crate::chunk::DataChunk;
@@ -21,8 +22,12 @@ use crate::vector::{LogicalType, Vector};
 pub enum ColKind {
     /// INT32 physical → i32 storage, carrying the given logical type.
     I32(LogicalType),
+    /// INT64 physical → i64 storage (keys / FKs on dimension tables).
+    I64,
     /// DOUBLE physical → f64 storage.
     F64,
+    /// BYTE_ARRAY physical → Utf8 storage (dimension-table string predicates).
+    Utf8,
 }
 
 /// Decode `columns` (by leaf name) from every row group, yielding one
@@ -73,6 +78,22 @@ pub fn scan_columns(path: &Path, columns: &[(&str, ColKind)]) -> Result<Vec<Data
                     }
                     Vector::i32(vals, logical)
                 }
+                ColKind::I64 => {
+                    let mut typed = match cr {
+                        ColumnReader::Int64ColumnReader(r) => r,
+                        _ => return Err(format!("expected INT64 for {name}")),
+                    };
+                    let mut vals: Vec<i64> = Vec::with_capacity(rows);
+                    while vals.len() < rows {
+                        let (records, _, _) = typed
+                            .read_records(rows - vals.len(), None, None, &mut vals)
+                            .map_err(|e| format!("read i64 {name}: {e}"))?;
+                        if records == 0 {
+                            break;
+                        }
+                    }
+                    Vector::i64(vals)
+                }
                 ColKind::F64 => {
                     let mut typed = match cr {
                         ColumnReader::DoubleColumnReader(r) => r,
@@ -88,6 +109,30 @@ pub fn scan_columns(path: &Path, columns: &[(&str, ColKind)]) -> Result<Vec<Data
                         }
                     }
                     Vector::f64(vals)
+                }
+                ColKind::Utf8 => {
+                    let mut typed = match cr {
+                        ColumnReader::ByteArrayColumnReader(r) => r,
+                        _ => return Err(format!("expected BYTE_ARRAY for {name}")),
+                    };
+                    let mut vals: Vec<ByteArray> = Vec::with_capacity(rows);
+                    while vals.len() < rows {
+                        let (records, _, _) = typed
+                            .read_records(rows - vals.len(), None, None, &mut vals)
+                            .map_err(|e| format!("read utf8 {name}: {e}"))?;
+                        if records == 0 {
+                            break;
+                        }
+                    }
+                    // Pack the byte arrays into one buffer + offsets.
+                    let mut offsets: Vec<u32> = Vec::with_capacity(vals.len() + 1);
+                    let mut data: Vec<u8> = Vec::new();
+                    offsets.push(0);
+                    for ba in &vals {
+                        data.extend_from_slice(ba.data());
+                        offsets.push(data.len() as u32);
+                    }
+                    Vector::utf8(offsets, data)
                 }
             };
             cols.push(vector);

@@ -11,6 +11,7 @@
 pub mod adaptive;
 pub mod agg;
 pub mod chunk;
+pub mod dim;
 pub mod exec;
 pub mod hashjoin;
 pub mod join;

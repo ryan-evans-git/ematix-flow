@@ -343,10 +343,32 @@ fixed-array sink into a HashMap-backed breaker cost nothing. Gate
 `tests/hash_aggregate.rs` (parallel merge + inner-drop + multi-measure + empty/single,
 exact-integer f64 so merge order can't perturb it). 26 engine tests green.
 
-Remaining integration: wire the **spilling** agg/join through the driver (per-worker
-`PartitionSpill` + merge) for high-cardinality group-bys, and build the Q08 dimension
-probes via engine pipelines (still SQL in the harness) — the last DataFusion
-dependency in the Q08 path.
+**Integration step 2 — native string decode + part probe. DONE (2026-07-18).** Q08's
+last DataFusion dependency is `build_probes` — the small-table reductions that seed
+the probes. The first (part) moves off DF here, which needed a capability the
+numeric-only engine lacked: **string decode + a string-equality filter**, landed as a
+reusable primitive. `vector.rs` adds `Storage::Utf8` (Arrow-style offsets + one byte
+buffer, no per-string alloc) + `Vector::utf8` + an `as_utf8()` `Utf8View` whose
+`get(i) → &str` hoists the storage match out of the row loop. `scan.rs` (the P0
+stock-parquet low-level reader — not DF, not Arrow) gains `ColKind::I64` and
+`ColKind::Utf8` (`ByteArrayColumnReader` packed into offsets+data). `dim.rs` =
+`collect_i64_keys_where_str_eq` (`SELECT key WHERE strcol = needle` — the semijoin
+membership seed); Q08's part reduction is `p_partkey WHERE p_type = 'ECONOMY ANODIZED
+STEEL'`, now built with **zero DataFusion**.
+
+Gate `tests/dim_part_native.rs`: native part reduction over SF1 `part.parquet` ==
+an independent pyarrow oracle (1451 rows, `p_partkey` checksum 145 231 383, keys
+distinct in [157, 199 949]). End-to-end SF-10: the natively-built part probe drives
+the same 60M-row lineitem semijoin and Q08 shares still equal DF pull within 1e-6
+(so the native set matches DF's), at **142.7 ms vs 197.7 ms = −27.8%** — unchanged
+(the dim-build runs before the timed section). 27 engine tests green.
+
+Remaining integration: the **supplier** (a join + a string flag) and **orders** (a
+4-way join + date window + year bucket) native reductions — reusing `Storage::Utf8`
+plus the engine's join operators — retire the last two `build_probes` SQL queries,
+making Q08 fully engine-native (dims → scan → join → aggregate). Separately, wire the
+**spilling** agg/join through the driver (per-worker `PartitionSpill` + merge) for
+high-cardinality group-bys / beyond-RAM joins.
 
 ---
 

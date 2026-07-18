@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ---- warmup + correctness (engine shares must equal the DF pull result) ----
-    let probes = build_probes(&ctx_plain).await?;
+    let probes = build_probes(&ctx_plain, &data_dir).await?;
     eprintln!(
         "probes: part={} orders={} supplier={}",
         probes.part.kind(),
@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pull.push(t.elapsed().as_secs_f64() * 1000.0);
 
         // dims rebuilt each trial (fair: the pull plan rebuilds them too).
-        let p = build_probes(&ctx_plain).await?;
+        let p = build_probes(&ctx_plain, &data_dir).await?;
         let t = Instant::now();
         let _ = engine_push_q08(&lineitem_path, &p, nthreads)?;
         engine.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -180,22 +180,22 @@ fn register_all(
     Ok(())
 }
 
-/// Build the three Q08 dimension reductions via SQL on the small tables,
-/// then hand them to the adaptive `choose` selector.
-async fn build_probes(ctx: &SessionContext) -> Result<Probes, Box<dyn std::error::Error>> {
-    // part survivors (p_type filter).
-    let mut part_keys: Vec<i64> = Vec::new();
-    for b in &ctx
-        .sql("SELECT p_partkey FROM part WHERE p_type = 'ECONOMY ANODIZED STEEL'")
-        .await?
-        .collect()
-        .await?
-    {
-        let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        for i in 0..k.len() {
-            part_keys.push(k.value(i));
-        }
-    }
+/// Build the three Q08 dimension reductions, then hand them to the adaptive
+/// `choose` selector. The part reduction is built **natively** (engine
+/// string decode + filter, no DataFusion); supplier and orders still use SQL
+/// (they need joins + a date window — the follow-on native builds).
+async fn build_probes(
+    ctx: &SessionContext,
+    data_dir: &std::path::Path,
+) -> Result<Probes, Box<dyn std::error::Error>> {
+    // part survivors (p_type filter) — NATIVE: the engine's own string
+    // decode + equality filter over part.parquet, zero DataFusion.
+    let part_keys = ematix_flow_engine::dim::collect_i64_keys_where_str_eq(
+        &data_dir.join("part.parquet"),
+        "p_partkey",
+        "p_type",
+        "ECONOMY ANODIZED STEEL",
+    )?;
     // supplier -> is_brazil.
     let mut sup_keys: Vec<i64> = Vec::new();
     let mut sup_pay: Vec<i64> = Vec::new();
