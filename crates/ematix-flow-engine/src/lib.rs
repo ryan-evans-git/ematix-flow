@@ -8,6 +8,7 @@
 //! - **P2** (in progress) gives the engine its own native decode
 //!   (`scan_native`, DF-free) and generalizes the operators.
 
+pub mod adaptive;
 pub mod agg;
 pub mod chunk;
 pub mod exec;

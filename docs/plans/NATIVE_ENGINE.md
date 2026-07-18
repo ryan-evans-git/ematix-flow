@@ -300,11 +300,35 @@ pair-count formula (200 000). Std-only, 17 engine tests green, clippy + fmt clea
 Follow-ons: multi-column payloads, recursive re-partition for a single overflowing
 build partition (key skew), per-worker parallel partitioning + merge.
 
-Remaining P2: **adaptive re-plan** at breakers (the last P2 capability); parallel
-spill (per-worker `PartitionSpill` + merge) wiring `SpillableSumAgg`/`SpillableHashJoin`
-through the driver. Also pending, orthogonal: promote the aggregate into a general
-breaker retiring Q08's query-specific `Sink`, and building dimension probes via
-engine pipelines (still SQL in the harness).
+**P2.6 — adaptive re-plan. DONE (2026-07-18).** The last distinct P2 capability, and
+the clearest "capabilities DF can't express" case: a static plan commits to a join
+strategy from *estimated* cardinalities before seeing a row, so a wrong estimate can
+commit it to spilling a build that fits in cache, or to an in-memory build that
+blows past RAM. `src/adaptive.rs` = `AdaptiveHashJoin`, a **hybrid hash join** that
+defers the choice to the build breaker: build rows buffer flat and optimistically
+in-memory; the moment the *observed* build crosses the budget it **transitions** to
+the P2.5 partitioned/spilling path (migrating what's buffered, routing the rest). If
+it never overflows, the whole join runs as one in-memory hash table — no partition/
+spill machinery. `plan_would_choose()` (what the estimate implied) vs `chosen()`
+(what observation used); their divergence is the re-plan (`replanned()`).
+
+Kill-gate `tests/adaptive_join.rs` proves the override in **both** directions, each
+cross-checked against an independent in-memory oracle: a wrong "build is 10 MB"
+estimate is **downgraded** to the in-memory join once the build is observed small
+(no spill); a wrong "build is 1 KB" estimate is **upgraded** to the spilling join
+once it overflows — the OOM a static plan would hit — and reaches disk; correct
+estimates (both directions) don't re-plan; every strategy's match multiset is
+bit-identical to the oracle. Std-only, 23 engine tests green, clippy + fmt clean.
+Follow-ons: build-side swap (build the smaller input), broadcast vs shuffle in the
+parallel setting, recursive re-partition under key skew.
+
+**P2's distinct capabilities are complete** — morsel scheduler (P2.3), spilling
+aggregate (P2.4), spilling hash-join (P2.5), adaptive re-plan (P2.6). What remains is
+**integration, not new capability**: wire these breakers through the parallel driver
+(per-worker `PartitionSpill` + merge), retire Q08's query-specific `Sink` by promoting
+the aggregate into a general breaker, and build dimension probes via engine pipelines
+(still SQL in the harness) — the P3-adjacent push toward running whole queries
+engine-native.
 
 ---
 
