@@ -57,6 +57,23 @@ SQL text
    rewrite framework exist. Slices 1–3 deliberately skip optimization — a naive
    plan that runs correctly first, rules second.
 
+## Status
+
+- **Slice 1 DONE** (2026-07-18, `d11531ea`) — `expr.rs`, gate `tests/expr_eval.rs`.
+- **Slice 2 DONE** (2026-07-18, `4160e7e5`) — `catalog.rs` + `logical.rs` +
+  `bind.rs`, gate `tests/bind_q6.rs` (decimal-exact `[0.05, 0.07]` bounds
+  pinned; f64-fold wrongness pinned by `assert_ne!(0.06+0.01, 0.07)`).
+- **Slice 3 DONE (2026-07-18, `dc08fb25`) — first P3 kill-gate HIT.**
+  `plan.rs`; gate `tests/sql_q6.rs`: `bind_sql(Q6) → execute` over SF-1 ==
+  `run_tpch_q6_native` **bit-for-bit** (same filter, same per-chunk partial
+  association, same chunk order ⇒ `assert_eq!` on the f64), plus the DuckDB
+  oracle (123141078.2283) asserted independently. The full pipeline — AST →
+  binder → owned `LogicalPlan` → physical plan → native scan → expression
+  eval → aggregate — is engine code end to end; DataFusion appears nowhere.
+  Sequential + interpreted on purpose; the parallel morsel driver and
+  `HashAggregateSink` exist and the planner grows into them next.
+- Slice 4 next: Q08 from SQL.
+
 ## Slice sequence (each independently gated, TDD)
 
 1. **`expr.rs` — bound `Expr` IR + `ScalarValue` + evaluator.** The general
