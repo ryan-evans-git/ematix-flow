@@ -324,11 +324,29 @@ parallel setting, recursive re-partition under key skew.
 
 **P2's distinct capabilities are complete** — morsel scheduler (P2.3), spilling
 aggregate (P2.4), spilling hash-join (P2.5), adaptive re-plan (P2.6). What remains is
-**integration, not new capability**: wire these breakers through the parallel driver
-(per-worker `PartitionSpill` + merge), retire Q08's query-specific `Sink` by promoting
-the aggregate into a general breaker, and build dimension probes via engine pipelines
-(still SQL in the harness) — the P3-adjacent push toward running whole queries
-engine-native.
+**integration, not new capability** — the P3-adjacent push toward running whole
+queries engine-native.
+
+**Integration step 1 — general aggregate breaker, Q08's bespoke `Sink` retired. DONE
+(2026-07-18).** `src/agg.rs` adds `AggBinding<N>` (a query's binding to the aggregate:
+given a `DataChunk`, emit `(group_key, [f64; N] measures)` per live row that belongs
+to a group; inner-join misses aren't emitted — the seam a P3 SQL front-end targets)
+and `HashAggregateSink<N, B>` (the general `GROUP BY key → SUM(measures)` breaker — a
+`Sink` the row-group-parallel driver runs one-per-worker, partials summed by
+`merge()`). The aggregation *machinery* now lives in the engine, not each query. The
+Q08 GO/NO-GO harness drops `Q08AggSink` entirely and supplies only a `Q08Agg` binding
+(year-bucket key from the orders inner-join payload; measures = total volume + its
+BRAZIL share). Parallel wiring is the driver's existing per-worker-sink + merge model
+— no driver change. SF-10: shares still == DF pull within 1e-6, and **141.5 ms vs
+193.7 ms DF = −27.0%**, statistically unchanged from P2.3's −27.7% — generalizing the
+fixed-array sink into a HashMap-backed breaker cost nothing. Gate
+`tests/hash_aggregate.rs` (parallel merge + inner-drop + multi-measure + empty/single,
+exact-integer f64 so merge order can't perturb it). 26 engine tests green.
+
+Remaining integration: wire the **spilling** agg/join through the driver (per-worker
+`PartitionSpill` + merge) for high-cardinality group-bys, and build the Q08 dimension
+probes via engine pipelines (still SQL in the harness) — the last DataFusion
+dependency in the Q08 path.
 
 ---
 

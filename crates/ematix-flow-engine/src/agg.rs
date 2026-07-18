@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::io;
 
 use crate::chunk::{DataChunk, Selection};
+use crate::exec::Sink;
 use crate::spill::{PartitionSpill, part_of};
 
 /// Bytes per buffered/spilled row (i64 key + i64 val).
@@ -147,6 +148,76 @@ impl SpillableSumAgg {
         }
         out.sort_unstable_by_key(|&(k, _)| k);
         Ok(out)
+    }
+}
+
+/// A query's binding to the general hash aggregate: given a decoded
+/// `DataChunk`, emit `(group_key, measure_contributions)` for each live row
+/// that belongs to a group. Rows with no group — an inner-join miss, a
+/// filtered row — are simply not emitted. `N` is the number of parallel
+/// `SUM` measures; implementations hoist column access out of the row loop.
+///
+/// This is the seam a SQL front-end (P3) will target: the aggregation
+/// *machinery* (hash accumulate + parallel merge) lives in
+/// [`HashAggregateSink`]; the query supplies only how to derive the key and
+/// measures — so a query needs no bespoke aggregation `Sink` of its own.
+pub trait AggBinding<const N: usize>: Send + Sync {
+    fn for_each_group(&self, chunk: &DataChunk, emit: impl FnMut(i64, [f64; N]));
+}
+
+/// The general `GROUP BY key → SUM(measures)` breaker: a [`Sink`] the
+/// row-group-parallel driver ([`crate::exec::run_scan_pipeline`]) runs
+/// one-per-worker, each accumulating into its own map; the caller sums them
+/// with [`merge`](Self::merge). Holds `N` running f64 sums per group.
+///
+/// In-memory today (Q08's group cardinality is tiny — two years); wiring
+/// the [`PartitionSpill`] path in for high-cardinality group-bys is a
+/// follow-on, behind this same `Sink` + `merge` interface.
+pub struct HashAggregateSink<const N: usize, B: AggBinding<N>> {
+    binding: std::sync::Arc<B>,
+    map: HashMap<i64, [f64; N]>,
+}
+
+impl<const N: usize, B: AggBinding<N>> HashAggregateSink<N, B> {
+    /// A fresh accumulator sharing `binding` (the probes / derived
+    /// expressions) with the other workers' sinks.
+    pub fn new(binding: std::sync::Arc<B>) -> Self {
+        Self {
+            binding,
+            map: HashMap::new(),
+        }
+    }
+
+    /// This worker's partial group→sums.
+    pub fn into_map(self) -> HashMap<i64, [f64; N]> {
+        self.map
+    }
+
+    /// Sum the per-worker partials element-wise into the final result.
+    pub fn merge(sinks: Vec<Self>) -> HashMap<i64, [f64; N]> {
+        let mut out: HashMap<i64, [f64; N]> = HashMap::new();
+        for s in sinks {
+            for (k, m) in s.map {
+                let e = out.entry(k).or_insert([0.0; N]);
+                for j in 0..N {
+                    e[j] += m[j];
+                }
+            }
+        }
+        out
+    }
+}
+
+impl<const N: usize, B: AggBinding<N>> Sink for HashAggregateSink<N, B> {
+    fn consume(&mut self, chunk: &DataChunk) {
+        // Split the borrow: the binding emits, this closure accumulates.
+        let Self { binding, map } = self;
+        binding.for_each_group(chunk, |k, m| {
+            let e = map.entry(k).or_insert([0.0; N]);
+            for j in 0..N {
+                e[j] += m[j];
+            }
+        });
     }
 }
 

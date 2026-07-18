@@ -28,8 +28,9 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 
+use ematix_flow_engine::agg::{AggBinding, HashAggregateSink};
 use ematix_flow_engine::chunk::DataChunk;
-use ematix_flow_engine::exec::{ProbeNarrowOp, PushOp, Sink, run_scan_pipeline};
+use ematix_flow_engine::exec::{ProbeNarrowOp, PushOp, run_scan_pipeline};
 use ematix_flow_engine::join::{ProbeStructure, choose};
 use ematix_flow_engine::scan_native::NativeColKind;
 
@@ -250,11 +251,12 @@ async fn build_probes(ctx: &SessionContext) -> Result<Probes, Box<dyn std::error
     })
 }
 
-/// Q08 hot path through the clean-room engine, end to end: the native
-/// scan feeds row-group morsels to `run_scan_pipeline`, which narrows on
-/// the part semijoin (`ProbeNarrowOp`, no materialization) and sums the
-/// market share in `Q08AggSink`. No core `masked_decode`, no DataFusion —
-/// the engine decodes and executes on its own; per-thread sinks merged here.
+/// Q08 hot path through the clean-room engine, end to end: the native scan
+/// feeds row-group morsels to `run_scan_pipeline`, which narrows on the
+/// part semijoin (`ProbeNarrowOp`, no materialization) and aggregates the
+/// market share in the engine's **general** `HashAggregateSink` — Q08
+/// supplies only the `Q08Agg` binding, no bespoke aggregation sink. No core
+/// `masked_decode`, no DataFusion; per-worker sinks merged here.
 fn engine_push_q08(
     lineitem: &std::path::Path,
     probes: &Probes,
@@ -273,42 +275,39 @@ fn engine_push_q08(
         key_col: 0,
         probe: Arc::clone(&probes.part),
     })];
-    let orders = Arc::clone(&probes.orders);
-    let supplier = Arc::clone(&probes.supplier);
-    let make_sink = || Q08AggSink {
-        orders: Arc::clone(&orders),
-        supplier: Arc::clone(&supplier),
-        acc: [[0.0; 2]; 2],
-    };
+    let binding = Arc::new(Q08Agg {
+        orders: Arc::clone(&probes.orders),
+        supplier: Arc::clone(&probes.supplier),
+    });
+    let make_sink = || HashAggregateSink::<2, Q08Agg>::new(Arc::clone(&binding));
 
     let sinks = run_scan_pipeline(lineitem, &columns, &ops, make_sink, nthreads)?;
 
-    // Merge per-thread accumulators, then form the market shares.
-    let mut acc = [[0.0f64; 2]; 2];
-    for s in &sinks {
-        for y in 0..2 {
-            acc[y][0] += s.acc[y][0];
-            acc[y][1] += s.acc[y][1];
-        }
-    }
-    Ok([
-        if acc[0][0] > 0.0 { acc[0][1] / acc[0][0] } else { 0.0 },
-        if acc[1][0] > 0.0 { acc[1][1] / acc[1][0] } else { 0.0 },
-    ])
+    // Merge per-worker group→[total, brazil], then form the shares. The
+    // group key is the year bucket (0=1995, 1=1996).
+    let merged = HashAggregateSink::merge(sinks);
+    let share = |bucket: i64| {
+        merged
+            .get(&bucket)
+            .map_or(0.0, |m| if m[0] > 0.0 { m[1] / m[0] } else { 0.0 })
+    };
+    Ok([share(0), share(1)])
 }
 
-/// Terminal breaker: buckets surviving lineitem rows by orders→year and
-/// sums `extprice*(1-discount)`, splitting the BRAZIL share via the
-/// supplier payload. One instance per worker thread; merged in
-/// `engine_push_q08`.
-struct Q08AggSink {
+/// Q08's binding to the engine's general aggregate breaker: derive the
+/// year-bucket group key from the orders inner-join payload, and the two
+/// market-share measures — total volume `extprice*(1-discount)` and the
+/// BRAZIL share of it (flagged by the supplier payload). This is all that
+/// stays query-specific; the hash accumulation + parallel merge live in the
+/// engine's `HashAggregateSink`. A `None` orders payload drops the row
+/// (inner join), so it is simply not emitted.
+struct Q08Agg {
     orders: Arc<ProbeStructure>,
     supplier: Arc<ProbeStructure>,
-    acc: [[f64; 2]; 2], // [year-bucket][0=total, 1=brazil]
 }
 
-impl Sink for Q08AggSink {
-    fn consume(&mut self, chunk: &DataChunk) {
+impl AggBinding<2> for Q08Agg {
+    fn for_each_group(&self, chunk: &DataChunk, mut emit: impl FnMut(i64, [f64; 2])) {
         // cols: 1=orderkey 2=suppkey 3=extprice 4=discount.
         let ok = chunk.col(1).as_i64();
         let sk = chunk.col(2).as_i64();
@@ -316,14 +315,14 @@ impl Sink for Q08AggSink {
         let disc = chunk.col(4).as_f64();
         chunk.sel.for_each(|i| {
             let i = i as usize;
-            // orders inner join: one payload lookup yields membership and
-            // the year bucket; supplier payload flags the BRAZIL share.
             if let Some(bucket) = self.orders.payload(ok[i]) {
                 let vol = ep[i] * (1.0 - disc[i]);
-                self.acc[bucket as usize][0] += vol;
-                if self.supplier.payload(sk[i]) == Some(1) {
-                    self.acc[bucket as usize][1] += vol;
-                }
+                let brazil = if self.supplier.payload(sk[i]) == Some(1) {
+                    vol
+                } else {
+                    0.0
+                };
+                emit(bucket, [vol, brazil]);
             }
         });
     }
