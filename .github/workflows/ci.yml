@@ -58,9 +58,27 @@ jobs:
   rust:
     name: rust (ubuntu-latest)
     runs-on: ubuntu-latest
+    env:
+      # Shrink test-binary debuginfo on CI. `cargo nextest` links ~30+
+      # test binaries, each statically pulling the full DataFusion + Arrow
+      # + Delta + Cranelift graph; with default dev debuginfo those
+      # binaries are huge and the linker exhausted the runner's memory/tmpfs
+      # mid-link — `ld terminated with signal 7 [Bus error]` (recurred 3×
+      # on v2, 2026-07-18). `line-tables-only` drops the heavy type/variable
+      # DWARF (the bulk) while keeping panic/backtrace line numbers for test
+      # diagnostics. Scoped to this job so local dev + benchmark builds are
+      # untouched. (Test binaries don't need full debuginfo to run.)
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
+      # `make-default: true` symlinks the system linker to mold, so EVERY
+      # link uses mold — not only those that honour the `-fuse-ld=mold`
+      # RUSTFLAG (build scripts / proc-macros / any link that bypassed it
+      # were falling back to GNU ld, which is what Bus-errored). mold also
+      # uses far less memory than ld on this dep graph.
       - uses: rui314/setup-mold@v1
+        with:
+          make-default: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
