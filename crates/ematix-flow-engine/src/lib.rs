@@ -14,6 +14,7 @@ pub mod join;
 pub mod pipeline;
 pub mod scan;
 pub mod scan_native;
+pub mod sched;
 pub mod vector;
 
 use std::path::Path;

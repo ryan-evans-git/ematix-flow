@@ -225,11 +225,36 @@ production DF = −22.4%** (correctness == DF pull; leaner than P1's −13.6% cr
 version). SF-10 single-query variance is ±5–10%, so read this as a solid GO, not a
 precise delta.
 
-Remaining P2: the **work-stealing morsel scheduler** (replace the driver's static
-`rg % nthreads` stride — the piece designed to be swapped), then spill + adaptive
-re-plan. Also pending: a *general* aggregate breaker (Q08's agg is still a
-query-specific `Sink` in the harness) and building dimension probe structures via
-engine pipelines (still SQL in the harness).
+**P2.3 — morsel scheduler. DONE (2026-07-18).** `src/sched.rs` adds `MorselQueue`,
+a shared lock-free morsel dispenser, and `run_scan_pipeline` now pulls row groups
+from it instead of owning a static `rg % nthreads` stride. A worker that finishes
+early immediately claims the next available row group, so **skew and stragglers
+stop setting the wall** — the measured motivation is real: SF-10 lineitem is 58 row
+groups spanning **~5× in row count** (217K–1.05M rows/RG) across 14 workers, exactly
+the imbalance a static stride mishandles. Gate `tests/sched_dispenses_once.rs`
+proves the invariant that licenses the swap: every morsel is dispensed **exactly
+once** under concurrent workers (no double-decode, no drop). Operators, sink, and
+decode path are untouched — only scheduling changed.
+
+Design note: this is the *work-sharing* form (one shared atomic queue, DuckDB's
+morsel model), not per-worker Chase-Lev deques. For a flat, statically-known list
+of scan morsels the two balance identically, and the shared counter has far less
+machinery; deque **stealing** only earns its keep once operators recursively spawn
+nested morsels — at which point `MorselQueue` grows a per-worker tier behind the
+same `next()` contract. Re-measured SF-10 Q08: **141.0 ms vs 195.1 ms production
+DF = −27.7%**, correctness == DF pull (market shares identical). The engine arm
+moved 148.9 → 141.0 ms vs P2.2 — the right direction for removing skew-induced
+stragglers, but inside SF-10's ±5–10% band, so read the scheduler's *isolated*
+contribution as at-or-better, not a banked +5%. Its real prize (straggler/skew
+absorption) is a robustness property that 58 RGs across 14 workers only mildly
+stresses; expect it clearer at SF-100 or under a noisy box. What P2.3 *proves* is
+the correctness invariant (exactly-once dispensing) and no regression — scheduling
+is now dynamic without touching the operators or the sink.
+
+Remaining P2: **spill** (a hash-join/agg correct beyond RAM) + **adaptive re-plan**
+at breakers. Also pending, orthogonal to scheduling: a *general* aggregate breaker
+(Q08's agg is still a query-specific `Sink` in the harness) and building dimension
+probe structures via engine pipelines (still SQL in the harness).
 
 ---
 

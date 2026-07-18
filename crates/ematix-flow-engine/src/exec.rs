@@ -2,11 +2,12 @@
 //! stateful terminal sinks (pipeline breakers), and a row-group-parallel
 //! driver over the native scan.
 //!
-//! This generalizes P1's hand-written Q08 loop into reusable pieces. The
-//! driver still assigns row groups to workers by static stride (as P1
-//! did); **P2.3 replaces that with a work-stealing morsel queue** — the
-//! operators, sinks, and decode path stay put, only the scheduling
-//! changes.
+//! This generalizes P1's hand-written Q08 loop into reusable pieces. P1
+//! (and P2.2) assigned row groups to workers by a static stride; **P2.3
+//! replaces that with a shared morsel dispenser** ([`crate::sched`]) so
+//! the work balances itself under row-group skew and stragglers — the
+//! operators, sinks, and decode path are untouched, only the scheduling
+//! changed.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use ematix_parquet_io::ParquetFile;
 use crate::chunk::DataChunk;
 use crate::join::{ProbeStructure, probe_narrow};
 use crate::scan_native::{NativeColKind, decode_row_group};
+use crate::sched::MorselQueue;
 
 /// A stateless pipelined push operator: narrows a chunk's selection (or
 /// attaches a column) for the next stage. Shared read-only across worker
@@ -53,8 +55,10 @@ impl PushOp for ProbeNarrowOp {
 ///
 /// `columns` are the leaf indices to decode (chunk column order); `ops`
 /// run in order per chunk; the sink absorbs the final chunk. Row groups
-/// are assigned to workers by static stride `rg % nthreads` — the piece
-/// P2.3 swaps for work-stealing.
+/// are the morsels: workers pull the next one from a shared
+/// [`MorselQueue`] rather than owning a static stride, so an early
+/// finisher absorbs the next available row group and skew/stragglers stop
+/// setting the wall.
 pub fn run_scan_pipeline<S, F>(
     path: &Path,
     columns: &[(usize, NativeColKind)],
@@ -74,32 +78,40 @@ where
         .collect();
     drop(md); // release the metadata borrow; the workers use nrows_of.
 
+    // One morsel per row group, dispensed on demand (P2.3). Never spawn
+    // more workers than there are morsels — the surplus would only race to
+    // an empty queue.
+    let queue = MorselQueue::new(n_rg);
+    let nworkers = nthreads.min(n_rg.max(1));
+
     let file_ref = &file;
     let nrows_ref = &nrows_of;
     let sink_ref = &make_sink;
+    let queue_ref = &queue;
 
     std::thread::scope(|scope| -> Result<Vec<S>, String> {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|t| {
+        let handles: Vec<_> = (0..nworkers)
+            .map(|_| {
                 scope.spawn(move || -> Result<S, String> {
                     let mut sink = sink_ref();
-                    let mut rg = t;
-                    while rg < n_rg {
+                    while let Some(rg) = queue_ref.next() {
                         let mut chunk = decode_row_group(file_ref, rg, nrows_ref[rg], columns)?;
                         for op in ops {
                             chunk = op.apply(chunk);
                         }
                         sink.consume(&chunk);
-                        rg += nthreads;
                     }
                     Ok(sink)
                 })
             })
             .collect();
 
-        let mut sinks = Vec::with_capacity(nthreads);
+        let mut sinks = Vec::with_capacity(nworkers);
         for h in handles {
-            sinks.push(h.join().map_err(|_| "worker thread panicked".to_string())??);
+            sinks.push(
+                h.join()
+                    .map_err(|_| "worker thread panicked".to_string())??,
+            );
         }
         Ok(sinks)
     })
