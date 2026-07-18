@@ -71,6 +71,13 @@ pub enum Expr {
         whens: Vec<(Expr, Expr)>,
         else_: Box<Expr>,
     },
+    /// `<expr> [NOT] LIKE '<pattern>'` — SQL pattern match (`%` = any run,
+    /// `_` = any one byte).
+    Like {
+        expr: Box<Expr>,
+        pattern: String,
+        negated: bool,
+    },
 }
 
 /// A value produced during evaluation. Integer-family logical types
@@ -144,6 +151,14 @@ impl Expr {
                 }
                 else_.eval(chunk, row)
             }
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+            } => match expr.eval(chunk, row) {
+                Val::Str(s) => Val::Bool(like_match(s.as_bytes(), pattern.as_bytes()) != *negated),
+                other => panic!("LIKE needs a string operand, got {other:?}"),
+            },
         }
     }
 
@@ -249,6 +264,34 @@ fn compare(op: BinaryOp, l: Val<'_>, r: Val<'_>) -> bool {
     }
 }
 
+/// SQL LIKE match over bytes: `%` matches any run (including empty), `_`
+/// matches exactly one byte. Classic greedy matcher with single-`%`
+/// backtracking — linear for the TPC-H patterns (`PROMO%`, `%special%`).
+fn like_match(s: &[u8], p: &[u8]) -> bool {
+    let (mut si, mut pi) = (0usize, 0usize);
+    let (mut star_p, mut star_s) = (usize::MAX, 0usize);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == b'_' || p[pi] == s[si]) {
+            si += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == b'%' {
+            star_p = pi;
+            star_s = si;
+            pi += 1;
+        } else if star_p != usize::MAX {
+            star_s += 1;
+            si = star_s;
+            pi = star_p + 1;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Days since the Unix epoch → calendar year (proleptic Gregorian; the
 /// inverse direction of the binder's `days_from_civil`).
 fn year_of_days(days: i32) -> i32 {
@@ -309,6 +352,17 @@ mod tests {
         };
         assert!(and(&t, &t).eval_bool(&chunk, 0));
         assert!(!and(&t, &f).eval_bool(&chunk, 0));
+    }
+
+    #[test]
+    fn like_patterns() {
+        assert!(like_match(b"PROMO BURNISHED", b"PROMO%"));
+        assert!(!like_match(b"STANDARD BRUSHED", b"PROMO%"));
+        assert!(like_match(b"abcXdef", b"abc_def"));
+        assert!(like_match(b"special packages", b"%special%"));
+        assert!(like_match(b"", b"%"));
+        assert!(!like_match(b"ab", b"a_c"));
+        assert!(like_match(b"aXbYc", b"a%b%c"));
     }
 
     #[test]

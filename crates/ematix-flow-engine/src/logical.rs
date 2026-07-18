@@ -91,13 +91,29 @@ pub struct OutputExpr {
     pub name: String,
 }
 
+/// One ORDER BY key: which output column, and direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderByKey {
+    /// Index into [`BoundQuery::output`].
+    pub output: usize,
+    pub desc: bool,
+}
+
 /// The bound, typed query: the flat select-project-join block.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundQuery {
     pub tables: Vec<TableInput>,
     pub edges: Vec<JoinEdge>,
     pub slots: Vec<Slot>,
+    /// A slot-space predicate referencing **multiple** tables — evaluated at
+    /// the join-tree root after payload attach (e.g. Q19's OR of
+    /// part×lineitem conjunct groups, or a join-cycle's residual equality).
+    pub post_filter: Option<Expr>,
     pub group: Vec<GroupExpr>,
     pub aggs: Vec<AggExpr>,
+    /// Row-space predicate over `[group keys…, agg values…]` (HAVING).
+    pub having: Option<Expr>,
     pub output: Vec<OutputExpr>,
+    pub order_by: Vec<OrderByKey>,
+    pub limit: Option<usize>,
 }

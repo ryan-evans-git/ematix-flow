@@ -113,14 +113,11 @@ fn group_key_binding_is_validated() {
         "error should name the unmatched select item: {err}"
     );
 
-    // Float-typed group keys are not yet supported — error by name.
-    let err = bind_sql(
+    // Float group keys are a capability now (typed group keys, Q10's
+    // c_acctbal) — the old rejection must NOT come back.
+    bind_sql(
         "select l_discount, sum(l_discount) from lineitem group by l_discount",
         &catalog,
     )
-    .unwrap_err();
-    assert!(
-        err.contains("l_discount"),
-        "error should name the non-integer key: {err}"
-    );
+    .expect("float group keys must bind");
 }

@@ -77,47 +77,77 @@ impl Executor<'_> {
             best.0
         };
         // children[t] = (child_table, parent_local_key_col, child_local_key_col)
+        // A spanning tree over the join edges; an edge whose two tables are
+        // already connected (a join CYCLE, e.g. Q5's customer-nation =
+        // supplier-nation constraint) becomes a **residual equality**
+        // evaluated post-join at the root.
         let mut children: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); n];
+        let mut residual_eq: Vec<Expr> = Vec::new();
         {
             let mut seen = vec![false; n];
             seen[root] = true;
-            let mut frontier = vec![root];
+            // Breadth-first in WHERE-declaration order: when a table is
+            // reachable through several edges (Q5's customer via the
+            // custkey join AND the nationkey constraint), the join listed
+            // first wins the tree slot and the other becomes residual —
+            // matching the query's natural lookup structure.
+            let mut frontier = std::collections::VecDeque::from([root]);
             let mut used_edges = vec![false; q.edges.len()];
-            while let Some(t) = frontier.pop() {
+            while let Some(t) = frontier.pop_front() {
                 for (ei, e) in q.edges.iter().enumerate() {
                     if used_edges[ei] {
                         continue;
                     }
                     let (sa, sb) = (q.slots[e.a], q.slots[e.b]);
-                    let (parent_slot, child_slot) = if sa.table == t && !seen[sb.table] {
-                        (sa, sb)
+                    let (parent_slot_col, child) = if sa.table == t && !seen[sb.table] {
+                        (sa.col, (sb.table, sb.col))
                     } else if sb.table == t && !seen[sa.table] {
-                        (sb, sa)
-                    } else if (sa.table == t && seen[sb.table] && sb.table != t)
-                        || (sb.table == t && seen[sa.table] && sa.table != t)
-                    {
-                        return Err(
-                            "cyclic or duplicate join conditions are not yet supported".into()
-                        );
+                        (sb.col, (sa.table, sa.col))
                     } else {
                         continue;
                     };
                     used_edges[ei] = true;
-                    seen[child_slot.table] = true;
-                    children[t].push((child_slot.table, parent_slot.col, child_slot.col));
-                    frontier.push(child_slot.table);
+                    seen[child.0] = true;
+                    children[t].push((child.0, parent_slot_col, child.1));
+                    frontier.push_back(child.0);
+                }
+            }
+            // Any unused edge connects two already-seen tables: a cycle.
+            for (ei, e) in q.edges.iter().enumerate() {
+                if !used_edges[ei] {
+                    residual_eq.push(Expr::Binary {
+                        op: crate::expr::BinaryOp::Eq,
+                        lhs: Box::new(Expr::Column(e.a)),
+                        rhs: Box::new(Expr::Column(e.b)),
+                    });
                 }
             }
         }
 
-        // Slots whose values must survive to aggregation (group keys + agg
-        // args reference them). Per non-root table these become payloads.
+        // The full post-join predicate: the bound multi-table filter plus
+        // any residual cycle equalities.
+        let post: Option<Expr> =
+            residual_eq
+                .into_iter()
+                .chain(q.post_filter.clone())
+                .reduce(|l, r| Expr::Binary {
+                    op: crate::expr::BinaryOp::And,
+                    lhs: Box::new(l),
+                    rhs: Box::new(r),
+                });
+
+        // Slots whose values must survive to the root (group keys, agg
+        // args, and the post-join predicate reference them). Per non-root
+        // table these become payloads.
         let mut needed: Vec<usize> = Vec::new();
         for g in &q.group {
             collect_slots(&g.expr, &mut needed);
         }
         for a in &q.aggs {
             collect_slots(&a.arg, &mut needed);
+        }
+        if let Some(p) = &post {
+            collect_slots(p, &mut needed);
         }
         needed.sort_unstable();
         needed.dedup();
@@ -174,12 +204,36 @@ impl Executor<'_> {
                     }
                 }
             }
+            // Post-join predicate (multi-table conjuncts + cycle
+            // residuals): evaluated once every payload is attached.
+            if let Some(p) = &post {
+                let scoped = DataChunk {
+                    cols: view.cols.clone(),
+                    sel,
+                };
+                sel = filter_expr(&scoped, p);
+            }
             view_chunks.push(view);
             sels.push(sel);
         }
 
-        // ---- Aggregate.
-        let (columns, rows) = self.aggregate(&view_chunks, &sels)?;
+        // ---- Aggregate, project, then HAVING → ORDER BY → LIMIT.
+        let (columns, mut rows) = self.aggregate(&view_chunks, &sels)?;
+        if !q.order_by.is_empty() {
+            rows.sort_by(|a, b| {
+                for k in &q.order_by {
+                    let ord = cmp_scalar(&a[k.output], &b[k.output]);
+                    let ord = if k.desc { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        if let Some(l) = q.limit {
+            rows.truncate(l);
+        }
         Ok(QueryResult { columns, rows })
     }
 
@@ -344,7 +398,7 @@ impl Executor<'_> {
         let nkeys = q.group.len();
 
         // key tuple → per-agg accumulator state.
-        let mut groups: BTreeMap<Vec<i64>, Vec<AggState>> = BTreeMap::new();
+        let mut groups: BTreeMap<Vec<GroupKey>, Vec<AggState>> = BTreeMap::new();
         if nkeys == 0 {
             // Scalar aggregate: keep SUM's per-chunk partial association
             // (what makes the Q6 gate bit-identical to the hand kernel).
@@ -365,7 +419,11 @@ impl Executor<'_> {
             for (chunk, sel) in chunks.iter().zip(sels) {
                 sel.for_each(|i| {
                     let i = i as usize;
-                    let key: Vec<i64> = q.group.iter().map(|g| g.expr.eval_i64(chunk, i)).collect();
+                    let key: Vec<GroupKey> = q
+                        .group
+                        .iter()
+                        .map(|g| GroupKey::from(g.expr.eval_value(chunk, i)))
+                        .collect();
                     let states = groups
                         .entry(key)
                         .or_insert_with(|| vec![AggState::default(); q.aggs.len()]);
@@ -379,32 +437,35 @@ impl Executor<'_> {
             }
         }
 
-        // ---- Output projection over row space [keys…, agg values…].
+        // ---- Build the row-space chunk [keys…, agg values…] with typed
+        // key columns (Int / Float / Utf8, from the key values themselves).
         let ngroups = groups.len();
-        let mut key_cols: Vec<Vec<i64>> = vec![Vec::with_capacity(ngroups); nkeys];
-        let mut agg_i64: Vec<Vec<i64>> = vec![Vec::new(); q.aggs.len()];
-        let mut agg_f64: Vec<Vec<f64>> = vec![Vec::new(); q.aggs.len()];
-        for (key, states) in &groups {
-            for (k, v) in key_cols.iter_mut().zip(key) {
-                k.push(*v);
-            }
-            for (j, (agg, st)) in q.aggs.iter().zip(states).enumerate() {
-                match agg.func {
-                    AggFunc::Count => agg_i64[j].push(st.count as i64),
-                    _ => agg_f64[j].push(st.finalize(agg.func)),
-                }
-            }
+        let mut cols: Vec<Vector> = Vec::with_capacity(nkeys + q.aggs.len());
+        for k in 0..nkeys {
+            cols.push(build_key_column(groups.keys().map(|key| &key[k]), ngroups));
         }
-        let mut cols: Vec<Vector> = key_cols.into_iter().map(Vector::i64).collect();
         for (j, agg) in q.aggs.iter().enumerate() {
-            cols.push(match agg.func {
-                AggFunc::Count => Vector::i64(std::mem::take(&mut agg_i64[j])),
-                _ => Vector::f64(std::mem::take(&mut agg_f64[j])),
-            });
+            match agg.func {
+                AggFunc::Count => cols.push(Vector::i64(
+                    groups.values().map(|st| st[j].count as i64).collect(),
+                )),
+                _ => cols.push(Vector::f64(
+                    groups.values().map(|st| st[j].finalize(agg.func)).collect(),
+                )),
+            }
         }
         let row_chunk = DataChunk::new(cols);
+
+        // HAVING filters groups; the output projection runs per survivor.
+        let keep: Vec<usize> = (0..ngroups)
+            .filter(|&r| match &q.having {
+                None => true,
+                Some(h) => h.eval_bool(&row_chunk, r),
+            })
+            .collect();
         let columns: Vec<String> = q.output.iter().map(|o| o.name.clone()).collect();
-        let rows = (0..ngroups)
+        let rows = keep
+            .into_iter()
             .map(|r| {
                 q.output
                     .iter()
@@ -413,6 +474,96 @@ impl Executor<'_> {
             })
             .collect();
         Ok((columns, rows))
+    }
+}
+
+/// A typed group-key value with a total order (BTreeMap grouping ⇒
+/// deterministic key-sorted output). Floats order by `total_cmp` and group
+/// by bit pattern — exact, NaN-safe.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum GroupKey {
+    Int(i64),
+    Float(FOrd),
+    Str(std::sync::Arc<str>),
+}
+
+/// An f64 with `total_cmp` ordering (bits stored, so `Eq` is exact).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FOrd(u64);
+
+impl PartialOrd for FOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for FOrd {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        f64::from_bits(self.0).total_cmp(&f64::from_bits(other.0))
+    }
+}
+
+impl From<ScalarValue> for GroupKey {
+    fn from(v: ScalarValue) -> Self {
+        match v {
+            ScalarValue::Int64(i) => GroupKey::Int(i),
+            ScalarValue::Int32(i) => GroupKey::Int(i as i64),
+            ScalarValue::Date32(d) => GroupKey::Int(d as i64),
+            ScalarValue::Boolean(b) => GroupKey::Int(i64::from(b)),
+            ScalarValue::Float64(f) => GroupKey::Float(FOrd(f.to_bits())),
+            ScalarValue::Utf8(s) => GroupKey::Str(s),
+        }
+    }
+}
+
+/// Build a typed row-space column from one group-key position across all
+/// groups (every value in a position shares a type by construction).
+fn build_key_column<'k>(keys: impl Iterator<Item = &'k GroupKey>, ngroups: usize) -> Vector {
+    let keys: Vec<&GroupKey> = keys.collect();
+    debug_assert_eq!(keys.len(), ngroups);
+    match keys.first() {
+        Some(GroupKey::Float(_)) => Vector::f64(
+            keys.iter()
+                .map(|k| match k {
+                    GroupKey::Float(f) => f64::from_bits(f.0),
+                    other => panic!("mixed group-key types: {other:?}"),
+                })
+                .collect(),
+        ),
+        Some(GroupKey::Str(_)) => {
+            let mut offsets = Vec::with_capacity(ngroups + 1);
+            let mut data = Vec::new();
+            offsets.push(0u32);
+            for k in &keys {
+                let GroupKey::Str(s) = k else {
+                    panic!("mixed group-key types: {k:?}");
+                };
+                data.extend_from_slice(s.as_bytes());
+                offsets.push(data.len() as u32);
+            }
+            Vector::utf8(offsets, data)
+        }
+        _ => Vector::i64(
+            keys.iter()
+                .map(|k| match k {
+                    GroupKey::Int(i) => *i,
+                    other => panic!("mixed group-key types: {other:?}"),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Total order over same-typed output scalars — the ORDER BY comparator.
+fn cmp_scalar(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
+    use ScalarValue::*;
+    match (a, b) {
+        (Int64(x), Int64(y)) => x.cmp(y),
+        (Int32(x), Int32(y)) => x.cmp(y),
+        (Date32(x), Date32(y)) => x.cmp(y),
+        (Float64(x), Float64(y)) => x.total_cmp(y),
+        (Utf8(x), Utf8(y)) => x.cmp(y),
+        (Boolean(x), Boolean(y)) => x.cmp(y),
+        _ => panic!("ORDER BY over mixed types: {a:?} vs {b:?}"),
     }
 }
 
@@ -564,6 +715,7 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
             collect_slots(rhs, out);
         }
         Expr::ExtractYear(i) => collect_slots(i, out),
+        Expr::Like { expr, .. } => collect_slots(expr, out),
         Expr::Case { whens, else_ } => {
             for (c, v) in whens {
                 collect_slots(c, out);
