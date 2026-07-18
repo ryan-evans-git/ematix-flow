@@ -7,6 +7,7 @@ members = [
     "crates/ematix-flow-distributed",
     "crates/ematix-flow-hash-join",
     "crates/ematix-flow-push",
+    "crates/ematix-flow-engine",
 ]
 
 [workspace.package]
