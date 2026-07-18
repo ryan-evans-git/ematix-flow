@@ -36,6 +36,11 @@ wheels/
 # SF=1 is ~1 GB; SF=10 ~10 GB; SF=100 ~100 GB. Never commit.
 /examples/tpch/data/
 
+# v2 S0.2: TPC-DS data (regenerated via
+# `cargo run --release -p ematix-flow-core --example tpcds_generate`).
+# Never commit — generated from DuckDB's tpcds extension.
+/examples/tpcds/data/
+
 # IDE / editor
 .idea/
 .vscode/
