@@ -147,15 +147,27 @@ SQL text
   dedup — Q2, Q15); **SUBSTRING** (Q22). All gates == canonical published
   SF-1 answers.
 
-## Remaining to full TPC-H (then TPC-DS — P4 tail)
+- **P4 TPC-H COMPLETE (2026-07-18, `90fdaee3`): 22/22 canonical TPC-H
+  queries plan from their production SQL texts and execute engine-native**,
+  each gated vs an independent oracle matching the canonical published SF-1
+  answers. The last two: **Q13** — `JOIN … ON` + LEFT OUTER (preserved-side
+  root forcing, miss-keeps-row narrowing, type-default payload attach, and
+  `count(left col)` → `CountMatched` via a synthetic matched-flag column —
+  the no-NULL engine's outer-join counting); **Q21** — the count-based
+  EXISTS rewrite: `EXISTS(same k, different s)` → a per-k
+  `count(distinct s)`/`min(s)`/`__m=1` derived table LEFT-joined on k, with
+  `EXISTS ⟺ __m=1 ∧ (cd≥2 ∨ ms≠s)` and `NOT EXISTS ⟺ __m=0 ∨ (cd=1 ∧ ms=s)`.
 
-- **Q13**: LEFT OUTER JOIN (`JOIN … ON` syntax) + NULL-aware
-  `count(o_orderkey)` = 0 for unmatched customers.
-- **Q21**: multi-condition correlated EXISTS (`l2.l_orderkey = l1.l_orderkey
-  AND l2.l_suppkey <> l1.l_suppkey`) — the count-based exists rewrite.
-- Then: parallelize planned queries through the morsel driver / spilling
-  breakers (the machinery exists); re-home the Σ rules onto `BoundQuery`;
-  CTE result sharing (Q15 materializes twice); date display formatting.
+## Next (P4 tail → P5/P6)
+
+- **Parallelize planned queries** through the morsel driver / spilling
+  breakers (the machinery exists and is proven; the planned path is
+  sequential+interpreted) — then benchmark planned-Q08 vs the hand-built
+  −29.6% arm to measure and close the interpreter gap.
+- **TPC-DS breadth** through the same front-end.
+- Re-home the Σ rules onto `BoundQuery`; CTE result sharing (Q15
+  materializes twice); NULL semantics beyond the outer-join stand-ins;
+  date display formatting.
 
 ## Slice sequence (each independently gated, TDD)
 
