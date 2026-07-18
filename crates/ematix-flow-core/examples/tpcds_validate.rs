@@ -148,10 +148,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut results: BTreeMap<String, (Emat, Parity)> = BTreeMap::new();
-    // v2 S1.2: which queries actually run on the native
-    // `FusedGroupingSetAggregateExec` (vs DataFusion's generic grouping-set
-    // exec) — proves the interception rule fires end-to-end on real TPC-DS.
-    let mut native_gs: Vec<String> = Vec::new();
     for path in &files {
         let name = path.file_stem().unwrap().to_string_lossy().into_owned();
         let raw = std::fs::read_to_string(path)?;
@@ -166,11 +162,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(RunErr::Exec(e)) => (Emat::ExecFail(e), Some(df_sql)),
             },
         };
-        if let (Emat::Pass { .. }, Some(df_sql)) = (&emat, &translated) {
-            if plan_uses_fused_gs(&ctx, df_sql).await {
-                native_gs.push(name.clone());
-            }
-        }
 
         // Oracle: run the SAME translated SQL on DuckDB, compare row count.
         let parity = match (&emat, &translated) {
@@ -224,31 +215,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  row-parity OK:    {parity_ok}/{emat_pass} (of ematix-passing)");
     println!("  parity MISMATCH:  {parity_mismatch}");
     println!("  oracle skipped:   {oracle_skip}");
-    println!(
-        "  native grouping-set (S1.2): {} queries on FusedGroupingSetAggregateExec {:?}",
-        native_gs.len(),
-        native_gs
-    );
     if emat_pass < total {
         println!("  (failing queries above are the SQL-surface gaps — see V2_SQL_SURFACE_GAPS.md)");
     }
     Ok(())
-}
-
-/// True if `sql`'s physical plan on the shared session runs on the native
-/// [`FusedGroupingSetAggregateExec`] — i.e. the S1.2 interception rule fired.
-async fn plan_uses_fused_gs(ctx: &datafusion::prelude::SessionContext, sql: &str) -> bool {
-    let Ok(df) = ctx.sql(sql).await else {
-        return false;
-    };
-    match df.create_physical_plan().await {
-        Ok(plan) => format!(
-            "{}",
-            datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
-        )
-        .contains("FusedGroupingSetAggregateExec"),
-        Err(_) => false,
-    }
 }
 
 enum RunErr {

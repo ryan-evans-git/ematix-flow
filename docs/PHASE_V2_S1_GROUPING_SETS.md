@@ -13,6 +13,47 @@ sprint (S1), with S1.3 (spill) able to slip into S9 if Π isn't ready.
 
 ---
 
+## ⛔ MEASUREMENT VERDICT (2026-07-18) — native operator REVERTED
+
+**The native grouping-set operator was built, measured, and reverted. Do
+not rebuild it on the "single-scan" premise — that premise is false.**
+
+S1.2 shipped a working, correct `FusedGroupingSetAggregateExec` +
+`InjectGroupingSetRule` (11 TPC-DS queries ran on it, row-parity clean).
+Before optimizing per-set aggregation into the fused kernels, we measured
+it against DataFusion's native grouping-set exec (`gs_ab_bench`, the
+`EMAT_GROUPING_SETS_FUSED` A/B toggle):
+
+| query (SF10) | DF-native | operator | verdict |
+|---|---:|---:|---|
+| q22 (5-set ROLLUP + AVG over a join) | 1353 ms | 2453 ms | **1.8× slower** |
+| q18 (7-set ROLLUP) | 81 ms | 86 ms | 6% slower |
+| q27 (avg-heavy ROLLUP) | 110 ms | 112 ms | neutral |
+
+**Root cause — the design's Model A premise (§4.1) is wrong.** It assumed
+DF re-scans the child per set, so a single-scan operator would win. But
+DataFusion's grouping-set `Partial` node already reads the child **once**
+and updates all sets in one pass. The operator therefore added
+materialisation + `n_sets` passes over the materialised data for **no
+scan saving** — strictly worse. A bespoke fused per-set accumulator would
+not fix this; the disadvantage is the orchestration, not the kernel.
+
+**Additional finding:** the existing fused string-key accumulators index
+by the **first byte** of the value (correct only for TPC-H's single-char
+flag columns), so they cannot correctly aggregate TPC-DS's multi-byte
+group keys anyway — a bespoke multi-key kernel would have been required
+even to *match* DF.
+
+**Conclusion:** DataFusion's native grouping-set execution is already
+correct **and** competitive. The S0.3 gap analysis's assumption that
+grouping sets are a benchmark liability is **not borne out**. Reverted the
+operator + rule + preset registration; kept the S1.1 value (plan-shape
+pin `gs_plan_probe`, the semantic-contract tests, and §4.0 below, which
+now document DF's shape for reference). The design in §4–§9 is retained
+**as the rejected proposal + its measured refutation**, not as a plan.
+
+---
+
 ## 1. Current state (why this phase exists)
 
 Grouping-set aggregation is **correct today but not on our engine.**
@@ -272,22 +313,8 @@ Do not gate S1's correctness exit on Π; gate it on "no OOM at SF=10 with
 | Story | What | Exit |
 |---|---|---|
 | **S1.1** ✅ | Plan-shape pin (`gs_plan_probe`, §4.0) + semantic contract tests (`tests/grouping_sets_semantics.rs`) + §3 `tpcds_validate` baseline | **DONE** — shape pinned (2 assumptions corrected); 3 semantic tests green on the shared session (incl. the data-NULL vs rolled-up-NULL gate); §3 queries q18/q22/q27/q36/q67/q77 all row-parity OK at SF1 |
-| **S1.2** 🟡 | `FusedGroupingSetAggregateExec` + `InjectGroupingSetRule` (registered in `preset`); `__grouping_id` + `GROUPING()`/`GROUPING_ID` projection | **correctness DONE** — recognizer (8 tests) + operator with 3 end-to-end rule-parity tests (byte-identical to DF for ROLLUP/CUBE/GROUPING SETS) + semantic contract now routes through the operator; SF1 §3 parity via `tpcds_validate`. **Fused-accumulator (benchmark speed) is the follow-on** (see note). |
-| **S1.3** | Memory bound + `GS_MAX_SETS` + AQE partition-bump; Π spill hooks stubbed | no OOM SF=10; parity SF=10 |
-
-**S1.2 what's fused vs delegated (honest scope).** The operator lands
-Model A's **single child scan** (the design's key win over DF's
-expand-then-aggregate, which pushes `n_sets ×` the rows through the
-accumulator): it materialises the child once and runs one aggregate per
-set over the shared batches, stitching rolled-up NULLs + the
-`__grouping_id` literal into DF's `Final` schema. **Per-set aggregation
-currently delegates to DataFusion's vectorized `AggregateExec`, not the
-ematix `FusedAggregateExec` kernels** — so correctness + the single-scan
-shape are in, but the fused-accumulator upgrade that wins the S6
-benchmark is an explicit follow-on, gated by the vectorization-proof
-micro-bench (§5). `EMAT_GROUPING_SETS_FUSED=0` opts back to DF's native
-grouping-set path. The child materialisation is the memory pressure S1.3
-must bound/spill at SF≥10.
+| **S1.2** ⛔ | `FusedGroupingSetAggregateExec` + `InjectGroupingSetRule` — built, measured, **REVERTED** | Operator was correct (11 queries, row-parity clean) but **1.8× slower than DF-native** (see the Measurement Verdict at the top). Reverted; DF-native grouping-set execution retained. |
+| **S1.3** | ~~Memory bound + spill~~ — **moot**: no native operator to bound; DF-native handles grouping-set memory. | n/a |
 
 **S1.1 note on RED-ness.** The §3 queries and the semantic contract are
 already *correct* on stock DataFusion (the S1 gap is fused *execution*,

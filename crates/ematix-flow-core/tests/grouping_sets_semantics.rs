@@ -1,19 +1,19 @@
-//! v2 S1.1 — grouping-set semantic contract (RED-first for Phase GS).
+//! v2 S1.1 — grouping-set semantic contract.
 //!
 //! Locks the *observable behaviour* of `GROUP BY ROLLUP / CUBE /
 //! GROUPING SETS` and the `GROUPING()` / `GROUPING_ID()` functions on the
-//! **shared v2 session** (`preset::session_context`, dogfooding S0.1),
-//! before S1.2 swaps DataFusion's generic hash aggregate for the native
-//! `FusedGroupingSetAggregateExec`. See `docs/PHASE_V2_S1_GROUPING_SETS.md`.
+//! **shared v2 session** (`preset::session_context`, dogfooding S0.1).
 //!
-//! These run on stock DataFusion today (correctness is already there —
-//! the S1 gap is *native/fused execution*, not results), so they are
-//! GREEN now and pin the exact result set the fused operator must
-//! reproduce byte-for-byte. The single most important contract here is
-//! the one most likely to catch a wrong implementation
-//! (`PHASE_V2_S1_GROUPING_SETS.md` §7): a **rolled-up NULL** (a column
-//! aggregated away) must be distinguishable from a **genuine data NULL**,
-//! via the grouping id — never by "is the value NULL?".
+//! **Standing regression guard.** S1.2 built a native grouping-set
+//! operator but measured it 1.8× slower than DataFusion's own path and
+//! reverted it (see the Measurement Verdict in
+//! `docs/PHASE_V2_S1_GROUPING_SETS.md`) — so these now guard DF-native
+//! grouping-set correctness on the ematix session, and would equally
+//! guard any future operator. The single most important contract here is
+//! the one most likely to catch a wrong implementation: a **rolled-up
+//! NULL** (a column aggregated away) must be distinguishable from a
+//! **genuine data NULL**, via the grouping id — never by "is the value
+//! NULL?".
 //!
 //! Hermetic: a tiny in-memory table, no TPC-DS data, so it runs in CI.
 

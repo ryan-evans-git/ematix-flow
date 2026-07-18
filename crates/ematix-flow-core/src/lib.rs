@@ -238,9 +238,6 @@ pub mod shared_subtree_exec;
 // `docs/PHASE_SIGMA_H1D_DIAGNOSIS_AND_DESIGN.md` for the binary-cost
 // vs exec-cost decomposition that motivated this split.
 pub mod fused_aggregate_filter_multi_agg_numeric;
-/// v2 S1.2 — grouping-set recognizer (Phase GS planner-interception core).
-/// See `docs/PHASE_V2_S1_GROUPING_SETS.md` §4.0/§4.3.
-pub mod fused_grouping_set_agg;
 // Σ.D3: cranelift-JIT'd inner loop for the unified fused-aggregate
 // operator. Hosts `FusedFilterAggSpec` IR + `FusedFilterAggJit`
 // runtime that `FilterSumSpec` and `FilterMultiAggSpec` build on.

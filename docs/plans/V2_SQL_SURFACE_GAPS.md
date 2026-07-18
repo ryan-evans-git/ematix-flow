@@ -29,7 +29,7 @@ So v2's SQL-surface work is mostly **"pull onto the push engine," not
 
 | # | Feature | TPC-DS queries (examples) | Plans today (DF)? | Native/fused on push engine? | Sprint |
 |---|---------|---------------------------|:---:|---|:---:|
-| 1 | `GROUPING SETS` / `ROLLUP` / `CUBE` + `GROUPING()` / `GROUPING_ID` | Q18, Q22, Q27, Q36, Q67, Q77, Q80 | ✅ | ❌ **fused recognizer bails on multi-set** (`fused_aggregate_filter_multi_agg_rule.rs:541`) → DataFusion generic `AggregateExec` | **S1** |
+| 1 | `GROUPING SETS` / `ROLLUP` / `CUBE` + `GROUPING()` / `GROUPING_ID` | Q18, Q22, Q27, Q36, Q67, Q77, Q80 | ✅ | ✅ **DF-native retained** — a native operator was built + measured **1.8× slower** and reverted (2026-07-18); DF's grouping-set exec is single-scan + vectorized. | ~~S1~~ done (no-op) |
 | 2 | Advanced window frames (`RANGE`, named windows, `RANK`/`DENSE_RANK`/`NTILE`/`LEAD`/`LAG`) | Q44, Q47, Q49, Q51, Q57, Q67 | ✅ | ❌ **no ematix window operator exists** (`windowed.rs` is *streaming* tumbling/hopping windows, not SQL window functions) → DataFusion `BoundedWindowAggExec` | **S2** |
 | 3 | `INTERSECT` / `EXCEPT` (+ `ALL`) | Q8, Q14, Q38, Q87 | ✅ | ❌ **no native set-op operator** → DataFusion built-in (semi/anti-join lowering) | **S2** |
 | 4 | Correlated + `EXISTS`/`NOT EXISTS` subqueries at depth | Q10, Q35, Q41 | ✅ (DF decorrelates) | ⚠ **DataFusion's built-in decorrelation** — no ematix pass; works, but the resulting joins may not hit ematix's reorder/bloom rules well | **S3** |
@@ -57,9 +57,15 @@ Legend: ✅ yes · ❌ no (gap) · ⚠ works but not ematix-native / needs verif
 Ordered by how much the *benchmark* (S6) depends on it being fused, not
 just correct:
 
-1. **Grouping sets (S1)** — highest leverage. Appears in ~7 queries and
-   is aggregation-heavy; a scalar fallback here directly loses the
-   benchmark. Already fully designed.
+1. ~~**Grouping sets (S1)** — highest leverage.~~ **REFUTED by measurement
+   (2026-07-18).** A native operator was built and benched against
+   DataFusion's grouping-set exec — it was **1.8× slower** (q22 SF10),
+   never faster. DF already single-scans the child and updates all sets in
+   one pass, so there is no scan-saving to capture; grouping sets are
+   **not** a benchmark liability. See the Measurement Verdict in
+   [`../PHASE_V2_S1_GROUPING_SETS.md`](../PHASE_V2_S1_GROUPING_SETS.md).
+   The premise below ("a scalar fallback loses the benchmark") was wrong:
+   DF's path is vectorized, not scalar.
 2. **Window functions (S2)** — net-new operator, several queries, and
    window aggregation is exactly where analytical engines differentiate.
 3. **Set-ops + large IN (S2)** — moderate; correctness is there, fusion
