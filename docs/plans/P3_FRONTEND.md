@@ -72,7 +72,27 @@ SQL text
   eval → aggregate — is engine code end to end; DataFusion appears nowhere.
   Sequential + interpreted on purpose; the parallel morsel driver and
   `HashAggregateSink` exist and the planner grows into them next.
-- Slice 4 next: Q08 from SQL.
+- **Slice 4a DONE** (2026-07-18, `7e1cc747`) — GROUP BY from SQL. Binder
+  partitions SELECT into group keys (must precede aggregates, must match
+  GROUP BY in order, must be integer-family columns — all bind-time checked)
+  and aggregate calls; executor hash-accumulates per key tuple (BTreeMap ⇒
+  key-sorted output). Gate `tests/sql_groupby.rs`: revenue by `l_linenumber`
+  over the 1994 window vs a pyarrow oracle (7 groups, rel 1e-9; exercises the
+  Int32 column path).
+- **Slice 4b DONE** (2026-07-18, `e94a0ce9`) — two-table joins from SQL.
+  Multi-table binder: comma-form FROM, WHERE split into conjuncts (cross-table
+  equality ⇒ join condition; else single-table attribution via a
+  touched-tables set ⇒ that table's filter; anything else errors by name).
+  `logical::Join` = inner equi-join, right side key-only; the executor
+  consumes the right side into key→match-**count** and narrows the left with
+  **selection multiplicity** (a live row kept once per match) — unique keys
+  degenerate to exactly the probe-narrow semijoin, duplicate keys stay
+  correct. Gate `tests/sql_join.rs`: both directions vs pyarrow — unique-key
+  (lineitem⋈orders-1994, 7 groups) and duplicate-key (orders⋈lineitem,
+  weighted sum over 6,001,215 rows — a membership-only join lands ~4× low).
+- Slice 4c next: the Q08 shape — >2 tables (dim chains) + payload-carrying
+  joins (dim columns in SELECT/GROUP BY, e.g. the year bucket and the
+  BRAZIL flag), onto `run_join_pipeline`/attach semantics.
 
 ## Slice sequence (each independently gated, TDD)
 
