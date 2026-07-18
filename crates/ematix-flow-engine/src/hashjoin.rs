@@ -18,12 +18,15 @@
 //! every matched `(key, build_payload, probe_payload)` — the probe side is
 //! never fully materialized.
 //!
-//! Scope (kill-gate): i64 key + one i64 payload per side, single-threaded.
-//! Multi-match (duplicate build keys) and inner-join drop (unmatched probe
-//! keys vanish) are handled — the semantics a semijoin ([`crate::join`])
-//! can't express. Deliberate follow-ons: multi-column payloads, recursive
-//! re-partition for a single build partition that itself overflows (key
-//! skew), and per-worker parallel partitioning + a merge.
+//! Scope (kill-gate): i64 key + one i64 payload per side. Multi-match
+//! (duplicate build keys) and inner-join drop (unmatched probe keys vanish)
+//! are handled — the semantics a semijoin ([`crate::join`]) can't express.
+//! The parallel face is [`merge`](SpillableHashJoin::merge): the two-input
+//! driver ([`run_join_pipeline`](crate::exec::run_join_pipeline)) scans both
+//! sides in parallel into per-worker joins, then `merge` joins them in one
+//! bounded per-partition pass. Deliberate follow-ons: multi-column payloads,
+//! and recursive re-partition for a single build partition that itself
+//! overflows (key skew).
 
 use std::collections::HashMap;
 use std::io;
@@ -153,40 +156,80 @@ impl SpillableHashJoin {
 
     /// Join every partition and emit each matched `(key, build_payload,
     /// probe_payload)`. Consumes the join. Peak memory is one partition's
-    /// build hash table; the probe side is streamed, not materialized.
-    pub fn run(mut self, mut emit: impl FnMut(i64, i64, i64)) -> io::Result<()> {
-        for p in 0..self.npart {
-            // Build this partition's hash table: key → all its build payloads
-            // (a Vec, so duplicate build keys all match — multi-match).
+    /// build hash table; the probe side is streamed, not materialized. The
+    /// single-join case of [`merge`](Self::merge).
+    pub fn run(self, emit: impl FnMut(i64, i64, i64)) -> io::Result<()> {
+        Self::merge(vec![self], emit)
+    }
+
+    /// Join several partitioned joins that share the same partitioning — the
+    /// per-worker joins produced by the two-input driver
+    /// ([`run_join_pipeline`](crate::exec::run_join_pipeline)) — and emit
+    /// every matched `(key, build_payload, probe_payload)`. Consumes them,
+    /// draining each one's spill runs.
+    ///
+    /// **This is what makes a parallel GRACE join correct.** Each worker's
+    /// join holds only the build/probe rows *it* decoded, so a key's build
+    /// row and its probe rows routinely sit in different joins. But every
+    /// occurrence of a key routes to the same partition index in *every*
+    /// join (all share [`part_of`]), so partition `p` can be finished across
+    /// all workers at once: build one hash table from **every** join's
+    /// partition-`p` build rows (in-memory remainder + streamed spill run),
+    /// then probe it with **every** join's partition-`p` probe rows. The
+    /// union of the joins' partition-`p` build (probe) rows is exactly the
+    /// build (probe) rows whose key hashes to `p` — complete and disjoint
+    /// from other partitions — so no matching pair is missed or split.
+    ///
+    /// Peak memory is still one partition's build hash table across all
+    /// workers (≈ total-build-rows / npart) with the probe streamed, so the
+    /// join runs beyond RAM exactly as the single-worker case does.
+    pub fn merge(mut joins: Vec<Self>, mut emit: impl FnMut(i64, i64, i64)) -> io::Result<()> {
+        let Some(first) = joins.first() else {
+            return Ok(());
+        };
+        let npart = first.npart;
+        debug_assert!(
+            joins.iter().all(|j| j.npart == npart),
+            "merged joins must share the same partition count"
+        );
+        for p in 0..npart {
+            // Build partition p's hash table from EVERY join's build rows
+            // (key → all its build payloads, so duplicate build keys all
+            // match — multi-match).
             let mut ht: HashMap<i64, Vec<i64>> = HashMap::new();
-            for (k, pay) in self.build_keys[p].iter().zip(&self.build_pay[p]) {
-                ht.entry(*k).or_default().push(*pay);
-            }
-            if self.build_spill.has_spill(p) {
-                self.build_spill
-                    .drain_partition(p, |k, pay| ht.entry(k).or_default().push(pay))?;
+            for j in &mut joins {
+                for (k, pay) in j.build_keys[p].iter().zip(&j.build_pay[p]) {
+                    ht.entry(*k).or_default().push(*pay);
+                }
+                if j.build_spill.has_spill(p) {
+                    j.build_spill
+                        .drain_partition(p, |k, pay| ht.entry(k).or_default().push(pay))?;
+                }
             }
             // Empty build partition ⇒ no probe row here can match; skip
             // (unmatched probe rows simply never emit — inner-join drop).
             if ht.is_empty() {
                 continue;
             }
-            // Probe the resident rows, then the streamed-back spill run.
-            for (k, ppay) in self.probe_keys[p].iter().zip(&self.probe_pay[p]) {
-                if let Some(bps) = ht.get(k) {
-                    for &bp in bps {
-                        emit(*k, bp, *ppay);
-                    }
-                }
-            }
-            if self.probe_spill.has_spill(p) {
-                self.probe_spill.drain_partition(p, |k, ppay| {
-                    if let Some(bps) = ht.get(&k) {
+            // Probe partition p with EVERY join's probe rows (resident, then
+            // the streamed-back spill run).
+            for j in &mut joins {
+                for (k, ppay) in j.probe_keys[p].iter().zip(&j.probe_pay[p]) {
+                    if let Some(bps) = ht.get(k) {
                         for &bp in bps {
-                            emit(k, bp, ppay);
+                            emit(*k, bp, *ppay);
                         }
                     }
-                })?;
+                }
+                if j.probe_spill.has_spill(p) {
+                    j.probe_spill.drain_partition(p, |k, ppay| {
+                        if let Some(bps) = ht.get(&k) {
+                            for &bp in bps {
+                                emit(k, bp, ppay);
+                            }
+                        }
+                    })?;
+                }
             }
         }
         Ok(())
