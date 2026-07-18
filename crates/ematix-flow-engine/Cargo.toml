@@ -29,3 +29,7 @@ ematix-flow-push = { path = "../ematix-flow-push" }
 ematix-parquet-codec = "0.17"
 ematix-parquet-format = "0.17"
 ematix-parquet-io = "0.17"
+# P3 front-end: tokenize→AST ONLY (the sanctioned bootstrap — a standalone
+# lib, not DataFusion). Everything from the AST inward — binder, logical IR,
+# planner — is owned engine code (src/bind.rs, src/logical.rs).
+sqlparser = { workspace = true }

@@ -4095,6 +4095,7 @@ dependencies = [
  "ematix-parquet-format",
  "ematix-parquet-io",
  "parquet 58.3.0",
+ "sqlparser 0.61.0",
 ]
 
 [[package]]

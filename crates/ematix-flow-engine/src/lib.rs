@@ -10,12 +10,15 @@
 
 pub mod adaptive;
 pub mod agg;
+pub mod bind;
+pub mod catalog;
 pub mod chunk;
 pub mod dim;
 pub mod exec;
 pub mod expr;
 pub mod hashjoin;
 pub mod join;
+pub mod logical;
 pub mod pipeline;
 pub mod scan;
 pub mod scan_native;
