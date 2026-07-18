@@ -90,9 +90,28 @@ SQL text
   correct. Gate `tests/sql_join.rs`: both directions vs pyarrow — unique-key
   (lineitem⋈orders-1994, 7 groups) and duplicate-key (orders⋈lineitem,
   weighted sum over 6,001,215 rows — a membership-only join lands ~4× low).
-- Slice 4c next: the Q08 shape — >2 tables (dim chains) + payload-carrying
-  joins (dim columns in SELECT/GROUP BY, e.g. the year bucket and the
-  BRAZIL flag), onto `run_join_pipeline`/attach semantics.
+- **Slices 4c + 5 DONE (2026-07-18, `4f5b5765`) — second P3 kill-gate HIT:
+  Q08 from SQL.** The IR went flat: `BoundQuery` = a join **graph** (per-table
+  scan+filters, join edges over a global slot space, group/agg/output exprs) —
+  the select-project-join block the Σ rules will rewrite. Binder: aliases +
+  qualified names (`nation n1/n2`), N-table FROM, row-space output projections
+  with aggregate extraction (`sum(a)/sum(b)`), EXTRACT(YEAR)/CASE/Div/strings/
+  count(*), connectivity validation. Executor: tree rooted at the **largest
+  table by parquet row count** (first cost-based physical decision); dim
+  subtrees → key→(count, payload) maps — key-only stays the semijoin narrow
+  with multiplicity, referenced dim columns **bubble up chains as payloads**
+  and attach to root chunks (unique-key payload joins, runtime-checked);
+  string scans route via the stock reader; full agg set COUNT(*)/MIN/MAX/AVG/
+  SUM; Q6's scalar-SUM bit-equality association preserved. Gates:
+  `sql_join_tree.rs` (payload bubbling + key-only chains), `sql_aggfuncs.rs`
+  (count == the Q6 gate's 114,160 — cross-checked), `sql_strings.rs` (1451
+  parts, the hand-built dim gate's numbers from SQL), `sql_exprs.rs`
+  (division-of-sums, CASE), **`sql_q08.rs` — the flattened 8-table Q08 with
+  self-joined nation, shares 1995 = 0.0344359 / 1996 = 0.0414855 (canonical
+  SF-1 answer) at rel 1e-9**. 55 engine tests green.
+- Next: parallelize planned queries through the morsel driver / spilling
+  breakers; ORDER BY/LIMIT/HAVING; NULLs; more TPC-H queries (P4 begins);
+  re-home the Σ rules onto `BoundQuery`.
 
 ## Slice sequence (each independently gated, TDD)
 
