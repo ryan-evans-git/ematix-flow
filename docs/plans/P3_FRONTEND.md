@@ -131,17 +131,31 @@ SQL text
     at bind to the `IN` semijoin it is (set semantics — no row
     multiplication).
 
+- **P4 derived tables + decorrelation (2026-07-18, `672222fe` + `23ba4277`):
+  20 of 22 TPC-H engine-native from SQL.** Added: **composite join keys**
+  (multi-edge table pairs fuse into one multi-column link — Q9's
+  lineitem⋈partsupp); **derived-table inlining** (plain select-project
+  FROM-subqueries merge into the outer join graph, view columns bind by
+  defining expression — Q7/Q9/Q22, the classic view-merge); **materialized
+  derived tables + WITH/CTEs** (`TableSource::Derived`, executor
+  materializes the inner `BoundQuery`, schema inferred via `output_types` —
+  Q15, CTE referenced twice); **correlated scalar decorrelation** (single or
+  multi-key correlation → grouped derived join; comparison lands in the
+  post-join filter via normal attribution — Q17, Q2, Q20's composite-key
+  correlation inside a nested IN-subquery); **plain row queries** (no
+  agg/GROUP BY → slot-space outputs, one row per joined row, no silent
+  dedup — Q2, Q15); **SUBSTRING** (Q22). All gates == canonical published
+  SF-1 answers.
+
 ## Remaining to full TPC-H (then TPC-DS — P4 tail)
 
-- **Derived tables / FROM-subqueries** (Q7, Q9, Q13, Q15): materialize an
-  inner `QueryResult` as a scannable input for an outer query.
-- **Correlated scalar subqueries** (Q2, Q17, Q20, Q22): decorrelate to
-  grouped joins (avg/min per key).
-- **LEFT OUTER JOIN + NULL semantics** (Q13); `substring` (Q22);
-  richer EXISTS shapes (Q21's multi-condition correlations).
+- **Q13**: LEFT OUTER JOIN (`JOIN … ON` syntax) + NULL-aware
+  `count(o_orderkey)` = 0 for unmatched customers.
+- **Q21**: multi-condition correlated EXISTS (`l2.l_orderkey = l1.l_orderkey
+  AND l2.l_suppkey <> l1.l_suppkey`) — the count-based exists rewrite.
 - Then: parallelize planned queries through the morsel driver / spilling
   breakers (the machinery exists); re-home the Σ rules onto `BoundQuery`;
-  date display formatting in results.
+  CTE result sharing (Q15 materializes twice); date display formatting.
 
 ## Slice sequence (each independently gated, TDD)
 
