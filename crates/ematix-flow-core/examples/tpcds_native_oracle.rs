@@ -315,8 +315,14 @@ fn main() {
             Err(e) => Verdict::NativeSkip(e),
             Ok(nrows) => {
                 // DuckDB oracle over the SAME canonical text (Spark
-                // backtick identifiers → DuckDB double-quotes).
-                let duck_sql = sql.replace('`', "\"");
+                // backtick identifiers → DuckDB double-quotes; q90's bare
+                // `at` alias is a DuckDB reserved word — quote it).
+                let duck_sql = sql
+                    .replace('`', "\"")
+                    .replace(") at,", ") \"at\",")
+                    // q77: `returns` as a BARE (no AS) alias is reserved in
+                    // DuckDB; with AS it parses fine.
+                    .replace(", 0) returns,", ", 0) AS returns,");
                 match duck_rows(&duck, &duck_sql) {
                     Err(e) => Verdict::OracleSkip(e),
                     Ok(drows) => compare(nrows, drows),

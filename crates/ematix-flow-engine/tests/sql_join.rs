@@ -145,15 +145,13 @@ fn cross_table_agg_arg_now_executes() {
 }
 
 #[test]
-fn missing_join_condition_errors() {
-    // Two tables but no join condition must error, not cross-join.
-    let err = bind_sql(
+fn missing_join_condition_is_a_cross_join() {
+    // Two tables with no join condition are a CROSS join (legitimate SQL)
+    // — the plan binds; the disconnected table attaches as a keyless
+    // fan-out child at execution (see q2/q8/q28's deliberate cross shapes).
+    bind_sql(
         "select sum(l_extendedprice) from lineitem, orders",
         &catalog(),
     )
-    .unwrap_err();
-    assert!(
-        err.to_lowercase().contains("join"),
-        "missing join condition should error: {err}"
-    );
+    .expect("a conditionless comma join binds as a cross join");
 }

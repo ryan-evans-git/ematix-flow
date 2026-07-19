@@ -58,8 +58,10 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<BoundQuery, String> {
 /// value SET, so the dedup is semantics-preserving (and gives the executor
 /// its grouped path).
 /// A CTE registry: name → (bound definition, output columns as
-/// (name, type)). CTE references materialize as derived tables.
-type CteMap = HashMap<String, (BoundQuery, Vec<(String, LogicalType)>)>;
+/// (name, type), defining AST). CTE references materialize as derived
+/// tables; the AST enables the scalar-aggregate cross-join view rewrite
+/// (q77's `FROM cs, cr` with a 1-row cr).
+type CteMap = HashMap<String, (BoundQuery, Vec<(String, LogicalType)>, ast::Query)>;
 
 fn bind_query(
     query: &ast::Query,
@@ -94,11 +96,25 @@ fn bind_query(
             }
             ctes.insert(
                 cte.alias.name.value.clone(),
-                (bq, names.into_iter().zip(tys).collect()),
+                (
+                    bq,
+                    names.into_iter().zip(tys).collect(),
+                    cte.query.as_ref().clone(),
+                ),
             );
         }
     }
     let ctes = &ctes;
+
+    // A parenthesized set-operation side — `a UNION ALL (SELECT …)`, or a
+    // whole `((…) EXCEPT (…))` body — parses as a `SetExpr::Query` wrapper.
+    // Flatten wrappers carrying no WITH/ORDER/LIMIT of their own into their
+    // bodies so every side is a plain Select/SetOperation (q2/q8/q23/q66/q87).
+    if contains_flattenable_wrapper(query.body.as_ref()) {
+        let mut q2 = query.clone();
+        *q2.body = flatten_setexpr(*q2.body);
+        return bind_query(&q2, catalog, set_semantics, ctes);
+    }
 
     if matches!(query.body.as_ref(), ast::SetExpr::SetOperation { .. }) {
         return bind_set_query(query, catalog, ctes);
@@ -252,9 +268,6 @@ fn bind_query(
         .iter()
         .any(|it| matches!(it, ast::SelectItem::Wildcard(_)))
     {
-        if !b.views.is_empty() {
-            return Err("SELECT * over an inlined subquery is not yet supported".into());
-        }
         let mut items = Vec::new();
         for item in &select.projection {
             if matches!(item, ast::SelectItem::Wildcard(_)) {
@@ -274,6 +287,16 @@ fn bind_query(
                                 ast::Ident::new(c.name.clone()),
                             ],
                         )));
+                    }
+                }
+                // Inlined views (including the scalar-aggregate cross-join
+                // views, q28) expand to their defining expressions.
+                for v in &b.views {
+                    for (name, e) in &v.cols {
+                        items.push(ast::SelectItem::ExprWithAlias {
+                            expr: e.clone(),
+                            alias: ast::Ident::new(name.clone()),
+                        });
                     }
                 }
             } else {
@@ -441,31 +464,11 @@ fn bind_query(
     filters.resize(b.tables.len(), Vec::new());
     let post_filter = post.into_iter().reduce(and);
 
-    // Every table must be reachable through join edges — a disconnected
-    // table would be a silent cross join.
-    {
-        let n = b.tables.len();
-        let mut seen = vec![false; n];
-        let mut stack = vec![0usize];
-        seen[0] = true;
-        while let Some(t) = stack.pop() {
-            for e in &edges {
-                let (ta, tb) = (b.slots[e.a].table, b.slots[e.b].table);
-                for (x, y) in [(ta, tb), (tb, ta)] {
-                    if x == t && !seen[y] {
-                        seen[y] = true;
-                        stack.push(y);
-                    }
-                }
-            }
-        }
-        if let Some(missing) = seen.iter().position(|s| !s) {
-            return Err(format!(
-                "table '{}' is not connected to the rest of the query (missing join condition)",
-                b.tables[missing].display
-            ));
-        }
-    }
+    // A table with no join edge to the rest is a CROSS join — legitimate
+    // SQL (q2's `y, z` linked only by an arithmetic predicate; q8's substr
+    // equijoin). The executor attaches disconnected components as keyless
+    // fan-out children whose early residual prunes during expansion, so no
+    // connectivity check is needed here.
 
     // HAVING: a row-space predicate over the per-group result rows (it may
     // reference aggregates, like the SELECT list).
@@ -654,7 +657,9 @@ fn remap_window_cols(e: &mut Expr, win_base: usize, group_base: usize) {
             remap_window_cols(lhs, win_base, group_base);
             remap_window_cols(rhs, win_base, group_base);
         }
-        Expr::ExtractYear(i) | Expr::CastInt(i) => remap_window_cols(i, win_base, group_base),
+        Expr::ExtractYear(i) | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+            remap_window_cols(i, win_base, group_base)
+        }
         Expr::Like { expr, .. }
         | Expr::InSub { expr, .. }
         | Expr::InSet { expr, .. }
@@ -960,7 +965,14 @@ impl Binder<'_> {
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| tname.clone());
-                if let Some((cte_bq, cols)) = self.ctes.get(&tname) {
+                if let Some((cte_bq, cols, cte_ast)) = self.ctes.get(&tname) {
+                    // A SCALAR-aggregate CTE (1 row) past the first FROM
+                    // item: cross-join-as-constants via scalar-subquery
+                    // views (q77's `FROM cs, cr`), same as the derived form.
+                    if !self.tables.is_empty() && scalar_agg_body(cte_ast) {
+                        let cte_ast = cte_ast.clone();
+                        return self.push_scalar_view(display, &cte_ast);
+                    }
                     // CTE reference → materialized derived table.
                     let idx = self.derived.len();
                     self.derived.push(cte_bq.clone());
@@ -1017,6 +1029,21 @@ impl Binder<'_> {
                                 !matches!(j.join_operator, ast::JoinOperator::FullOuter(_))
                             })
                         })
+                        // Inlining merges the inner tables into THIS scope —
+                        // a name already registered (q2/q59's twin deriveds
+                        // over the same CTE + date_dim) must MATERIALIZE
+                        // instead, or the displays collide.
+                        && inner.from.iter().all(|twj| match &twj.relation {
+                            ast::TableFactor::Table { name, alias, .. } => {
+                                let d = alias
+                                    .as_ref()
+                                    .map(|a| a.name.value.clone())
+                                    .unwrap_or_else(|| name.to_string());
+                                !self.tables.iter().any(|t| t.display.eq_ignore_ascii_case(&d))
+                                    && !self.views.iter().any(|v| v.alias.eq_ignore_ascii_case(&d))
+                            }
+                            _ => true,
+                        })
                         && inner.projection.iter().all(|it| match it {
                             ast::SelectItem::UnnamedExpr(e)
                             | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
@@ -1070,6 +1097,11 @@ impl Binder<'_> {
                         cols,
                     });
                     Ok(())
+                } else if !self.tables.is_empty() && scalar_agg_body(subquery) {
+                    // A SCALAR-AGGREGATE derived (no GROUP BY → exactly one
+                    // row) past the first FROM item is a CROSS join of a
+                    // 1-row table (q28/q61/q88/q90's bucket shape).
+                    self.push_scalar_view(alias.name.value.clone(), subquery)
                 } else {
                     // MATERIALIZE: bind the aggregate inner as a derived
                     // query with an inferred output schema.
@@ -1108,6 +1140,73 @@ impl Binder<'_> {
             }
             other => Err(format!("unsupported FROM item: {other}")),
         }
+    }
+
+    /// If `f` is `round(x [, digits])` or `upper(x)`, bind it (slot space).
+    /// `Ok(None)` = neither.
+    fn bind_round_or_upper(&mut self, f: &ast::Function) -> Result<Option<Expr>, String> {
+        let fname = f.name.to_string().to_lowercase();
+        if fname != "round" && fname != "upper" {
+            return Ok(None);
+        }
+        let ast::FunctionArguments::List(list) = &f.args else {
+            return Err(format!("'{fname}' needs an argument list"));
+        };
+        let mut args: Vec<&ast::Expr> = Vec::new();
+        for a in &list.args {
+            match a {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => args.push(e),
+                other => return Err(format!("unsupported {fname} argument: {other}")),
+            }
+        }
+        match (fname.as_str(), args.as_slice()) {
+            ("upper", [x]) => Ok(Some(Expr::Upper(Box::new(self.bind_scalar(x)?)))),
+            ("round", [x]) => Ok(Some(Expr::Round {
+                expr: Box::new(self.bind_scalar(x)?),
+                digits: 0,
+            })),
+            ("round", [x, d]) => {
+                let digits = match self.clone_free_literal(d)? {
+                    ScalarValue::Int64(v) => v as i32,
+                    other => return Err(format!("round digits must be an integer: {other:?}")),
+                };
+                Ok(Some(Expr::Round {
+                    expr: Box::new(self.bind_scalar(x)?),
+                    digits,
+                }))
+            }
+            _ => Err(format!("'{fname}' takes the wrong number of arguments")),
+        }
+    }
+
+    /// Register a SCALAR-aggregate query (guaranteed one row) as a view of
+    /// single-column scalar subqueries: each column reference substitutes
+    /// as a constant through the uncorrelated-subquery machinery, making a
+    /// cross join of the 1-row table edge-free (q28/q61/q77/q88/q90).
+    fn push_scalar_view(&mut self, alias: String, subquery: &ast::Query) -> Result<(), String> {
+        let ast::SetExpr::Select(inner) = subquery.body.as_ref() else {
+            unreachable!("scalar_agg_body checked Select");
+        };
+        let mut cols = Vec::new();
+        for (i, item) in inner.projection.iter().enumerate() {
+            let (e_item, name) = match item {
+                ast::SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.clone()),
+                ast::SelectItem::UnnamedExpr(e) => (e, format!("col{i}")),
+                other => {
+                    return Err(format!("unsupported select item: {other}"));
+                }
+            };
+            let mut q1 = subquery.clone();
+            let ast::SetExpr::Select(s1) = q1.body.as_mut() else {
+                unreachable!("checked Select");
+            };
+            s1.projection = vec![ast::SelectItem::UnnamedExpr(e_item.clone())];
+            q1.order_by = None;
+            q1.limit_clause = None;
+            cols.push((name, ast::Expr::Subquery(Box::new(q1))));
+        }
+        self.views.push(ViewMap { alias, cols });
+        Ok(())
     }
 
     /// Register an explicit `JOIN … ON` clause. INNER joins route their ON
@@ -1406,6 +1505,64 @@ impl Binder<'_> {
                     self.uses_grouping = true;
                     return Ok(Expr::Column(GROUPING_BASE + k));
                 }
+                // concat over group keys / row-space parts (q66's
+                // `concat(w_warehouse_name, …)` in a grouped projection).
+                if f.name.to_string().eq_ignore_ascii_case("concat")
+                    && let ast::FunctionArguments::List(list) = &f.args
+                {
+                    let parts = list
+                        .args
+                        .iter()
+                        .map(|a| match a {
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(x)) => {
+                                self.bind_output(x, group, aggs)
+                            }
+                            other => Err(format!("unsupported concat argument: {other}")),
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    return Ok(Expr::Concat(parts));
+                }
+                // round/upper over row-space arguments (round(sum(x),2)).
+                let fname = f.name.to_string().to_lowercase();
+                if (fname == "round" || fname == "upper")
+                    && let ast::FunctionArguments::List(list) = &f.args
+                {
+                    let mut args: Vec<&ast::Expr> = Vec::new();
+                    for a in &list.args {
+                        match a {
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(x)) => {
+                                args.push(x)
+                            }
+                            other => {
+                                return Err(format!("unsupported {fname} argument: {other}"));
+                            }
+                        }
+                    }
+                    return match (fname.as_str(), args.as_slice()) {
+                        ("upper", [x]) => {
+                            Ok(Expr::Upper(Box::new(self.bind_output(x, group, aggs)?)))
+                        }
+                        ("round", [x]) => Ok(Expr::Round {
+                            expr: Box::new(self.bind_output(x, group, aggs)?),
+                            digits: 0,
+                        }),
+                        ("round", [x, d]) => {
+                            let digits = match self.clone_free_literal(d)? {
+                                ScalarValue::Int64(v) => v as i32,
+                                other => {
+                                    return Err(format!(
+                                        "round digits must be an integer: {other:?}"
+                                    ));
+                                }
+                            };
+                            Ok(Expr::Round {
+                                expr: Box::new(self.bind_output(x, group, aggs)?),
+                                digits,
+                            })
+                        }
+                        _ => Err(format!("'{fname}' takes the wrong number of arguments")),
+                    };
+                }
                 if let Some(rewritten) = rewrite_scalar_fn(f)? {
                     return self.bind_output(&rewritten, group, aggs);
                 }
@@ -1470,6 +1627,34 @@ impl Binder<'_> {
                     other => Err(format!("unsupported CAST target over aggregate: {other}")),
                 }
             }
+            // SUBSTR over a row-space string (q8/q85's grouped
+            // `substr(ca_zip, 1, 5)`): the inner binds in row space,
+            // bounds are literals.
+            ast::Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                let inner = self.bind_output(expr, group, aggs)?;
+                let mut lit_i64 = |e: &Option<Box<ast::Expr>>| -> Result<Option<i64>, String> {
+                    match e {
+                        None => Ok(None),
+                        Some(x) => match self.clone_free_literal(x)? {
+                            ScalarValue::Int64(v) => Ok(Some(v)),
+                            other => Err(format!("SUBSTRING bounds must be integers: {other:?}")),
+                        },
+                    }
+                };
+                let from = lit_i64(substring_from)?
+                    .ok_or("SUBSTRING requires a FROM position (so far)")?;
+                let len = lit_i64(substring_for)?;
+                Ok(Expr::Substr {
+                    expr: Box::new(inner),
+                    from,
+                    len,
+                })
+            }
             other => Err(format!("unsupported expression over aggregates: {other}")),
         }
     }
@@ -1531,7 +1716,7 @@ impl Binder<'_> {
                 .as_ref()
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| tname.clone());
-            let def = if let Some((_, cols)) = self.ctes.get(&tname) {
+            let def = if let Some((_, cols, _)) = self.ctes.get(&tname) {
                 TableDef {
                     path: PathBuf::new(),
                     columns: cols
@@ -1703,6 +1888,13 @@ impl Binder<'_> {
         let ast::SetExpr::Select(select) = subquery.body.as_ref() else {
             return Err("EXISTS subquery must be a plain SELECT".into());
         };
+        // MULTI-table EXISTS (q10/q35/q69's `EXISTS (SELECT * FROM fact,
+        // date_dim WHERE c_customer_sk = fact_customer_sk AND …)`): find
+        // the single correlation equality, strip it, and bind the rest as
+        // a set-semantics IN-subquery — `outer IN (SELECT inner FROM …)`.
+        if select.from.len() > 1 {
+            return self.bind_exists_multi(subquery, select, negated);
+        }
         let [from] = select.from.as_slice() else {
             return Err("EXISTS subquery must have exactly one FROM table (so far)".into());
         };
@@ -1851,6 +2043,135 @@ impl Binder<'_> {
             set_ops: Vec::new(),
             derived: inner.derived,
         };
+        self.subs.push(bq);
+        Ok(Bound::Expr(Expr::InSub {
+            expr: Box::new(Expr::Column(outer_slot)),
+            sub: self.subs.len() - 1,
+            negated,
+        }))
+    }
+
+    /// A multi-table `[NOT] EXISTS`: exactly one correlation equality
+    /// (inner col = outer col) among the WHERE conjuncts; everything else
+    /// (including the inner tables' own join edges) stays in the rebuilt
+    /// subquery, which binds through the ordinary multi-table machinery
+    /// with set semantics.
+    fn bind_exists_multi(
+        &mut self,
+        subquery: &ast::Query,
+        select: &ast::Select,
+        negated: bool,
+    ) -> Result<Bound, String> {
+        // Inner defs (catalog tables or CTEs, optionally aliased).
+        let mut inner_defs: Vec<(TableDef, String)> = Vec::new();
+        for twj in &select.from {
+            if !twj.joins.is_empty() {
+                return Err("JOIN inside EXISTS is not yet supported".into());
+            }
+            let ast::TableFactor::Table { name, alias, .. } = &twj.relation else {
+                return Err("EXISTS FROM must be plain tables".into());
+            };
+            let tname = name.to_string();
+            let display = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| tname.clone());
+            let def = if let Some((_, cs, _)) = self.ctes.get(&tname) {
+                TableDef {
+                    path: PathBuf::new(),
+                    columns: cs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (n, ty))| crate::catalog::ColumnDef {
+                            name: n.clone(),
+                            leaf: i,
+                            ty: *ty,
+                            dec_scale: None,
+                            nullable: false,
+                        })
+                        .collect(),
+                }
+            } else {
+                self.catalog
+                    .table(&tname)
+                    .ok_or_else(|| format!("unknown table '{tname}'"))?
+                    .clone()
+            };
+            inner_defs.push((def, display));
+        }
+        let inner_of = |parts: &[&str]| -> Option<()> {
+            match parts {
+                [c] => inner_defs
+                    .iter()
+                    .any(|(d, _)| d.column(c).is_some())
+                    .then_some(()),
+                [t, c] => inner_defs
+                    .iter()
+                    .any(|(d, disp)| disp.eq_ignore_ascii_case(t) && d.column(c).is_some())
+                    .then_some(()),
+                _ => None,
+            }
+        };
+
+        let mut conjuncts = Vec::new();
+        if let Some(w) = &select.selection {
+            split_and(w, &mut conjuncts);
+        }
+        // (inner-side AST expr, outer slot)
+        let mut corr: Option<(ast::Expr, usize)> = None;
+        let mut rest: Vec<ast::Expr> = Vec::new();
+        for conj in conjuncts {
+            if let ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } = conj
+                && let (Some(lp), Some(rp)) = (ident_parts(left), ident_parts(right))
+            {
+                let l_in = inner_of(&lp).is_some();
+                let r_in = inner_of(&rp).is_some();
+                // Exactly one side inner, the other resolvable outside.
+                if l_in ^ r_in {
+                    let (ie, op_) = if l_in {
+                        (left.as_ref(), &rp)
+                    } else {
+                        (right.as_ref(), &lp)
+                    };
+                    let outer_parts: Vec<&str> = op_.to_vec();
+                    if let Ok(slot) = self.resolve_parts(&outer_parts) {
+                        if corr.is_some() {
+                            return Err(
+                                "multiple correlated conditions in EXISTS are not yet supported"
+                                    .into(),
+                            );
+                        }
+                        corr = Some((ie.clone(), slot));
+                        continue;
+                    }
+                }
+            }
+            rest.push(conj.clone());
+        }
+        let Some((inner_expr, outer_slot)) = corr else {
+            return Err("uncorrelated EXISTS is not yet supported".into());
+        };
+
+        // Rebuild: SELECT <inner corr col> FROM … WHERE rest — bound with
+        // set semantics (membership only cares about the value set).
+        let mut q2 = subquery.clone();
+        let ast::SetExpr::Select(s2) = q2.body.as_mut() else {
+            unreachable!("checked Select");
+        };
+        s2.projection = vec![ast::SelectItem::UnnamedExpr(inner_expr)];
+        s2.selection = rest.into_iter().reduce(|l, r| ast::Expr::BinaryOp {
+            left: Box::new(l),
+            op: ast::BinaryOperator::And,
+            right: Box::new(r),
+        });
+        let bq = bind_query(&q2, self.catalog, true, self.ctes)?;
+        if bq.output.len() != 1 {
+            return Err("an EXISTS rewrite must select exactly one column".into());
+        }
         self.subs.push(bq);
         Ok(Bound::Expr(Expr::InSub {
             expr: Box::new(Expr::Column(outer_slot)),
@@ -2577,10 +2898,16 @@ impl Binder<'_> {
                 if let Some(parts) = self.bind_concat(f)? {
                     return Ok(Bound::Expr(Expr::Concat(parts)));
                 }
+                if let Some(e2) = self.bind_round_or_upper(f)? {
+                    return Ok(Bound::Expr(e2));
+                }
                 if let Some(rewritten) = rewrite_scalar_fn(f)? {
                     return self.bind(&rewritten);
                 }
-                Err("aggregate calls are only allowed in the SELECT list (so far)".into())
+                Err(format!(
+                    "unsupported function '{}' outside the SELECT list",
+                    f.name
+                ))
             }
             other => Err(format!("unsupported expression: {other}")),
         }
@@ -2654,7 +2981,7 @@ fn infer_slot_type(q: &BoundQuery, e: &Expr) -> LogicalType {
             binary_type(*op, infer_slot_type(q, lhs), infer_slot_type(q, rhs))
         }
         Expr::ExtractYear(_) | Expr::CastInt(_) => LogicalType::Int64,
-        Expr::Substr { .. } | Expr::Concat(_) => LogicalType::Utf8,
+        Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) => LogicalType::Utf8,
         Expr::Case { whens, .. } => whens
             .first()
             .map(|(_, v)| infer_slot_type(q, v))
@@ -2691,7 +3018,7 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
             infer_row_type(q, key_tys, rhs),
         ),
         Expr::ExtractYear(_) | Expr::CastInt(_) => LogicalType::Int64,
-        Expr::Substr { .. } | Expr::Concat(_) => LogicalType::Utf8,
+        Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) => LogicalType::Utf8,
         Expr::Case { whens, .. } => whens
             .first()
             .map(|(_, v)| infer_row_type(q, key_tys, v))
@@ -2722,6 +3049,67 @@ fn binary_type(op: BinaryOp, l: LogicalType, r: LogicalType) -> LogicalType {
         }
         Div => LogicalType::Float64,
         _ => LogicalType::Int64, // comparisons/logic used as keys: 0/1
+    }
+}
+
+/// Is this query a SCALAR aggregate — a plain SELECT whose every item is
+/// an aggregate, with no GROUP BY — and therefore guaranteed to produce
+/// exactly one row? (The cross-join-as-constant view rewrite depends on
+/// the one-row guarantee.)
+fn scalar_agg_body(q: &ast::Query) -> bool {
+    let ast::SetExpr::Select(inner) = q.body.as_ref() else {
+        return false;
+    };
+    matches!(
+        &inner.group_by,
+        ast::GroupByExpr::Expressions(g, m) if g.is_empty() && m.is_empty()
+    ) && inner.having.is_none()
+        && inner.distinct.is_none()
+        && !inner.from.is_empty()
+        && q.with.is_none()
+        && inner.projection.iter().all(|it| match it {
+            ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                contains_aggregate(e) && !contains_window(e)
+            }
+            _ => false,
+        })
+}
+
+/// Is this a `SetExpr::Query` wrapper that [`flatten_setexpr`] can unwrap
+/// (no WITH / ORDER BY / LIMIT of its own), anywhere in the set-op tree?
+fn contains_flattenable_wrapper(e: &ast::SetExpr) -> bool {
+    match e {
+        ast::SetExpr::Query(q) => {
+            q.with.is_none() && q.order_by.is_none() && q.limit_clause.is_none()
+        }
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            contains_flattenable_wrapper(left) || contains_flattenable_wrapper(right)
+        }
+        _ => false,
+    }
+}
+
+/// Recursively unwrap parenthesized `SetExpr::Query` sides into their
+/// bodies (see [`contains_flattenable_wrapper`]).
+fn flatten_setexpr(e: ast::SetExpr) -> ast::SetExpr {
+    match e {
+        ast::SetExpr::Query(q)
+            if q.with.is_none() && q.order_by.is_none() && q.limit_clause.is_none() =>
+        {
+            flatten_setexpr(*q.body)
+        }
+        ast::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => ast::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left: Box::new(flatten_setexpr(*left)),
+            right: Box::new(flatten_setexpr(*right)),
+        },
+        other => other,
     }
 }
 
@@ -2770,7 +3158,7 @@ fn rewrite_full_outer(
             .as_ref()
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| tname.clone());
-        let cols: Vec<String> = if let Some((_, cs)) = ctes.get(&tname) {
+        let cols: Vec<String> = if let Some((_, cs, _)) = ctes.get(&tname) {
             cs.iter().map(|(n, _)| n.clone()).collect()
         } else if let Some(d) = catalog.table(&tname) {
             d.columns.iter().map(|c| c.name.clone()).collect()
@@ -3205,7 +3593,9 @@ fn references_columns(e: &Expr) -> bool {
         Expr::Column(_) => true,
         Expr::Literal(_) => false,
         Expr::Binary { lhs, rhs, .. } => references_columns(lhs) || references_columns(rhs),
-        Expr::ExtractYear(i) | Expr::CastInt(i) => references_columns(i),
+        Expr::ExtractYear(i) | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+            references_columns(i)
+        }
         Expr::Like { expr, .. } => references_columns(expr),
         Expr::ScalarSub(_) => false,
         Expr::InSub { expr, .. }

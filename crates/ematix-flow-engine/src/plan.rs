@@ -253,7 +253,10 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
                 walk(lhs, f);
                 walk(rhs, f);
             }
-            Expr::ExtractYear(i) | Expr::CastInt(i) => walk(i, f),
+            Expr::ExtractYear(i)
+            | Expr::CastInt(i)
+            | Expr::Round { expr: i, .. }
+            | Expr::Upper(i) => walk(i, f),
             Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
             | Expr::InSet { expr, .. }
@@ -306,7 +309,10 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
                 walk(lhs, f);
                 walk(rhs, f);
             }
-            Expr::ExtractYear(i) | Expr::CastInt(i) => walk(i, f),
+            Expr::ExtractYear(i)
+            | Expr::CastInt(i)
+            | Expr::Round { expr: i, .. }
+            | Expr::Upper(i) => walk(i, f),
             Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
             | Expr::InSet { expr, .. }
@@ -686,6 +692,12 @@ fn fill_key(kbuf: &mut Vec<i64>, key_cols: &[KeyCol], i: usize) -> bool {
             None => return false,
         }
     }
+    // A KEYLESS (cross-join) link uses the constant key 0 — every row on
+    // both sides shares it, so a probe matches the whole dim (the fan-out's
+    // early residual then prunes during expansion).
+    if key_cols.is_empty() {
+        kbuf.push(0);
+    }
     true
 }
 
@@ -968,40 +980,56 @@ impl Executor<'_> {
             // matching the query's natural lookup structure.
             let mut frontier = std::collections::VecDeque::from([root]);
             let mut used_edges = vec![false; q.edges.len()];
-            while let Some(t) = frontier.pop_front() {
-                for (ei, e) in q.edges.iter().enumerate() {
-                    if used_edges[ei] {
-                        continue;
-                    }
-                    let (sa, sb) = (q.slots[e.a], q.slots[e.b]);
-                    let (parent_slot_col, child) = if sa.table == t && !seen[sb.table] {
-                        (sa.col, (sb.table, sb.col))
-                    } else if sb.table == t && !seen[sa.table] {
-                        (sb.col, (sa.table, sa.col))
-                    } else {
-                        continue;
-                    };
-                    used_edges[ei] = true;
-                    seen[child.0] = true;
-                    // Absorb every other edge between this same pair into
-                    // one composite-key link.
-                    let mut links: Links = vec![(parent_slot_col, child.1)];
-                    for (ej, e2) in q.edges.iter().enumerate() {
-                        if used_edges[ej] {
+            loop {
+                while let Some(t) = frontier.pop_front() {
+                    for (ei, e) in q.edges.iter().enumerate() {
+                        if used_edges[ei] {
                             continue;
                         }
-                        let (x, y) = (q.slots[e2.a], q.slots[e2.b]);
-                        if x.table == t && y.table == child.0 {
-                            links.push((x.col, y.col));
-                            used_edges[ej] = true;
-                        } else if y.table == t && x.table == child.0 {
-                            links.push((y.col, x.col));
-                            used_edges[ej] = true;
+                        let (sa, sb) = (q.slots[e.a], q.slots[e.b]);
+                        let (parent_slot_col, child) = if sa.table == t && !seen[sb.table] {
+                            (sa.col, (sb.table, sb.col))
+                        } else if sb.table == t && !seen[sa.table] {
+                            (sb.col, (sa.table, sa.col))
+                        } else {
+                            continue;
+                        };
+                        used_edges[ei] = true;
+                        seen[child.0] = true;
+                        // Absorb every other edge between this same pair into
+                        // one composite-key link.
+                        let mut links: Links = vec![(parent_slot_col, child.1)];
+                        for (ej, e2) in q.edges.iter().enumerate() {
+                            if used_edges[ej] {
+                                continue;
+                            }
+                            let (x, y) = (q.slots[e2.a], q.slots[e2.b]);
+                            if x.table == t && y.table == child.0 {
+                                links.push((x.col, y.col));
+                                used_edges[ej] = true;
+                            } else if y.table == t && x.table == child.0 {
+                                links.push((y.col, x.col));
+                                used_edges[ej] = true;
+                            }
                         }
+                        let is_left = q.edges[ei].preserved.is_some();
+                        children[t].push((child.0, links, is_left));
+                        frontier.push_back(child.0);
                     }
-                    let is_left = q.edges[ei].preserved.is_some();
-                    children[t].push((child.0, links, is_left));
-                    frontier.push_back(child.0);
+                }
+                // A DISCONNECTED component (no join edge to anything seen —
+                // a deliberate cross join, q2/q8): its first table attaches
+                // as a KEYLESS child of the root (empty links = constant
+                // key, every root row × every component row; the fan-out's
+                // early residual prunes during expansion), then its own
+                // component joins on normally below it.
+                match seen.iter().position(|s| !s) {
+                    Some(t) => {
+                        seen[t] = true;
+                        children[root].push((t, Vec::new(), false));
+                        frontier.push_back(t);
+                    }
+                    None => break,
                 }
             }
             // Any unused edge connects two already-seen tables: a cycle.
@@ -1287,7 +1315,9 @@ impl Executor<'_> {
         }
 
         let pay_tys: Vec<LogicalType> = payload_slots.iter().map(|&s| self.slot_ty(s)).collect();
-        let key_len = link_cols.len();
+        // A keyless cross-join child stores the constant key `0` (stride 1;
+        // see fill_key) — chunks_exact(0) in the merge would panic.
+        let key_len = link_cols.len().max(1);
         let nshards = self.nthreads.next_power_of_two().clamp(1, 64);
 
         // ---- Phase 1: morsel-parallel scan+emit. Each worker decodes a
@@ -1904,7 +1934,7 @@ impl Executor<'_> {
                         sel.for_each(|i| states[j].count += flags[i as usize] as u64);
                     }
                     AggFunc::CountDistinct => sel.for_each(|i| {
-                        if let Some(v) = agg.arg.eval_opt_i64(&view, i as usize) {
+                        if let Some(v) = agg.arg.eval_opt_distinct_key(&view, i as usize) {
                             states[j].distinct.insert(v);
                         }
                     }),
@@ -1938,7 +1968,7 @@ impl Executor<'_> {
                         states[j].count += view.col(ctx.matched_cols[&t]).as_i64()[i] as u64;
                     }
                     AggFunc::CountDistinct => {
-                        if let Some(v) = agg.arg.eval_opt_i64(&view, i) {
+                        if let Some(v) = agg.arg.eval_opt_distinct_key(&view, i) {
                             states[j].distinct.insert(v);
                         }
                     }
@@ -2836,7 +2866,9 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
             collect_slots(lhs, out);
             collect_slots(rhs, out);
         }
-        Expr::ExtractYear(i) | Expr::CastInt(i) => collect_slots(i, out),
+        Expr::ExtractYear(i) | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+            collect_slots(i, out)
+        }
         Expr::Like { expr, .. } => collect_slots(expr, out),
         Expr::ScalarSub(_) => {}
         Expr::InSub { expr, .. }

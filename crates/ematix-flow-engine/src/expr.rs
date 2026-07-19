@@ -73,6 +73,17 @@ pub enum Expr {
     /// rounds to the nearest integer (DuckDB `CAST` semantics: `10714.82` →
     /// `10715`). An already-integer operand is unchanged.
     CastInt(Box<Expr>),
+    /// `round(<expr>, digits)` — round half away from zero at `digits`
+    /// decimal places (q2/q78's ratio projections).
+    Round {
+        expr: Box<Expr>,
+        digits: i32,
+    },
+    /// `upper(<expr>)` — an OWNED string, so like [`Expr::Concat`] it is
+    /// evaluated via `eval_value` (projections), and comparisons containing
+    /// it are handled inline in the `Binary` arm (no owned value escapes
+    /// the borrowed `Val` path). q24's `c_birth_country = upper(ca_country)`.
+    Upper(Box<Expr>),
     /// `CASE WHEN c₁ THEN v₁ [WHEN c₂ THEN v₂ …] ELSE e END` (the `ELSE` is
     /// required by the binder — no NULLs yet).
     Case {
@@ -206,6 +217,34 @@ impl Expr {
                 ScalarValue::Null => Val::Null,
             },
             Expr::Binary { op, lhs, rhs } => {
+                // upper() yields an OWNED string; a comparison containing it
+                // evaluates both sides here (transform applied inline) so no
+                // owned value escapes the borrowed path.
+                if matches!(lhs.as_ref(), Expr::Upper(_)) || matches!(rhs.as_ref(), Expr::Upper(_))
+                {
+                    let side = |e: &Expr| -> Option<String> {
+                        match e {
+                            Expr::Upper(inner) => match inner.eval(chunk, row) {
+                                Val::Str(s) => Some(s.to_uppercase()),
+                                Val::Null => None,
+                                other => panic!("upper needs a string, got {other:?}"),
+                            },
+                            _ => match e.eval(chunk, row) {
+                                Val::Str(s) => Some(s.to_string()),
+                                Val::Null => None,
+                                other => panic!("string comparison got {other:?}"),
+                            },
+                        }
+                    };
+                    let (Some(a), Some(b)) = (side(lhs), side(rhs)) else {
+                        return Val::Null;
+                    };
+                    return match op {
+                        BinaryOp::Eq => Val::Bool(a == b),
+                        BinaryOp::NotEq => Val::Bool(a != b),
+                        other => panic!("upper() only supports =/<> comparisons, got {other:?}"),
+                    };
+                }
                 let l = lhs.eval(chunk, row);
                 let r = rhs.eval(chunk, row);
                 eval_binary(*op, l, r)
@@ -221,6 +260,18 @@ impl Expr {
                 Val::Null => Val::Null,
                 other => panic!("CAST AS INT needs a numeric operand, got {other:?}"),
             },
+            Expr::Round { expr, digits } => match expr.eval(chunk, row) {
+                Val::Int(i) => Val::Int(i),
+                Val::Float(f) => {
+                    let p = 10f64.powi(*digits);
+                    Val::Float((f * p).round() / p)
+                }
+                Val::Null => Val::Null,
+                other => panic!("round needs a numeric operand, got {other:?}"),
+            },
+            Expr::Upper(_) => {
+                panic!("upper() must be evaluated via eval_value or inside a comparison")
+            }
             Expr::Case { whens, else_ } => {
                 for (cond, val) in whens {
                     if cond.eval(chunk, row).expect_bool() {
@@ -322,6 +373,14 @@ impl Expr {
             }
             return ScalarValue::Utf8(Arc::from(out.as_str()));
         }
+        // upper() builds an owned string — evaluate here like concat.
+        if let Expr::Upper(inner) = self {
+            return match inner.eval_value(chunk, row) {
+                ScalarValue::Utf8(s) => ScalarValue::Utf8(Arc::from(s.to_uppercase().as_str())),
+                ScalarValue::Null => ScalarValue::Null,
+                other => panic!("upper needs a string, got {other:?}"),
+            };
+        }
         match self.eval(chunk, row) {
             Val::Int(i) => ScalarValue::Int64(i),
             Val::Float(f) => ScalarValue::Float64(f),
@@ -348,6 +407,20 @@ impl Expr {
         match self.eval(chunk, row) {
             Val::Null => None,
             v => Some(v.expect_int("integer aggregate input")),
+        }
+    }
+
+    /// Evaluate to a COUNT(DISTINCT …) set key, or `None` on SQL NULL.
+    /// Integers key as themselves; floats by bit pattern (`-0.0`
+    /// normalized so it groups with `0.0`) — q28's
+    /// `count(DISTINCT ss_list_price)` over a decimal column.
+    #[inline]
+    pub fn eval_opt_distinct_key(&self, chunk: &DataChunk, row: usize) -> Option<i64> {
+        match self.eval(chunk, row) {
+            Val::Null => None,
+            Val::Int(i) => Some(i),
+            Val::Float(f) => Some((if f == 0.0 { 0.0f64 } else { f }).to_bits() as i64),
+            other => panic!("COUNT(DISTINCT) key: unsupported value {other:?}"),
         }
     }
 

@@ -454,6 +454,39 @@ window-over-derived is the q49 prerequisite.
   columns. Zero executor change; reuses the LEFT + anti + UNION ALL
   machinery hardened above.
 
+- **The last 19 (2026-07-19): exec 84→103/103 — EVERY TPC-DS query
+  executes and parity-matches DuckDB.** Nine coupled features:
+  - **Parenthesized set-op sides** — `a UNION ALL (SELECT …)` parses as a
+    `SetExpr::Query` wrapper; wrappers with no own WITH/ORDER/LIMIT
+    flatten recursively before binding (q2/q23ab/q87).
+  - **Row-space concat/SUBSTR** in grouped projections (`bind_output`
+    arms; q66/q85/q8).
+  - **Scalar-aggregate cross-join views** — a no-GROUP-BY aggregate
+    derived/CTE (guaranteed 1 row) past the first FROM item becomes a
+    view of single-column scalar subqueries: references substitute as
+    constants, so the cross join needs no edge (q28/q61/q77/q88/q90).
+    `SELECT *` expands over views. `count(DISTINCT <float>)` keys by bit
+    pattern (`eval_opt_distinct_key`; q28 panicked on Float input).
+  - **Multi-table EXISTS** — one correlation equality found among the
+    conjuncts, stripped, rest bound as a set-semantics IN-subquery
+    (q10/q35/q69).
+  - **Inline-collision → materialize** — twin plain deriveds over the
+    same CTE/table names can't both inline into one scope (q2/q59).
+  - **Keyless cross-join children** — the bind connectivity check is
+    GONE: a disconnected component is legitimate SQL (a cross join) and
+    attaches as a constant-key (`fill_key` pushes 0) fan-out child; the
+    batched early residual prunes during expansion. Covers q2's
+    `d_week_seq1 = d_week_seq2 - 53` arithmetic join and q8's
+    `substr(s_zip,1,2) = substr(V1.ca_zip,1,2)` expression join.
+  - **round(x[,d]) + upper(x)** — `Expr::Round` (numeric, borrowed path);
+    `Expr::Upper` yields an OWNED string so it evaluates via `eval_value`
+    in projections and INLINE inside =/<> comparisons (no owned value
+    escapes the borrowed `Val` path); q24ab's
+    `c_birth_country = upper(ca_country)`, q2/q78's `round(ratio, 2)`.
+  - **Oracle-harness DuckDB fixups** — q90's bare `at` alias and q77's
+    bare `returns` alias are DuckDB-reserved; quoted/AS-prefixed on the
+    DuckDB side only.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
