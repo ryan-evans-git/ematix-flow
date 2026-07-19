@@ -169,11 +169,33 @@ SQL text
   MAP BUILDING (15M single-threaded inserts), per-row interpreted
   expression eval, payload attach — the named next levers.
 
+- **Sharded columnar dim maps (2026-07-18, `33de3a16`): planned Q08 SF-10
+  836 ms → 350 ms (2.4×; cumulative 20× from the 7000 ms interpreted
+  baseline).** All three named levers landed as one `DimResult` redesign:
+  dim builds run as two morsel-parallel phases (scan+emit into
+  per-(row-group, shard) buffers → concurrent per-shard merges, folding
+  row groups in row-group order so layout and dup-key errors stay
+  deterministic); payloads store COLUMNAR per shard (`PayCol`), probes
+  return a payload row index recorded during the narrow probe itself, and
+  the attach gathers typed values with no re-probe, no `ScalarValue`
+  boxing; `FastHasher` (multiplicative mix + fmix64) replaces SipHash in
+  the dim maps; probe/emit loops read keys and payload sources by direct
+  slice view (`KeyCol`/`PaySrc`) instead of per-row interpreter dispatch.
+  Thread scaling 2952/840/350 ms at 1/4/14 threads; single-thread total
+  work itself dropped 1.8× (5347→2952 ms). 76/76 green incl. the Q6
+  bit-equality gate. **Remaining 2.5× to the 141 ms arm decomposes as:
+  root decode ~140 ms (at the Snappy-decompress wall — REV.20), root
+  probe/attach/agg ~100 ms, and the dim phase serialized BEFORE the root
+  ~110 ms. The next structural lever is pipelining dim builds under root
+  decode (bounded decode-ahead queue) — an architecture change, not a
+  local optimization.**
+
 ## Next (P4 tail → P5/P6)
 
-- Close the remaining planned-vs-hand-built gap: parallel/sharded dim map
-  builds, `ProbeStructure` fast path for key-only dims, vectorized
-  expression eval, allocation-free payload attach.
+- Overlap the dim-build phase with root decode (bounded decode-ahead
+  queue) — the last named structural lever toward the hand-built 141 ms;
+  vectorized expression eval for the grouped-agg per-row path (Q1-shaped
+  queries) remains banked.
 - **TPC-DS breadth** through the same front-end.
 - Re-home the Σ rules onto `BoundQuery`; CTE result sharing (Q15
   materializes twice); NULL semantics beyond the outer-join stand-ins;
