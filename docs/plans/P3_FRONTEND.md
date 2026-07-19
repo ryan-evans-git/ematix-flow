@@ -631,6 +631,54 @@ window-over-derived is the q49 prerequisite.
   agg-kernel unit: hash agg + string interning), q4 7s, 6s cluster
   (q72/q51/q28/q23ab).
 
+- **Sorted-Vec agg spine (2026-07-19, `9f492b68`): q67 9.0→3.0s, q4
+  6.1→3.7s, q51→4.5s, q23a→3.4s, q23b→3.5s.** The planned "hash-agg
+  kernel rewrite" turned out unnecessary — the sample showed ~40% of
+  q67's merge phase was `BTreeMap::from_iter` re-SORTING and
+  re-tree-building the k-way merge's already-sorted output, and the
+  single hottest remaining symbol (712 samples, 5× anything) was DROP
+  GLUE freeing 5.8M `Vec<GroupKey>` keys inline. Post-merge grouped
+  representation is now a sorted `Vec<(key, states)>` (`GroupsVec`):
+  merge returns the concatenated range output directly; the ROLLUP
+  cascade iterates contiguously and APPENDS its levels after the base
+  (finest first — new pinned convention); HAVING pre-filter keeps a
+  vec; finalize builds row-space columns in PARALLEL (per-column scoped
+  threads) and the columnar hand-off projects chunks in parallel; the
+  consumed groups vec drops on a detached thread.
+  `tests/sql_agg_vec_spine.rs` (level-append order + bit-identical at
+  1/13/default threads).
+
+- **Column-at-a-time filter masks (2026-07-19, `d8019201`): q28
+  4.4→0.94s, q88→0.4s.** q28's six 28.8M-row slices spent 20× more in
+  recursive per-row `Expr::eval` than in decode. `filter_expr` now
+  builds typed whole-column boolean masks for And/Or (hybrid per-row
+  fallback on unmaskable siblings, evaluated only on undecided rows),
+  cmp col-vs-lit / col-vs-col with the interpreter's exact promotion
+  rules, IS NULL from validity, IN sets, LIKE. NULL→false masks compose
+  exactly through And/Or (no NOT node exists — per-leaf negation flags
+  handled inside each leaf). Sparse selections (<1/4 live) keep the
+  per-row path. `tests/expr_filter_mask.rs` row-equivalence vs the
+  interpreter across every leaf kernel/validity/promotion/negation.
+
+- **Fan-out key widening + probe-domain mask fix (2026-07-19,
+  `c7ba2080`): q72 5.0→3.6s.** The dig found the mask fast path never
+  engaged on fan-out residual batches — `n_rows()` reads the FIRST
+  column (an empty placeholder in fan-out views), failing every leaf
+  length check; the domain now comes from the selection (this is the
+  whole q72 win — the batch residual evaluates columnar). The widening
+  lever itself (post-join `Eq(colA, colB)` across subtrees → promoted
+  into the dim's composite key; build appends the subtree-side value at
+  emit, probe appends the root-side column, attach-order constrained)
+  landed with two measured guards: the LARGER subtree wins the
+  orientation (widening tiny d1 dragged the fan-out ahead of the
+  narrowing dims: 5s→12s), and a dim larger than the probe side never
+  widens, with NO small-side fallback (inventory's 133M-row build went
+  1.0→7.1s at 26.6M widened Multi keys — Vec-alloc per emit — costing
+  more than the probe saved). So q72 runs UNwidened; the lever fires
+  2000× on dim-smaller-than-root shapes (gate suite 466s→0.2s).
+  EMAT_NO_WIDEN / EMAT_TRACE_JOIN. `tests/sql_fanout_key_widen.rs`
+  (widened ≡ pre-joined formulations through independent machinery).
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead

@@ -597,7 +597,15 @@ fn year_of_days(days: i32) -> i32 {
 /// Skipped when the live selection is sparse (whole-column loops would
 /// out-cost the survivors).
 pub fn filter_expr(chunk: &DataChunk, pred: &Expr) -> Selection {
-    let n = chunk.n_rows();
+    // The row domain comes from the SELECTION for the dense case:
+    // fan-out views carry empty placeholder columns, so `n_rows()` (the
+    // first column's length) can read 0 there while the live columns are
+    // full-length — which silently disabled the mask path (every leaf's
+    // length check failed).
+    let n = match &chunk.sel {
+        Selection::All(k) => *k,
+        Selection::Indices(_) => chunk.n_rows(),
+    };
     if chunk.sel.len() * 4 >= n
         && let Some(mask) = try_mask(chunk, pred, n)
     {

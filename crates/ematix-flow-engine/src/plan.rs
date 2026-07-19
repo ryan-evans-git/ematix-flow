@@ -727,6 +727,10 @@ enum KeyCol<'a> {
     I32(&'a [i32], Option<&'a [bool]>),
     /// String keys intern to i64 through the run's [`StrInterner`].
     Str(Utf8View<'a>, Option<&'a [bool]>, &'a StrInterner),
+    /// A constant key component — the keyless (cross-join) probe's `0`
+    /// when widened keys follow it (mirrors `fill_key`'s empty-key
+    /// convention on the build side).
+    Const(i64),
 }
 
 impl KeyCol<'_> {
@@ -745,6 +749,7 @@ impl KeyCol<'_> {
                 Some(v) if !v[i] => None,
                 _ => Some(interner.intern(view.get(i))),
             },
+            KeyCol::Const(v) => Some(*v),
         }
     }
 }
@@ -757,6 +762,33 @@ fn key_col<'a>(chunk: &'a DataChunk, col: usize, interner: &'a StrInterner) -> K
         LogicalType::Int32 | LogicalType::Date32 => KeyCol::I32(v.as_i32(), valid),
         LogicalType::Utf8 => KeyCol::Str(v.as_utf8(), valid, interner),
         other => panic!("join key must be integer-family or string, got {other:?}"),
+    }
+}
+
+/// Where a widened key component's value comes from during a dim build.
+enum ExtraKeySrc {
+    /// The dim table's own chunk column.
+    OwnCol(usize),
+    /// Payload column `jc` of child subtree `ci` — read from the probed
+    /// hit row during emission.
+    Child { ci: usize, jc: usize },
+}
+
+/// Read a payload value as a key component (`i64`, strings interned).
+/// `None` = NULL payload (can never key-match) — mirrors [`KeyCol::get`].
+#[inline]
+fn pay_key(pc: &PayCol, i: usize, interner: &StrInterner) -> Option<i64> {
+    if !pc.row_valid(i) {
+        return None;
+    }
+    match &pc.data {
+        PayData::I64(v) => Some(v[i]),
+        PayData::Str { offsets, data } => {
+            let s = std::str::from_utf8(&data[offsets[i] as usize..offsets[i + 1] as usize])
+                .expect("payload strings are valid utf8");
+            Some(interner.intern(s))
+        }
+        PayData::F64(_) => None,
     }
 }
 
@@ -961,6 +993,11 @@ struct RootCtx<'a> {
     post: &'a Option<Expr>,
     matched_cols: &'a HashMap<usize, usize>,
     filter: &'a Option<Expr>,
+    /// Fan-out key widening per child: ordered (root-side slot,
+    /// subtree-side slot) pairs whose root-side columns append to the
+    /// probe key (the dim was built with the matching subtree-side
+    /// values appended).
+    widen: &'a HashMap<usize, Vec<(usize, usize)>>,
 }
 
 /// Where a table's row groups come from.
@@ -1169,6 +1206,152 @@ impl Executor<'_> {
         needed.sort_unstable();
         needed.dedup();
 
+        // ---- FAN-OUT KEY WIDENING: a post-join conjunct
+        // `Eq(Column(x), Column(y))` whose sides live in DIFFERENT root
+        // subtrees promotes into the subtree-side child's composite probe
+        // key — the expansion then never emits the rows the residual
+        // would kill (q72's cs⋈inventory fans ~1300× on item_sk alone;
+        // with d2's week_seq in the key it fans ~5×). Sound because a
+        // key mismatch drops exactly the rows the (still-applied,
+        // idempotent) Eq conjunct drops, and a NULL on either side is a
+        // probe miss = the conjunct's UNKNOWN. INNER children only: for
+        // a LEFT child a key miss would keep the root row where the
+        // post-filter drops it. Float slots are excluded (key equality
+        // is exact i64 / interned-string identity; the interpreter
+        // compares floats via f64 — keep those in the filter).
+        // widen[c] = ordered (root-side slot, subtree-side slot) pairs;
+        // widen_order = (must-attach-first child, widened child).
+        let mut widen: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        let mut widen_order: Vec<(usize, usize)> = Vec::new();
+        {
+            // owner[t] = the root child whose subtree contains table t.
+            let mut owner: Vec<Option<usize>> = vec![None; n];
+            for (c, _, _) in &children[root] {
+                let mut stack = vec![*c];
+                while let Some(t) = stack.pop() {
+                    owner[t] = Some(*c);
+                    for (cc, _, _) in &children[t] {
+                        stack.push(*cc);
+                    }
+                }
+            }
+            let left_of: HashMap<usize, bool> =
+                children[root].iter().map(|(c, _, l)| (*c, *l)).collect();
+            // Same key family on both sides: 0 = integer, 1 = string,
+            // 2 = float (never widened).
+            let fam = |s: usize| match self.slot_ty(s) {
+                LogicalType::Utf8 => 1u8,
+                LogicalType::Float64 => 2,
+                _ => 0,
+            };
+            // Would constraint (before, after) close a cycle?
+            let reaches = |order: &[(usize, usize)], from: usize, to: usize| -> bool {
+                let mut stack = vec![from];
+                let mut seen: Vec<usize> = Vec::new();
+                while let Some(x) = stack.pop() {
+                    if x == to {
+                        return true;
+                    }
+                    if seen.contains(&x) {
+                        continue;
+                    }
+                    seen.push(x);
+                    stack.extend(order.iter().filter(|&&(b, _)| b == x).map(|&(_, a)| a));
+                }
+                false
+            };
+            // Subtree size hints (parquet footer row counts): widening
+            // pays on the side that would otherwise FAN OUT, so the
+            // larger subtree wins the key and the smaller side stays the
+            // probe-time column. (Widening the small side is not just
+            // pointless — its ordering constraint would drag the big
+            // fan-out ahead of the narrowing dims: q72 went 5s → 12s
+            // when d1 won the week equality instead of inventory.)
+            // A widened dim LARGER than the probe side is excluded
+            // entirely: rebuilding its map at the widened cardinality
+            // costs more than the expansion it saves (q72's 133M-row
+            // inventory vs the 14M-row catalog_sales root — build went
+            // 1.0s → 7.1s while the probe saved ~1.5s).
+            let root_rows = self.table_rows_hint(root).max(1);
+            let mut subtree_hint: HashMap<usize, u64> = HashMap::new();
+            for (t, o) in owner.iter().enumerate() {
+                if let Some(c) = o {
+                    let rows = self.table_rows_hint(t);
+                    let e = subtree_hint.entry(*c).or_insert(0);
+                    *e = (*e).max(rows);
+                }
+            }
+            let mut conjuncts: Vec<&Expr> = Vec::new();
+            if let Some(p) = &post {
+                split_and_expr(p, &mut conjuncts);
+            }
+            for cj in conjuncts {
+                let Expr::Binary {
+                    op: crate::expr::BinaryOp::Eq,
+                    lhs,
+                    rhs,
+                } = cj
+                else {
+                    continue;
+                };
+                let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref()) else {
+                    continue;
+                };
+                if fam(*a) != fam(*b) || fam(*a) == 2 {
+                    continue;
+                }
+                // Of the (up to two) legal orientations, the SUBTREE side
+                // with the larger size hint widens.
+                let mut best: Option<(u64, usize, Option<usize>, usize, usize)> = None;
+                for (sub, other) in [(*a, *b), (*b, *a)] {
+                    let Some(c) = owner[q.slots[sub].table] else {
+                        continue; // sub side is the root itself
+                    };
+                    let d = owner[q.slots[other].table]; // None = root
+                    if d == Some(c) || left_of.get(&c).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(d) = d
+                        && (left_of.get(&d).copied().unwrap_or(false)
+                            || reaches(&widen_order, c, d))
+                    {
+                        continue;
+                    }
+                    let hint = subtree_hint.get(&c).copied().unwrap_or(0);
+                    if best.is_none_or(|(h, ..)| hint > h) {
+                        best = Some((hint, c, d, other, sub));
+                    }
+                }
+                // The size gate applies to the CHOSEN side, with no
+                // fallback: when the fan-out side is too big to widen,
+                // widening the small side instead would drag the big
+                // fan-out ahead of the narrowing dims (the q72 5s → 12s
+                // failure mode) — better to widen nothing.
+                if best.is_some_and(|(h, ..)| h > root_rows) {
+                    best = None;
+                }
+                if let Some((hint, c, d, other, sub)) = best {
+                    if std::env::var("EMAT_TRACE_JOIN").is_ok() {
+                        eprintln!(
+                            "join: widen child '{}' key with slot {sub} (= root-side {other}), \
+                             size hint {hint}",
+                            q.tables[c].name
+                        );
+                    }
+                    if let Some(d) = d {
+                        widen_order.push((d, c));
+                    }
+                    widen.entry(c).or_default().push((other, sub));
+                }
+            }
+        }
+
+        // Debug/bench escape hatch.
+        if std::env::var("EMAT_NO_WIDEN").is_ok() {
+            widen.clear();
+            widen_order.clear();
+        }
+
         // ---- Process every dim subtree bottom-up.
         let mut dim_results: Vec<Option<DimResult>> = Vec::with_capacity(n);
         for _ in 0..n {
@@ -1176,7 +1359,20 @@ impl Executor<'_> {
         }
         for (child, links, _) in &children[root] {
             let child_cols: Vec<usize> = links.iter().map(|&(_, c)| c).collect();
-            dim_results[*child] = Some(self.build_dim(*child, &child_cols, &children, &needed)?);
+            let extra: Vec<usize> = widen
+                .get(child)
+                .map(|v| v.iter().map(|&(_, sub)| sub).collect())
+                .unwrap_or_default();
+            let t0 = std::time::Instant::now();
+            dim_results[*child] =
+                Some(self.build_dim(*child, &child_cols, &children, &needed, &extra)?);
+            if std::env::var("EMAT_TRACE_JOIN").is_ok() {
+                eprintln!(
+                    "join: built dim '{}' in {:?}",
+                    q.tables[*child].name,
+                    t0.elapsed()
+                );
+            }
         }
 
         // ---- Root: MORSEL-PARALLEL per row group. Each worker decodes a
@@ -1192,6 +1388,21 @@ impl Executor<'_> {
         // filter can see those columns (q72's week-match + qty predicates).
         let mut root_children = children[root].clone();
         root_children.sort_by_key(|(c, _, _)| dim_results[*c].as_ref().is_some_and(|d| d.multi));
+        // A widened child's root-side key slots come from other subtrees'
+        // payloads — those children MUST attach first (overrides the
+        // multi-last preference; widen_order is acyclic by construction).
+        for _ in 0..widen_order.len() {
+            for &(before, after) in &widen_order {
+                let pb = root_children.iter().position(|(t, _, _)| *t == before);
+                let pa = root_children.iter().position(|(t, _, _)| *t == after);
+                if let (Some(pb), Some(pa)) = (pb, pa)
+                    && pb > pa
+                {
+                    let item = root_children.remove(pb);
+                    root_children.insert(pa, item);
+                }
+            }
+        }
         // Matched-flag columns (LEFT children) append past the slot space
         // in (processing-order) child order — a fixed layout every chunk.
         let mut matched_cols: HashMap<usize, usize> = HashMap::new();
@@ -1211,6 +1422,7 @@ impl Executor<'_> {
             post: &post,
             matched_cols: &matched_cols,
             filter: &ti.filter,
+            widen: &widen,
         };
 
         let src = self.table_src(root)?;
@@ -1407,6 +1619,7 @@ impl Executor<'_> {
         link_cols: &[usize],
         children: &[Vec<(usize, Links, bool)>],
         needed: &[usize],
+        extra_key_slots: &[usize],
     ) -> Result<DimResult, String> {
         let q = self.q;
         // This subtree's own payload slots…
@@ -1428,15 +1641,39 @@ impl Executor<'_> {
                 );
             }
             let child_cols: Vec<usize> = links.iter().map(|&(_, c)| c).collect();
-            let r = self.build_dim(*child, &child_cols, children, needed)?;
+            let r = self.build_dim(*child, &child_cols, children, needed, &[])?;
             payload_slots.extend(r.payload_slots.iter().copied());
             child_results.push((links.iter().map(|&(p, _)| p).collect(), r));
         }
 
+        // Widened-key sources: each extra key slot is either this table's
+        // own column or a descendant's payload (its value arrives with
+        // the child probe hit during emission).
+        let extra_srcs: Vec<ExtraKeySrc> = extra_key_slots
+            .iter()
+            .map(|&s| {
+                if q.slots[s].table == t {
+                    return ExtraKeySrc::OwnCol(q.slots[s].col);
+                }
+                let (ci, (_, r)) = child_results
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (_, r))| r.payload_slots.contains(&s))
+                    .expect("widened key slot must live in this subtree");
+                let jc = r
+                    .payload_slots
+                    .iter()
+                    .position(|&x| x == s)
+                    .expect("position exists");
+                ExtraKeySrc::Child { ci, jc }
+            })
+            .collect();
+
         let pay_tys: Vec<LogicalType> = payload_slots.iter().map(|&s| self.slot_ty(s)).collect();
         // A keyless cross-join child stores the constant key `0` (stride 1;
         // see fill_key) — chunks_exact(0) in the merge would panic.
-        let key_len = link_cols.len().max(1);
+        // Widened keys extend the stride.
+        let key_len = link_cols.len().max(1) + extra_srcs.len();
         let nshards = self.nthreads.next_power_of_two().clamp(1, 64);
 
         // ---- Phase 1: morsel-parallel scan+emit. Each worker decodes a
@@ -1451,6 +1688,7 @@ impl Executor<'_> {
         let nworkers = self.nthreads.clamp(1, n_rg.max(1));
         let (src_ref, queue_ref, emits_ref) = (&src, &queue, &emits);
         let (cr_ref, tys_ref, own_ref) = (&child_results, &pay_tys, &own_payload);
+        let ex_ref = &extra_srcs;
         // A multi (fan-out) child forces the general cartesian-product
         // emit: this table's row expands to one dim row per COMBINATION of
         // its children's payload rows (a child chain contributes several).
@@ -1490,6 +1728,16 @@ impl Executor<'_> {
                             .iter()
                             .map(|&s| pay_src(&chunk, q.slots[s].col))
                             .collect();
+                        // Widened extras: own-column sources read this
+                        // chunk directly; child-payload sources read the
+                        // probed hit during emission.
+                        let extra_own: Vec<Option<KeyCol>> = ex_ref
+                            .iter()
+                            .map(|e| match e {
+                                ExtraKeySrc::OwnCol(c) => Some(key_col(&chunk, *c, &self.interner)),
+                                ExtraKeySrc::Child { .. } => None,
+                            })
+                            .collect();
                         let mut kbuf: Vec<i64> = Vec::with_capacity(8);
                         if !any_multi {
                             // FAST PATH: every child contributes one payload
@@ -1521,6 +1769,27 @@ impl Executor<'_> {
                                 // A NULL own-key row can never be matched.
                                 if !fill_key(&mut kbuf, &key_cols, i) {
                                     return;
+                                }
+                                // Widened extras append after the base key
+                                // (a NULL extra can never match either).
+                                for (ex, own) in ex_ref.iter().zip(&extra_own) {
+                                    let v = match ex {
+                                        ExtraKeySrc::OwnCol(_) => {
+                                            own.as_ref().expect("own key col").get(i)
+                                        }
+                                        ExtraKeySrc::Child { ci, jc } => {
+                                            let (s, row) = hits[*ci];
+                                            pay_key(
+                                                cr_ref[*ci].1.map.pay_col(s as usize, *jc),
+                                                row as usize,
+                                                &self.interner,
+                                            )
+                                        }
+                                    };
+                                    match v {
+                                        Some(v) => kbuf.push(v),
+                                        None => return,
+                                    }
                                 }
                                 let buf = &mut bufs[shard_of(&kbuf, nshards)];
                                 buf.keys.extend_from_slice(&kbuf);
@@ -1582,31 +1851,78 @@ impl Executor<'_> {
                                 if !ok || !fill_key(&mut kbuf, &key_cols, i) {
                                     return;
                                 }
-                                let shard = shard_of(&kbuf, nshards);
+                                // Own-column widened extras are per-row
+                                // constants; child-payload extras vary per
+                                // odometer combination and rebuild inside
+                                // the loop (in extras order).
+                                let mut own_vals: Vec<i64> = Vec::new();
+                                for (ex, own) in ex_ref.iter().zip(&extra_own) {
+                                    match ex {
+                                        ExtraKeySrc::OwnCol(_) => {
+                                            match own.as_ref().expect("own key col").get(i) {
+                                                Some(v) => own_vals.push(v),
+                                                None => return,
+                                            }
+                                        }
+                                        ExtraKeySrc::Child { .. } => own_vals.push(0),
+                                    }
+                                }
+                                let base_len = kbuf.len();
+                                let fixed_shard = if ex_ref.is_empty() {
+                                    Some(shard_of(&kbuf, nshards))
+                                } else {
+                                    None
+                                };
                                 for x in idx.iter_mut() {
                                     *x = 0;
                                 }
                                 loop {
-                                    let mut weight = 1u64;
-                                    for ci in 0..ncr {
-                                        weight *= matches[ci][idx[ci]].2;
+                                    kbuf.truncate(base_len);
+                                    let mut dead = false;
+                                    for (xi, ex) in ex_ref.iter().enumerate() {
+                                        let v = match ex {
+                                            ExtraKeySrc::OwnCol(_) => Some(own_vals[xi]),
+                                            ExtraKeySrc::Child { ci, jc } => {
+                                                let (s, row, _) = matches[*ci][idx[*ci]];
+                                                pay_key(
+                                                    cr_ref[*ci].1.map.pay_col(s as usize, *jc),
+                                                    row as usize,
+                                                    &self.interner,
+                                                )
+                                            }
+                                        };
+                                        match v {
+                                            Some(v) => kbuf.push(v),
+                                            None => {
+                                                dead = true;
+                                                break;
+                                            }
+                                        }
                                     }
-                                    let buf = &mut bufs[shard];
-                                    buf.keys.extend_from_slice(&kbuf);
-                                    buf.weights.push(weight);
-                                    let mut j = 0;
-                                    for src in &own_srcs {
-                                        buf.pay[j].push_src(src, i);
-                                        j += 1;
-                                    }
-                                    for (ci, (_, r)) in cr_ref.iter().enumerate() {
-                                        let (s, row, _) = matches[ci][idx[ci]];
-                                        for jc in 0..r.payload_slots.len() {
-                                            buf.pay[j].push_from(
-                                                r.map.pay_col(s as usize, jc),
-                                                row as usize,
-                                            );
+                                    if !dead {
+                                        let mut weight = 1u64;
+                                        for ci in 0..ncr {
+                                            weight *= matches[ci][idx[ci]].2;
+                                        }
+                                        let shard =
+                                            fixed_shard.unwrap_or_else(|| shard_of(&kbuf, nshards));
+                                        let buf = &mut bufs[shard];
+                                        buf.keys.extend_from_slice(&kbuf);
+                                        buf.weights.push(weight);
+                                        let mut j = 0;
+                                        for src in &own_srcs {
+                                            buf.pay[j].push_src(src, i);
                                             j += 1;
+                                        }
+                                        for (ci, (_, r)) in cr_ref.iter().enumerate() {
+                                            let (s, row, _) = matches[ci][idx[ci]];
+                                            for jc in 0..r.payload_slots.len() {
+                                                buf.pay[j].push_from(
+                                                    r.map.pay_col(s as usize, jc),
+                                                    row as usize,
+                                                );
+                                                j += 1;
+                                            }
                                         }
                                     }
                                     // Advance the odometer (least-significant
@@ -1758,6 +2074,22 @@ impl Executor<'_> {
     }
 
     /// Build a table's row-group source (materialized / native / stock).
+    /// Cheap plan-time row-count hint for a table (parquet footer; 0 for
+    /// derived inputs and unreadable files — "unknown, don't prefer").
+    fn table_rows_hint(&self, t: usize) -> u64 {
+        match &self.q.tables[t].source {
+            TableSource::Parquet(path) => ParquetFile::open(path)
+                .ok()
+                .and_then(|f| {
+                    f.metadata()
+                        .ok()
+                        .map(|md| md.row_groups.iter().map(|rg| rg.num_rows as u64).sum())
+                })
+                .unwrap_or(0),
+            TableSource::Derived(_) => 0,
+        }
+    }
+
     fn table_src(&self, t: usize) -> Result<RootSrc, String> {
         let q = self.q;
         let ti = &q.tables[t];
@@ -1938,10 +2270,24 @@ impl Executor<'_> {
                 .iter()
                 .map(|&(p, _)| self.local_to_slot(ctx.root, p))
                 .collect();
-            let key_cols: Vec<KeyCol> = key_slots
+            let mut key_cols: Vec<KeyCol> = key_slots
                 .iter()
                 .map(|&s| key_col(&view, s, &self.interner))
                 .collect();
+            // Widened keys: the root-side columns of promoted equalities
+            // (payloads of children attached earlier — ordering enforced
+            // at planning) extend the probe key in widen-list order,
+            // mirroring the dim build.
+            if let Some(w) = ctx.widen.get(child) {
+                // A widened KEYLESS child: mirror the build side's
+                // constant-0 base key before the extras.
+                if key_slots.is_empty() {
+                    key_cols.push(KeyCol::Const(0));
+                }
+                for &(root_slot, _) in w {
+                    key_cols.push(key_col(&view, root_slot, &self.interner));
+                }
+            }
 
             if dim.multi {
                 if *left {
