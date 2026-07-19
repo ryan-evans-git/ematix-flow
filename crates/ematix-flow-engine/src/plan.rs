@@ -444,14 +444,34 @@ fn shard_of(k: &[i64], nshards: usize) -> usize {
     (h >> 33) as usize & (nshards - 1)
 }
 
-/// One shard of a dim map: key → (match weight, payload row), with the
-/// shard's payload values stored COLUMNAR (`pay[j]` aligned with the
+/// One shard of a dim map: key → (match count, HEAD payload row), with
+/// the shard's payload values stored COLUMNAR (`pay[j]` aligned with the
 /// subtree's `payload_slots[j]`). A probe returns a row index; the attach
 /// step gathers typed values directly — no per-row `ScalarValue`.
+///
+/// `chain` is present only when this shard held a **duplicate payload
+/// key** — several dim rows sharing one join key, each with its own
+/// payload. It threads those rows into a per-key singly-linked list so
+/// the root can fan a matching row out to one output row per dim row.
+/// Absent (the common case) = every key maps to one payload row; the
+/// probe's `count` is that row's multiplicity.
 struct Shard<K> {
     map: FastMap<K, (u64, u32)>,
     pay: Vec<PayCol>,
+    chain: Option<ShardChain>,
 }
+
+/// Per-key payload chains for a duplicate-key shard (indexed by payload
+/// row). `next[r]` links to the next dim row sharing `r`'s key
+/// (`NO_NEXT` = list end); `weight[r]` is that row's own multiplicity
+/// (grandchild fan-out — 1 in the common case).
+struct ShardChain {
+    next: Vec<u32>,
+    weight: Vec<u32>,
+}
+
+/// End-of-list sentinel for [`ShardChain::next`].
+const NO_NEXT: u32 = u32::MAX;
 
 /// A columnar payload store (one column of one shard): typed values plus
 /// a lazily-materialized validity (`None` = no NULLs seen — the common
@@ -702,6 +722,23 @@ impl DimMap {
         }
     }
 
+    /// Shard `s`'s duplicate-key chain, if it has one.
+    #[inline]
+    fn chain_of(&self, s: usize) -> Option<&ShardChain> {
+        match self {
+            DimMap::Single(shards) => shards[s].chain.as_ref(),
+            DimMap::Multi(shards) => shards[s].chain.as_ref(),
+        }
+    }
+
+    /// Any shard held a duplicate payload key (⇒ the root must fan out).
+    fn multi(&self) -> bool {
+        match self {
+            DimMap::Single(s) => s.iter().any(|x| x.chain.is_some()),
+            DimMap::Multi(s) => s.iter().any(|x| x.chain.is_some()),
+        }
+    }
+
     fn nshards(&self) -> usize {
         match self {
             DimMap::Single(s) => s.len(),
@@ -792,12 +829,14 @@ fn gather_payload(map: &DimMap, j: usize, refs: &[u64], ty: LogicalType) -> Vect
     out.with_validity(any_null.then_some(valid))
 }
 
-/// A processed dim subtree: (composite) join key → (match weight,
-/// columnar payload row) across shards; `payload_slots` names the attach
-/// targets.
+/// A processed dim subtree: (composite) join key → (match count, columnar
+/// payload row(s)) across shards; `payload_slots` names the attach
+/// targets. `multi` = some key has several payload rows (the root fans
+/// out one output row per row via [`DimMap::chain_of`]).
 struct DimResult {
     payload_slots: Vec<usize>,
     map: DimMap,
+    multi: bool,
 }
 
 /// Per-(row-group, shard) emission from a dim scan — keys flat with
@@ -1186,6 +1225,15 @@ impl Executor<'_> {
             }
             let child_cols: Vec<usize> = links.iter().map(|&(_, c)| c).collect();
             let r = self.build_dim(*child, &child_cols, children, needed)?;
+            if r.multi {
+                // A fan-out dim below another join would need this dim's
+                // build to expand too — only root-level fan-out is wired.
+                return Err(format!(
+                    "duplicate-key payload join below the root (table '{}') is not yet \
+                     supported — only at the join-tree root",
+                    q.tables[*child].name
+                ));
+            }
             payload_slots.extend(r.payload_slots.iter().copied());
             child_results.push((links.iter().map(|&(p, _)| p).collect(), r));
         }
@@ -1308,30 +1356,32 @@ impl Executor<'_> {
             .collect();
 
         // ---- Phase 2: per-shard merge, shards in parallel. Each shard
-        // folds its buffers in row-group order, so the layout (and any
-        // duplicate-key error) is deterministic at any thread count.
-        let name = &q.tables[t].name;
+        // folds its buffers in row-group order, so the layout (and the
+        // per-key chain order) is deterministic at any thread count.
         let map = if key_len == 1 {
-            DimMap::Single(self.merge_shards(&emits, key_len, nshards, &pay_tys, name, |k| k[0])?)
+            DimMap::Single(self.merge_shards(&emits, key_len, nshards, &pay_tys, |k| k[0])?)
         } else {
-            DimMap::Multi(
-                self.merge_shards(&emits, key_len, nshards, &pay_tys, name, |k| k.to_vec())?,
-            )
+            DimMap::Multi(self.merge_shards(&emits, key_len, nshards, &pay_tys, |k| k.to_vec())?)
         };
-        Ok(DimResult { payload_slots, map })
+        let multi = map.multi();
+        Ok(DimResult {
+            payload_slots,
+            map,
+            multi,
+        })
     }
 
     /// Merge every row group's emit buffers into per-shard maps + columnar
-    /// payload stores, shards in parallel. A duplicate key accumulates
-    /// weight for a key-only dim and errors for a payload dim (the
-    /// duplicate-key payload join is a labelled follow-on).
+    /// payload stores, shards in parallel. A duplicate key with no payload
+    /// accumulates its match count (the semijoin narrow); a duplicate key
+    /// WITH payload threads the extra dim rows onto a per-key chain (the
+    /// duplicate-key payload fan-out).
     fn merge_shards<K: std::hash::Hash + Eq + Send>(
         &self,
         emits: &[RgEmits],
         key_len: usize,
         nshards: usize,
         pay_tys: &[LogicalType],
-        table_name: &str,
         make_key: impl Fn(&[i64]) -> K + Sync,
     ) -> Result<Vec<Shard<K>>, String> {
         let has_payload = !pay_tys.is_empty();
@@ -1345,36 +1395,59 @@ impl Executor<'_> {
                 handles.push(scope.spawn(move || -> Result<(), String> {
                     while let Some(s) = queue_ref.next() {
                         let total: usize = emits.iter().map(|rg| rg[s].weights.len()).sum();
-                        let mut shard = Shard {
-                            map: FastMap::with_capacity_and_hasher(total, Default::default()),
-                            pay: pay_tys.iter().map(|&ty| PayCol::new(ty)).collect(),
-                        };
+                        let mut map: FastMap<K, (u64, u32)> =
+                            FastMap::with_capacity_and_hasher(total, Default::default());
+                        let mut pay: Vec<PayCol> =
+                            pay_tys.iter().map(|&ty| PayCol::new(ty)).collect();
+                        // Built lazily on the first duplicate payload key.
+                        let mut chain: Option<ShardChain> = None;
                         for rg in emits {
                             let buf = &rg[s];
-                            let base = shard.pay.first().map_or(0, PayCol::len);
+                            let base = pay.first().map_or(0, PayCol::len);
+                            let buf_len = buf.weights.len();
+                            if let Some(ch) = &mut chain {
+                                ch.next.resize(base + buf_len, NO_NEXT);
+                                ch.weight.resize(base + buf_len, 0);
+                            }
                             for (idx, key) in buf.keys.chunks_exact(key_len).enumerate() {
+                                let gidx = (base + idx) as u32;
+                                let w = buf.weights[idx];
                                 use std::collections::hash_map::Entry;
-                                match shard.map.entry(mk(key)) {
+                                match map.entry(mk(key)) {
                                     Entry::Vacant(e) => {
-                                        e.insert((buf.weights[idx], (base + idx) as u32));
+                                        e.insert((w, gidx));
+                                        if let Some(ch) = &mut chain {
+                                            ch.weight[gidx as usize] = w as u32;
+                                        }
                                     }
                                     Entry::Occupied(mut e) => {
-                                        if has_payload {
-                                            return Err(format!(
-                                                "duplicate join key {key:?} in table \
-                                                 '{table_name}' with payload columns — not yet \
-                                                 supported"
-                                            ));
+                                        if !has_payload {
+                                            e.get_mut().0 += w;
+                                            continue;
                                         }
-                                        e.get_mut().0 += buf.weights[idx];
+                                        let (old_cnt, old_head) = *e.get();
+                                        let ch = chain.get_or_insert_with(|| ShardChain {
+                                            next: vec![NO_NEXT; base + buf_len],
+                                            weight: vec![0; base + buf_len],
+                                        });
+                                        // A length-1 head's own weight equals
+                                        // its stored count (unique until now);
+                                        // record it before it becomes interior.
+                                        if ch.next[old_head as usize] == NO_NEXT {
+                                            ch.weight[old_head as usize] = old_cnt as u32;
+                                        }
+                                        // Prepend the new row as the head.
+                                        ch.next[gidx as usize] = old_head;
+                                        ch.weight[gidx as usize] = w as u32;
+                                        e.insert((old_cnt + w, gidx));
                                     }
                                 }
                             }
-                            for (p, o) in shard.pay.iter_mut().zip(&buf.pay) {
+                            for (p, o) in pay.iter_mut().zip(&buf.pay) {
                                 p.append(o);
                             }
                         }
-                        out_ref.lock().expect("lock")[s] = Some(shard);
+                        out_ref.lock().expect("lock")[s] = Some(Shard { map, pay, chain });
                     }
                     Ok(())
                 }));
@@ -1499,6 +1572,14 @@ impl Executor<'_> {
         self.q.tables[table].projection[col].ty
     }
 
+    fn local_to_slot(&self, t: usize, col: usize) -> usize {
+        self.q
+            .slots
+            .iter()
+            .position(|s| s.table == t && s.col == col)
+            .expect("every join key has a slot")
+    }
+
     /// Process one root row group end-to-end: slot view → root filter →
     /// per-child probe/attach (scratch keys, zero per-row allocation) →
     /// post-join predicate → this RG's aggregation partial.
@@ -1509,26 +1590,47 @@ impl Executor<'_> {
             None => chunk.sel.clone(),
             Some(pred) => filter_expr(&view, pred),
         };
-        let nrows = chunk.n_rows();
+        // `vlen` is the live column length. It equals the row-group size
+        // until a fan-out child materializes an EXPANDED view (one output
+        // row per matched dim row) — after which keys read straight from
+        // the view's own (root) slot columns, uniformly.
+        let mut vlen = chunk.n_rows();
         let mut kbuf: Vec<i64> = Vec::with_capacity(8);
         for (child, links, left) in ctx.children {
             let dim = ctx.dims[*child].as_ref().expect("dim built");
-            // Root-side keys read by direct slice index.
-            let key_cols: Vec<KeyCol> = links
+            // Root-side keys read from the view's slot columns (survives
+            // an earlier fan-out's rematerialization).
+            let key_slots: Vec<usize> = links
                 .iter()
-                .map(|&(p, _)| key_col(&chunk, p, &self.interner))
+                .map(|&(p, _)| self.local_to_slot(ctx.root, p))
                 .collect();
+            let key_cols: Vec<KeyCol> = key_slots
+                .iter()
+                .map(|&s| key_col(&view, s, &self.interner))
+                .collect();
+
+            if dim.multi {
+                if *left {
+                    return Err("LEFT duplicate-key payload join is not yet supported".into());
+                }
+                let (nv, ns, nl) = self.fanout_child(&view, &sel, vlen, dim, &key_cols, &mut kbuf);
+                view = nv;
+                sel = ns;
+                vlen = nl;
+                continue;
+            }
+
             let has_pay = !dim.payload_slots.is_empty();
             // Narrow with multiplicity; a LEFT child keeps misses once. A
             // hit's (shard, payload row) is recorded during the SAME probe
             // — the attach below gathers without re-probing the map.
             let mut out = Vec::new();
             let mut refs: Vec<u64> = if has_pay {
-                vec![NO_REF; nrows]
+                vec![NO_REF; vlen]
             } else {
                 Vec::new()
             };
-            let mut matched: Vec<i64> = if *left { vec![0; nrows] } else { Vec::new() };
+            let mut matched: Vec<i64> = if *left { vec![0; vlen] } else { Vec::new() };
             sel.for_each(|i| {
                 let iu = i as usize;
                 // A NULL root key is a guaranteed miss (kept once by a
@@ -1650,6 +1752,86 @@ impl Executor<'_> {
             }
         });
         Ok(RgOut::Grouped(groups))
+    }
+
+    /// Fan a matched-set out through a duplicate-key payload dim: each live
+    /// row expands to one output row per dim row sharing its key (walking
+    /// the shard chain), and the whole view REMATERIALIZES to the expanded
+    /// length — existing columns gathered by the source root row, this
+    /// dim's payload columns gathered by each output row's own dim row.
+    /// Returns the new (view, all-selected, length).
+    fn fanout_child(
+        &self,
+        view: &DataChunk,
+        sel: &Selection,
+        vlen: usize,
+        dim: &DimResult,
+        key_cols: &[KeyCol],
+        kbuf: &mut Vec<i64>,
+    ) -> (DataChunk, Selection, usize) {
+        // Per output row: the source view row it came from, and the dim
+        // payload row it carries (`NO_REF` is unused here — inner only).
+        let mut rows: Vec<usize> = Vec::new();
+        let mut pay_ref: Vec<u64> = Vec::new();
+        sel.for_each(|i| {
+            let iu = i as usize;
+            let hit = fill_key(kbuf, key_cols, iu)
+                .then(|| dim.map.get(kbuf))
+                .flatten();
+            let Some((count, s, head)) = hit else {
+                return;
+            };
+            let enc = |r: u32| ((s as u64) << 32) | r as u64;
+            match dim.map.chain_of(s as usize) {
+                // A real chain (head has a successor): walk it, emitting
+                // each dim row `weight` times (grandchild fan-out).
+                Some(ch) if ch.next[head as usize] != NO_NEXT => {
+                    let mut r = head;
+                    loop {
+                        for _ in 0..ch.weight[r as usize] {
+                            rows.push(iu);
+                            pay_ref.push(enc(r));
+                        }
+                        let nx = ch.next[r as usize];
+                        if nx == NO_NEXT {
+                            break;
+                        }
+                        r = nx;
+                    }
+                }
+                // Single dim row (unique key, or a chain of length one):
+                // `count` identical copies.
+                _ => {
+                    for _ in 0..count {
+                        rows.push(iu);
+                        pay_ref.push(enc(head));
+                    }
+                }
+            }
+        });
+
+        let len = rows.len();
+        let cols: Vec<Vector> = view
+            .cols
+            .iter()
+            .enumerate()
+            .map(|(c, col)| {
+                if let Some(j) = dim.payload_slots.iter().position(|&s| s == c) {
+                    // This dim's payload column: gather by each output
+                    // row's own dim row.
+                    gather_payload(&dim.map, j, &pay_ref, self.slot_ty(c))
+                } else if col.len() == vlen {
+                    // A populated column (root data, an earlier payload, a
+                    // matched flag): gather by the source root row.
+                    gather_rows(col, &rows)
+                } else {
+                    // A not-yet-attached placeholder — stays empty until
+                    // its own child attaches it full-length.
+                    Vector::i64(Vec::new())
+                }
+            })
+            .collect();
+        (DataChunk::new(cols), Selection::All(len), len)
     }
 
     /// Merged groups → the row-space chunk → HAVING → output projection.
