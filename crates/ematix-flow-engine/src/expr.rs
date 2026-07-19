@@ -100,6 +100,13 @@ pub enum Expr {
         set: std::sync::Arc<std::collections::HashSet<i64>>,
         negated: bool,
     },
+    /// A materialized STRING membership test (from an IN-subquery over a
+    /// string column).
+    InSetStr {
+        expr: Box<Expr>,
+        set: std::sync::Arc<std::collections::HashSet<Box<str>>>,
+        negated: bool,
+    },
     /// `<expr> IS [NOT] NULL`.
     IsNull {
         expr: Box<Expr>,
@@ -219,6 +226,11 @@ impl Expr {
             Expr::ScalarSub(_) | Expr::InSub { .. } => {
                 panic!("unresolved subquery in evaluation — executor substitution missed it")
             }
+            Expr::InSetStr { expr, set, negated } => match expr.eval(chunk, row) {
+                Val::Null => Val::Null,
+                Val::Str(v) => Val::Bool(set.contains(v) != *negated),
+                other => panic!("string IN needs a string operand, got {other:?}"),
+            },
             Expr::IsNull { expr, negated } => {
                 Val::Bool(matches!(expr.eval(chunk, row), Val::Null) != *negated)
             }

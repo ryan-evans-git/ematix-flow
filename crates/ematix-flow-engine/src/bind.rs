@@ -292,9 +292,12 @@ fn bind_query(
                         let (ta, tb) = (b.slots[a].table, b.slots[bb].table);
                         if ta != tb {
                             let (ka, kb) = (b.slot_col(a), b.slot_col(bb));
-                            if !is_integer_family(ka.ty) || !is_integer_family(kb.ty) {
+                            let both_int = is_integer_family(ka.ty) && is_integer_family(kb.ty);
+                            let both_str = ka.ty == LogicalType::Utf8 && kb.ty == LogicalType::Utf8;
+                            if !both_int && !both_str {
                                 return Err(format!(
-                                    "join keys '{}' = '{}' must be integer-typed",
+                                    "join keys '{}' = '{}' must both be integers or both \
+                                     strings",
                                     ka.name, kb.name
                                 ));
                             }
@@ -498,6 +501,7 @@ fn remap_window_cols(e: &mut Expr, base: usize) {
         Expr::Like { expr, .. }
         | Expr::InSub { expr, .. }
         | Expr::InSet { expr, .. }
+        | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Substr { expr, .. } => remap_window_cols(expr, base),
         Expr::Case { whens, else_ } => {
@@ -1916,9 +1920,7 @@ impl Binder<'_> {
                 else_result,
                 ..
             } => {
-                if operand.is_some() {
-                    return Err("CASE <operand> WHEN … is not yet supported".into());
-                }
+                // `CASE <operand> WHEN v …` desugars to `WHEN operand = v`.
                 let null_else = ast::Expr::Value(ast::Value::Null.into());
                 let else_: &ast::Expr = match else_result {
                     Some(e2) => e2,
@@ -1927,8 +1929,16 @@ impl Binder<'_> {
                 let whens = conditions
                     .iter()
                     .map(|cw| {
+                        let cond = match operand {
+                            None => cw.condition.clone(),
+                            Some(op) => ast::Expr::BinaryOp {
+                                left: op.clone(),
+                                op: ast::BinaryOperator::Eq,
+                                right: Box::new(cw.condition.clone()),
+                            },
+                        };
                         Ok((
-                            materialize(self.bind(&cw.condition)?),
+                            materialize(self.bind(&cond)?),
                             materialize(self.bind(&cw.result)?),
                         ))
                     })
@@ -2302,6 +2312,7 @@ fn references_columns(e: &Expr) -> bool {
         Expr::ScalarSub(_) => false,
         Expr::InSub { expr, .. }
         | Expr::InSet { expr, .. }
+        | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Substr { expr, .. } => references_columns(expr),
         Expr::Case { whens, else_ } => {

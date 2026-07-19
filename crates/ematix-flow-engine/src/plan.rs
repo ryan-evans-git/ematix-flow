@@ -64,11 +64,21 @@ pub fn execute(q: &BoundQuery) -> Result<QueryResult, String> {
         return execute_set(q);
     }
     if q.subqueries.is_empty() {
-        return Executor { q, nthreads }.run();
+        return Executor {
+            q,
+            nthreads,
+            interner: StrInterner::default(),
+        }
+        .run();
     }
     let mut q2 = q.clone();
     resolve_subqueries(&mut q2)?;
-    Executor { q: &q2, nthreads }.run()
+    Executor {
+        q: &q2,
+        nthreads,
+        interner: StrInterner::default(),
+    }
+    .run()
 }
 
 /// Execute a set-operation query: run the base block (its ORDER BY /
@@ -152,6 +162,7 @@ fn resolve_subqueries(q: &mut BoundQuery) -> Result<(), String> {
     let subs = std::mem::take(&mut q.subqueries);
     let mut scalars: Vec<Option<ScalarValue>> = vec![None; subs.len()];
     let mut sets: Vec<Option<Arc<HashSet<i64>>>> = vec![None; subs.len()];
+    let mut str_sets: Vec<Option<Arc<HashSet<Box<str>>>>> = vec![None; subs.len()];
 
     // Which index is used how (a sub could in principle be used both ways).
     let mut want_scalar = vec![false; subs.len()];
@@ -178,11 +189,21 @@ fn resolve_subqueries(q: &mut BoundQuery) -> Result<(), String> {
         }
         if want_set[i] {
             let mut set = HashSet::with_capacity(r.rows.len());
+            let mut strs: HashSet<Box<str>> = HashSet::new();
             for row in &r.rows {
                 match &row[0] {
-                    ScalarValue::Int64(v) => set.insert(*v),
-                    ScalarValue::Int32(v) => set.insert(*v as i64),
-                    ScalarValue::Date32(v) => set.insert(*v as i64),
+                    ScalarValue::Int64(v) => {
+                        set.insert(*v);
+                    }
+                    ScalarValue::Int32(v) => {
+                        set.insert(*v as i64);
+                    }
+                    ScalarValue::Date32(v) => {
+                        set.insert(*v as i64);
+                    }
+                    ScalarValue::Utf8(v) => {
+                        strs.insert(v.as_ref().into());
+                    }
                     // A NULL element matches nothing by equality. (Strict
                     // SQL: `x NOT IN (…, NULL)` is UNKNOWN for every x —
                     // that full three-valued NOT IN is a labelled
@@ -190,11 +211,20 @@ fn resolve_subqueries(q: &mut BoundQuery) -> Result<(), String> {
                     // its non-NULL elements.)
                     ScalarValue::Null => continue,
                     other => {
-                        return Err(format!("IN subquery must yield integers (got {other:?})"));
+                        return Err(format!(
+                            "IN subquery must yield integers or strings (got {other:?})"
+                        ));
                     }
                 };
             }
-            sets[i] = Some(Arc::new(set));
+            if !strs.is_empty() && !set.is_empty() {
+                return Err("IN subquery mixes integer and string values".into());
+            }
+            if !strs.is_empty() {
+                str_sets[i] = Some(Arc::new(strs));
+            } else {
+                sets[i] = Some(Arc::new(set));
+            }
         }
     }
 
@@ -203,10 +233,19 @@ fn resolve_subqueries(q: &mut BoundQuery) -> Result<(), String> {
             *e = Expr::Literal(scalars[*i].clone().expect("scalar computed"));
         }
         Expr::InSub { expr, sub, negated } => {
-            *e = Expr::InSet {
-                expr: std::mem::replace(expr, Box::new(Expr::Column(0))),
-                set: sets[*sub].clone().expect("set computed"),
-                negated: *negated,
+            let inner = std::mem::replace(expr, Box::new(Expr::Column(0)));
+            *e = if let Some(strs) = &str_sets[*sub] {
+                Expr::InSetStr {
+                    expr: inner,
+                    set: strs.clone(),
+                    negated: *negated,
+                }
+            } else {
+                Expr::InSet {
+                    expr: inner,
+                    set: sets[*sub].clone().expect("set computed"),
+                    negated: *negated,
+                }
             };
         }
         _ => {}
@@ -229,6 +268,7 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
             Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
             | Expr::InSet { expr, .. }
+            | Expr::InSetStr { expr, .. }
             | Expr::IsNull { expr, .. }
             | Expr::Substr { expr, .. } => walk(expr, f),
             Expr::Case { whens, else_ } => {
@@ -276,6 +316,7 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
             Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
             | Expr::InSet { expr, .. }
+            | Expr::InSetStr { expr, .. }
             | Expr::IsNull { expr, .. }
             | Expr::Substr { expr, .. } => walk(expr, f),
             Expr::Case { whens, else_ } => {
@@ -313,6 +354,29 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
 struct Executor<'q> {
     q: &'q BoundQuery,
     nthreads: usize,
+    /// String join keys intern to i64 ids for the duration of one run —
+    /// string equi-joins ride the engine's integer key machinery. The
+    /// per-lookup lock is fine: string-keyed joins are dim-sized in
+    /// practice (fact-side hot keys stay integer, lock untouched).
+    interner: StrInterner,
+}
+
+/// One run's string-key interner (equal strings ⇒ equal ids).
+#[derive(Default)]
+struct StrInterner(Mutex<HashMap<Box<str>, i64>>);
+
+impl StrInterner {
+    fn intern(&self, s: &str) -> i64 {
+        let mut m = self.0.lock().expect("lock");
+        match m.get(s) {
+            Some(&id) => id,
+            None => {
+                let id = m.len() as i64;
+                m.insert(s.into(), id);
+                id
+            }
+        }
+    }
 }
 
 /// The (parent_local_col, child_local_col) equi-join pairs linking a dim to
@@ -557,6 +621,8 @@ fn pay_src(chunk: &DataChunk, col: usize) -> PaySrc<'_> {
 enum KeyCol<'a> {
     I64(&'a [i64], Option<&'a [bool]>),
     I32(&'a [i32], Option<&'a [bool]>),
+    /// String keys intern to i64 through the run's [`StrInterner`].
+    Str(Utf8View<'a>, Option<&'a [bool]>, &'a StrInterner),
 }
 
 impl KeyCol<'_> {
@@ -571,17 +637,22 @@ impl KeyCol<'_> {
                 Some(v) if !v[i] => None,
                 _ => Some(s[i] as i64),
             },
+            KeyCol::Str(view, valid, interner) => match valid {
+                Some(v) if !v[i] => None,
+                _ => Some(interner.intern(view.get(i))),
+            },
         }
     }
 }
 
-fn key_col(chunk: &DataChunk, col: usize) -> KeyCol<'_> {
+fn key_col<'a>(chunk: &'a DataChunk, col: usize, interner: &'a StrInterner) -> KeyCol<'a> {
     let v = chunk.col(col);
     let valid = v.validity.as_deref();
     match v.logical {
         LogicalType::Int64 => KeyCol::I64(v.as_i64(), valid),
         LogicalType::Int32 | LogicalType::Date32 => KeyCol::I32(v.as_i32(), valid),
-        other => panic!("join key must be integer-family, got {other:?}"),
+        LogicalType::Utf8 => KeyCol::Str(v.as_utf8(), valid, interner),
+        other => panic!("join key must be integer-family or string, got {other:?}"),
     }
 }
 
@@ -1153,11 +1224,17 @@ impl Executor<'_> {
                                 pay: tys_ref.iter().map(|&ty| PayCol::new(ty)).collect(),
                             })
                             .collect();
-                        let key_cols: Vec<KeyCol> =
-                            link_cols.iter().map(|&c| key_col(&chunk, c)).collect();
+                        let key_cols: Vec<KeyCol> = link_cols
+                            .iter()
+                            .map(|&c| key_col(&chunk, c, &self.interner))
+                            .collect();
                         let child_keys: Vec<Vec<KeyCol>> = cr_ref
                             .iter()
-                            .map(|(pk, _)| pk.iter().map(|&c| key_col(&chunk, c)).collect())
+                            .map(|(pk, _)| {
+                                pk.iter()
+                                    .map(|&c| key_col(&chunk, c, &self.interner))
+                                    .collect()
+                            })
                             .collect();
                         let own_srcs: Vec<PaySrc> = own_ref
                             .iter()
@@ -1437,7 +1514,10 @@ impl Executor<'_> {
         for (child, links, left) in ctx.children {
             let dim = ctx.dims[*child].as_ref().expect("dim built");
             // Root-side keys read by direct slice index.
-            let key_cols: Vec<KeyCol> = links.iter().map(|&(p, _)| key_col(&chunk, p)).collect();
+            let key_cols: Vec<KeyCol> = links
+                .iter()
+                .map(|&(p, _)| key_col(&chunk, p, &self.interner))
+                .collect();
             let has_pay = !dim.payload_slots.is_empty();
             // Narrow with multiplicity; a LEFT child keeps misses once. A
             // hit's (shard, payload row) is recorded during the SAME probe
@@ -2088,6 +2168,7 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
         Expr::ScalarSub(_) => {}
         Expr::InSub { expr, .. }
         | Expr::InSet { expr, .. }
+        | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Substr { expr, .. } => collect_slots(expr, out),
         Expr::Case { whens, else_ } => {
