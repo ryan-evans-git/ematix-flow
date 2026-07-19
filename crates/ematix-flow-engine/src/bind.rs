@@ -251,9 +251,20 @@ fn bind_query(
         for item in &select.projection {
             if matches!(item, ast::SelectItem::Wildcard(_)) {
                 for bt in &b.tables {
+                    // Synthetic decorrelation tables (`__corr…`/`__ex…`) are
+                    // internal — `SELECT *` never exposes them.
+                    if bt.display.starts_with("__") {
+                        continue;
+                    }
                     for c in &bt.def.columns {
-                        items.push(ast::SelectItem::UnnamedExpr(ast::Expr::Identifier(
-                            ast::Ident::new(c.name.clone()),
+                        // QUALIFIED references: two FROM tables may share a
+                        // column name (q14b's `channel` in both deriveds) —
+                        // each expansion must resolve to its own table.
+                        items.push(ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(
+                            vec![
+                                ast::Ident::new(bt.display.clone()),
+                                ast::Ident::new(c.name.clone()),
+                            ],
                         )));
                     }
                 }
@@ -368,6 +379,15 @@ fn bind_query(
                                     ka.name, kb.name
                                 ));
                             }
+                            // A WHERE equijoin touching a LEFT JOIN's
+                            // nullable side demotes that join to INNER: a
+                            // NULL-filled key can never satisfy the equality
+                            // (q93's `sr_reason_sk = r_reason_sk`).
+                            if !from_on {
+                                for t in [ta, tb] {
+                                    b.demote_left(t);
+                                }
+                            }
                             edges.push(JoinEdge {
                                 a,
                                 b: bb,
@@ -387,29 +407,21 @@ fn bind_query(
                     ));
                 }
                 Attribution::Single(t) if b.left_tables.contains(&t) && !from_on => {
-                    // A WHERE predicate on a LEFT JOIN's nullable side that
-                    // rejects NULLs (any comparison/arithmetic — NULL makes
-                    // it UNKNOWN, so unmatched rows drop) is exactly an INNER
-                    // join. Demote: clear the preserved marking on t's edge
-                    // and route the predicate as t's filter. An `IS NULL`
-                    // conjunct is the opposite (an anti-join) — still refused.
+                    // A WHERE predicate on a LEFT JOIN's nullable side:
+                    // - `IS NULL` selects the UNMATCHED rows (an anti-join,
+                    //   q78's `WHERE wr_order_number IS NULL`). It must see
+                    //   the NULL-filled payload, so it routes as a POST-JOIN
+                    //   filter — pushing it down to the table would instead
+                    //   filter the table's real rows pre-join.
+                    // - anything NULL-rejecting (comparison/arithmetic —
+                    //   NULL makes it UNKNOWN, so unmatched rows drop) is
+                    //   exactly an INNER join: demote and push down.
                     if matches!(conj, ast::Expr::IsNull(_)) {
-                        return Err(format!(
-                            "WHERE '{conj}' selects a LEFT JOIN's unmatched rows (anti-join) \
-                             — not yet supported"
-                        ));
+                        post.push(e);
+                    } else {
+                        b.demote_left(t);
+                        filters[t].push(e);
                     }
-                    b.left_tables.remove(&t);
-                    for ei in 0..b.extra_edges.len() {
-                        let (a, bb, pres) = {
-                            let ed = &b.extra_edges[ei];
-                            (ed.a, ed.b, ed.preserved.is_some())
-                        };
-                        if pres && (b.slots[a].table == t || b.slots[bb].table == t) {
-                            b.extra_edges[ei].preserved = None;
-                        }
-                    }
-                    filters[t].push(e);
                 }
                 Attribution::Single(t) => filters[t].push(e),
                 Attribution::Multi => post.push(e),
@@ -1001,12 +1013,15 @@ impl Binder<'_> {
                 if plain {
                     let inner = inner_select.expect("plain implies a Select body");
                     // INLINE: merge its tables + WHERE into this scope, and
-                    // expose its select items as view columns.
+                    // expose its select items as view columns. JOIN … ON
+                    // clauses route exactly like the top-level FROM loop
+                    // (q93's `store_sales LEFT OUTER JOIN store_returns ON …`
+                    // inside a derived table).
                     for twj in &inner.from {
-                        if !twj.joins.is_empty() {
-                            return Err("JOIN … ON syntax is not yet supported".into());
-                        }
                         self.add_from_item(&twj.relation)?;
+                        for join in &twj.joins {
+                            self.add_join(join)?;
+                        }
                     }
                     if let Some(w) = &inner.selection {
                         let mut cs = Vec::new();
@@ -1090,7 +1105,10 @@ impl Binder<'_> {
         let (on, left) = match &join.join_operator {
             ast::JoinOperator::Inner(ast::JoinConstraint::On(e))
             | ast::JoinOperator::Join(ast::JoinConstraint::On(e)) => (e, false),
-            ast::JoinOperator::LeftOuter(ast::JoinConstraint::On(e)) => (e, true),
+            // `LEFT JOIN` and `LEFT OUTER JOIN` parse as distinct variants
+            // but mean the same thing.
+            ast::JoinOperator::LeftOuter(ast::JoinConstraint::On(e))
+            | ast::JoinOperator::Left(ast::JoinConstraint::On(e)) => (e, true),
             other => return Err(format!("unsupported join: {other:?}")),
         };
         let ntables_before = self.tables.len();
@@ -1208,16 +1226,29 @@ impl Binder<'_> {
     fn resolve_parts(&mut self, parts: &[&str]) -> Result<usize, String> {
         let (t, cname) = match parts {
             [c] => {
+                // Real (user-visible) tables take precedence for unqualified
+                // names; synthetic decorrelation tables (`__corr…`/`__ex…`)
+                // only resolve when no real table has the column — an
+                // internal materialization must not make a query's own
+                // column reference ambiguous (q16/q94).
                 let mut hit = None;
-                for (t, bt) in self.tables.iter().enumerate() {
-                    if bt.def.column(c).is_some() {
-                        if let Some(prev) = hit {
-                            return Err(format!(
-                                "column '{c}' is ambiguous (in '{}' and '{}') — qualify it",
-                                self.tables[prev as usize].display, bt.display
-                            ));
+                for synthetic_pass in [false, true] {
+                    for (t, bt) in self.tables.iter().enumerate() {
+                        if bt.display.starts_with("__") != synthetic_pass {
+                            continue;
                         }
-                        hit = Some(t as u32);
+                        if bt.def.column(c).is_some() {
+                            if let Some(prev) = hit {
+                                return Err(format!(
+                                    "column '{c}' is ambiguous (in '{}' and '{}') — qualify it",
+                                    self.tables[prev as usize].display, bt.display
+                                ));
+                            }
+                            hit = Some(t as u32);
+                        }
+                    }
+                    if hit.is_some() {
+                        break;
                     }
                 }
                 (
@@ -1469,35 +1500,77 @@ impl Binder<'_> {
         let ast::SetExpr::Select(sel) = sq.body.as_ref() else {
             return Ok(None);
         };
-        // The inner tables' defs (plain catalog tables only).
-        let mut inner_defs: Vec<TableDef> = Vec::new();
+        // The inner tables' defs — catalog tables or CTEs, optionally
+        // aliased (q1's `customer_total_return ctr2`). Each entry pairs the
+        // def with the name a qualified inner reference may use.
+        let mut inner_defs: Vec<(TableDef, String)> = Vec::new();
         for twj in &sel.from {
-            let ast::TableFactor::Table {
-                name, alias: None, ..
-            } = &twj.relation
-            else {
+            if !twj.joins.is_empty() {
+                return Ok(None);
+            }
+            let ast::TableFactor::Table { name, alias, .. } = &twj.relation else {
                 return Ok(None);
             };
-            match self.catalog.table(&name.to_string()) {
-                Some(d) => inner_defs.push(d.clone()),
-                None => return Ok(None),
-            }
+            let tname = name.to_string();
+            let display = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| tname.clone());
+            let def = if let Some((_, cols)) = self.ctes.get(&tname) {
+                TableDef {
+                    path: PathBuf::new(),
+                    columns: cols
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (n, ty))| crate::catalog::ColumnDef {
+                            name: n.clone(),
+                            leaf: i,
+                            ty: *ty,
+                            dec_scale: None,
+                            nullable: false,
+                        })
+                        .collect(),
+                }
+            } else {
+                match self.catalog.table(&tname) {
+                    Some(d) => d.clone(),
+                    None => return Ok(None),
+                }
+            };
+            inner_defs.push((def, display));
         }
-        let inner_has = |c: &str| inner_defs.iter().any(|d| d.column(c).is_some());
+        let inner_has = |c: &str| inner_defs.iter().any(|(d, _)| d.column(c).is_some());
+        // A qualified reference belongs to the inner scope when its
+        // qualifier names an inner table/alias.
+        let inner_qualified = |tbl: &str, c: &str| {
+            inner_defs
+                .iter()
+                .any(|(d, disp)| disp.eq_ignore_ascii_case(tbl) && d.column(c).is_some())
+        };
         let outer_has = |parts: &[&str]| match parts {
             [c] => !inner_has(c) && self.tables.iter().any(|t| t.def.column(c).is_some()),
-            [tbl, c] => self
-                .tables
-                .iter()
-                .any(|t| t.display.eq_ignore_ascii_case(tbl) && t.def.column(c).is_some()),
+            [tbl, c] => {
+                !inner_qualified(tbl, c)
+                    && self
+                        .tables
+                        .iter()
+                        .any(|t| t.display.eq_ignore_ascii_case(tbl) && t.def.column(c).is_some())
+            }
             _ => false,
         };
 
-        // Find THE correlation conjunct.
-        let mut conjuncts = Vec::new();
+        // Find THE correlation conjunct(s) — after OR-factoring, which
+        // hoists a correlation duplicated in every OR branch
+        // (q41's `(corr AND A) OR (corr AND B)` → `corr AND (A OR B)`).
+        let mut conjuncts_owned: Vec<ast::Expr> = Vec::new();
         if let Some(w) = &sel.selection {
-            split_and(w, &mut conjuncts);
+            let mut raw = Vec::new();
+            split_and(w, &mut raw);
+            for c in raw {
+                factor_or(c, &mut conjuncts_owned);
+            }
         }
+        let conjuncts: Vec<&ast::Expr> = conjuncts_owned.iter().collect();
         // One or more correlation equalities (Q20 correlates on partkey AND
         // suppkey — the derived table groups by the composite key).
         let mut corr: Vec<(String, Vec<String>)> = Vec::new(); // (inner col, outer parts)
@@ -1513,6 +1586,11 @@ impl Binder<'_> {
                     let pick = |ip: &[&str], op: &[&str]| -> Option<(String, Vec<String>)> {
                         match ip {
                             [c] if inner_has(c) && outer_has(op) => {
+                                Some((c.to_string(), op.iter().map(|x| x.to_string()).collect()))
+                            }
+                            // Inner side qualified by an inner alias
+                            // (`ctr2.ctr_store_sk = ctr1.ctr_store_sk`).
+                            [tbl, c] if inner_qualified(tbl, c) && outer_has(op) => {
                                 Some((c.to_string(), op.iter().map(|x| x.to_string()).collect()))
                             }
                             _ => None,
@@ -1945,6 +2023,25 @@ impl Binder<'_> {
             )
         };
         Ok(Bound::Expr(pred))
+    }
+
+    /// Demote table `t`'s LEFT OUTER join to INNER (no-op if `t` is not a
+    /// nullable side): clear the preserved marking on its edges and drop it
+    /// from `left_tables`. Called when a WHERE conjunct on `t` rejects NULLs
+    /// — a filter, or an equijoin whose NULL-filled key can never match.
+    fn demote_left(&mut self, t: usize) {
+        if !self.left_tables.remove(&t) {
+            return;
+        }
+        for ei in 0..self.extra_edges.len() {
+            let (a, bb, pres) = {
+                let ed = &self.extra_edges[ei];
+                (ed.a, ed.b, ed.preserved.is_some())
+            };
+            if pres && (self.slots[a].table == t || self.slots[bb].table == t) {
+                self.extra_edges[ei].preserved = None;
+            }
+        }
     }
 
     /// If `f` is `GROUPING(col)`, resolve `col` to its GROUP BY key index —
