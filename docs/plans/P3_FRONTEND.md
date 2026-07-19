@@ -259,6 +259,15 @@ SQL text
   Q6 bit gate holds. q17/q25/q29/q91 now execute and match DuckDB;
   regression `tests/dup_key_payload_join.rs::fanout_below_root`.
 
+- **Date-string coercion in BETWEEN / IN (2026-07-19, `ce6fd812`):
+  TPC-DS exec 52 → 56, all 56 parity-match DuckDB.** The comparison arm
+  already folds a `'YYYY-MM-DD'` string to Date32 against a date column,
+  but BETWEEN and IN build their comparisons via `binary()` directly and
+  skipped it — so `d_date BETWEEN '…' AND …` reached the evaluator as a
+  string-vs-integer compare and panicked the worker (q32/q83/q92/q95).
+  Both desugars now coerce their bounds / elements. Regression in
+  `tests/sql_null_semantics.rs`.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
