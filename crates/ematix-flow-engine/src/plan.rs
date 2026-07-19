@@ -38,10 +38,39 @@ use crate::sched::MorselQueue;
 use crate::vector::{LogicalType, Utf8View, Vector};
 
 /// A query result: named columns, row-major values.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<ScalarValue>>,
+    /// COLUMNAR hand-off for derived consumers: when a derived execution's
+    /// outputs are plain columns/literals (no ORDER BY / LIMIT / DISTINCT
+    /// / windows), the result carries bounded output chunks instead of
+    /// materialized rows (`rows` is then empty). Skips the per-cell
+    /// `ScalarValue` round-trip — q4's 3.26M-row `year_total` paid 2.7s
+    /// building rows plus a re-columnization per reference.
+    pub col_chunks: Option<Vec<DataChunk>>,
+}
+
+/// Logical row count of a result in either representation.
+fn result_len(r: &QueryResult) -> usize {
+    match &r.col_chunks {
+        Some(chunks) => chunks.iter().map(DataChunk::n_rows).sum(),
+        None => r.rows.len(),
+    }
+}
+
+/// Semantic equality: same columns and the same logical rows, whichever
+/// representation each side carries.
+impl PartialEq for QueryResult {
+    fn eq(&self, other: &Self) -> bool {
+        fn rows_of(r: &QueryResult) -> std::borrow::Cow<'_, [Vec<ScalarValue>]> {
+            match &r.col_chunks {
+                Some(chunks) => std::borrow::Cow::Owned(rows_from_chunks(chunks)),
+                None => std::borrow::Cow::Borrowed(&r.rows),
+            }
+        }
+        self.columns == other.columns && *rows_of(self) == *rows_of(other)
+    }
 }
 
 /// Execute a bound query on the engine. Uncorrelated subqueries run first
@@ -52,6 +81,13 @@ pub fn execute(q: &BoundQuery) -> Result<QueryResult, String> {
 }
 
 fn execute_with(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, String> {
+    execute_mode(q, memo, false)
+}
+
+/// `columnar` requests the chunked result representation — legal only for
+/// derived consumers ([`result_to_chunks`] handles both forms); the
+/// top-level entry always uses rows.
+fn execute_mode(q: &BoundQuery, memo: &DerivedMemo, columnar: bool) -> Result<QueryResult, String> {
     // Worker count: EMAT_ENGINE_THREADS overrides; default = all cores.
     // Results are BIT-IDENTICAL at any thread count — each row group's
     // partial is computed independently and partials merge in row-group
@@ -65,7 +101,7 @@ fn execute_with(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, Strin
                 .unwrap_or(1)
         });
     if !q.set_ops.is_empty() {
-        return execute_set(q, memo);
+        return execute_set(q, memo, columnar);
     }
     if q.subqueries.is_empty() {
         return Executor {
@@ -73,6 +109,7 @@ fn execute_with(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, Strin
             nthreads,
             interner: StrInterner::default(),
             memo,
+            columnar,
         }
         .run();
     }
@@ -83,6 +120,7 @@ fn execute_with(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, Strin
         nthreads,
         interner: StrInterner::default(),
         memo,
+        columnar,
     }
     .run()
 }
@@ -90,7 +128,7 @@ fn execute_with(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, Strin
 /// Execute a set-operation query: run the base block (its ORDER BY /
 /// LIMIT withheld), fold each side's rows in with the set semantics, then
 /// order and limit the COMBINED rows.
-fn execute_set(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, String> {
+fn execute_set(q: &BoundQuery, memo: &DerivedMemo, columnar: bool) -> Result<QueryResult, String> {
     use crate::logical::SetOp;
     let mut base = q.clone();
     let set_ops = std::mem::take(&mut base.set_ops);
@@ -110,29 +148,50 @@ fn execute_set(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, String
         rows
     };
 
-    let mut r = execute_with(&base, memo)?;
+    // A columnar consumer + pure UNION ALL (no dedup, no ordering) lets
+    // each side hand off chunks and the union just CONCATENATE them.
+    let col_mode = columnar
+        && order_by.is_empty()
+        && limit.is_none()
+        && set_ops.iter().all(|(op, _)| matches!(op, SetOp::UnionAll));
+    let mut r = execute_mode(&base, memo, col_mode)?;
     for (op, side) in &set_ops {
-        let rs = execute_with(side, memo)?;
+        let mut rs = execute_mode(side, memo, col_mode)?;
+        if matches!(op, SetOp::UnionAll) && r.col_chunks.is_some() && rs.col_chunks.is_some() {
+            if let (Some(dst), Some(src)) = (r.col_chunks.as_mut(), rs.col_chunks.take()) {
+                dst.extend(src);
+            }
+            continue;
+        }
+        // A side whose own shape didn't qualify returned rows — downgrade
+        // any chunked partner so the fold stays uniform.
+        if let Some(chunks) = r.col_chunks.take() {
+            r.rows = rows_from_chunks(&chunks);
+        }
+        let rs_rows = match rs.col_chunks.take() {
+            Some(chunks) => rows_from_chunks(&chunks),
+            None => rs.rows,
+        };
         r.rows = match op {
             SetOp::UnionAll => {
                 let mut rows = r.rows;
-                rows.extend(rs.rows);
+                rows.extend(rs_rows);
                 rows
             }
             SetOp::Union => {
                 let mut rows = r.rows;
-                rows.extend(rs.rows);
+                rows.extend(rs_rows);
                 dedup(rows)
             }
             SetOp::Intersect => {
-                let right = dedup(rs.rows);
+                let right = dedup(rs_rows);
                 dedup(r.rows)
                     .into_iter()
                     .filter(|row| right.binary_search_by(|x| row_cmp(x, row)).is_ok())
                     .collect()
             }
             SetOp::Except => {
-                let right = dedup(rs.rows);
+                let right = dedup(rs_rows);
                 dedup(r.rows)
                     .into_iter()
                     .filter(|row| right.binary_search_by(|x| row_cmp(x, row)).is_err())
@@ -372,6 +431,9 @@ struct Executor<'q> {
     interner: StrInterner,
     /// The top-level call's derived-result memo (see [`DerivedMemo`]).
     memo: &'q DerivedMemo,
+    /// The consumer accepts the chunked result representation (derived
+    /// executions — see [`QueryResult::col_chunks`]).
+    columnar: bool,
 }
 
 /// One top-level `execute` call's derived-query memo, keyed by the
@@ -1183,7 +1245,7 @@ impl Executor<'_> {
         // ---- Merge partials in row-group order, then HAVING → ORDER BY →
         // LIMIT.
         let outputs = outputs.into_inner().expect("no poisoned lock");
-        let (columns, mut rows) =
+        let (columns, mut rows, col_chunks) =
             if q.group.is_empty() && q.aggs.is_empty() && !q.windows.is_empty() {
                 // No-GROUP-BY window query: concatenate every RG's slot chunk
                 // into the single input, append one column per window expression
@@ -1227,7 +1289,7 @@ impl Executor<'_> {
                             .collect()
                     })
                     .collect();
-                (columns, rows)
+                (columns, rows, None)
             } else if q.group.is_empty() && q.aggs.is_empty() {
                 let columns: Vec<String> = q.output.iter().map(|o| o.name.clone()).collect();
                 let mut rows = Vec::new();
@@ -1236,7 +1298,7 @@ impl Executor<'_> {
                         rows.append(&mut r);
                     }
                 }
-                (columns, rows)
+                (columns, rows, None)
             } else {
                 let trace = std::env::var("EMAT_TRACE_AGG").is_ok();
                 let t0 = std::time::Instant::now();
@@ -1284,7 +1346,10 @@ impl Executor<'_> {
                 let t2 = std::time::Instant::now();
                 let r = self.finalize_groups(groups)?;
                 if trace {
-                    eprintln!("agg: finalize {} rows in {:?}", r.1.len(), t2.elapsed());
+                    let n = r.2.as_ref().map_or(r.1.len(), |c| {
+                        c.iter().map(DataChunk::n_rows).sum()
+                    });
+                    eprintln!("agg: finalize {n} rows in {:?}", t2.elapsed());
                 }
                 r
             };
@@ -1314,7 +1379,11 @@ impl Executor<'_> {
                 row.truncate(keep);
             }
         }
-        Ok(QueryResult { columns, rows })
+        Ok(QueryResult {
+            columns,
+            rows,
+            col_chunks,
+        })
     }
 
     /// Recursively process dim table `t` (joined to its parent via its
@@ -1701,18 +1770,19 @@ impl Executor<'_> {
                 let r = match cached {
                     Some(r) => {
                         if std::env::var("EMAT_TRACE_DERIVED").is_ok() {
-                            eprintln!("derived '{}': memo hit ({} rows)", ti.name, r.rows.len());
+                            eprintln!("derived '{}': memo hit ({} rows)", ti.name, result_len(&r));
                         }
                         r
                     }
                     None => {
                         let t0 = std::time::Instant::now();
-                        let r = std::sync::Arc::new(execute_with(&q.derived[*i], self.memo)?);
+                        let r =
+                            std::sync::Arc::new(execute_mode(&q.derived[*i], self.memo, true)?);
                         if std::env::var("EMAT_TRACE_DERIVED").is_ok() {
                             eprintln!(
                                 "derived '{}': {} rows in {:?}",
                                 ti.name,
-                                r.rows.len(),
+                                result_len(&r),
                                 t0.elapsed()
                             );
                         }
@@ -2237,10 +2307,11 @@ impl Executor<'_> {
     }
 
     /// Merged groups → the row-space chunk → HAVING → output projection.
+    #[allow(clippy::type_complexity)]
     fn finalize_groups(
         &self,
         mut groups: BTreeMap<Vec<GroupKey>, Vec<AggState>>,
-    ) -> Result<(Vec<String>, Vec<Vec<ScalarValue>>), String> {
+    ) -> Result<(Vec<String>, Vec<Vec<ScalarValue>>, Option<Vec<DataChunk>>), String> {
         let q = self.q;
         let nkeys = q.group.len();
         // ---- A HAVING that references only AGGREGATE slots pre-filters
@@ -2311,6 +2382,59 @@ impl Executor<'_> {
             })
             .collect();
         let columns: Vec<String> = q.output.iter().map(|o| o.name.clone()).collect();
+        // COLUMNAR hand-off (derived consumers): outputs that are plain
+        // columns / literals — no windows, ordering, limit, distinct or
+        // hidden outputs — project by selecting VECTORS from the row-space
+        // chunk (an Arc clone when HAVING kept everything) instead of
+        // evaluating 3M+ ScalarValue cells. Bounded chunks keep downstream
+        // per-row-group parallelism.
+        if self.columnar
+            && q.windows.is_empty()
+            && q.order_by.is_empty()
+            && q.limit.is_none()
+            && !q.distinct
+            && q.hidden_outputs == 0
+            && q.output.iter().all(|o| match &o.expr {
+                Expr::Column(_) => true,
+                Expr::Literal(v) => matches!(
+                    v,
+                    ScalarValue::Int64(_)
+                        | ScalarValue::Int32(_)
+                        | ScalarValue::Date32(_)
+                        | ScalarValue::Boolean(_)
+                        | ScalarValue::Float64(_)
+                        | ScalarValue::Utf8(_)
+                ),
+                _ => false,
+            })
+        {
+            const CHUNK: usize = 1 << 21;
+            let all_kept = keep.len() == ngroups;
+            let mut chunks = Vec::with_capacity(keep.len() / CHUNK + 1);
+            let mut lo = 0;
+            loop {
+                let hi = (lo + CHUNK).min(keep.len());
+                let batch = &keep[lo..hi];
+                let out_cols: Vec<Vector> = q
+                    .output
+                    .iter()
+                    .map(|o| match &o.expr {
+                        Expr::Column(i) if all_kept && keep.len() <= CHUNK => {
+                            row_chunk.cols[*i].clone()
+                        }
+                        Expr::Column(i) => gather_rows(&row_chunk.cols[*i], batch),
+                        Expr::Literal(v) => literal_column(v, batch.len()),
+                        _ => unreachable!("qualified above"),
+                    })
+                    .collect();
+                chunks.push(DataChunk::new(out_cols));
+                if hi == keep.len() {
+                    break;
+                }
+                lo = hi;
+            }
+            return Ok((columns, Vec::new(), Some(chunks)));
+        }
         // Window stage: compact the surviving groups into a dense chunk,
         // append one computed column per window expression (row space
         // extends to [keys…, aggs…, windows…]), then project.
@@ -2334,7 +2458,7 @@ impl Executor<'_> {
                         .collect()
                 })
                 .collect();
-            return Ok((columns, rows));
+            return Ok((columns, rows, None));
         }
         let rows = keep
             .into_iter()
@@ -2345,8 +2469,46 @@ impl Executor<'_> {
                     .collect()
             })
             .collect();
-        Ok((columns, rows))
+        Ok((columns, rows, None))
     }
+}
+
+/// A length-`n` constant column for a literal output (the columnar
+/// hand-off's `'s' sale_type`-style projections).
+fn literal_column(v: &ScalarValue, n: usize) -> Vector {
+    match v {
+        ScalarValue::Utf8(s) => {
+            let bytes = s.as_bytes();
+            let mut offsets = Vec::with_capacity(n + 1);
+            let mut data = Vec::with_capacity(bytes.len() * n);
+            offsets.push(0u32);
+            for _ in 0..n {
+                data.extend_from_slice(bytes);
+                offsets.push(data.len() as u32);
+            }
+            Vector::utf8(offsets, data)
+        }
+        ScalarValue::Float64(f) => Vector::f64(vec![*f; n]),
+        ScalarValue::Int64(i) => Vector::i64(vec![*i; n]),
+        ScalarValue::Int32(i) => Vector::i64(vec![*i as i64; n]),
+        ScalarValue::Date32(d) => Vector::i64(vec![*d as i64; n]),
+        ScalarValue::Boolean(b) => Vector::i64(vec![i64::from(*b); n]),
+        other => unreachable!("literal_column on unqualified literal {other:?}"),
+    }
+}
+
+/// Materialize rows from a chunked result — the set-operation downgrade
+/// path when one UNION side qualified for the columnar hand-off and a
+/// partner (or the operation itself) did not.
+fn rows_from_chunks(chunks: &[DataChunk]) -> Vec<Vec<ScalarValue>> {
+    let mut rows = Vec::with_capacity(chunks.iter().map(DataChunk::n_rows).sum());
+    for c in chunks {
+        let exprs: Vec<Expr> = (0..c.cols.len()).map(Expr::Column).collect();
+        for r in 0..c.n_rows() {
+            rows.push(exprs.iter().map(|e| e.eval_value(c, r)).collect());
+        }
+    }
+    rows
 }
 
 /// The typed aggregate-value columns of a merged group map, in agg order —
@@ -3088,6 +3250,11 @@ impl AggState {
 /// 74.8M-row CTE dedup ran as ONE row group on one thread (a 10s
 /// single-threaded BTreeMap build in the sample profile).
 fn result_to_chunks(r: &QueryResult, ti: &TableInput) -> Result<Vec<DataChunk>, String> {
+    // Columnar hand-off: select/coerce vectors per stored chunk — an Arc
+    // clone per matching column, no per-cell work.
+    if let Some(chunks) = &r.col_chunks {
+        return chunks.iter().map(|c| chunk_project(c, ti)).collect();
+    }
     const CHUNK: usize = 1 << 21;
     let n = r.rows.len();
     let mut chunks = Vec::with_capacity(n / CHUNK + 1);
@@ -3101,6 +3268,50 @@ fn result_to_chunks(r: &QueryResult, ti: &TableInput) -> Result<Vec<DataChunk>, 
         lo = hi;
     }
     Ok(chunks)
+}
+
+/// Shape one stored columnar chunk to `ti`'s projection. The producer's
+/// vector universe is {i64, f64, utf8} (group keys, agg values, literal
+/// columns), so coercions mirror the rows path exactly: an i64 vector
+/// under a Float64 declaration widens; type clashes error just as the
+/// per-cell conversion would.
+fn chunk_project(chunk: &DataChunk, ti: &TableInput) -> Result<DataChunk, String> {
+    let mut cols = Vec::with_capacity(ti.projection.len());
+    for c in &ti.projection {
+        let v = chunk
+            .cols
+            .get(c.leaf)
+            .ok_or_else(|| format!("derived column '{}' out of range", c.name))?;
+        let out = match (c.ty, v.logical) {
+            (LogicalType::Utf8, LogicalType::Utf8) => v.clone(),
+            (LogicalType::Utf8, other) => {
+                return Err(format!(
+                    "derived column '{}' expected Utf8, got {other:?}",
+                    c.name
+                ));
+            }
+            (LogicalType::Float64, LogicalType::Float64) => v.clone(),
+            (LogicalType::Float64, LogicalType::Int64) => {
+                let valid = v.validity.as_ref().map(|m| m.to_vec());
+                Vector::f64(v.as_i64().iter().map(|&x| x as f64).collect()).with_validity(valid)
+            }
+            (LogicalType::Float64, other) => {
+                return Err(format!(
+                    "derived column '{}' expected Float64, got {other:?}",
+                    c.name
+                ));
+            }
+            (_, LogicalType::Int64) => v.clone(),
+            (_, other) => {
+                return Err(format!(
+                    "derived column '{}' expected an integer, got {other:?}",
+                    c.name
+                ));
+            }
+        };
+        cols.push(out);
+    }
+    Ok(DataChunk::new(cols))
 }
 
 /// Rows `lo..hi` of a materialized [`QueryResult`] as a chunk shaped like

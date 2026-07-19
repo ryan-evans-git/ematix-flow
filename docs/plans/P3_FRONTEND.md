@@ -585,6 +585,31 @@ window-over-derived is the q49 prerequisite.
   Sweep 103/103. sf10 tail now: q67 14s (kernel-shaped, rank top-K
   designed), then the 9s cluster (q4/q14ab).
 
+- **Rank top-K + columnar hand-off (2026-07-19, `84d4308f` +
+  `1ada5eac`): q67 12.3→8.4s, q4 8.5→6.2s, q78→3.8s.**
+  1. **Rank top-K window prune** — outer `WHERE rk <= K` on a derived's
+     LONE rank()/row_number() window arms `WindowExpr::top_k` at bind
+     time; the executor selects each partition's K-th best row
+     (`select_nth`, linear) and keeps only rows at-or-before it before
+     the window sort/projection. q67's dw2: 5.79M → 1,107 rows. Rank
+     values on the prefix are provably identical; threshold ties are
+     trimmed by the still-applied filter; dense_rank excluded (its
+     rank-K frontier passes the K-th best row); shared CTEs never take
+     the hint. `tests/sql_window_topk.rs`.
+  2. **Columnar derived hand-off** — `QueryResult::col_chunks`: a
+     derived whose outputs are plain columns/literals (no windows /
+     ORDER / LIMIT / DISTINCT) returns bounded chunks — finalize
+     selects VECTORS from the row-space chunk (Arc clone when HAVING
+     kept everything) instead of evaluating millions of ScalarValue
+     cells; UNION ALL concatenates side chunk lists; `result_to_chunks`
+     passes vectors through with rows-path-equivalent coercions; mixed
+     set-op sides downgrade via `rows_from_chunks`. The representation
+     is internal to table_src↔consumers — the top level always
+     materializes rows. `tests/sql_derived_chunking.rs` + full suite.
+  Final sweeps: sf1 103/103, sf10 103/103 solo. sf10 tail after this
+  session: q67 8.4s (dw1 merge/rollup/finalize kernels), q14ab ~8s,
+  q4 6.2s — all kernel/CTE-internal now, no plan-shape lever visible.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
