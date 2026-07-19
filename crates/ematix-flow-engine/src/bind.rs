@@ -76,6 +76,13 @@ fn bind_query(
     set_semantics: bool,
     outer_ctes: &CteMap,
 ) -> Result<BoundQuery, String> {
+    // Constant pushdown into single-referenced CTE group keys (q78's sf10
+    // lever): an outer `WHERE cte_col = const` — directly, or transitively
+    // through join equalities — injects the constant into the CTE's own
+    // WHERE, so its aggregation never builds the filtered-away groups.
+    if let Some(q2) = rewrite_cte_const_pushdown(query, catalog) {
+        return bind_query(&q2, catalog, set_semantics, outer_ctes);
+    }
     // WITH: bind each CTE (earlier CTEs visible to later ones), extending
     // the registry this query level sees.
     let mut ctes: CteMap = outer_ctes.clone();
@@ -3428,6 +3435,337 @@ fn ident_parts(e: &ast::Expr) -> Option<Vec<&str>> {
         ast::Expr::Nested(inner) => ident_parts(inner),
         _ => None,
     }
+}
+
+/// Count word-boundary occurrences of `name` in `text`, case-insensitively
+/// (`_` and alphanumerics are word characters, so CTE `ws` does not match
+/// column `ws_qty`). Drives the conservative single-reference check for
+/// constant pushdown: any doubt counts as an extra reference.
+fn count_word(text: &str, name: &str) -> usize {
+    let text = text.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let (t, n) = (text.as_bytes(), name.as_bytes());
+    let mut count = 0;
+    let mut i = 0;
+    while i + n.len() <= t.len() {
+        if &t[i..i + n.len()] == n
+            && (i == 0 || !is_word(t[i - 1]))
+            && (i + n.len() == t.len() || !is_word(t[i + n.len()]))
+        {
+            count += 1;
+            i += n.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+/// Constant pushdown into single-referenced CTE group keys — q78's sf10
+/// lever. The outer query aggregates nothing away, but its `WHERE
+/// cte_col = const` arrives only AFTER each CTE has materialized every
+/// group (q78's `ss` CTE builds 24M year×item×customer groups at sf10,
+/// then the outer filter keeps one year). This pre-bind AST rewrite:
+///
+/// 1. attributes every outer FROM item's columns (CTE outputs from the
+///    WITH clause, base-table columns from the catalog);
+/// 2. seeds `col = literal` conjuncts from the outer WHERE (and from
+///    INNER-join ONs; from a LEFT ON only when the column sits on the
+///    nullable side);
+/// 3. propagates the constants across join equalities — both ways through
+///    WHERE/INNER-ON equalities, and only INTO the nullable side through a
+///    LEFT ON (`ws_sold_year = ss_sold_year` carries `= 2000` into `ws`:
+///    matched rows must satisfy it, unmatched rows are NULL-filled either
+///    way, so pruning the build side never changes a preserved row);
+/// 4. injects `inner_expr = const` into a CTE's WHERE when the column maps
+///    to one of its plain GROUP BY keys AND the CTE is referenced exactly
+///    once in the whole query (a shared CTE must not inherit one
+///    reference's filter).
+///
+/// Returns the rewritten query, or None when nothing (new) is pushable —
+/// the recursion in [`bind_query`] terminates because a second pass finds
+/// every conjunct already present.
+fn rewrite_cte_const_pushdown(query: &ast::Query, catalog: &Catalog) -> Option<ast::Query> {
+    let with = query.with.as_ref()?;
+    if with.recursive {
+        return None;
+    }
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let selection = select.selection.as_ref()?;
+
+    // The CTE output-column names, straight from the AST (explicit column
+    // list, or each select item's alias / bare identifier; anything
+    // unnameable attributes nothing).
+    let cte_out_cols = |q: &ast::Query| -> Vec<Option<String>> {
+        let ast::SetExpr::Select(s) = q.body.as_ref() else {
+            return Vec::new();
+        };
+        s.projection
+            .iter()
+            .map(|item| match item {
+                ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                ast::SelectItem::UnnamedExpr(e) => {
+                    ident_parts(e).map(|p| p.last().expect("nonempty").to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let ctes: Vec<(&ast::Cte, Vec<Option<String>>)> = with
+        .cte_tables
+        .iter()
+        .map(|c| {
+            let cols = if c.alias.columns.is_empty() {
+                cte_out_cols(&c.query)
+            } else {
+                c.alias
+                    .columns
+                    .iter()
+                    .map(|col| Some(col.name.value.clone()))
+                    .collect()
+            };
+            (c, cols)
+        })
+        .collect();
+
+    // FROM items in join order: display name, backing CTE (if any), and
+    // column set. Any FROM shape beyond plain named tables bails — the
+    // attribution below must be exact.
+    struct Item {
+        display: String,
+        cte: Option<usize>,
+        cols: Vec<String>,
+    }
+    let mut items: Vec<Item> = Vec::new();
+    // Directed constant-flow edges between (item, col) nodes, plus seeds.
+    type Node = (usize, String);
+    let mut edges: Vec<(Node, Node, bool)> = Vec::new();
+    let mut seeds: Vec<(Node, ast::Expr)> = Vec::new();
+
+    let add_item = |items: &mut Vec<Item>, tf: &ast::TableFactor| -> Option<()> {
+        let ast::TableFactor::Table { name, alias, .. } = tf else {
+            return None;
+        };
+        let tname = name.to_string();
+        let display = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| tname.clone());
+        let cte = ctes
+            .iter()
+            .position(|(c, _)| c.alias.name.value.eq_ignore_ascii_case(&tname));
+        let cols: Vec<String> = match cte {
+            Some(i) => ctes[i].1.iter().flatten().cloned().collect(),
+            None => catalog
+                .table(&tname)?
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+        };
+        items.push(Item { display, cte, cols });
+        Some(())
+    };
+
+    // (item, col) for an identifier, only when unambiguous.
+    let resolve = |items: &[Item], e: &ast::Expr| -> Option<(usize, String)> {
+        let parts = ident_parts(e)?;
+        match parts.as_slice() {
+            [col] => {
+                let mut hit = None;
+                for (i, it) in items.iter().enumerate() {
+                    if it.cols.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+                        if hit.is_some() {
+                            return None; // ambiguous
+                        }
+                        hit = Some((i, col.to_ascii_lowercase()));
+                    }
+                }
+                hit
+            }
+            [tab, col] => {
+                let i = items
+                    .iter()
+                    .position(|it| it.display.eq_ignore_ascii_case(tab))?;
+                items[i]
+                    .cols
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(col))
+                    .then(|| (i, col.to_ascii_lowercase()))
+            }
+            _ => None,
+        }
+    };
+
+    // Walk FROM: collect items and, per join ON, the equality edges with
+    // their legal flow direction.
+    let mut pending_ons: Vec<(usize, bool, ast::Expr)> = Vec::new(); // (right item, is_left, on)
+    for twj in &select.from {
+        add_item(&mut items, &twj.relation)?;
+        for join in &twj.joins {
+            let (on, is_left) = match &join.join_operator {
+                ast::JoinOperator::Inner(ast::JoinConstraint::On(e))
+                | ast::JoinOperator::Join(ast::JoinConstraint::On(e)) => (e, false),
+                ast::JoinOperator::LeftOuter(ast::JoinConstraint::On(e))
+                | ast::JoinOperator::Left(ast::JoinConstraint::On(e)) => (e, true),
+                _ => return None,
+            };
+            add_item(&mut items, &join.relation)?;
+            pending_ons.push((items.len() - 1, is_left, on.clone()));
+        }
+    }
+
+    let is_literal = |e: &ast::Expr| matches!(e, ast::Expr::Value(_));
+    let mut eat_conjunct = |e: &ast::Expr, nullable_item: Option<usize>| {
+        let ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Eq,
+            right,
+        } = e
+        else {
+            return;
+        };
+        match (
+            resolve(&items, left),
+            resolve(&items, right),
+            is_literal(left),
+            is_literal(right),
+        ) {
+            (Some(a), Some(b), _, _) => {
+                // In a LEFT ON, constants may flow only INTO the nullable
+                // side; everywhere else both ways.
+                let (a_ok, b_ok) = match nullable_item {
+                    Some(n) => (a.0 == n, b.0 == n),
+                    None => (true, true),
+                };
+                edges.push((a.clone(), b.clone(), b_ok));
+                edges.push((b, a, a_ok));
+            }
+            (Some(a), None, _, true) if nullable_item.is_none_or(|n| a.0 == n) => {
+                seeds.push((a, (**right).clone()));
+            }
+            (None, Some(b), true, _) if nullable_item.is_none_or(|n| b.0 == n) => {
+                seeds.push((b, (**left).clone()));
+            }
+            _ => {}
+        }
+    };
+    let mut where_conjs = Vec::new();
+    split_and(selection, &mut where_conjs);
+    for c in &where_conjs {
+        eat_conjunct(c, None);
+    }
+    for (right, is_left, on) in &pending_ons {
+        let mut on_conjs = Vec::new();
+        split_and(on, &mut on_conjs);
+        for c in on_conjs {
+            eat_conjunct(c, is_left.then_some(*right));
+        }
+    }
+
+    // Propagate constants to fixpoint over the directed edges.
+    let mut consts: HashMap<(usize, String), ast::Expr> = HashMap::new();
+    for (node, lit) in seeds {
+        consts.entry(node).or_insert(lit);
+    }
+    loop {
+        let mut grew = false;
+        for (from, to, ok) in &edges {
+            if *ok && consts.contains_key(from) && !consts.contains_key(to) {
+                let lit = consts[from].clone();
+                consts.insert(to.clone(), lit);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    // Inject into single-referenced CTEs whose column is a plain GROUP BY
+    // key. The reference count is textual but word-boundary exact, over the
+    // body plus every OTHER CTE definition — a false extra only skips the
+    // optimization.
+    let body_text = query.body.to_string();
+    let mut new_query = query.clone();
+    let mut changed = false;
+    for ((item, col), lit) in &consts {
+        let Some(ci) = items[*item].cte else { continue };
+        let cte_name = &ctes[ci].0.alias.name.value;
+        let refs = count_word(&body_text, cte_name)
+            + with
+                .cte_tables
+                .iter()
+                .filter(|c| !c.alias.name.value.eq_ignore_ascii_case(cte_name))
+                .map(|c| count_word(&c.query.to_string(), cte_name))
+                .sum::<usize>();
+        if refs != 1 {
+            continue;
+        }
+        // The inner expression behind this output column, which must be a
+        // plain (modifier-free, non-ROLLUP) GROUP BY key.
+        let ast::SetExpr::Select(inner) = ctes[ci].0.query.body.as_ref() else {
+            continue;
+        };
+        let out_idx = ctes[ci].1.iter().position(|c| {
+            c.as_ref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(col))
+        });
+        let Some(out_idx) = out_idx else { continue };
+        let inner_expr = match inner.projection.get(out_idx) {
+            Some(ast::SelectItem::ExprWithAlias { expr, .. })
+            | Some(ast::SelectItem::UnnamedExpr(expr)) => expr,
+            _ => continue,
+        };
+        let ast::GroupByExpr::Expressions(gexprs, mods) = &inner.group_by else {
+            continue;
+        };
+        if !mods.is_empty()
+            || gexprs
+                .iter()
+                .any(|g| matches!(g, ast::Expr::Rollup(_) | ast::Expr::Cube(_)))
+            || !gexprs.contains(inner_expr)
+        {
+            continue;
+        }
+        let conj = ast::Expr::BinaryOp {
+            left: Box::new(inner_expr.clone()),
+            op: ast::BinaryOperator::Eq,
+            right: Box::new(lit.clone()),
+        };
+        // Idempotence: skip if this exact conjunct is already there (the
+        // re-bind after a successful rewrite lands back here).
+        let target = new_query
+            .with
+            .as_mut()
+            .expect("cloned WITH")
+            .cte_tables
+            .get_mut(ci)
+            .expect("cte index");
+        let ast::SetExpr::Select(tsel) = target.query.body.as_mut() else {
+            continue;
+        };
+        if let Some(sel) = &tsel.selection {
+            let mut existing = Vec::new();
+            split_and(sel, &mut existing);
+            if existing.contains(&&conj) {
+                continue;
+            }
+        }
+        tsel.selection = Some(match tsel.selection.take() {
+            Some(old) => ast::Expr::BinaryOp {
+                left: Box::new(old),
+                op: ast::BinaryOperator::And,
+                right: Box::new(conj),
+            },
+            None => conj,
+        });
+        changed = true;
+    }
+    changed.then_some(new_query)
 }
 
 /// Does the AST expression contain an **aggregate or window** call? Unlike

@@ -311,6 +311,7 @@ fn main() {
         let sql = sql.trim().trim_end_matches(';').to_string();
 
         // Native engine over the canonical Spark text.
+        let t0 = std::time::Instant::now();
         let native: Result<Vec<Vec<Cell>>, String> = catch_unwind(AssertUnwindSafe(|| {
             let bq = bind_sql(&sql, &catalog).map_err(|e| format!("bind: {e}"))?;
             let r = execute(&bq).map_err(|e| format!("exec: {e}"))?;
@@ -320,6 +321,8 @@ fn main() {
                 .collect())
         }))
         .unwrap_or_else(|_| Err("panic".into()));
+        let native_ms = t0.elapsed().as_millis();
+        let mut duck_ms = 0u128;
 
         let verdict = match native {
             Err(e) => Verdict::NativeSkip(e),
@@ -333,13 +336,17 @@ fn main() {
                     // q77: `returns` as a BARE (no AS) alias is reserved in
                     // DuckDB; with AS it parses fine.
                     .replace(", 0) returns,", ", 0) AS returns,");
-                match duck_rows(&duck, &duck_sql) {
+                let td = std::time::Instant::now();
+                let dres = duck_rows(&duck, &duck_sql);
+                duck_ms = td.elapsed().as_millis();
+                match dres {
                     Err(e) => Verdict::OracleSkip(e),
                     Ok(drows) => compare(nrows, drows),
                 }
             }
         };
         if only.is_some() {
+            println!("  timing: native {native_ms} ms, duck {duck_ms} ms");
             if let Verdict::Mismatch { diffs, .. } = &verdict {
                 for (a, b) in diffs {
                     println!("  native: {a}");
