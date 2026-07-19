@@ -18,9 +18,11 @@
 //!   the stock low-level reader (`scan.rs` — dimension tables); numeric
 //!   scans use the native ematix-parquet path.
 //!
-//! Sequential and interpreted, on purpose — correctness gates first; the
-//! parallel morsel driver and the spilling/parallel join machinery exist
-//! (`exec.rs`) and the planner grows into them next.
+//! Parallelism: the root scan, every dim scan+emit, and the per-shard dim
+//! merges are all morsel-parallel (`sched::MorselQueue`). Per-row-group
+//! partials merge in row-group order and dim shards merge their row groups
+//! in row-group order, so results are deterministic — and the scalar-SUM
+//! path bit-identical to sequential — at any thread count.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -33,7 +35,7 @@ use crate::logical::{AggFunc, BoundQuery, Slot, TableInput, TableSource};
 use crate::scan::{ColKind, StockScan};
 use crate::scan_native::{NativeColKind, decode_row_group};
 use crate::sched::MorselQueue;
-use crate::vector::{LogicalType, Vector};
+use crate::vector::{LogicalType, Utf8View, Vector};
 
 /// A query result: named columns, row-major values.
 #[derive(Clone, Debug, PartialEq)]
@@ -235,31 +237,324 @@ struct Executor<'q> {
 /// its parent — several pairs form a composite key.
 type Links = Vec<(usize, usize)>;
 
-/// A dim map keyed by the join key — specialized for the ubiquitous
-/// single-column key (no per-row `Vec` allocation on probe or build);
-/// composite keys use slice-keyed lookups (`Vec<i64>: Borrow<[i64]>`), so
-/// probing never allocates either way.
-enum DimMap {
-    Single(HashMap<i64, (u64, Vec<ScalarValue>)>),
-    Multi(HashMap<Vec<i64>, (u64, Vec<ScalarValue>)>),
+/// A fast non-cryptographic hasher for the engine's integer join keys
+/// (multiplicative mixing + a murmur fmix64 finish). The std SipHash
+/// default is DoS-resistant but several× slower on the probe-heavy join
+/// paths; keys here are the user's own data, not attacker-controlled
+/// protocol input.
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        // fmix64: full avalanche, so hashbrown's low index bits and top-7
+        // control bits are both well mixed.
+        let mut h = self.0;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    #[inline]
+    fn write_i64(&mut self, v: i64) {
+        self.write_u64(v as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(v as u64);
+    }
+    #[inline]
+    fn write_u8(&mut self, v: u8) {
+        self.write_u64(v as u64);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
 }
 
-impl DimMap {
-    #[inline]
-    fn get(&self, k: &[i64]) -> Option<&(u64, Vec<ScalarValue>)> {
+type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+
+/// Pick the shard for a (composite) key — an independent multiplicative
+/// mix taking TOP bits, uncorrelated with [`FastHasher`]'s in-map
+/// placement. `nshards` must be a power of two.
+#[inline]
+fn shard_of(k: &[i64], nshards: usize) -> usize {
+    let mut h = 0u64;
+    for &x in k {
+        h = (h.rotate_left(29) ^ x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    (h >> 33) as usize & (nshards - 1)
+}
+
+/// One shard of a dim map: key → (match weight, payload row), with the
+/// shard's payload values stored COLUMNAR (`pay[j]` aligned with the
+/// subtree's `payload_slots[j]`). A probe returns a row index; the attach
+/// step gathers typed values directly — no per-row `ScalarValue`.
+struct Shard<K> {
+    map: FastMap<K, (u64, u32)>,
+    pay: Vec<PayCol>,
+}
+
+/// A columnar payload store (one column of one shard).
+enum PayCol {
+    /// Integer family — `Int32`/`Date32` widen to `i64` on entry (the
+    /// representation the attach step has always produced).
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+    Str {
+        offsets: Vec<u32>,
+        data: Vec<u8>,
+    },
+}
+
+impl PayCol {
+    fn new(ty: LogicalType) -> PayCol {
+        match ty {
+            LogicalType::Utf8 => PayCol::Str {
+                offsets: vec![0],
+                data: Vec::new(),
+            },
+            LogicalType::Float64 => PayCol::F64(Vec::new()),
+            _ => PayCol::I64(Vec::new()),
+        }
+    }
+
+    fn len(&self) -> usize {
         match self {
-            DimMap::Single(m) => m.get(&k[0]),
-            DimMap::Multi(m) => m.get(k),
+            PayCol::I64(v) => v.len(),
+            PayCol::F64(v) => v.len(),
+            PayCol::Str { offsets, .. } => offsets.len() - 1,
+        }
+    }
+
+    /// Append row `i` of a source chunk column (typed, no boxing).
+    #[inline]
+    fn push_src(&mut self, src: &PaySrc, i: usize) {
+        match (self, src) {
+            (PayCol::I64(v), PaySrc::I64(s)) => v.push(s[i]),
+            (PayCol::I64(v), PaySrc::I32(s)) => v.push(s[i] as i64),
+            (PayCol::F64(v), PaySrc::F64(s)) => v.push(s[i]),
+            (PayCol::Str { offsets, data }, PaySrc::Str(view)) => {
+                data.extend_from_slice(view.get(i).as_bytes());
+                offsets.push(data.len() as u32);
+            }
+            _ => panic!("payload type mismatch"),
+        }
+    }
+
+    /// Append row `i` of another payload column (a bubbled child value).
+    #[inline]
+    fn push_from(&mut self, other: &PayCol, i: usize) {
+        match (self, other) {
+            (PayCol::I64(v), PayCol::I64(o)) => v.push(o[i]),
+            (PayCol::F64(v), PayCol::F64(o)) => v.push(o[i]),
+            (
+                PayCol::Str { offsets, data },
+                PayCol::Str {
+                    offsets: oo,
+                    data: od,
+                },
+            ) => {
+                data.extend_from_slice(&od[oo[i] as usize..oo[i + 1] as usize]);
+                offsets.push(data.len() as u32);
+            }
+            _ => panic!("payload type mismatch"),
+        }
+    }
+
+    /// Bulk-append a whole emit buffer's column (the shard-merge step).
+    fn append(&mut self, other: &PayCol) {
+        match (self, other) {
+            (PayCol::I64(v), PayCol::I64(o)) => v.extend_from_slice(o),
+            (PayCol::F64(v), PayCol::F64(o)) => v.extend_from_slice(o),
+            (
+                PayCol::Str { offsets, data },
+                PayCol::Str {
+                    offsets: oo,
+                    data: od,
+                },
+            ) => {
+                let base = data.len() as u32;
+                data.extend_from_slice(od);
+                offsets.extend(oo.iter().skip(1).map(|&e| base + e));
+            }
+            _ => panic!("payload type mismatch"),
         }
     }
 }
 
-/// A processed dim subtree: (composite) join key → (match count, payload
-/// values aligned with `payload_slots`).
+/// A borrowed typed view of a chunk column feeding payload emission.
+enum PaySrc<'a> {
+    I64(&'a [i64]),
+    I32(&'a [i32]),
+    F64(&'a [f64]),
+    Str(Utf8View<'a>),
+}
+
+fn pay_src(chunk: &DataChunk, col: usize) -> PaySrc<'_> {
+    let v = chunk.col(col);
+    match v.logical {
+        LogicalType::Int64 => PaySrc::I64(v.as_i64()),
+        LogicalType::Int32 | LogicalType::Date32 => PaySrc::I32(v.as_i32()),
+        LogicalType::Float64 => PaySrc::F64(v.as_f64()),
+        LogicalType::Utf8 => PaySrc::Str(v.as_utf8()),
+    }
+}
+
+/// A borrowed integer join-key column — probe loops read keys by direct
+/// slice index instead of per-row interpreter dispatch.
+enum KeyCol<'a> {
+    I64(&'a [i64]),
+    I32(&'a [i32]),
+}
+
+impl KeyCol<'_> {
+    #[inline]
+    fn get(&self, i: usize) -> i64 {
+        match self {
+            KeyCol::I64(s) => s[i],
+            KeyCol::I32(s) => s[i] as i64,
+        }
+    }
+}
+
+fn key_col(chunk: &DataChunk, col: usize) -> KeyCol<'_> {
+    let v = chunk.col(col);
+    match v.logical {
+        LogicalType::Int64 => KeyCol::I64(v.as_i64()),
+        LogicalType::Int32 | LogicalType::Date32 => KeyCol::I32(v.as_i32()),
+        other => panic!("join key must be integer-family, got {other:?}"),
+    }
+}
+
+/// A dim map sharded by key hash — shards scan-emit AND merge in
+/// parallel; a probe pays one extra multiply to pick its shard.
+enum DimMap {
+    Single(Vec<Shard<i64>>),
+    Multi(Vec<Shard<Vec<i64>>>),
+}
+
+impl DimMap {
+    /// Probe: `Some((match weight, shard, payload row))`.
+    #[inline]
+    fn get(&self, k: &[i64]) -> Option<(u64, u32, u32)> {
+        match self {
+            DimMap::Single(shards) => {
+                let s = shard_of(k, shards.len());
+                shards[s].map.get(&k[0]).map(|&(w, r)| (w, s as u32, r))
+            }
+            DimMap::Multi(shards) => {
+                let s = shard_of(k, shards.len());
+                shards[s].map.get(k).map(|&(w, r)| (w, s as u32, r))
+            }
+        }
+    }
+
+    /// Payload column `j` of shard `s`.
+    #[inline]
+    fn pay_col(&self, s: usize, j: usize) -> &PayCol {
+        match self {
+            DimMap::Single(shards) => &shards[s].pay[j],
+            DimMap::Multi(shards) => &shards[s].pay[j],
+        }
+    }
+
+    fn nshards(&self) -> usize {
+        match self {
+            DimMap::Single(s) => s.len(),
+            DimMap::Multi(s) => s.len(),
+        }
+    }
+}
+
+/// Encoded (shard << 32 | payload row) probe result per root row;
+/// `NO_REF` marks a LEFT miss (the attach writes the type default).
+const NO_REF: u64 = u64::MAX;
+
+/// Gather payload column `j` across shards into a full-length root column
+/// (rows without a ref get the type default — 0 / 0.0 / "").
+fn gather_payload(map: &DimMap, j: usize, refs: &[u64], ty: LogicalType) -> Vector {
+    let cols: Vec<&PayCol> = (0..map.nshards()).map(|s| map.pay_col(s, j)).collect();
+    match ty {
+        LogicalType::Float64 => {
+            let mut v = vec![0.0f64; refs.len()];
+            for (r, &e) in refs.iter().enumerate() {
+                if e != NO_REF {
+                    let PayCol::F64(c) = cols[(e >> 32) as usize] else {
+                        panic!("payload type mismatch");
+                    };
+                    v[r] = c[(e & 0xffff_ffff) as usize];
+                }
+            }
+            Vector::f64(v)
+        }
+        LogicalType::Utf8 => {
+            let mut offsets = Vec::with_capacity(refs.len() + 1);
+            let mut data = Vec::new();
+            offsets.push(0u32);
+            for &e in refs {
+                if e != NO_REF {
+                    let PayCol::Str {
+                        offsets: oo,
+                        data: od,
+                    } = cols[(e >> 32) as usize]
+                    else {
+                        panic!("payload type mismatch");
+                    };
+                    let i = (e & 0xffff_ffff) as usize;
+                    data.extend_from_slice(&od[oo[i] as usize..oo[i + 1] as usize]);
+                }
+                offsets.push(data.len() as u32);
+            }
+            Vector::utf8(offsets, data)
+        }
+        // Integer family attaches as i64 (Date32 payloads are day numbers;
+        // EXTRACT and comparisons treat them identically).
+        _ => {
+            let mut v = vec![0i64; refs.len()];
+            for (r, &e) in refs.iter().enumerate() {
+                if e != NO_REF {
+                    let PayCol::I64(c) = cols[(e >> 32) as usize] else {
+                        panic!("payload type mismatch");
+                    };
+                    v[r] = c[(e & 0xffff_ffff) as usize];
+                }
+            }
+            Vector::i64(v)
+        }
+    }
+}
+
+/// A processed dim subtree: (composite) join key → (match weight,
+/// columnar payload row) across shards; `payload_slots` names the attach
+/// targets.
 struct DimResult {
     payload_slots: Vec<usize>,
     map: DimMap,
 }
+
+/// Per-(row-group, shard) emission from a dim scan — keys flat with
+/// stride `key_len`, weights aligned, payload values columnar.
+struct EmitBuf {
+    keys: Vec<i64>,
+    weights: Vec<u64>,
+    pay: Vec<PayCol>,
+}
+
+/// One row group's shard-routed emissions.
+type RgEmits = Vec<EmitBuf>;
 
 /// One row group's aggregation partial — merged in row-group order, which
 /// keeps results deterministic and (for the scalar-SUM path) bit-identical
@@ -594,7 +889,11 @@ impl Executor<'_> {
 
     /// Recursively process dim table `t` (joined to its parent via its
     /// local columns `link_cols` — a composite key when several) into a
-    /// key → (count, payloads) map.
+    /// sharded key → (weight, columnar payload) map. Two parallel phases:
+    /// scan+emit (morsel-parallel per row group, each surviving row routed
+    /// to a shard bucket) and per-shard merge (morsel-parallel per shard)
+    /// — the multi-million-insert sequential dim build was the wall-clock
+    /// tail once the root scan went parallel.
     fn build_dim(
         &self,
         t: usize,
@@ -609,6 +908,7 @@ impl Executor<'_> {
             .copied()
             .filter(|&s| q.slots[s].table == t)
             .collect();
+        let own_payload = payload_slots.clone();
         // …plus every child's, bubbled up.
         // (parent-local key cols, result) per child.
         let mut child_results: Vec<(Vec<usize>, DimResult)> = Vec::new();
@@ -626,123 +926,201 @@ impl Executor<'_> {
             child_results.push((links.iter().map(|&(p, _)| p).collect(), r));
         }
 
-        let has_payload = !payload_slots.is_empty();
-        let mut map = if link_cols.len() == 1 {
-            DimMap::Single(HashMap::new())
-        } else {
-            DimMap::Multi(HashMap::new())
-        };
-        let own_payload: Vec<usize> = payload_slots
-            .iter()
-            .copied()
-            .filter(|&s| q.slots[s].table == t)
-            .collect();
-        // Pre-resolve key slots; probe/build keys fill a reused scratch
-        // buffer (zero per-row allocation).
-        let link_slots: Vec<usize> = link_cols
-            .iter()
-            .map(|&c| self.local_to_slot(t, c))
-            .collect();
-        let child_key_slots: Vec<Vec<usize>> = child_results
-            .iter()
-            .map(|(parent_keys, _)| {
-                parent_keys
-                    .iter()
-                    .map(|&c| self.local_to_slot(t, c))
-                    .collect()
-            })
+        let pay_tys: Vec<LogicalType> = payload_slots.iter().map(|&s| self.slot_ty(s)).collect();
+        let key_len = link_cols.len();
+        let nshards = self.nthreads.next_power_of_two().clamp(1, 64);
+
+        // ---- Phase 1: morsel-parallel scan+emit. Each worker decodes a
+        // row group, applies the table filter, probes the child maps
+        // (direct-slice keys, scratch buffer, zero per-row allocation),
+        // and routes surviving rows into per-shard buffers.
+        let ti = &q.tables[t];
+        let src = self.table_src(t)?;
+        let n_rg = src.n_rg();
+        let emits: Mutex<Vec<Option<RgEmits>>> = Mutex::new((0..n_rg).map(|_| None).collect());
+        let queue = MorselQueue::new(n_rg);
+        let nworkers = self.nthreads.clamp(1, n_rg.max(1));
+        let (src_ref, queue_ref, emits_ref) = (&src, &queue, &emits);
+        let (cr_ref, tys_ref, own_ref) = (&child_results, &pay_tys, &own_payload);
+        std::thread::scope(|scope| -> Result<(), String> {
+            let mut handles = Vec::with_capacity(nworkers);
+            for _ in 0..nworkers {
+                handles.push(scope.spawn(move || -> Result<(), String> {
+                    let local_stock = src_ref.open_local_stock()?;
+                    while let Some(rg) = queue_ref.next() {
+                        let chunk = src_ref.decode(rg, local_stock.as_ref())?;
+                        let sel = match &ti.filter {
+                            None => chunk.sel.clone(),
+                            Some(pred) => filter_expr(&self.slot_view(t, &chunk), pred),
+                        };
+                        let mut bufs: RgEmits = (0..nshards)
+                            .map(|_| EmitBuf {
+                                keys: Vec::new(),
+                                weights: Vec::new(),
+                                pay: tys_ref.iter().map(|&ty| PayCol::new(ty)).collect(),
+                            })
+                            .collect();
+                        let key_cols: Vec<KeyCol> =
+                            link_cols.iter().map(|&c| key_col(&chunk, c)).collect();
+                        let child_keys: Vec<Vec<KeyCol>> = cr_ref
+                            .iter()
+                            .map(|(pk, _)| pk.iter().map(|&c| key_col(&chunk, c)).collect())
+                            .collect();
+                        let own_srcs: Vec<PaySrc> = own_ref
+                            .iter()
+                            .map(|&s| pay_src(&chunk, q.slots[s].col))
+                            .collect();
+                        let mut kbuf: Vec<i64> = Vec::with_capacity(8);
+                        let mut hits: Vec<(u32, u32)> = Vec::with_capacity(cr_ref.len());
+                        sel.for_each(|i| {
+                            let i = i as usize;
+                            // Probe each child; a miss drops the row, hits
+                            // multiply.
+                            let mut weight = 1u64;
+                            hits.clear();
+                            for (kcs, (_, r)) in child_keys.iter().zip(cr_ref) {
+                                kbuf.clear();
+                                for kc in kcs {
+                                    kbuf.push(kc.get(i));
+                                }
+                                match r.map.get(&kbuf) {
+                                    None => {
+                                        weight = 0;
+                                        break;
+                                    }
+                                    Some((w, s, row)) => {
+                                        weight *= w;
+                                        hits.push((s, row));
+                                    }
+                                }
+                            }
+                            if weight == 0 {
+                                return;
+                            }
+                            kbuf.clear();
+                            for kc in &key_cols {
+                                kbuf.push(kc.get(i));
+                            }
+                            let buf = &mut bufs[shard_of(&kbuf, nshards)];
+                            buf.keys.extend_from_slice(&kbuf);
+                            buf.weights.push(weight);
+                            // Payload in `payload_slots` order: own first,
+                            // then each child's block.
+                            let mut j = 0;
+                            for src in &own_srcs {
+                                buf.pay[j].push_src(src, i);
+                                j += 1;
+                            }
+                            for ((_, r), &(s, row)) in cr_ref.iter().zip(&hits) {
+                                for jc in 0..r.payload_slots.len() {
+                                    buf.pay[j]
+                                        .push_from(r.map.pay_col(s as usize, jc), row as usize);
+                                    j += 1;
+                                }
+                            }
+                        });
+                        emits_ref.lock().expect("lock")[rg] = Some(bufs);
+                    }
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                h.join()
+                    .map_err(|_| "worker thread panicked".to_string())??;
+            }
+            Ok(())
+        })?;
+        let emits: Vec<RgEmits> = emits
+            .into_inner()
+            .expect("no poisoned lock")
+            .into_iter()
+            .map(|o| o.expect("every row group emitted"))
             .collect();
 
-        for (chunk, sel) in self.filtered_chunks(t)? {
-            let view = self.slot_view(t, &chunk);
-            let mut err: Option<String> = None;
-            let mut kbuf: Vec<i64> = Vec::with_capacity(8);
-            sel.for_each(|i| {
-                if err.is_some() {
-                    return;
-                }
-                let i = i as usize;
-                // Probe each child; a miss drops the row, hits multiply.
-                let mut weight = 1u64;
-                let mut bubbled: Vec<&Vec<ScalarValue>> = Vec::new();
-                for (slots, (_, r)) in child_key_slots.iter().zip(&child_results) {
-                    kbuf.clear();
-                    for &sl in slots {
-                        kbuf.push(Expr::Column(sl).eval_i64(&view, i));
-                    }
-                    match r.map.get(&kbuf) {
-                        None => {
-                            weight = 0;
-                            break;
-                        }
-                        Some((cnt, pay)) => {
-                            weight *= cnt;
-                            if !r.payload_slots.is_empty() {
-                                bubbled.push(pay);
-                            }
-                        }
-                    }
-                }
-                if weight == 0 {
-                    return;
-                }
-                // Assemble payloads in `payload_slots` order: own first,
-                // then each child's block.
-                let mut pay: Vec<ScalarValue> = Vec::with_capacity(payload_slots.len());
-                for &s in &own_payload {
-                    pay.push(Expr::Column(s).eval_value(&view, i));
-                }
-                for block in &bubbled {
-                    pay.extend(block.iter().cloned());
-                }
-                kbuf.clear();
-                for &sl in &link_slots {
-                    kbuf.push(Expr::Column(sl).eval_i64(&view, i));
-                }
-                use std::collections::hash_map::Entry;
-                let dup = match &mut map {
-                    DimMap::Single(m) => match m.entry(kbuf[0]) {
-                        Entry::Vacant(e) => {
-                            e.insert((weight, pay));
-                            false
-                        }
-                        Entry::Occupied(mut e) => {
-                            if has_payload {
-                                true
-                            } else {
-                                e.get_mut().0 += weight;
-                                false
-                            }
-                        }
-                    },
-                    DimMap::Multi(m) => match m.entry(kbuf.clone()) {
-                        Entry::Vacant(e) => {
-                            e.insert((weight, pay));
-                            false
-                        }
-                        Entry::Occupied(mut e) => {
-                            if has_payload {
-                                true
-                            } else {
-                                e.get_mut().0 += weight;
-                                false
-                            }
-                        }
-                    },
-                };
-                if dup {
-                    err = Some(format!(
-                        "duplicate join key {kbuf:?} in table '{}' with payload columns — \
-                         not yet supported",
-                        q.tables[t].name
-                    ));
-                }
-            });
-            if let Some(e) = err {
-                return Err(e);
-            }
-        }
+        // ---- Phase 2: per-shard merge, shards in parallel. Each shard
+        // folds its buffers in row-group order, so the layout (and any
+        // duplicate-key error) is deterministic at any thread count.
+        let name = &q.tables[t].name;
+        let map = if key_len == 1 {
+            DimMap::Single(self.merge_shards(&emits, key_len, nshards, &pay_tys, name, |k| k[0])?)
+        } else {
+            DimMap::Multi(
+                self.merge_shards(&emits, key_len, nshards, &pay_tys, name, |k| k.to_vec())?,
+            )
+        };
         Ok(DimResult { payload_slots, map })
+    }
+
+    /// Merge every row group's emit buffers into per-shard maps + columnar
+    /// payload stores, shards in parallel. A duplicate key accumulates
+    /// weight for a key-only dim and errors for a payload dim (the
+    /// duplicate-key payload join is a labelled follow-on).
+    fn merge_shards<K: std::hash::Hash + Eq + Send>(
+        &self,
+        emits: &[RgEmits],
+        key_len: usize,
+        nshards: usize,
+        pay_tys: &[LogicalType],
+        table_name: &str,
+        make_key: impl Fn(&[i64]) -> K + Sync,
+    ) -> Result<Vec<Shard<K>>, String> {
+        let has_payload = !pay_tys.is_empty();
+        let out: Mutex<Vec<Option<Shard<K>>>> = Mutex::new((0..nshards).map(|_| None).collect());
+        let queue = MorselQueue::new(nshards);
+        let nworkers = self.nthreads.clamp(1, nshards);
+        let (queue_ref, out_ref, mk) = (&queue, &out, &make_key);
+        std::thread::scope(|scope| -> Result<(), String> {
+            let mut handles = Vec::with_capacity(nworkers);
+            for _ in 0..nworkers {
+                handles.push(scope.spawn(move || -> Result<(), String> {
+                    while let Some(s) = queue_ref.next() {
+                        let total: usize = emits.iter().map(|rg| rg[s].weights.len()).sum();
+                        let mut shard = Shard {
+                            map: FastMap::with_capacity_and_hasher(total, Default::default()),
+                            pay: pay_tys.iter().map(|&ty| PayCol::new(ty)).collect(),
+                        };
+                        for rg in emits {
+                            let buf = &rg[s];
+                            let base = shard.pay.first().map_or(0, PayCol::len);
+                            for (idx, key) in buf.keys.chunks_exact(key_len).enumerate() {
+                                use std::collections::hash_map::Entry;
+                                match shard.map.entry(mk(key)) {
+                                    Entry::Vacant(e) => {
+                                        e.insert((buf.weights[idx], (base + idx) as u32));
+                                    }
+                                    Entry::Occupied(mut e) => {
+                                        if has_payload {
+                                            return Err(format!(
+                                                "duplicate join key {key:?} in table \
+                                                 '{table_name}' with payload columns — not yet \
+                                                 supported"
+                                            ));
+                                        }
+                                        e.get_mut().0 += buf.weights[idx];
+                                    }
+                                }
+                            }
+                            for (p, o) in shard.pay.iter_mut().zip(&buf.pay) {
+                                p.append(o);
+                            }
+                        }
+                        out_ref.lock().expect("lock")[s] = Some(shard);
+                    }
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                h.join()
+                    .map_err(|_| "worker thread panicked".to_string())??;
+            }
+            Ok(())
+        })?;
+        Ok(out
+            .into_inner()
+            .expect("no poisoned lock")
+            .into_iter()
+            .map(|o| o.expect("every shard merged"))
+            .collect())
     }
 
     /// Build a table's row-group source (materialized / native / stock).
@@ -816,52 +1194,6 @@ impl Executor<'_> {
         })
     }
 
-    /// Scan table `t` and apply its own filter, yielding (chunk, live
-    /// selection) pairs in row-group order. Decode + filter run
-    /// MORSEL-PARALLEL per row group (the dim-side scans — e.g. Q08's 15M
-    /// orders — were the sequential tail once the root went parallel).
-    fn filtered_chunks(&self, t: usize) -> Result<Vec<(DataChunk, Selection)>, String> {
-        let ti = &self.q.tables[t];
-        let src = self.table_src(t)?;
-        let n_rg = src.n_rg();
-        let outputs: Mutex<Vec<Option<(DataChunk, Selection)>>> =
-            Mutex::new((0..n_rg).map(|_| None).collect());
-        let queue = MorselQueue::new(n_rg);
-        let nworkers = self.nthreads.clamp(1, n_rg.max(1));
-        let (src_ref, queue_ref, out_ref) = (&src, &queue, &outputs);
-        std::thread::scope(|scope| -> Result<(), String> {
-            let mut handles = Vec::with_capacity(nworkers);
-            for _ in 0..nworkers {
-                handles.push(scope.spawn(move || -> Result<(), String> {
-                    let local_stock = src_ref.open_local_stock()?;
-                    while let Some(rg) = queue_ref.next() {
-                        let chunk = src_ref.decode(rg, local_stock.as_ref())?;
-                        let sel = match &ti.filter {
-                            None => chunk.sel.clone(),
-                            Some(pred) => {
-                                let view = self.slot_view(t, &chunk);
-                                filter_expr(&view, pred)
-                            }
-                        };
-                        out_ref.lock().expect("lock")[rg] = Some((chunk, sel));
-                    }
-                    Ok(())
-                }));
-            }
-            for h in handles {
-                h.join()
-                    .map_err(|_| "worker thread panicked".to_string())??;
-            }
-            Ok(())
-        })?;
-        Ok(outputs
-            .into_inner()
-            .expect("no poisoned lock")
-            .into_iter()
-            .map(|o| o.expect("every row group decoded"))
-            .collect())
-    }
-
     /// Arrange a table-local chunk into the global slot space: this table's
     /// slots map to its columns, every other slot gets a placeholder that
     /// panics if touched (a wiring bug, not a data condition).
@@ -884,14 +1216,6 @@ impl Executor<'_> {
         }
     }
 
-    fn local_to_slot(&self, t: usize, col: usize) -> usize {
-        self.q
-            .slots
-            .iter()
-            .position(|s| s.table == t && s.col == col)
-            .expect("every join key has a slot")
-    }
-
     fn slot_ty(&self, s: usize) -> LogicalType {
         let Slot { table, col } = self.q.slots[s];
         self.q.tables[table].projection[col].ty
@@ -907,29 +1231,39 @@ impl Executor<'_> {
             None => chunk.sel.clone(),
             Some(pred) => filter_expr(&view, pred),
         };
-        let nrows = chunk.cols.first().map_or(0, |c| c.len());
+        let nrows = chunk.n_rows();
         let mut kbuf: Vec<i64> = Vec::with_capacity(8);
         for (child, links, left) in ctx.children {
             let dim = ctx.dims[*child].as_ref().expect("dim built");
-            let key_slots: Vec<usize> = links
-                .iter()
-                .map(|&(p, _)| self.local_to_slot(ctx.root, p))
-                .collect();
-            // Narrow with multiplicity; a LEFT child keeps misses once.
+            // Root-side keys read by direct slice index.
+            let key_cols: Vec<KeyCol> = links.iter().map(|&(p, _)| key_col(&chunk, p)).collect();
+            let has_pay = !dim.payload_slots.is_empty();
+            // Narrow with multiplicity; a LEFT child keeps misses once. A
+            // hit's (shard, payload row) is recorded during the SAME probe
+            // — the attach below gathers without re-probing the map.
             let mut out = Vec::new();
+            let mut refs: Vec<u64> = if has_pay {
+                vec![NO_REF; nrows]
+            } else {
+                Vec::new()
+            };
             let mut matched: Vec<i64> = if *left { vec![0; nrows] } else { Vec::new() };
             sel.for_each(|i| {
+                let iu = i as usize;
                 kbuf.clear();
-                for &sl in &key_slots {
-                    kbuf.push(Expr::Column(sl).eval_i64(&view, i as usize));
+                for kc in &key_cols {
+                    kbuf.push(kc.get(iu));
                 }
                 match dim.map.get(&kbuf) {
-                    Some((cnt, _)) => {
-                        for _ in 0..*cnt {
+                    Some((cnt, s, row)) => {
+                        for _ in 0..cnt {
                             out.push(i);
                         }
+                        if has_pay {
+                            refs[iu] = ((s as u64) << 32) | row as u64;
+                        }
                         if *left {
-                            matched[i as usize] = 1;
+                            matched[iu] = 1;
                         }
                     }
                     None if *left => out.push(i),
@@ -937,39 +1271,11 @@ impl Executor<'_> {
                 }
             });
             sel = Selection::Indices(out);
-            // Attach the subtree's payload slots as full-length columns
-            // (LEFT misses take type defaults — 0 / 0.0 / "").
-            if !dim.payload_slots.is_empty() {
-                let mut row_vals: HashMap<u32, Vec<ScalarValue>> = HashMap::new();
-                sel.for_each(|i| {
-                    if row_vals.contains_key(&i) {
-                        return;
-                    }
-                    kbuf.clear();
-                    for &sl in &key_slots {
-                        kbuf.push(Expr::Column(sl).eval_i64(&view, i as usize));
-                    }
-                    match dim.map.get(&kbuf) {
-                        Some((_, pay)) => {
-                            row_vals.insert(i, pay.clone());
-                        }
-                        None => {
-                            debug_assert!(*left, "non-left miss survived narrowing");
-                            let defaults = dim
-                                .payload_slots
-                                .iter()
-                                .map(|&sl| default_value(self.slot_ty(sl)))
-                                .collect();
-                            row_vals.insert(i, defaults);
-                        }
-                    }
-                });
-                for (j, &slot) in dim.payload_slots.iter().enumerate() {
-                    let ty = self.slot_ty(slot);
-                    view.cols[slot] = build_column(ty, nrows, |row| {
-                        row_vals.get(&(row as u32)).map(|v| v[j].clone())
-                    });
-                }
+            // Attach the subtree's payload slots as full-length typed
+            // columns gathered straight from the shards' columnar stores
+            // (LEFT misses keep NO_REF → type defaults — 0 / 0.0 / "").
+            for (j, &slot) in dim.payload_slots.iter().enumerate() {
+                view.cols[slot] = gather_payload(&dim.map, j, &refs, self.slot_ty(slot));
             }
             if *left {
                 debug_assert_eq!(ctx.matched_cols[child], view.cols.len());
@@ -1328,61 +1634,6 @@ fn table_rows(ti: &TableInput) -> Result<u64, String> {
     let f = ParquetFile::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let md = f.metadata().map_err(|e| format!("metadata: {e}"))?;
     Ok(md.row_groups.iter().map(|rg| rg.num_rows as u64).sum())
-}
-
-/// Build a full-length attached column of type `ty`; `get(row)` yields the
-/// payload value for live rows (`None` rows get a default — they are never
-/// selected).
-fn build_column(
-    ty: LogicalType,
-    nrows: usize,
-    get: impl Fn(usize) -> Option<ScalarValue>,
-) -> Vector {
-    match ty {
-        LogicalType::Utf8 => {
-            let mut offsets = Vec::with_capacity(nrows + 1);
-            let mut data = Vec::new();
-            offsets.push(0u32);
-            for r in 0..nrows {
-                if let Some(ScalarValue::Utf8(s)) = get(r) {
-                    data.extend_from_slice(s.as_bytes());
-                }
-                offsets.push(data.len() as u32);
-            }
-            Vector::utf8(offsets, data)
-        }
-        LogicalType::Float64 => {
-            let mut v = vec![0.0f64; nrows];
-            for (r, slot) in v.iter_mut().enumerate() {
-                if let Some(ScalarValue::Float64(x)) = get(r) {
-                    *slot = x;
-                }
-            }
-            Vector::f64(v)
-        }
-        // Integer family attaches as i64 (Date32 payload values are day
-        // numbers; EXTRACT and comparisons treat them identically).
-        _ => {
-            let mut v = vec![0i64; nrows];
-            for (r, slot) in v.iter_mut().enumerate() {
-                match get(r) {
-                    Some(ScalarValue::Int64(x)) => *slot = x,
-                    Some(ScalarValue::Int32(x)) | Some(ScalarValue::Date32(x)) => *slot = x as i64,
-                    _ => {}
-                }
-            }
-            Vector::i64(v)
-        }
-    }
-}
-
-/// The type default a LEFT-join miss attaches (the no-NULL engine's stand-in).
-fn default_value(ty: LogicalType) -> ScalarValue {
-    match ty {
-        LogicalType::Utf8 => ScalarValue::Utf8("".into()),
-        LogicalType::Float64 => ScalarValue::Float64(0.0),
-        _ => ScalarValue::Int64(0),
-    }
 }
 
 /// Collect every slot referenced by a slot-space expression.
