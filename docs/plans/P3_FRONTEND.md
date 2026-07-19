@@ -231,6 +231,22 @@ SQL text
   *build* would have to expand too. Gate: `tests/dup_key_payload_join.rs`
   (125,811 fanned rows, revenue 104159495.71 vs pyarrow).
 
+- **Oracle parity gate (2026-07-18, `bdb62c55`): all 48 native-executing
+  TPC-DS queries MATCH DuckDB value-for-value at SF=1.**
+  `ematix-flow-core/examples/tpcds_native_oracle.rs` runs each query the
+  native engine can execute AND the same text on in-process DuckDB over
+  the identical Parquet, comparing full result sets (sorted multiset,
+  1e-6 FP tolerance, trimmed strings — the `tpch_validate` contract);
+  non-zero exit on any mismatch. The sweep found and fixed three real
+  correctness bugs that *executed and returned plausible wrong numbers*:
+  ORDER BY sorted NULLs FIRST (SQL default is NULLS LAST — with LIMIT it
+  changed which rows survived); SUM/MIN/MAX/AVG/STDDEV over zero non-NULL
+  values returned 0.0 instead of NULL; and `count(*)` over an otherwise-
+  unreferenced table returned 0 (the empty projection lost the row
+  count — this broke `count(*)` over *any* single table). Regression
+  pins in `tests/sql_null_semantics.rs`. The lesson: coverage (runs) is
+  not correctness (right answer) — only a value-oracle caught these.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
