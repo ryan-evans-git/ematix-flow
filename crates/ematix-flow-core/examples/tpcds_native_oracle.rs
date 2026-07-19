@@ -16,8 +16,10 @@
 //!
 //! Usage:
 //! ```sh
-//! cargo run --release -p ematix-flow-core --example tpcds_native_oracle
-//! cargo run --release -p ematix-flow-core --example tpcds_native_oracle -- q65   # one query, verbose
+//! cargo run --release -p ematix-flow-core --example tpcds_native_oracle              # sf1 sweep
+//! cargo run --release -p ematix-flow-core --example tpcds_native_oracle -- q65       # one query, verbose
+//! cargo run --release -p ematix-flow-core --example tpcds_native_oracle -- sf10      # sf10 sweep
+//! cargo run --release -p ematix-flow-core --example tpcds_native_oracle -- sf10 q65  # sf10, one query
 //! ```
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -232,16 +234,24 @@ fn rows_eq(a: &[Cell], b: &[Cell]) -> bool {
 }
 
 fn main() {
-    let only = std::env::args().nth(1);
+    // Args: [sfN] [qNN] — a leading `sfN` selects the data scale (default
+    // sf1); the remaining arg filters to one query (verbose mode).
+    let mut args = std::env::args().skip(1).peekable();
+    let sf = if args.peek().is_some_and(|a| a.starts_with("sf")) {
+        args.next().expect("peeked")
+    } else {
+        "sf1".to_string()
+    };
+    let only = args.next();
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .expect("workspace root")
         .to_path_buf();
-    let data = workspace.join("examples/tpcds/data/sf1");
+    let data = workspace.join("examples/tpcds/data").join(&sf);
     let qdir = workspace.join("examples/tpcds/queries/spark");
     if !data.join("store_sales.parquet").exists() {
-        println!("skip: TPC-DS SF=1 data not found at {}", data.display());
+        println!("skip: TPC-DS {sf} data not found at {}", data.display());
         return;
     }
 
@@ -369,7 +379,7 @@ fn main() {
         }
     }
     let executing = ok + mismatch + oskip;
-    println!("\n=== TPC-DS native-vs-DuckDB parity (SF=1) ===");
+    println!("\n=== TPC-DS native-vs-DuckDB parity ({sf}) ===");
     println!("  native executes:  {executing}/{}", verdicts.len());
     println!("  parity OK:        {ok}/{executing}");
     println!("  MISMATCH:         {mismatch}");

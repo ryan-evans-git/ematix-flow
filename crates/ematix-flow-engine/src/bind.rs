@@ -2339,22 +2339,43 @@ impl Binder<'_> {
         let outer_s = Expr::Column(outer_s_slot);
         let lit = |v: i64| Expr::Literal(ScalarValue::Int64(v));
 
+        // NULL semantics (q16's nullable cs_warehouse_sk, surfaced at
+        // sf10): a NULL outer_s makes `s <> outer_s` UNKNOWN for every
+        // inner row — EXISTS is FALSE regardless of cd. And a key whose
+        // inner rows all have NULL s (cd = 0, ms NULL) satisfies nothing —
+        // EXISTS false, NOT EXISTS true.
+        let s_null = |neg: bool| Expr::IsNull {
+            expr: Box::new(Expr::Column(outer_s_slot)),
+            negated: neg,
+        };
+        let ms_null = |ms: Expr| Expr::IsNull {
+            expr: Box::new(ms),
+            negated: false,
+        };
         let pred = if !negated {
-            // __m = 1 AND (cd >= 2 OR ms <> outer_s)
+            // outer_s IS NOT NULL AND __m = 1 AND (cd >= 2 OR ms <> outer_s)
+            // (an all-NULL key has ms NULL → the <> is UNKNOWN → false ✓)
             and(
-                binary(BinaryOp::Eq, m, lit(1)),
-                or(
-                    binary(BinaryOp::GtEq, cd, lit(2)),
-                    binary(BinaryOp::NotEq, ms, outer_s),
+                s_null(true),
+                and(
+                    binary(BinaryOp::Eq, m, lit(1)),
+                    or(
+                        binary(BinaryOp::GtEq, cd, lit(2)),
+                        binary(BinaryOp::NotEq, ms, outer_s),
+                    ),
                 ),
             )
         } else {
-            // __m = 0 OR (cd = 1 AND ms = outer_s)
+            // outer_s IS NULL OR __m = 0
+            //   OR (cd <= 1 AND (ms IS NULL OR ms = outer_s))
             or(
-                binary(BinaryOp::Eq, m, lit(0)),
-                and(
-                    binary(BinaryOp::Eq, cd, lit(1)),
-                    binary(BinaryOp::Eq, ms, outer_s),
+                s_null(false),
+                or(
+                    binary(BinaryOp::Eq, m, lit(0)),
+                    and(
+                        binary(BinaryOp::LtEq, cd, lit(1)),
+                        or(ms_null(ms.clone()), binary(BinaryOp::Eq, ms, outer_s)),
+                    ),
                 ),
             )
         };

@@ -487,6 +487,18 @@ window-over-derived is the q49 prerequisite.
     bare `returns` alias are DuckDB-reserved; quoted/AS-prefixed on the
     DuckDB side only.
 
+- **sf10 parity gate (2026-07-19, `56dd31eb`): 103/103 PARITY_OK at BOTH
+  scales.** `tpcds_native_oracle` takes a scale arg (`sf10 [qNN]`);
+  the sf10 sweep runs per-query subprocesses (an OOM SIGKILL loses one
+  query, not the run) — 0 mismatch, 0 deaths; q72's batched fan-out holds
+  at 133M-row inventory; slowest q4 62s / q23ab ~50s. The sweep surfaced
+  ONE scale-dependent bug: the counted `<>`-EXISTS rewrite ignored NULL
+  semantics on the compared column (q16's nullable `cs_warehouse_sk`) —
+  a NULL outer value must make EXISTS false (the `cd ≥ 2` shortcut fired
+  anyway), and an all-NULL inner key must make NOT EXISTS true. NULL
+  guards added; `tests/sql_exists_neq_nulls.rs` pins both counts against
+  an independent python row-walk oracle.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
