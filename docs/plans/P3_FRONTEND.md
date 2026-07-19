@@ -700,11 +700,33 @@ window-over-derived is the q49 prerequisite.
   ★ THE MEASURED TAIL LEVER IS NOW EXPLICIT: grouped aggregation over
   BTreeMap + per-RG sorted-merge — per-row `Vec<GroupKey>` alloc,
   string-key `Arc<str>` churn, and cross-partial `AggState::merge`
-  (q39 6.12M-group merge 2.4s). The fix is a hash-based grouped agg:
-  interned-i64 group keys + per-RG hash table + hash-partitioned merge
-  (the dim-build sharding model), with a final sort to keep the
-  deterministic + rollup-contiguous output the sorted-Vec spine relies
-  on. Big unit — start fresh.
+  (q39 6.12M-group merge 2.4s).
+
+- **Hash-based grouped aggregation — BUILT, MEASURED NET-NEGATIVE,
+  REVERTED (2026-07-19).** Replaced per-RG BTreeMap build + k-way sorted
+  merge with per-RG `FastMap` build + worker-side shard routing +
+  hash-partitioned parallel merge (fold per shard in RG order → SUM
+  bit-identical at any thread count; unsorted-but-deterministic output,
+  parity gate sorts). Fully implemented + gated (a determinism/value
+  guard, 4 order-assuming tests updated to sort-before-compare, sf1
+  103/103). Result: **q39 merge 2.4→1.5s (−0.5s total)** — the ONE win
+  (string-key comparisons removed) — but **q67 3.0→7.3s** and **q51
+  4.5→6.9s**, net **+5.3s worse**. ★★ WHY (the load-bearing insight):
+  the old design's SORTED output is relied on across the engine —
+  (a) the ROLLUP cascade needs key-contiguity, and the old BTreeMap
+  build AMORTIZES that sort into the parallel per-RG build (q67's
+  "merge" was 208ms *because* the runs were pre-sorted); the hash design
+  defers it to one big final sort of 5.79M rows × 8 string keys = 5.7s;
+  (b) non-rollup consumers are order-sensitive too — q51's FULL-OUTER-
+  JOIN-via-UNION rewrite regressed 1.5s on unsorted grouped input. Hash
+  merge only wins a large NON-rollup terminal aggregation with expensive
+  key comparisons (q39), and the aggregation can't know if its consumer
+  needs order. ★ LESSON: a "faster merge" that drops a global invariant
+  (sorted output) pays for it downstream — measure the WHOLE query, not
+  the merge in isolation; and amortized-into-parallel-build can beat a
+  single post-pass. Not retried without: interned-i64 keys to keep the
+  k-way merge (attacks q39's actual cost — string compares — WITHOUT
+  losing sort), or a per-consumer "needs-sorted" signal.
 
 ## Next (P4 tail → P5/P6)
 
