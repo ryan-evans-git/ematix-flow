@@ -1152,6 +1152,19 @@ impl Executor<'_> {
             }
             self.finalize_groups(groups)?
         };
+        // `SELECT DISTINCT` grouping did not fold away (see BoundQuery::
+        // distinct): dedup the result rows before ORDER BY / LIMIT so a
+        // LIMIT counts distinct rows, not raw ones.
+        if q.distinct {
+            rows.sort_by(|a, b| {
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| cmp_scalar(x, y))
+                    .find(|o| o.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            rows.dedup();
+        }
         order_rows(&mut rows, &q.order_by);
         if let Some(l) = q.limit {
             rows.truncate(l);

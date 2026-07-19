@@ -191,6 +191,11 @@ pub struct BoundQuery {
     /// Window expressions — row space extends to `[group keys…, agg
     /// values…, window values…]` after HAVING.
     pub windows: Vec<WindowExpr>,
+    /// `SELECT DISTINCT` that grouping did not already absorb — dedup the
+    /// final output rows before ORDER BY / LIMIT. Zero-cost when false, and
+    /// the common no-GROUP-BY DISTINCT folds into grouping instead (so this
+    /// stays false there).
+    pub distinct: bool,
     pub order_by: Vec<OrderByKey>,
     pub limit: Option<usize>,
     /// Uncorrelated subqueries referenced by [`Expr::ScalarSub`] /

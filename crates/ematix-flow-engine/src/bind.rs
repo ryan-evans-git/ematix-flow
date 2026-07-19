@@ -151,15 +151,29 @@ fn bind_query(
         other => return Err(format!("unsupported GROUP BY form: {other:?}")),
     };
 
-    // An aggregate-less, group-less IN-subquery SELECT becomes GROUP BY its
-    // items (set semantics — see fn docs).
-    let group: Vec<GroupExpr> = if group.is_empty()
-        && set_semantics
+    // `SELECT DISTINCT` — plain DISTINCT dedups the projected rows; DISTINCT
+    // ON is a different (Postgres) feature we don't model.
+    let is_distinct = match &select.distinct {
+        // `SELECT ALL` is the explicit no-dedup default.
+        None | Some(ast::Distinct::All) => false,
+        Some(ast::Distinct::Distinct) => true,
+        Some(ast::Distinct::On(_)) => {
+            return Err("DISTINCT ON is not supported".into());
+        }
+    };
+
+    // An aggregate-less, group-less IN-subquery SELECT — or an equivalent
+    // `SELECT DISTINCT` — becomes GROUP BY its items (set semantics; see fn
+    // docs). Folding DISTINCT into the group-by dedups during aggregation
+    // rather than materializing every row and deduping after.
+    let fold_into_group = group.is_empty()
+        && (set_semantics || is_distinct)
         && select.projection.iter().all(|it| match it {
             ast::SelectItem::UnnamedExpr(e) => !contains_function(e),
             ast::SelectItem::ExprWithAlias { expr, .. } => !contains_function(expr),
             _ => false,
-        }) {
+        });
+    let group: Vec<GroupExpr> = if fold_into_group {
         let mut g = Vec::new();
         for item in &select.projection {
             let (ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. }) =
@@ -175,6 +189,11 @@ fn bind_query(
     } else {
         group
     };
+    // A DISTINCT that grouping did NOT fold away (layered on an explicit
+    // GROUP BY, or over an aggregate/expression projection) is deduped from
+    // the final rows by the executor. When it folded in, the group-by
+    // already made the rows unique, so no post-dedup is needed.
+    let distinct = is_distinct && !fold_into_group;
 
     // SELECT. Three shapes:
     // - aggregate/grouped: items are row-space projections, aggregate calls
@@ -492,6 +511,7 @@ fn bind_query(
         output,
         hidden_outputs,
         windows: b.windows,
+        distinct,
         order_by,
         limit,
         subqueries: b.subs,
@@ -1522,6 +1542,7 @@ impl Binder<'_> {
                 name: inner_col,
             }],
             hidden_outputs: 0,
+            distinct: false,
             order_by: Vec::new(),
             limit: None,
             subqueries: inner.subs,
@@ -1631,6 +1652,7 @@ impl Binder<'_> {
                 },
             ],
             hidden_outputs: 0,
+            distinct: false,
             order_by: Vec::new(),
             limit: None,
             subqueries: inner.subs,

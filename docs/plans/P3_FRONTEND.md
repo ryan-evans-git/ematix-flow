@@ -268,6 +268,23 @@ SQL text
   Both desugars now coerce their bounds / elements. Regression in
   `tests/sql_null_semantics.rs`.
 
+- **`SELECT DISTINCT` (2026-07-19, `<pending>`): a correctness fix, not a
+  coverage bump — exec holds 56/103, parity 56/56.** DISTINCT was silently
+  dropped: a plain-row DISTINCT emitted one output row per joined row
+  (duplicates and all), wrong-but-hidden only because the queries that use
+  it (q38/q87) feed INTERSECT/EXCEPT, which dedup anyway. Now the common
+  no-GROUP-BY DISTINCT **folds into a GROUP BY over the projected columns**
+  (reusing the oracle-verified set-semantics path — dedups during
+  aggregation, no post-materialize), and a `BoundQuery::distinct` flag
+  dedups the final rows for any residual shape (DISTINCT layered on an
+  explicit GROUP BY, or over an aggregate) so it is never silently wrong.
+  `DISTINCT ON` errors; `SELECT ALL` is the no-dedup default. The folded
+  path leaves the flag false, so unique queries pay nothing. q41 (the one
+  query where top-level DISTINCT is load-bearing) stays gated by an
+  unrelated feature (correlated `i1.i_category` scalar subquery), so the
+  exec count is unchanged. Regression `tests/sql_distinct.rs` (3 paths:
+  fold-into-group, flag-dedup over explicit GROUP BY, DISTINCT+ORDER+LIMIT).
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
