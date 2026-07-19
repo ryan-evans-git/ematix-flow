@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::chunk::{DataChunk, Selection};
 use crate::pipeline::filter;
-use crate::vector::LogicalType;
+use crate::vector::{LogicalType, Vector};
 
 /// A literal scalar value.
 #[derive(Clone, Debug, PartialEq)]
@@ -937,6 +937,143 @@ fn cmp_cols_mask(
             let (x, y) = (IntGet::of(va)?, IntGet::of(vb)?);
             Some(ord_mask(op, valid, n, |i| Some(x.at(i).cmp(&y.at(i)))))
         }
+    }
+}
+
+/// Evaluate a numeric expression to a whole typed column (`Int64` or
+/// `Float64`, with validity), or `None` if it is not a vectorizable
+/// numeric producer (a string/boolean leaf, CASE, LIKE, a bare
+/// Column/Literal — those stay on the cheap per-row path). This is the
+/// aggregate-argument analog of the [`filter_expr`] mask: the grouped and
+/// scalar agg loops precompute a COMPOUND arg once per chunk instead of
+/// walking the interpreter per row (q4's `sum(((a-b-c)+d)/2)`).
+///
+/// BIT-IDENTICAL to per-row [`Expr::eval_opt_f64`]: integer arithmetic
+/// stays in `i64` until consumed (a large sum converted before vs after
+/// diverges), any float operand promotes the node to `f64`, `Div` is
+/// always `f64`, and a NULL operand propagates (validity ANDs). Only
+/// `Column`, `Literal`, and `Binary(Add|Sub|Mul|Div)` participate.
+pub fn eval_num_col(chunk: &DataChunk, e: &Expr) -> Option<Vector> {
+    // Bare leaves aren't worth a column materialization — the per-row
+    // path reads them directly. Compound expressions rooted at a Binary
+    // recurse into leaves here (so a leaf CALL still resolves).
+    match e {
+        Expr::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+            ) =>
+        {
+            let l = num_col_leaf(chunk, lhs)?;
+            let r = num_col_leaf(chunk, rhs)?;
+            Some(num_binary(*op, &l, &r))
+        }
+        _ => None,
+    }
+}
+
+/// Recurse into a numeric node (leaf or nested arithmetic), returning its
+/// typed column. Unlike [`eval_num_col`], a bare Column/Literal DOES
+/// resolve here — it is a child of some arithmetic node.
+fn num_col_leaf(chunk: &DataChunk, e: &Expr) -> Option<Vector> {
+    match e {
+        Expr::Column(i) => {
+            let v = chunk.col(*i);
+            match v.logical {
+                LogicalType::Int64 => Some(v.clone()),
+                LogicalType::Int32 | LogicalType::Date32 => {
+                    let out = Vector::i64(v.as_i32().iter().map(|&x| x as i64).collect());
+                    Some(out.with_validity(v.validity.as_ref().map(|m| m.to_vec())))
+                }
+                LogicalType::Float64 => Some(v.clone()),
+                LogicalType::Utf8 => None,
+            }
+        }
+        Expr::Literal(s) => match s {
+            ScalarValue::Int64(x) => Some(Vector::i64(vec![*x])),
+            ScalarValue::Int32(x) => Some(Vector::i64(vec![*x as i64])),
+            ScalarValue::Date32(x) => Some(Vector::i64(vec![*x as i64])),
+            ScalarValue::Float64(x) => Some(Vector::f64(vec![*x])),
+            // A broadcast literal is length-1; num_binary broadcasts it.
+            _ => None,
+        },
+        Expr::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+            ) =>
+        {
+            let l = num_col_leaf(chunk, lhs)?;
+            let r = num_col_leaf(chunk, rhs)?;
+            Some(num_binary(*op, &l, &r))
+        }
+        _ => None,
+    }
+}
+
+/// Element-wise arithmetic over two typed columns (length-1 = broadcast),
+/// mirroring [`arith`]: both integer ⇒ integer result (except `Div`);
+/// any float ⇒ f64; validity ANDs.
+fn num_binary(op: BinaryOp, l: &Vector, r: &Vector) -> Vector {
+    use BinaryOp::*;
+    let n = l.len().max(r.len());
+    let at_valid = |v: &Vector, i: usize| -> bool {
+        let idx = if v.len() == 1 { 0 } else { i };
+        v.validity.as_ref().is_none_or(|m| m[idx])
+    };
+    let valid: Option<Vec<bool>> = if l.validity.is_some() || r.validity.is_some() {
+        Some((0..n).map(|i| at_valid(l, i) && at_valid(r, i)).collect())
+    } else {
+        None
+    };
+    let both_int = l.logical != LogicalType::Float64
+        && r.logical != LogicalType::Float64
+        && !matches!(op, Div);
+    let out = if both_int {
+        let li = l.as_i64();
+        let ri = r.as_i64();
+        let get = |s: &[i64], i: usize| s[if s.len() == 1 { 0 } else { i }];
+        Vector::i64(
+            (0..n)
+                .map(|i| {
+                    let (a, b) = (get(li, i), get(ri, i));
+                    match op {
+                        Add => a + b,
+                        Sub => a - b,
+                        Mul => a * b,
+                        _ => unreachable!("Div is not both_int"),
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        let lf = col_as_f64(l);
+        let rf = col_as_f64(r);
+        let get = |s: &[f64], i: usize| s[if s.len() == 1 { 0 } else { i }];
+        Vector::f64(
+            (0..n)
+                .map(|i| {
+                    let (a, b) = (get(&lf, i), get(&rf, i));
+                    match op {
+                        Add => a + b,
+                        Sub => a - b,
+                        Mul => a * b,
+                        Div => a / b,
+                        _ => unreachable!("non-arith op in num_binary"),
+                    }
+                })
+                .collect(),
+        )
+    };
+    out.with_validity(valid)
+}
+
+/// A typed numeric column as `f64` (integer family widens — matching the
+/// interpreter's `Val::as_f64`).
+fn col_as_f64(v: &Vector) -> std::borrow::Cow<'_, [f64]> {
+    match v.logical {
+        LogicalType::Float64 => std::borrow::Cow::Borrowed(v.as_f64()),
+        _ => std::borrow::Cow::Owned(v.as_i64().iter().map(|&x| x as f64).collect()),
     }
 }
 

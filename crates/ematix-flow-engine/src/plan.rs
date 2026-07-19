@@ -30,7 +30,7 @@ use std::sync::Mutex;
 use ematix_parquet_io::ParquetFile;
 
 use crate::chunk::{DataChunk, Selection};
-use crate::expr::{Expr, ScalarValue, filter_expr, sum_expr_f64};
+use crate::expr::{Expr, ScalarValue, eval_num_col, filter_expr, sum_expr_f64};
 use crate::logical::{AggExpr, AggFunc, BoundQuery, OrderByKey, Slot, TableInput, TableSource};
 use crate::scan::{ColKind, StockScan};
 use crate::scan_native::{NativeColKind, decode_row_group};
@@ -763,6 +763,20 @@ fn key_col<'a>(chunk: &'a DataChunk, col: usize, interner: &'a StrInterner) -> K
         LogicalType::Utf8 => KeyCol::Str(v.as_utf8(), valid, interner),
         other => panic!("join key must be integer-family or string, got {other:?}"),
     }
+}
+
+/// Read a precomputed agg-argument column at row `i` as the aggregate's
+/// f64 input, or `None` on SQL NULL — bit-identical to
+/// [`Expr::eval_opt_f64`] (integer family widens, an invalid row is NULL).
+#[inline]
+fn col_opt_f64(v: &Vector, i: usize) -> Option<f64> {
+    if v.validity.as_ref().is_some_and(|m| !m[i]) {
+        return None;
+    }
+    Some(match v.logical {
+        LogicalType::Float64 => v.as_f64()[i],
+        _ => v.as_i64()[i] as f64,
+    })
 }
 
 /// Where a widened key component's value comes from during a dim build.
@@ -2412,6 +2426,40 @@ impl Executor<'_> {
             });
             return Ok(RgOut::Rows(rows));
         }
+        // Vectorized agg-argument columns: a COMPOUND numeric arg (an
+        // arithmetic tree) evaluates once as a whole typed column here
+        // instead of walking the recursive interpreter per row inside the
+        // aggregation loop (q4's `sum(((a-b-c)+d)/2)` over 3.26M rows).
+        // Only the f64-consuming aggs, only when the arg vectorizes
+        // (`eval_num_col` = Some — bare columns and non-arith stay on the
+        // cheap per-row path), and only when the selection is DENSE (a
+        // full-column pass would waste work on a sparse post-filter
+        // selection; the selective scalar aggregates — Q6 — keep the
+        // exact per-row path, preserving the bit-equality gate).
+        // EMAT_NO_VEC_AGG forces the per-row path (A/B escape hatch,
+        // like EMAT_NO_WIDEN).
+        let n_view = view.n_rows();
+        let dense = sel.len() * 2 >= n_view && std::env::var("EMAT_NO_VEC_AGG").is_err();
+        let arg_cols: Vec<Option<Vector>> = q
+            .aggs
+            .iter()
+            .map(|a| {
+                if dense
+                    && matches!(
+                        a.func,
+                        AggFunc::Sum
+                            | AggFunc::Min
+                            | AggFunc::Max
+                            | AggFunc::Avg
+                            | AggFunc::StddevSamp
+                    )
+                {
+                    eval_num_col(&view, &a.arg)
+                } else {
+                    None
+                }
+            })
+            .collect();
         if q.group.is_empty() {
             let mut states = vec![AggState::default(); q.aggs.len()];
             for (j, agg) in q.aggs.iter().enumerate() {
@@ -2421,10 +2469,20 @@ impl Executor<'_> {
                         // finalize can distinguish 0.0 from an all-NULL
                         // (SQL-NULL) sum; the summation order is unchanged
                         // (the Q6 bit-equality gate depends on it).
-                        states[j].sum += sum_expr_f64(&view, &sel, &agg.arg);
-                        sel.for_each(|i| {
-                            states[j].count += u64::from(!agg.arg.eval_is_null(&view, i as usize));
-                        });
+                        if let Some(col) = &arg_cols[j] {
+                            sel.for_each(|i| {
+                                if let Some(x) = col_opt_f64(col, i as usize) {
+                                    states[j].sum += x;
+                                    states[j].count += 1;
+                                }
+                            });
+                        } else {
+                            states[j].sum += sum_expr_f64(&view, &sel, &agg.arg);
+                            sel.for_each(|i| {
+                                states[j].count +=
+                                    u64::from(!agg.arg.eval_is_null(&view, i as usize));
+                            });
+                        }
                     }
                     // count(*) counts rows; count(<expr>) skips NULLs.
                     AggFunc::Count if matches!(agg.arg, Expr::Literal(_)) => {
@@ -2442,11 +2500,21 @@ impl Executor<'_> {
                             states[j].distinct.insert(v);
                         }
                     }),
-                    _ => sel.for_each(|i| {
-                        if let Some(v) = agg.arg.eval_opt_f64(&view, i as usize) {
-                            states[j].update(v);
+                    _ => {
+                        if let Some(col) = &arg_cols[j] {
+                            sel.for_each(|i| {
+                                if let Some(x) = col_opt_f64(col, i as usize) {
+                                    states[j].update(x);
+                                }
+                            });
+                        } else {
+                            sel.for_each(|i| {
+                                if let Some(v) = agg.arg.eval_opt_f64(&view, i as usize) {
+                                    states[j].update(v);
+                                }
+                            });
                         }
-                    }),
+                    }
                 }
             }
             return Ok(RgOut::Scalar(states));
@@ -2477,7 +2545,11 @@ impl Executor<'_> {
                         }
                     }
                     _ => {
-                        if let Some(v) = agg.arg.eval_opt_f64(&view, i) {
+                        let v = match &arg_cols[j] {
+                            Some(col) => col_opt_f64(col, i),
+                            None => agg.arg.eval_opt_f64(&view, i),
+                        };
+                        if let Some(v) = v {
                             states[j].update(v);
                         }
                     }

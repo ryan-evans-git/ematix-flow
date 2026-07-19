@@ -679,6 +679,33 @@ window-over-derived is the q49 prerequisite.
   EMAT_NO_WIDEN / EMAT_TRACE_JOIN. `tests/sql_fanout_key_widen.rs`
   (widened ≡ pre-joined formulations through independent machinery).
 
+- **Vectorized agg-argument eval (2026-07-19, `5bb21952`): TPC-H Q1
+  sf10 1508→1143ms (−24%); INERT on the TPC-DS tail (honest).** A
+  compound numeric agg arg (arithmetic tree, e.g. Q1's
+  `sum(l_ext * (1 - l_disc) * (1 + l_tax))`) evaluates once as a typed
+  column per chunk (`eval_num_col`, the agg-arg analog of the filter
+  mask) instead of the interpreter per row. Bit-identical to
+  `eval_opt_f64`: integer stays i64 until consumed, float promotes,
+  Div→f64, NULL propagates; fires only for dense selections so Q6's
+  selective per-row summation (and its bit-equality gate) is untouched.
+  ★ LESSON — the profile OVERTURNED my "helps the whole board" pitch:
+  q4's `Expr::eval` was `eval_value` on the *group keys* + the
+  BTreeMap-build closure, NOT the agg arg (`num_binary` dropped to ~1
+  sample after — the precompute fired but the arg was never the cost).
+  The TPC-DS tail (q4/q39/q51) is grouped-BUILD + k-way-merge +
+  gather_payload bound; this lever is real only for the compute-in-agg
+  family (TPC-H Q1). Verified: A/B via EMAT_NO_VEC_AGG, sf10 sweep
+  103/103 neutral (3 flagged deltas re-timed to baseline solo =
+  consecutive-warm thermal). `tests/expr_num_col.rs`.
+  ★ THE MEASURED TAIL LEVER IS NOW EXPLICIT: grouped aggregation over
+  BTreeMap + per-RG sorted-merge — per-row `Vec<GroupKey>` alloc,
+  string-key `Arc<str>` churn, and cross-partial `AggState::merge`
+  (q39 6.12M-group merge 2.4s). The fix is a hash-based grouped agg:
+  interned-i64 group keys + per-RG hash table + hash-partitioned merge
+  (the dim-build sharding model), with a final sort to keep the
+  deterministic + rollup-contiguous output the sorted-Vec spine relies
+  on. Big unit — start fresh.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
