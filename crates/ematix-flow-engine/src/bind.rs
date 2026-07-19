@@ -83,6 +83,23 @@ fn bind_query(
     if let Some(q2) = rewrite_cte_const_pushdown(query, catalog) {
         return bind_query(&q2, catalog, set_semantics, outer_ctes);
     }
+    // Offset-equijoin promotion (q59/q2's sf10 lever): `WHERE a = b ± N`
+    // between two derived FROM items becomes a real join edge via a hidden
+    // computed column on b's side; both participants must materialize.
+    // Idempotent — the rewritten conjunct has no compound side, so the
+    // pattern no longer matches. Fires only on a plain-Select body with an
+    // all-derived FROM, which the flatten/set-op/full-outer early paths
+    // below never see.
+    let mut forced_mat: BTreeSet<String> = BTreeSet::new();
+    let owned_query: ast::Query;
+    let query = match rewrite_offset_equijoin(query) {
+        Some((q2, force)) => {
+            forced_mat = force;
+            owned_query = q2;
+            &owned_query
+        }
+        None => query,
+    };
     // WITH: bind each CTE (earlier CTEs visible to later ones), extending
     // the registry this query level sees.
     let mut ctes: CteMap = outer_ctes.clone();
@@ -162,6 +179,7 @@ fn bind_query(
         windows: Vec::new(),
         extra_edges: Vec::new(),
         pending_conjuncts: Vec::new(),
+        force_materialize: forced_mat,
         left_tables: BTreeSet::new(),
         plain_passthrough: false,
         uses_grouping: false,
@@ -942,6 +960,11 @@ struct Binder<'a> {
     /// clauses; the bool marks ON-origin (exempt from the LEFT-side WHERE
     /// guard — ON conditions are pre-join filters by definition).
     pending_conjuncts: Vec<(ast::Expr, bool)>,
+    /// Derived-table aliases (lowercased) that must MATERIALIZE even when
+    /// inline-eligible — set by the offset-equijoin promotion: inlining a
+    /// participant would re-open a join cycle whose broken edge falls back
+    /// to the fan-out residual path this rewrite exists to avoid.
+    force_materialize: BTreeSet<String>,
     /// Tables joined via LEFT OUTER (their rows may be unmatched).
     left_tables: BTreeSet<usize>,
     /// A window query with no GROUP BY (`rank() OVER … FROM derived`): its
@@ -1029,10 +1052,14 @@ impl Binder<'_> {
                     _ => None,
                 };
                 let plain = inner_select.is_some_and(|inner| {
-                    matches!(
-                        &inner.group_by,
-                        ast::GroupByExpr::Expressions(g, m) if g.is_empty() && m.is_empty()
-                    ) && inner.having.is_none()
+                    !self
+                        .force_materialize
+                        .contains(&alias.name.value.to_ascii_lowercase())
+                        && matches!(
+                            &inner.group_by,
+                            ast::GroupByExpr::Expressions(g, m) if g.is_empty() && m.is_empty()
+                        )
+                        && inner.having.is_none()
                         && subquery.order_by.is_none()
                         && subquery.limit_clause.is_none()
                         && inner.distinct.is_none()
@@ -2016,6 +2043,7 @@ impl Binder<'_> {
             windows: Vec::new(),
             extra_edges: Vec::new(),
             pending_conjuncts: Vec::new(),
+            force_materialize: BTreeSet::new(),
             left_tables: BTreeSet::new(),
             plain_passthrough: false,
             uses_grouping: false,
@@ -2235,6 +2263,7 @@ impl Binder<'_> {
             windows: Vec::new(),
             extra_edges: Vec::new(),
             pending_conjuncts: Vec::new(),
+            force_materialize: BTreeSet::new(),
             left_tables: BTreeSet::new(),
             plain_passthrough: false,
             uses_grouping: false,
@@ -3766,6 +3795,216 @@ fn rewrite_cte_const_pushdown(query: &ast::Query, catalog: &Catalog) -> Option<a
         changed = true;
     }
     changed.then_some(new_query)
+}
+
+/// Offset-equijoin promotion — q59/q2's sf10 lever. Their outer join is
+/// `FROM (…) y, (…) x WHERE y.store = x.store AND y.week = x.week - 52`:
+/// the arithmetic conjunct can't be a join edge, so the executor joined on
+/// the store key alone (~180 duplicate rows per store at sf10) and filtered
+/// ~17M fanned-out candidates row-by-row (15s; DuckDB 0.15s). The offset
+/// IS an equijoin — on a computed key. This pre-bind rewrite:
+///
+/// - matches WHERE conjuncts `a = b ± N` (either orientation) where `a`
+///   and `b` are output columns of two DIFFERENT derived FROM items;
+/// - appends `<b's underlying expr> ± N AS __ejk<i>` to b's subquery
+///   projection and rewrites the conjunct to the plain equality
+///   `a = x.__ejk<i>` — a real edge the planner merges with the other
+///   equalities into one composite-key join;
+/// - forces BOTH participants to materialize: inlining one would splice
+///   its inner tables into this scope and re-open a join cycle whose
+///   broken edge falls right back into the fan-out residual path.
+///
+/// Fires only when every FROM item is an aliased, join-free derived
+/// subquery — attribution must be exact. Returns the rewritten query plus
+/// the aliases to force-materialize, or None.
+fn rewrite_offset_equijoin(query: &ast::Query) -> Option<(ast::Query, BTreeSet<String>)> {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let selection = select.selection.as_ref()?;
+
+    // Every FROM item: an aliased derived with a plain Select body.
+    let mut items: Vec<(String, Vec<Option<String>>)> = Vec::new();
+    for twj in &select.from {
+        if !twj.joins.is_empty() {
+            return None;
+        }
+        let ast::TableFactor::Derived {
+            subquery,
+            alias: Some(alias),
+            ..
+        } = &twj.relation
+        else {
+            return None;
+        };
+        let ast::SetExpr::Select(inner) = subquery.body.as_ref() else {
+            return None;
+        };
+        let cols = inner
+            .projection
+            .iter()
+            .map(|item| match item {
+                ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                ast::SelectItem::UnnamedExpr(e) => {
+                    ident_parts(e).map(|p| p.last().expect("nonempty").to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        items.push((alias.name.value.clone(), cols));
+    }
+    if items.len() < 2 {
+        return None;
+    }
+
+    // (item, output idx) for an identifier, only when unambiguous.
+    let resolve = |e: &ast::Expr| -> Option<(usize, usize)> {
+        let parts = ident_parts(e)?;
+        let find = |i: usize, col: &str| {
+            items[i]
+                .1
+                .iter()
+                .position(|c| c.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(col)))
+        };
+        match parts.as_slice() {
+            [col] => {
+                let mut hit = None;
+                for i in 0..items.len() {
+                    if let Some(j) = find(i, col) {
+                        if hit.is_some() {
+                            return None; // ambiguous
+                        }
+                        hit = Some((i, j));
+                    }
+                }
+                hit
+            }
+            [tab, col] => {
+                let i = items.iter().position(|(a, _)| a.eq_ignore_ascii_case(tab))?;
+                find(i, col).map(|j| (i, j))
+            }
+            _ => None,
+        }
+    };
+    let mut conjs: Vec<&ast::Expr> = Vec::new();
+    split_and(selection, &mut conjs);
+    let mut new_conjs: Vec<ast::Expr> = conjs.iter().map(|c| (*c).clone()).collect();
+    let mut force: BTreeSet<String> = BTreeSet::new();
+    // Per-item appended computed columns: (item, expr, hidden name).
+    let mut appended: Vec<(usize, ast::Expr, String)> = Vec::new();
+    for (ci, conj) in conjs.iter().enumerate() {
+        let ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Eq,
+            right,
+        } = conj
+        else {
+            continue;
+        };
+        // One plain side, one `ident ± lit` side (either orientation).
+        let (plain, compound) = if compound_side(right).is_some() {
+            (left, right)
+        } else if compound_side(left).is_some() {
+            (right, left)
+        } else {
+            continue;
+        };
+        let (cident, cop, clit) = compound_side(compound).expect("checked");
+        let Some((pa, _)) = resolve(plain) else {
+            continue;
+        };
+        let Some((pb, jb)) = resolve(cident) else {
+            continue;
+        };
+        if pa == pb {
+            continue; // same table — an ordinary filter
+        }
+        // b's underlying expression (strip the output alias).
+        let hidden = format!("__ejk{}", appended.len());
+        let jexpr = ast::Expr::BinaryOp {
+            left: Box::new(match query_derived_item(query, pb, jb) {
+                Some(e) => e.clone(),
+                None => continue,
+            }),
+            op: cop,
+            right: Box::new(clit.clone()),
+        };
+        appended.push((pb, jexpr, hidden.clone()));
+        new_conjs[ci] = ast::Expr::BinaryOp {
+            left: Box::new((**plain).clone()),
+            op: ast::BinaryOperator::Eq,
+            right: Box::new(ast::Expr::CompoundIdentifier(vec![
+                ast::Ident::new(items[pb].0.clone()),
+                ast::Ident::new(hidden),
+            ])),
+        };
+        force.insert(items[pa].0.to_ascii_lowercase());
+        force.insert(items[pb].0.to_ascii_lowercase());
+    }
+    if appended.is_empty() {
+        return None;
+    }
+
+    let mut q2 = query.clone();
+    let ast::SetExpr::Select(sel2) = q2.body.as_mut() else {
+        unreachable!("checked Select above");
+    };
+    for (i, expr, name) in appended {
+        let ast::TableFactor::Derived { subquery, .. } = &mut sel2.from[i].relation else {
+            unreachable!("checked Derived above");
+        };
+        let ast::SetExpr::Select(inner) = subquery.body.as_mut() else {
+            unreachable!("checked Select above");
+        };
+        inner.projection.push(ast::SelectItem::ExprWithAlias {
+            expr,
+            alias: ast::Ident::new(name),
+        });
+    }
+    sel2.selection = new_conjs.into_iter().reduce(|a, b| ast::Expr::BinaryOp {
+        left: Box::new(a),
+        op: ast::BinaryOperator::And,
+        right: Box::new(b),
+    });
+    Some((q2, force))
+}
+
+/// `ident ± Number`, decomposed as (ident, op, literal) — the compound
+/// side of an offset-equijoin conjunct.
+fn compound_side(e: &ast::Expr) -> Option<(&ast::Expr, ast::BinaryOperator, &ast::Expr)> {
+    let ast::Expr::BinaryOp { left, op, right } = e else {
+        return None;
+    };
+    if !matches!(op, ast::BinaryOperator::Plus | ast::BinaryOperator::Minus) {
+        return None;
+    }
+    let lit_ok =
+        |x: &ast::Expr| matches!(x, ast::Expr::Value(v) if matches!(v.value, ast::Value::Number(..)));
+    if ident_parts(left).is_some() && lit_ok(right) {
+        Some((left, op.clone(), right))
+    } else {
+        None
+    }
+}
+
+/// The underlying (alias-stripped) expression of derived FROM item `i`'s
+/// `j`-th output column, if it is a plain expr item.
+fn query_derived_item(query: &ast::Query, i: usize, j: usize) -> Option<&ast::Expr> {
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let ast::TableFactor::Derived { subquery, .. } = &select.from[i].relation else {
+        return None;
+    };
+    let ast::SetExpr::Select(inner) = subquery.body.as_ref() else {
+        return None;
+    };
+    match inner.projection.get(j)? {
+        ast::SelectItem::ExprWithAlias { expr, .. } | ast::SelectItem::UnnamedExpr(expr) => {
+            Some(expr)
+        }
+        _ => None,
+    }
 }
 
 /// Does the AST expression contain an **aggregate or window** call? Unlike

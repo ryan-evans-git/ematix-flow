@@ -542,6 +542,28 @@ window-over-derived is the q49 prerequisite.
   kernel-shaped: finalize row materialization, the 5.8M-row rank
   window (top-K pushdown candidate), string-keyed merge itself.
 
+- **q59 offset-equijoin (2026-07-19, `103ad8fa`): 15.0s→0.91s (16.5×).**
+  The sample profile showed 14s of per-row `Expr::eval` + per-access
+  `from_utf8`: the outer `WHERE store1 = store2 AND week1 = week2 - 52`
+  joined on the ~102-distinct store id alone (the arithmetic conjunct
+  couldn't be an edge) and string-filtered ~17M fanned candidates. Two
+  levers:
+  1. **Offset-equijoin promotion** (bind pre-pass): `a = b ± N` between
+     two derived FROM items appends `<b's expr> ± N AS __ejk<i>` to b's
+     projection, rewrites the conjunct to a plain equality, and
+     force-materializes BOTH participants (inlining one re-opens a join
+     cycle whose broken edge falls back to the residual). The planner
+     then merges the equalities into one composite-key hash join. Also
+     fires on q2's `- 53` (neutral there — its cost is the 21.6M-row
+     materialized-union CTE, a different shape).
+     `tests/sql_offset_equijoin.rs` pins edges/no-residual/both-
+     materialized + result equivalence vs a hand-computed key.
+  2. **Validate-once UTF-8**: `Vector::utf8` checks the whole buffer +
+     offset char boundaries at construction; `Utf8View::get` slices
+     unchecked (was re-validating per access on every string path).
+     Construction-rejects-invalid tests pin the invariant.
+  Post-lever sweep 103/103; new sf10 tail: q67 14s, q95 13s, q4/q14ab 9s.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead

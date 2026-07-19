@@ -91,6 +91,19 @@ impl Vector {
     /// single `data` byte buffer. Row `i` is `data[offsets[i]..offsets[i+1]]`.
     pub fn utf8(offsets: Vec<u32>, data: Vec<u8>) -> Self {
         debug_assert!(!offsets.is_empty(), "utf8 offsets need nrows+1 entries");
+        // Validate ONCE here — whole buffer + every offset on a char
+        // boundary — so `Utf8View::get` can slice UNCHECKED. Per-access
+        // `from_utf8` was a top-3 cost in string-residual join loops
+        // (q59: 17M fanned rows × get × validate). A valid buffer sliced
+        // at char boundaries yields valid UTF-8 at every offset pair.
+        std::str::from_utf8(&data).expect("BYTE_ARRAY not valid UTF-8");
+        for &o in &offsets {
+            let o = o as usize;
+            assert!(
+                o <= data.len() && (o == data.len() || data[o] & 0xC0 != 0x80),
+                "utf8 offset {o} not on a char boundary"
+            );
+        }
         Vector {
             logical: LogicalType::Utf8,
             storage: Storage::Utf8 {
@@ -178,7 +191,11 @@ impl<'a> Utf8View<'a> {
     pub fn get(&self, i: usize) -> &'a str {
         let s = self.offsets[i] as usize;
         let e = self.offsets[i + 1] as usize;
-        std::str::from_utf8(&self.data[s..e]).expect("parquet BYTE_ARRAY not valid UTF-8")
+        // SAFETY: `Vector::utf8` (the only `Storage::Utf8` constructor)
+        // validated the whole buffer and every offset's char boundary, so
+        // any offset-pair slice is valid UTF-8.
+        debug_assert!(std::str::from_utf8(&self.data[s..e]).is_ok());
+        unsafe { std::str::from_utf8_unchecked(&self.data[s..e]) }
     }
 
     pub fn len(&self) -> usize {
@@ -187,5 +204,35 @@ impl<'a> Utf8View<'a> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The unchecked `Utf8View::get` is sound only because construction
+    /// validates — invalid bytes must panic HERE, not slip through.
+    #[test]
+    #[should_panic(expected = "not valid UTF-8")]
+    fn utf8_constructor_rejects_invalid_bytes() {
+        Vector::utf8(vec![0, 2], vec![0xFF, 0xFE]);
+    }
+
+    /// An offset landing inside a multi-byte char must panic too — a
+    /// valid buffer sliced off a char boundary is not valid UTF-8.
+    #[test]
+    #[should_panic(expected = "char boundary")]
+    fn utf8_constructor_rejects_split_char() {
+        // 'é' = 0xC3 0xA9; offset 1 splits it.
+        Vector::utf8(vec![0, 1, 2], "é".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn utf8_get_roundtrip() {
+        let v = Vector::utf8(vec![0, 5, 11], b"helloworld!".to_vec());
+        let view = v.as_utf8();
+        assert_eq!(view.get(0), "hello");
+        assert_eq!(view.get(1), "world!");
     }
 }
