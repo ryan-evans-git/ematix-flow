@@ -1973,9 +1973,14 @@ impl Binder<'_> {
                 high,
             } => {
                 // Desugar: e BETWEEN lo AND hi  →  e >= lo AND e <= hi.
+                // A 'YYYY-MM-DD' string bound against a date-typed `e`
+                // folds to Date32 (as the comparison arm does — the Spark
+                // texts write `d_date BETWEEN '…' AND …`).
                 let bound = materialize(self.bind(expr)?);
-                let lo = materialize(self.bind(low)?);
-                let hi = materialize(self.bind(high)?);
+                let mut lo = materialize(self.bind(low)?);
+                let mut hi = materialize(self.bind(high)?);
+                self.coerce_date_literal(&mut lo, &bound);
+                self.coerce_date_literal(&mut hi, &bound);
                 Ok(Bound::Expr(and(
                     binary(BinaryOp::GtEq, bound.clone(), lo),
                     binary(BinaryOp::LtEq, bound, hi),
@@ -1999,7 +2004,13 @@ impl Binder<'_> {
                     (BinaryOp::Eq, or)
                 };
                 list.iter()
-                    .map(|item| Ok(binary(cmp, bound.clone(), materialize(self.bind(item)?))))
+                    .map(|item| {
+                        let mut it = materialize(self.bind(item)?);
+                        // `date_col IN ('YYYY-MM-DD', …)` — fold each string
+                        // element to Date32 against a date-typed column.
+                        self.coerce_date_literal(&mut it, &bound);
+                        Ok(binary(cmp, bound.clone(), it))
+                    })
                     .collect::<Result<Vec<_>, String>>()?
                     .into_iter()
                     .reduce(fold)

@@ -14,7 +14,7 @@ use ematix_flow_engine::plan::execute;
 fn catalog() -> Catalog {
     let data = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tpcds/data/sf1");
     let mut c = Catalog::new();
-    for t in ["store_sales", "customer"] {
+    for t in ["store_sales", "customer", "date_dim"] {
         c.register_parquet(t, data.join(format!("{t}.parquet")))
             .expect("register");
     }
@@ -65,4 +65,18 @@ fn order_by_nulls_last_both_directions() {
     let desc = run("select ss_store_sk from store_sales group by ss_store_sk \
          order by ss_store_sk desc limit 1");
     assert_eq!(desc, vec![vec![ScalarValue::Int64(10)]]);
+}
+
+/// A 'YYYY-MM-DD' string bound compared against a Date column folds to
+/// Date32 in BETWEEN and IN (the Spark texts elide `date`), instead of
+/// panicking on a string-vs-date compare. January 2000 has 31 days; the
+/// three-element IN set matches its three dates.
+#[test]
+fn date_string_coercion_in_between_and_in() {
+    let btw =
+        run("select count(*) from date_dim where d_date between '2000-01-01' and '2000-01-31'");
+    assert_eq!(btw, vec![vec![ScalarValue::Int64(31)]]);
+    let inl = run("select count(*) from date_dim \
+         where d_date in ('2000-06-30', '2000-09-27', '2000-11-17')");
+    assert_eq!(inl, vec![vec![ScalarValue::Int64(3)]]);
 }
