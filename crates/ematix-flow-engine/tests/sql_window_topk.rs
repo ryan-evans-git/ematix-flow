@@ -44,11 +44,7 @@ fn rank_filter_arms_topk() {
     let c = catalog();
     let q = bind_sql(&topk_sql("rk <= 10"), &c).expect("bind");
     assert_eq!(q.derived.len(), 1, "dw2 materializes");
-    assert_eq!(
-        q.derived[0].windows.len(),
-        1,
-        "dw2 carries the rank window"
-    );
+    assert_eq!(q.derived[0].windows.len(), 1, "dw2 carries the rank window");
     assert_eq!(
         q.derived[0].windows[0].top_k,
         Some(10),
@@ -81,5 +77,8 @@ fn dense_rank_is_left_alone() {
              FROM store_sales GROUP BY ss_store_sk, ss_item_sk) dw1
      ) dw2 WHERE rk <= 5 ORDER BY ss_store_sk, rk";
     let q = bind_sql(sql, &c).expect("bind");
-    assert_eq!(q.derived[0].windows[0].top_k, None, "dense_rank stays unpruned");
+    assert_eq!(
+        q.derived[0].windows[0].top_k, None,
+        "dense_rank stays unpruned"
+    );
 }

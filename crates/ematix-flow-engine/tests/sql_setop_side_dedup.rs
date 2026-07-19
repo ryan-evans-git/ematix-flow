@@ -109,7 +109,10 @@ fn union_all_keeps_multiplicity() {
     )
     .expect("bind");
     assert!(q.group.is_empty(), "UNION ALL base stays plain rows");
-    assert!(q.set_ops[0].1.group.is_empty(), "UNION ALL side stays plain");
+    assert!(
+        q.set_ops[0].1.group.is_empty(),
+        "UNION ALL side stays plain"
+    );
     let r = execute(&q).expect("exec");
     let single = execute(
         &bind_sql(

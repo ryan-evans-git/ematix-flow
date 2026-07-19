@@ -13,11 +13,8 @@ use ematix_flow_engine::plan::execute;
 fn catalog() -> Catalog {
     let data = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tpcds/data/sf1");
     let mut c = Catalog::new();
-    c.register_parquet(
-        "store_sales",
-        data.join("store_sales.parquet"),
-    )
-    .expect("register");
+    c.register_parquet("store_sales", data.join("store_sales.parquet"))
+        .expect("register");
     c
 }
 
@@ -63,7 +60,7 @@ fn multi_chunk_derived_preserves_plain_rows() {
         .expect("bind"),
     )
     .expect("exec");
-    let direct = execute(&bind_sql("SELECT count(*) FROM store_sales", &c).expect("bind"))
-        .expect("exec");
+    let direct =
+        execute(&bind_sql("SELECT count(*) FROM store_sales", &c).expect("bind")).expect("exec");
     assert_eq!(through.rows, direct.rows);
 }

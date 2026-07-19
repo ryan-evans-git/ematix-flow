@@ -3848,10 +3848,10 @@ fn rewrite_cte_const_pushdown(query: &ast::Query, catalog: &Catalog) -> Option<a
         let ast::SetExpr::Select(inner) = ctes[ci].0.query.body.as_ref() else {
             continue;
         };
-        let out_idx = ctes[ci].1.iter().position(|c| {
-            c.as_ref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(col))
-        });
+        let out_idx = ctes[ci]
+            .1
+            .iter()
+            .position(|c| c.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(col)));
         let Some(out_idx) = out_idx else { continue };
         let inner_expr = match inner.projection.get(out_idx) {
             Some(ast::SelectItem::ExprWithAlias { expr, .. })
@@ -3989,7 +3989,9 @@ fn rewrite_offset_equijoin(query: &ast::Query) -> Option<(ast::Query, BTreeSet<S
                 hit
             }
             [tab, col] => {
-                let i = items.iter().position(|(a, _)| a.eq_ignore_ascii_case(tab))?;
+                let i = items
+                    .iter()
+                    .position(|(a, _)| a.eq_ignore_ascii_case(tab))?;
                 find(i, col).map(|j| (i, j))
             }
             _ => None,
@@ -4156,7 +4158,10 @@ fn rewrite_cte_set_narrowing(query: &ast::Query) -> Option<ast::Query> {
             let mut displays: Vec<(String, bool)> = Vec::new();
             let mut refs_here = 0usize;
             for twj in &sub.from {
-                let ast::TableFactor::Table { name: tn, alias, .. } = &twj.relation else {
+                let ast::TableFactor::Table {
+                    name: tn, alias, ..
+                } = &twj.relation
+                else {
                     continue;
                 };
                 let tname = tn.to_string();
@@ -4268,9 +4273,7 @@ fn collect_idents<'e>(e: &'e ast::Expr, out: &mut Vec<Vec<&'e str>>) -> bool {
                 return matches!(f.args, ast::FunctionArguments::None);
             };
             list.args.iter().all(|a| match a {
-                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(x)) => {
-                    collect_idents(x, out)
-                }
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(x)) => collect_idents(x, out),
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) => true,
                 _ => false,
             })
@@ -4288,8 +4291,7 @@ fn compound_side(e: &ast::Expr) -> Option<(&ast::Expr, ast::BinaryOperator, &ast
     if !matches!(op, ast::BinaryOperator::Plus | ast::BinaryOperator::Minus) {
         return None;
     }
-    let lit_ok =
-        |x: &ast::Expr| matches!(x, ast::Expr::Value(v) if matches!(v.value, ast::Value::Number(..)));
+    let lit_ok = |x: &ast::Expr| matches!(x, ast::Expr::Value(v) if matches!(v.value, ast::Value::Number(..)));
     if ident_parts(left).is_some() && lit_ok(right) {
         Some((left, op.clone(), right))
     } else {

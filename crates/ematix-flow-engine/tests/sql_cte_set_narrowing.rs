@@ -58,8 +58,10 @@ fn cte_widths(q: &BoundQuery, out: &mut Vec<usize>) {
         let ss = d
             .tables
             .iter()
-            .filter(|t| matches!(&t.source, ematix_flow_engine::logical::TableSource::Parquet(p)
-                if p.to_string_lossy().contains("store_sales")))
+            .filter(|t| {
+                matches!(&t.source, ematix_flow_engine::logical::TableSource::Parquet(p)
+                if p.to_string_lossy().contains("store_sales"))
+            })
             .count();
         if ss == 2 {
             out.push(d.output.len());

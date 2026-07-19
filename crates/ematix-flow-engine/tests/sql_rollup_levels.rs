@@ -24,7 +24,9 @@ fn catalog() -> Catalog {
 }
 
 fn rows(c: &Catalog, sql: &str) -> Vec<Vec<ScalarValue>> {
-    execute(&bind_sql(sql, c).expect("bind")).expect("exec").rows
+    execute(&bind_sql(sql, c).expect("bind"))
+        .expect("exec")
+        .rows
 }
 
 /// Render rows for multiset comparison. Floats print at 9 significant
@@ -64,7 +66,9 @@ fn rollup_equals_union_of_prefix_groupings() {
     );
     let mut expect = rows(
         &c,
-        &format!("SELECT i_category, i_class, i_brand, {agg} {base} GROUP BY i_category, i_class, i_brand"),
+        &format!(
+            "SELECT i_category, i_class, i_brand, {agg} {base} GROUP BY i_category, i_class, i_brand"
+        ),
     );
     expect.extend(
         rows(
@@ -78,22 +82,27 @@ fn rollup_equals_union_of_prefix_groupings() {
         }),
     );
     expect.extend(
-        rows(&c, &format!("SELECT i_category, {agg} {base} GROUP BY i_category"))
+        rows(
+            &c,
+            &format!("SELECT i_category, {agg} {base} GROUP BY i_category"),
+        )
+        .into_iter()
+        .map(|mut r| {
+            r.insert(1, ScalarValue::Null);
+            r.insert(2, ScalarValue::Null);
+            r
+        }),
+    );
+    expect.extend(
+        rows(&c, &format!("SELECT {agg} {base}"))
             .into_iter()
             .map(|mut r| {
+                r.insert(0, ScalarValue::Null);
                 r.insert(1, ScalarValue::Null);
                 r.insert(2, ScalarValue::Null);
                 r
             }),
     );
-    expect.extend(rows(&c, &format!("SELECT {agg} {base}")).into_iter().map(
-        |mut r| {
-            r.insert(0, ScalarValue::Null);
-            r.insert(1, ScalarValue::Null);
-            r.insert(2, ScalarValue::Null);
-            r
-        },
-    ));
     assert!(rolled.len() > 100, "shape produces real group counts");
     assert_eq!(
         sorted(rolled),
@@ -118,7 +127,9 @@ fn rollup_multi_column_term() {
     );
     let mut expect = rows(
         &c,
-        &format!("SELECT i_category, i_class, i_brand, count(*) {base} GROUP BY i_category, i_class, i_brand"),
+        &format!(
+            "SELECT i_category, i_class, i_brand, count(*) {base} GROUP BY i_category, i_class, i_brand"
+        ),
     );
     expect.extend(
         rows(
@@ -131,14 +142,16 @@ fn rollup_multi_column_term() {
             r
         }),
     );
-    expect.extend(rows(&c, &format!("SELECT count(*) {base}")).into_iter().map(
-        |mut r| {
-            r.insert(0, ScalarValue::Null);
-            r.insert(1, ScalarValue::Null);
-            r.insert(2, ScalarValue::Null);
-            r
-        },
-    ));
+    expect.extend(
+        rows(&c, &format!("SELECT count(*) {base}"))
+            .into_iter()
+            .map(|mut r| {
+                r.insert(0, ScalarValue::Null);
+                r.insert(1, ScalarValue::Null);
+                r.insert(2, ScalarValue::Null);
+                r
+            }),
+    );
     assert_eq!(
         sorted(rolled),
         sorted(expect),
