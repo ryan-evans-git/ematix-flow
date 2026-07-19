@@ -1223,34 +1223,32 @@ impl Executor<'_> {
                 }
                 (columns, rows)
             } else {
-                let mut groups: BTreeMap<Vec<GroupKey>, Vec<AggState>> = BTreeMap::new();
+                let trace = std::env::var("EMAT_TRACE_AGG").is_ok();
+                let t0 = std::time::Instant::now();
+                let mut maps: Vec<BTreeMap<Vec<GroupKey>, Vec<AggState>>> = Vec::new();
+                let mut scalar: Option<Vec<AggState>> = None;
                 for out in outputs.into_iter().flatten() {
                     match out {
                         RgOut::Scalar(states) => {
-                            let entry = groups
-                                .entry(Vec::new())
-                                .or_insert_with(|| vec![AggState::default(); q.aggs.len()]);
+                            let entry =
+                                scalar.get_or_insert_with(|| vec![AggState::default(); q.aggs.len()]);
                             for (a, b) in entry.iter_mut().zip(&states) {
                                 a.merge(b);
                             }
                         }
-                        RgOut::Grouped(map) => {
-                            for (k, states) in map {
-                                match groups.entry(k) {
-                                    std::collections::btree_map::Entry::Vacant(e) => {
-                                        e.insert(states);
-                                    }
-                                    std::collections::btree_map::Entry::Occupied(mut e) => {
-                                        for (a, b) in e.get_mut().iter_mut().zip(&states) {
-                                            a.merge(b);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        RgOut::Grouped(map) => maps.push(map),
                         RgOut::Rows(_) | RgOut::Chunk(_) => {
                             unreachable!("plain-row / window-chunk handled above")
                         }
+                    }
+                }
+                let mut groups = kway_merge_groups(maps);
+                if let Some(states) = scalar {
+                    let entry = groups
+                        .entry(Vec::new())
+                        .or_insert_with(|| vec![AggState::default(); q.aggs.len()]);
+                    for (a, b) in entry.iter_mut().zip(&states) {
+                        a.merge(b);
                     }
                 }
                 // A scalar aggregate over zero surviving row groups still
@@ -1258,10 +1256,22 @@ impl Executor<'_> {
                 if groups.is_empty() && q.group.is_empty() {
                     groups.insert(Vec::new(), vec![AggState::default(); q.aggs.len()]);
                 }
+                if trace {
+                    eprintln!("agg: merged {} groups in {:?}", groups.len(), t0.elapsed());
+                }
+                let t1 = std::time::Instant::now();
                 if !q.rollup_terms.is_empty() {
                     add_rollup_levels(&mut groups, &q.rollup_terms);
+                    if trace {
+                        eprintln!("agg: rollup -> {} groups in {:?}", groups.len(), t1.elapsed());
+                    }
                 }
-                self.finalize_groups(groups)?
+                let t2 = std::time::Instant::now();
+                let r = self.finalize_groups(groups)?;
+                if trace {
+                    eprintln!("agg: finalize {} rows in {:?}", r.1.len(), t2.elapsed());
+                }
+                r
             };
         // `SELECT DISTINCT` grouping did not fold away (see BoundQuery::
         // distinct): dedup the result rows before ORDER BY / LIMIT so a
@@ -2544,32 +2554,134 @@ enum GroupKey {
 /// its surviving prefix (SUM/COUNT/MIN/MAX/AVG/… all merge exactly), with
 /// the dropped columns keyed `GroupKey::Rollup` (renders NULL, but distinct
 /// from a genuine NULL group so the subtotal never merges into one).
+/// Merge per-row-group aggregation partials into one sorted map by K-WAY
+/// run merge: each partial iterates in key order, a small heap of run
+/// heads yields globally sorted (key, states) pairs, equal keys merge on
+/// the fly, and the final map bulk-builds from the sorted unique stream.
+/// Replaces per-entry tree probing into an ever-growing map (log-n
+/// multi-string key comparisons per insert — 8s of q67's sf10 time; the
+/// heap pass is ~log-k).
+fn kway_merge_groups(
+    maps: Vec<BTreeMap<Vec<GroupKey>, Vec<AggState>>>,
+) -> BTreeMap<Vec<GroupKey>, Vec<AggState>> {
+    if maps.len() <= 1 {
+        return maps.into_iter().next().unwrap_or_default();
+    }
+    // Min-heap of run heads, ordered by (key, run). States ride along —
+    // moved, never cloned.
+    struct Head {
+        key: Vec<GroupKey>,
+        run: usize,
+        states: Vec<AggState>,
+    }
+    impl PartialEq for Head {
+        fn eq(&self, o: &Self) -> bool {
+            self.key == o.key && self.run == o.run
+        }
+    }
+    impl Eq for Head {}
+    impl Ord for Head {
+        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+            // Reversed: BinaryHeap is a max-heap, we need the SMALLEST key.
+            o.key.cmp(&self.key).then(o.run.cmp(&self.run))
+        }
+    }
+    impl PartialOrd for Head {
+        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    let mut runs: Vec<_> = maps.into_iter().map(|m| m.into_iter()).collect();
+    let mut heap = std::collections::BinaryHeap::with_capacity(runs.len());
+    for (i, r) in runs.iter_mut().enumerate() {
+        if let Some((key, states)) = r.next() {
+            heap.push(Head {
+                key,
+                run: i,
+                states,
+            });
+        }
+    }
+    let mut out: Vec<(Vec<GroupKey>, Vec<AggState>)> = Vec::new();
+    while let Some(h) = heap.pop() {
+        if let Some((key, states)) = runs[h.run].next() {
+            heap.push(Head {
+                key,
+                run: h.run,
+                states,
+            });
+        }
+        match out.last_mut() {
+            Some((lk, ls)) if *lk == h.key => {
+                for (a, b) in ls.iter_mut().zip(&h.states) {
+                    a.merge(b);
+                }
+            }
+            _ => out.push((h.key, h.states)),
+        }
+    }
+    // Sorted + unique input → BTreeMap's bulk-build path.
+    BTreeMap::from_iter(out)
+}
+
 fn add_rollup_levels(groups: &mut BTreeMap<Vec<GroupKey>, Vec<AggState>>, term_sizes: &[usize]) {
-    // The base grouping set (all terms) is already present; derive the rest.
-    let base: Vec<(Vec<GroupKey>, Vec<AggState>)> =
-        groups.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    // Cumulative column count kept after the first `t` terms.
+    // The base grouping set (all terms) is already present; derive the rest
+    // by CASCADE: level t re-aggregates level t+1 (not the base), and each
+    // step is a single linear run-merge — the source iterates in key order,
+    // truncating a key to its prefix preserves that order, so groups
+    // sharing the kept prefix are CONTIGUOUS. q67's 8-level rollup over
+    // 4.8M string-keyed base groups at sf10: 38.8M tree probes → one
+    // sorted pass per level over an ever-shrinking input (16.5s → sub-s).
     let mut kept_cols = vec![0usize; term_sizes.len() + 1];
     for (i, &sz) in term_sizes.iter().enumerate() {
         kept_cols[i + 1] = kept_cols[i] + sz;
     }
+    // Absorb one source group into the level being built: merge into the
+    // current run if the kept prefix matches, else start a new subtotal.
+    fn absorb(
+        level: &mut Vec<(Vec<GroupKey>, Vec<AggState>)>,
+        keep: usize,
+        k: &[GroupKey],
+        states: &[AggState],
+    ) {
+        if let Some((lk, ls)) = level.last_mut() {
+            if lk[..keep] == k[..keep] {
+                for (a, b) in ls.iter_mut().zip(states) {
+                    a.merge(b);
+                }
+                return;
+            }
+        }
+        let mut key = k.to_vec();
+        for slot in key.iter_mut().skip(keep) {
+            *slot = GroupKey::Rollup;
+        }
+        level.push((key, states.to_vec()));
+    }
+    let mut levels: Vec<Vec<(Vec<GroupKey>, Vec<AggState>)>> = Vec::new();
     for t in (0..term_sizes.len()).rev() {
         let keep = kept_cols[t];
-        for (k, states) in &base {
-            let mut key = k.clone();
-            for slot in key.iter_mut().skip(keep) {
-                *slot = GroupKey::Rollup;
-            }
-            match groups.entry(key) {
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    e.insert(states.clone());
-                }
-                std::collections::btree_map::Entry::Occupied(mut e) => {
-                    for (a, b) in e.get_mut().iter_mut().zip(states) {
-                        a.merge(b);
-                    }
+        let mut level = Vec::new();
+        match levels.last() {
+            None => {
+                for (k, s) in groups.iter() {
+                    absorb(&mut level, keep, k, s);
                 }
             }
+            Some(prev) => {
+                for (k, s) in prev {
+                    absorb(&mut level, keep, k, s);
+                }
+            }
+        }
+        levels.push(level);
+    }
+    // Level keys carry a Rollup suffix the base never has, and each level's
+    // suffix pattern is unique — plain inserts, no collisions.
+    for level in levels {
+        for (k, s) in level {
+            let dup = groups.insert(k, s);
+            debug_assert!(dup.is_none(), "rollup level key collided");
         }
     }
 }
