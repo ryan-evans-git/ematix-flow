@@ -369,6 +369,35 @@ window-over-derived is the q49 prerequisite.
     Float64 — a materialization type clash. A numeric *literal* under a
     decimal/float cast is now coerced to `Float64` (int targets still pass
     through integral). This lets the union reconcile.
+- **Window-over-derived + LEFT→INNER demotion + aggregate-in-CAST
+  (2026-07-19): q49 executes + parity-matches DuckDB (34 rows) → exec
+  63→66/102 (q49 + two ratio queries), 66/66 parity, 0 MISMATCH.** Three
+  stacked features, each a prerequisite for the next layer of q49:
+  - **Aggregate inside a CAST** — `cast(sum(x) AS DECIMAL(15,4)) /
+    cast(sum(y) AS DECIMAL(15,4))` (a decimal ratio of two sums). A cast
+    previously hid the aggregate from `contains_aggregate`/`contains_function`
+    (they had no `Cast` arm), so the query was misclassified as plain-rows
+    and the `sum` hit the generic scalar path ("aggregate calls are only
+    allowed in the SELECT list"). Both predicates now descend through `Cast`,
+    and `bind_output` gained a `Cast` arm that binds the inner aggregate in
+    row space then applies the same numeric-cast → Float64 typing (shared
+    `float_cast_expr` helper with the scalar path).
+  - **Window over a no-GROUP-BY input** (`rank() OVER (ORDER BY r) FROM
+    derived`) — the new `windowed_plain` mode: the row space IS the slot
+    space, so non-window projections pass through as slot columns
+    (`Binder::plain_passthrough`) and windows append after the last slot
+    (remap base = slot count, not group+agg count). The executor gathers
+    each row group's surviving rows into a slot-indexed `RgOut::Chunk`,
+    `concat_chunks` merges them into the single global input, then the
+    existing window stage appends one column per window and projects.
+    `output_types` / `infer_windowed_slot_type` type a `Column ≥ nslots` as
+    its window value (rank → Int64). Regression `tests/sql_window_over_derived.rs`.
+  - **LEFT→INNER demotion** — a WHERE predicate on a LEFT JOIN's nullable
+    side that rejects NULLs (`wr.wr_return_amt > 10000` — any
+    comparison/arithmetic is UNKNOWN on NULL, so unmatched rows drop) is
+    exactly an INNER join. The binder now clears the edge's `preserved`
+    marking and routes the predicate as that table's filter instead of
+    erroring; an `IS NULL` conjunct (the anti-join case) is still refused.
 
 ## Next (P4 tail → P5/P6)
 

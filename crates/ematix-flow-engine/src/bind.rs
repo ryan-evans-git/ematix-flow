@@ -125,6 +125,7 @@ fn bind_query(
         extra_edges: Vec::new(),
         pending_conjuncts: Vec::new(),
         left_tables: BTreeSet::new(),
+        plain_passthrough: false,
     };
     for twj in &select.from {
         b.add_from_item(&twj.relation)?;
@@ -262,6 +263,28 @@ fn bind_query(
     } else {
         select.projection.clone()
     };
+    // A no-GROUP-BY window query (`rank() OVER … FROM derived`, q49): its
+    // non-window projections are slot-space passthroughs. Distinct from a
+    // grouped window (which computes over aggregate rows); a *true*
+    // aggregate at this level would need the grouped path, so it disqualifies.
+    fn item_expr(it: &ast::SelectItem) -> Option<&ast::Expr> {
+        match it {
+            ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                Some(e)
+            }
+            _ => None,
+        }
+    }
+    let windowed_plain = !set_semantics
+        && group.is_empty()
+        && projection
+            .iter()
+            .any(|it| item_expr(it).is_some_and(contains_window))
+        && projection
+            .iter()
+            .all(|it| item_expr(it).is_none_or(|e| !contains_nonwindow_agg(e)));
+    b.plain_passthrough = windowed_plain;
+
     let mut aggs: Vec<AggExpr> = Vec::new();
     let mut output: Vec<OutputExpr> = Vec::new();
     for (idx, item) in projection.iter().enumerate() {
@@ -287,7 +310,7 @@ fn bind_query(
             name,
         });
     }
-    if aggs.is_empty() && group.is_empty() && !plain_rows {
+    if aggs.is_empty() && group.is_empty() && !plain_rows && !windowed_plain {
         return Err("SELECT list must contain an aggregate, a GROUP BY, or plain columns".into());
     }
 
@@ -362,10 +385,29 @@ fn bind_query(
                     ));
                 }
                 Attribution::Single(t) if b.left_tables.contains(&t) && !from_on => {
-                    return Err(format!(
-                        "WHERE condition '{conj}' on a LEFT JOIN's right side is not yet \
-                         supported (it would change the join to INNER)"
-                    ));
+                    // A WHERE predicate on a LEFT JOIN's nullable side that
+                    // rejects NULLs (any comparison/arithmetic — NULL makes
+                    // it UNKNOWN, so unmatched rows drop) is exactly an INNER
+                    // join. Demote: clear the preserved marking on t's edge
+                    // and route the predicate as t's filter. An `IS NULL`
+                    // conjunct is the opposite (an anti-join) — still refused.
+                    if matches!(conj, ast::Expr::IsNull(_)) {
+                        return Err(format!(
+                            "WHERE '{conj}' selects a LEFT JOIN's unmatched rows (anti-join) \
+                             — not yet supported"
+                        ));
+                    }
+                    b.left_tables.remove(&t);
+                    for ei in 0..b.extra_edges.len() {
+                        let (a, bb, pres) = {
+                            let ed = &b.extra_edges[ei];
+                            (ed.a, ed.b, ed.preserved.is_some())
+                        };
+                        if pres && (b.slots[a].table == t || b.slots[bb].table == t) {
+                            b.extra_edges[ei].preserved = None;
+                        }
+                    }
+                    filters[t].push(e);
                 }
                 Attribution::Single(t) => filters[t].push(e),
                 Attribution::Multi => post.push(e),
@@ -511,10 +553,14 @@ fn bind_query(
     let mut output = output;
     let mut having = having;
     if !b.windows.is_empty() {
-        if group.is_empty() && aggs.is_empty() {
-            return Err("window functions without GROUP BY are not yet supported".into());
-        }
-        let base = group.len() + aggs.len();
+        // Row space is `[keys…, aggs…, windows…]`; in a no-GROUP-BY window
+        // query (`windowed_plain`) the base row space IS the slot space, so
+        // windows append after every scan slot.
+        let base = if group.is_empty() && aggs.is_empty() {
+            b.slots.len()
+        } else {
+            group.len() + aggs.len()
+        };
         for o in &mut output {
             remap_window_cols(&mut o.expr, base);
         }
@@ -823,6 +869,10 @@ struct Binder<'a> {
     pending_conjuncts: Vec<(ast::Expr, bool)>,
     /// Tables joined via LEFT OUTER (their rows may be unmatched).
     left_tables: BTreeSet<usize>,
+    /// A window query with no GROUP BY (`rank() OVER … FROM derived`): its
+    /// non-window projections are slot-space passthroughs, so `bind_output`
+    /// returns a plain column reference instead of demanding a GROUP BY key.
+    plain_passthrough: bool,
 }
 
 /// A partially-bound expression: either a real bound expression, or a
@@ -1219,7 +1269,11 @@ impl Binder<'_> {
             if let Some(g) = group.iter().position(|ge| ge.expr == bound) {
                 return Ok(Expr::Column(g));
             }
-            if !references_columns(&bound) {
+            // In a no-GROUP-BY window query the row space IS the slot space,
+            // so a plain column reference is a valid passthrough output (it
+            // becomes a scan column the window stage reads alongside the
+            // window results).
+            if self.plain_passthrough || !references_columns(&bound) {
                 return Ok(bound);
             }
             return Err(format!("'{e}' is neither an aggregate nor a GROUP BY key"));
@@ -1267,6 +1321,31 @@ impl Binder<'_> {
                 let l = self.bind_output(left, group, aggs)?;
                 let r = self.bind_output(right, group, aggs)?;
                 Ok(binary(op, l, r))
+            }
+            // A cast wrapping an aggregate (q49's `cast(sum(x) AS
+            // DECIMAL(15,4))`): bind the inner aggregate in row space, then
+            // apply the same numeric-cast typing as the scalar path.
+            ast::Expr::Cast {
+                expr, data_type, ..
+            } => {
+                use ast::DataType as DT;
+                let inner = self.bind_output(expr, group, aggs)?;
+                match data_type {
+                    DT::Decimal(_)
+                    | DT::Numeric(_)
+                    | DT::Float(_)
+                    | DT::Double(_)
+                    | DT::DoublePrecision => Ok(float_cast_expr(inner)),
+                    DT::Int(_)
+                    | DT::Integer(_)
+                    | DT::BigInt(_)
+                    | DT::SmallInt(_)
+                    | DT::Char(_)
+                    | DT::Varchar(_)
+                    | DT::Text
+                    | DT::Date => Ok(inner),
+                    other => Err(format!("unsupported CAST target over aggregate: {other}")),
+                }
             }
             other => Err(format!("unsupported expression over aggregates: {other}")),
         }
@@ -1562,6 +1641,7 @@ impl Binder<'_> {
             extra_edges: Vec::new(),
             pending_conjuncts: Vec::new(),
             left_tables: BTreeSet::new(),
+            plain_passthrough: false,
         };
         let key_slot = inner.resolve_parts(&[&inner_col])?;
         let mut inner_filters: Vec<Expr> = Vec::new();
@@ -1648,6 +1728,7 @@ impl Binder<'_> {
             extra_edges: Vec::new(),
             pending_conjuncts: Vec::new(),
             left_tables: BTreeSet::new(),
+            plain_passthrough: false,
         };
         let key_slot = inner.resolve_parts(&[&inner_col])?;
         let s_slot = inner.resolve_parts(&[&ineq_col])?;
@@ -2004,19 +2085,7 @@ impl Binder<'_> {
                     | DT::Float(_)
                     | DT::Double(_)
                     | DT::DoublePrecision => {
-                        let inner = materialize(self.bind(expr)?);
-                        let floated = match inner {
-                            Expr::Literal(ScalarValue::Int64(i)) => {
-                                Expr::Literal(ScalarValue::Float64(i as f64))
-                            }
-                            Expr::Literal(ScalarValue::Int32(i)) => {
-                                Expr::Literal(ScalarValue::Float64(i as f64))
-                            }
-                            // Already Float64, or a non-literal expression
-                            // (runtime already evaluates in f64).
-                            other => other,
-                        };
-                        Ok(Bound::Expr(floated))
+                        Ok(Bound::Expr(float_cast_expr(materialize(self.bind(expr)?))))
                     }
                     // Integer casts pass through: the engine keeps integer
                     // numerics integral.
@@ -2300,6 +2369,15 @@ pub(crate) fn output_types(q: &BoundQuery) -> Vec<LogicalType> {
     let visible = &q.output[..q.output.len() - q.hidden_outputs];
     // A PLAIN-ROWS query's outputs live in SLOT space, not row space.
     if q.group.is_empty() && q.aggs.is_empty() {
+        // A no-GROUP-BY *window* query's row space is [slots…, windows…]:
+        // a column past the last slot is a window value.
+        if !q.windows.is_empty() {
+            let nslots = q.slots.len();
+            return visible
+                .iter()
+                .map(|o| infer_windowed_slot_type(q, nslots, &o.expr))
+                .collect();
+        }
         return visible
             .iter()
             .map(|o| infer_slot_type(q, &o.expr))
@@ -2309,6 +2387,28 @@ pub(crate) fn output_types(q: &BoundQuery) -> Vec<LogicalType> {
         .iter()
         .map(|o| infer_row_type(q, &key_tys, &o.expr))
         .collect()
+}
+
+/// Infer a type in a no-GROUP-BY window query's row space: columns
+/// `[0, nslots)` are scan slots, columns at/after `nslots` are window values.
+fn infer_windowed_slot_type(q: &BoundQuery, nslots: usize, e: &Expr) -> LogicalType {
+    match e {
+        Expr::Column(i) if *i >= nslots => match q.windows[*i - nslots].func {
+            WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::RowNumber => LogicalType::Int64,
+            WindowFunc::Agg(_) => LogicalType::Float64,
+        },
+        Expr::Binary { op, lhs, rhs } => binary_type(
+            *op,
+            infer_windowed_slot_type(q, nslots, lhs),
+            infer_windowed_slot_type(q, nslots, rhs),
+        ),
+        Expr::Case { whens, .. } => whens
+            .first()
+            .map(|(_, v)| infer_windowed_slot_type(q, nslots, v))
+            .unwrap_or(LogicalType::Float64),
+        // Slot columns and everything else fall back to the slot inference.
+        _ => infer_slot_type(q, e),
+    }
 }
 
 fn infer_slot_type(q: &BoundQuery, e: &Expr) -> LogicalType {
@@ -2467,6 +2567,10 @@ fn contains_aggregate(e: &ast::Expr) -> bool {
         }
         ast::Expr::Extract { expr, .. } => contains_aggregate(expr),
         ast::Expr::Substring { expr, .. } => contains_aggregate(expr),
+        // A cast is transparent to the aggregate it wraps — q49's
+        // `cast(sum(x) AS DECIMAL(15,4))` must still route to the grouped
+        // path, not be mistaken for a plain scalar projection.
+        ast::Expr::Cast { expr, .. } => contains_aggregate(expr),
         ast::Expr::Case {
             conditions,
             else_result,
@@ -2476,6 +2580,93 @@ fn contains_aggregate(e: &ast::Expr) -> bool {
                 .iter()
                 .any(|cw| contains_aggregate(&cw.condition) || contains_aggregate(&cw.result))
                 || else_result.as_ref().is_some_and(|e| contains_aggregate(e))
+        }
+        _ => false,
+    }
+}
+
+/// Does the AST expression contain a window call (`fn(...) OVER (...)`)?
+/// A window forces its own execution stage even with no GROUP BY.
+fn contains_window(e: &ast::Expr) -> bool {
+    match e {
+        ast::Expr::Function(f) => {
+            f.over.is_some()
+                || match &f.args {
+                    ast::FunctionArguments::List(list) => list.args.iter().any(|a| {
+                        matches!(a,
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                                if contains_window(e))
+                    }),
+                    _ => false,
+                }
+        }
+        ast::Expr::Nested(i) => contains_window(i),
+        ast::Expr::BinaryOp { left, right, .. } => contains_window(left) || contains_window(right),
+        ast::Expr::UnaryOp { expr, .. } => contains_window(expr),
+        ast::Expr::Cast { expr, .. } => contains_window(expr),
+        ast::Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            conditions
+                .iter()
+                .any(|cw| contains_window(&cw.condition) || contains_window(&cw.result))
+                || else_result.as_ref().is_some_and(|e| contains_window(e))
+        }
+        _ => false,
+    }
+}
+
+/// Does the AST expression contain a **non-window** aggregate call (a bare
+/// `sum`/`count`/… with no `OVER`)? A no-GROUP-BY window query is only a
+/// slot-passthrough shape when it has none of these.
+fn contains_nonwindow_agg(e: &ast::Expr) -> bool {
+    match e {
+        ast::Expr::Function(f) => {
+            if f.over.is_some() {
+                // A window call — descend into its arguments but the call
+                // itself is not a bare aggregate.
+                return match &f.args {
+                    ast::FunctionArguments::List(list) => list.args.iter().any(|a| {
+                        matches!(a,
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                                if contains_nonwindow_agg(e))
+                    }),
+                    _ => false,
+                };
+            }
+            if matches!(
+                f.name.to_string().to_lowercase().as_str(),
+                "sum" | "count" | "min" | "max" | "avg" | "stddev_samp"
+            ) {
+                return true;
+            }
+            match &f.args {
+                ast::FunctionArguments::List(list) => list.args.iter().any(|a| {
+                    matches!(a,
+                        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                            if contains_nonwindow_agg(e))
+                }),
+                _ => false,
+            }
+        }
+        ast::Expr::Nested(i) => contains_nonwindow_agg(i),
+        ast::Expr::BinaryOp { left, right, .. } => {
+            contains_nonwindow_agg(left) || contains_nonwindow_agg(right)
+        }
+        ast::Expr::UnaryOp { expr, .. } => contains_nonwindow_agg(expr),
+        ast::Expr::Cast { expr, .. } => contains_nonwindow_agg(expr),
+        ast::Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            conditions.iter().any(|cw| {
+                contains_nonwindow_agg(&cw.condition) || contains_nonwindow_agg(&cw.result)
+            }) || else_result
+                .as_ref()
+                .is_some_and(|e| contains_nonwindow_agg(e))
         }
         _ => false,
     }
@@ -2501,6 +2692,7 @@ fn contains_function(e: &ast::Expr) -> bool {
             contains_function(expr) || contains_function(pattern)
         }
         ast::Expr::Extract { expr, .. } => contains_function(expr),
+        ast::Expr::Cast { expr, .. } => contains_function(expr),
         ast::Expr::Subquery(_) | ast::Expr::InSubquery { .. } | ast::Expr::Exists { .. } => false,
         ast::Expr::Substring { expr, .. } => contains_function(expr),
         ast::Expr::Case {
@@ -2640,6 +2832,19 @@ fn materialize(b: Bound) -> Expr {
     match b {
         Bound::Expr(e) => e,
         Bound::Dec(d) => Expr::Literal(d.to_scalar()),
+    }
+}
+
+/// Coerce an expression under a `CAST(_ AS DECIMAL/NUMERIC/FLOAT/DOUBLE)` to
+/// Float64 typing: a numeric *literal* becomes a Float64 literal (so a union
+/// branch's `cast(0 AS DECIMAL)` types as float, not int); everything else
+/// passes through (aggregate columns and arithmetic already evaluate in f64,
+/// and `infer_*_type` already reports Float64 for them).
+fn float_cast_expr(inner: Expr) -> Expr {
+    match inner {
+        Expr::Literal(ScalarValue::Int64(i)) => Expr::Literal(ScalarValue::Float64(i as f64)),
+        Expr::Literal(ScalarValue::Int32(i)) => Expr::Literal(ScalarValue::Float64(i as f64)),
+        other => other,
     }
 }
 

@@ -856,6 +856,10 @@ enum RgOut {
     Scalar(Vec<AggState>),
     Grouped(BTreeMap<Vec<GroupKey>, Vec<AggState>>),
     Rows(Vec<Vec<ScalarValue>>),
+    /// A no-GROUP-BY window query: this row group's surviving rows, gathered
+    /// into a slot-indexed chunk. The chunks concatenate across row groups
+    /// into the single input the (global) window stage runs over.
+    Chunk(DataChunk),
 }
 
 /// Shared, read-only context for per-row-group root processing.
@@ -1043,6 +1047,17 @@ impl Executor<'_> {
             for o in &q.output {
                 collect_slots(&o.expr, &mut needed);
             }
+            // A no-GROUP-BY window query also reads its ORDER BY / PARTITION
+            // BY / argument expressions from the slot-space chunk.
+            for w in &q.windows {
+                collect_slots(&w.arg, &mut needed);
+                for p in &w.partition {
+                    collect_slots(p, &mut needed);
+                }
+                for (o, _) in &w.order {
+                    collect_slots(o, &mut needed);
+                }
+            }
         }
         needed.sort_unstable();
         needed.dedup();
@@ -1117,54 +1132,86 @@ impl Executor<'_> {
         // ---- Merge partials in row-group order, then HAVING → ORDER BY →
         // LIMIT.
         let outputs = outputs.into_inner().expect("no poisoned lock");
-        let (columns, mut rows) = if q.group.is_empty() && q.aggs.is_empty() {
-            let columns: Vec<String> = q.output.iter().map(|o| o.name.clone()).collect();
-            let mut rows = Vec::new();
-            for out in outputs.into_iter().flatten() {
-                if let RgOut::Rows(mut r) = out {
-                    rows.append(&mut r);
+        let (columns, mut rows) =
+            if q.group.is_empty() && q.aggs.is_empty() && !q.windows.is_empty() {
+                // No-GROUP-BY window query: concatenate every RG's slot chunk
+                // into the single input, append one column per window expression
+                // (row space extends to [slots…, windows…]), then project.
+                let columns: Vec<String> = q.output.iter().map(|o| o.name.clone()).collect();
+                let chunks: Vec<DataChunk> = outputs
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|out| match out {
+                        RgOut::Chunk(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect();
+                let base = concat_chunks(chunks);
+                let n = base.n_rows();
+                let mut cols = base.cols.clone();
+                for w in &q.windows {
+                    cols.push(compute_window(w, &base, n));
                 }
-            }
-            (columns, rows)
-        } else {
-            let mut groups: BTreeMap<Vec<GroupKey>, Vec<AggState>> = BTreeMap::new();
-            for out in outputs.into_iter().flatten() {
-                match out {
-                    RgOut::Scalar(states) => {
-                        let entry = groups
-                            .entry(Vec::new())
-                            .or_insert_with(|| vec![AggState::default(); q.aggs.len()]);
-                        for (a, b) in entry.iter_mut().zip(&states) {
-                            a.merge(b);
-                        }
+                let full = DataChunk::new(cols);
+                let rows = (0..n)
+                    .map(|r| {
+                        q.output
+                            .iter()
+                            .map(|o| o.expr.eval_value(&full, r))
+                            .collect()
+                    })
+                    .collect();
+                (columns, rows)
+            } else if q.group.is_empty() && q.aggs.is_empty() {
+                let columns: Vec<String> = q.output.iter().map(|o| o.name.clone()).collect();
+                let mut rows = Vec::new();
+                for out in outputs.into_iter().flatten() {
+                    if let RgOut::Rows(mut r) = out {
+                        rows.append(&mut r);
                     }
-                    RgOut::Grouped(map) => {
-                        for (k, states) in map {
-                            match groups.entry(k) {
-                                std::collections::btree_map::Entry::Vacant(e) => {
-                                    e.insert(states);
-                                }
-                                std::collections::btree_map::Entry::Occupied(mut e) => {
-                                    for (a, b) in e.get_mut().iter_mut().zip(&states) {
-                                        a.merge(b);
+                }
+                (columns, rows)
+            } else {
+                let mut groups: BTreeMap<Vec<GroupKey>, Vec<AggState>> = BTreeMap::new();
+                for out in outputs.into_iter().flatten() {
+                    match out {
+                        RgOut::Scalar(states) => {
+                            let entry = groups
+                                .entry(Vec::new())
+                                .or_insert_with(|| vec![AggState::default(); q.aggs.len()]);
+                            for (a, b) in entry.iter_mut().zip(&states) {
+                                a.merge(b);
+                            }
+                        }
+                        RgOut::Grouped(map) => {
+                            for (k, states) in map {
+                                match groups.entry(k) {
+                                    std::collections::btree_map::Entry::Vacant(e) => {
+                                        e.insert(states);
+                                    }
+                                    std::collections::btree_map::Entry::Occupied(mut e) => {
+                                        for (a, b) in e.get_mut().iter_mut().zip(&states) {
+                                            a.merge(b);
+                                        }
                                     }
                                 }
                             }
                         }
+                        RgOut::Rows(_) | RgOut::Chunk(_) => {
+                            unreachable!("plain-row / window-chunk handled above")
+                        }
                     }
-                    RgOut::Rows(_) => unreachable!("plain-row handled above"),
                 }
-            }
-            // A scalar aggregate over zero surviving row groups still
-            // yields one (default) row — matching sequential semantics.
-            if groups.is_empty() && q.group.is_empty() {
-                groups.insert(Vec::new(), vec![AggState::default(); q.aggs.len()]);
-            }
-            if !q.rollup_terms.is_empty() {
-                add_rollup_levels(&mut groups, &q.rollup_terms);
-            }
-            self.finalize_groups(groups)?
-        };
+                // A scalar aggregate over zero surviving row groups still
+                // yields one (default) row — matching sequential semantics.
+                if groups.is_empty() && q.group.is_empty() {
+                    groups.insert(Vec::new(), vec![AggState::default(); q.aggs.len()]);
+                }
+                if !q.rollup_terms.is_empty() {
+                    add_rollup_levels(&mut groups, &q.rollup_terms);
+                }
+                self.finalize_groups(groups)?
+            };
         // `SELECT DISTINCT` grouping did not fold away (see BoundQuery::
         // distinct): dedup the result rows before ORDER BY / LIMIT so a
         // LIMIT counts distinct rows, not raw ones.
@@ -1766,6 +1813,15 @@ impl Executor<'_> {
 
         // ---- This RG's aggregation partial.
         if q.group.is_empty() && q.aggs.is_empty() {
+            // No-GROUP-BY window query: gather this RG's surviving rows into
+            // a slot-indexed chunk. The window stage runs over the whole
+            // concatenation, so we cannot emit projected rows per RG here.
+            if !q.windows.is_empty() {
+                let mut idx: Vec<usize> = Vec::new();
+                sel.for_each(|i| idx.push(i as usize));
+                let cols: Vec<Vector> = view.cols.iter().map(|c| gather_rows(c, &idx)).collect();
+                return Ok(RgOut::Chunk(DataChunk::new(cols)));
+            }
             let mut rows = Vec::new();
             sel.for_each(|i| {
                 rows.push(
@@ -2043,6 +2099,70 @@ fn gather_rows(v: &Vector, idx: &[usize]) -> Vector {
         LogicalType::Int64 => Vector::i64(idx.iter().map(|&r| v.as_i64()[r]).collect()),
     };
     out.with_validity(valid.filter(|m| m.iter().any(|&b| !b)))
+}
+
+/// Concatenate row-group chunks (identical column layout) into one dense
+/// chunk — the single input a no-GROUP-BY window stage runs over. Validity
+/// is merged (a column with no mask contributes all-valid rows).
+fn concat_chunks(chunks: Vec<DataChunk>) -> DataChunk {
+    let Some(first) = chunks.first() else {
+        return DataChunk::new(Vec::new());
+    };
+    let ncols = first.cols.len();
+    let total: usize = chunks.iter().map(DataChunk::n_rows).sum();
+    let mut cols = Vec::with_capacity(ncols);
+    for j in 0..ncols {
+        let logical = first.cols[j].logical;
+        let any_valid = chunks.iter().any(|c| c.cols[j].validity.is_some());
+        let mut valid: Option<Vec<bool>> = any_valid.then(|| Vec::with_capacity(total));
+        if let Some(v) = &mut valid {
+            for c in &chunks {
+                let col = &c.cols[j];
+                match &col.validity {
+                    Some(m) => v.extend_from_slice(m),
+                    None => v.extend(std::iter::repeat_n(true, col.len())),
+                }
+            }
+        }
+        let out = match logical {
+            LogicalType::Float64 => {
+                let mut o = Vec::with_capacity(total);
+                for c in &chunks {
+                    o.extend_from_slice(c.cols[j].as_f64());
+                }
+                Vector::f64(o)
+            }
+            LogicalType::Int64 => {
+                let mut o = Vec::with_capacity(total);
+                for c in &chunks {
+                    o.extend_from_slice(c.cols[j].as_i64());
+                }
+                Vector::i64(o)
+            }
+            LogicalType::Int32 | LogicalType::Date32 => {
+                let mut o = Vec::with_capacity(total);
+                for c in &chunks {
+                    o.extend_from_slice(c.cols[j].as_i32());
+                }
+                Vector::i32(o, logical)
+            }
+            LogicalType::Utf8 => {
+                let mut offsets = Vec::with_capacity(total + 1);
+                let mut data = Vec::new();
+                offsets.push(0u32);
+                for c in &chunks {
+                    let view = c.cols[j].as_utf8();
+                    for r in 0..c.cols[j].len() {
+                        data.extend_from_slice(view.get(r).as_bytes());
+                        offsets.push(data.len() as u32);
+                    }
+                }
+                Vector::utf8(offsets, data)
+            }
+        };
+        cols.push(out.with_validity(valid));
+    }
+    DataChunk::new(cols)
 }
 
 /// Evaluate one window expression over the block's result chunk (`n`
