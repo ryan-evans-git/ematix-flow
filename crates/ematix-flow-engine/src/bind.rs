@@ -2061,9 +2061,6 @@ impl Binder<'_> {
                 // TPC-H's `date '…' - interval '90' day`).
                 if let ast::Expr::Interval(iv) = right.as_ref() {
                     let base = materialize(self.bind(left)?);
-                    let Expr::Literal(ScalarValue::Date32(d)) = base else {
-                        return Err("intervals apply to date literals only (so far)".into());
-                    };
                     let signed = match op {
                         ast::BinaryOperator::Plus => 1,
                         ast::BinaryOperator::Minus => -1,
@@ -2071,9 +2068,24 @@ impl Binder<'_> {
                             return Err(format!("unsupported interval operator: {other}"));
                         }
                     };
-                    return Ok(Bound::Expr(Expr::Literal(ScalarValue::Date32(shift_date(
-                        d, iv, signed,
-                    )?))));
+                    // A literal date folds at bind time (any interval unit).
+                    if let Expr::Literal(ScalarValue::Date32(d)) = base {
+                        return Ok(Bound::Expr(Expr::Literal(ScalarValue::Date32(shift_date(
+                            d, iv, signed,
+                        )?))));
+                    }
+                    // A date COLUMN ± a day/week interval is a constant
+                    // offset on the Date32 (days since epoch), so it lowers
+                    // to integer add — the evaluator compares dates as their
+                    // day counts (q72's `d3.d_date > d1.d_date + 5 days`).
+                    // Months/years would need per-row civil arithmetic and
+                    // stay literal-only.
+                    let days = interval_days(iv, signed)?;
+                    return Ok(Bound::Expr(binary(
+                        BinaryOp::Add,
+                        base,
+                        Expr::Literal(ScalarValue::Int64(days as i64)),
+                    )));
                 }
                 let op = bind_op(op)?;
                 let l = self.bind(left)?;
@@ -2379,9 +2391,8 @@ fn references_columns(e: &Expr) -> bool {
     }
 }
 
-/// Shift a Date32 day count by an interval (`'90' day`, `'3' month`,
-/// `'1' year`), folding at bind time.
-fn shift_date(days: i32, iv: &ast::Interval, sign: i32) -> Result<i32, String> {
+/// The signed integer count of an interval (`'90' day` → 90).
+fn interval_count(iv: &ast::Interval, sign: i32) -> Result<i32, String> {
     let ast::Expr::Value(v) = iv.value.as_ref() else {
         return Err(format!("unsupported interval value: {}", iv.value));
     };
@@ -2391,13 +2402,37 @@ fn shift_date(days: i32, iv: &ast::Interval, sign: i32) -> Result<i32, String> {
         other => return Err(format!("unsupported interval value: {other}")),
     }
     .map_err(|_| format!("bad interval count in {iv}"))?;
-    let n = n * sign;
+    Ok(n * sign)
+}
+
+/// Shift a Date32 day count by an interval (`'90' day`, `'3' month`,
+/// `'1' year`), folding at bind time.
+fn shift_date(days: i32, iv: &ast::Interval, sign: i32) -> Result<i32, String> {
+    let n = interval_count(iv, sign)?;
     match iv.leading_field {
         Some(ast::DateTimeField::Day | ast::DateTimeField::Days) => Ok(days + n),
+        Some(ast::DateTimeField::Week(_) | ast::DateTimeField::Weeks) => Ok(days + n * 7),
         Some(ast::DateTimeField::Month | ast::DateTimeField::Months) => Ok(shift_months(days, n)),
         Some(ast::DateTimeField::Year | ast::DateTimeField::Years) => {
             Ok(shift_months(days, n * 12))
         }
+        ref other => Err(format!("unsupported interval field: {other:?}")),
+    }
+}
+
+/// The signed day offset of a **day or week** interval — the constant a
+/// date column shifts by. Month/year intervals vary in length, so they
+/// are literal-only (they can't lower to a constant integer add).
+fn interval_days(iv: &ast::Interval, sign: i32) -> Result<i32, String> {
+    let n = interval_count(iv, sign)?;
+    match iv.leading_field {
+        Some(ast::DateTimeField::Day | ast::DateTimeField::Days) => Ok(n),
+        Some(ast::DateTimeField::Week(_) | ast::DateTimeField::Weeks) => Ok(n * 7),
+        Some(ast::DateTimeField::Month | ast::DateTimeField::Months)
+        | Some(ast::DateTimeField::Year | ast::DateTimeField::Years) => Err(
+            "month/year intervals on a date column are not yet supported (literal dates only)"
+                .into(),
+        ),
         ref other => Err(format!("unsupported interval field: {other:?}")),
     }
 }
