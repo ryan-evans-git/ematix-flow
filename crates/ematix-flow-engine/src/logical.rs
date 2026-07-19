@@ -181,6 +181,12 @@ pub struct BoundQuery {
     /// part×lineitem conjunct groups, or a join-cycle's residual equality).
     pub post_filter: Option<Expr>,
     pub group: Vec<GroupExpr>,
+    /// `GROUP BY ROLLUP(t₁, t₂, …)` — the column count of each ROLLUP term
+    /// (`ROLLUP(a, b)` → `[1, 1]`; `ROLLUP((a,b), c)` → `[2, 1]`). Empty for
+    /// a plain GROUP BY. The `group` list holds the flattened term columns;
+    /// the executor emits one grouping set per term prefix (all terms, drop
+    /// the last, …, drop all = grand total), NULL-filling dropped columns.
+    pub rollup_terms: Vec<usize>,
     pub aggs: Vec<AggExpr>,
     /// Row-space predicate over `[group keys…, agg values…]` (HAVING).
     pub having: Option<Expr>,

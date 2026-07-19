@@ -136,17 +136,39 @@ fn bind_query(
     // GROUP BY first (slot space) — SELECT items match against these. Keys
     // may be integer, float, or string valued (the executor's typed group
     // keys); booleans group as 0/1.
+    let mut rollup_terms: Vec<usize> = Vec::new();
     let group: Vec<GroupExpr> = match &select.group_by {
         ast::GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => {
-            let mut out = Vec::new();
-            for e in exprs {
-                let bound = b.bind_scalar(e)?;
-                out.push(GroupExpr { expr: bound });
+            // `GROUP BY ROLLUP(t₁, …)` parses as a single `Expr::Rollup`
+            // wrapping the terms; flatten the term columns into the group
+            // list and record each term's width for the executor.
+            if let [ast::Expr::Rollup(terms)] = exprs.as_slice() {
+                let mut out = Vec::new();
+                for term in terms {
+                    rollup_terms.push(term.len());
+                    for e in term {
+                        out.push(GroupExpr {
+                            expr: b.bind_scalar(e)?,
+                        });
+                    }
+                }
+                out
+            } else if exprs
+                .iter()
+                .any(|e| matches!(e, ast::Expr::Cube(_) | ast::Expr::GroupingSets(_)))
+            {
+                return Err("GROUP BY CUBE / GROUPING SETS are not yet supported".into());
+            } else {
+                let mut out = Vec::new();
+                for e in exprs {
+                    let bound = b.bind_scalar(e)?;
+                    out.push(GroupExpr { expr: bound });
+                }
+                out
             }
-            out
         }
         ast::GroupByExpr::Expressions(..) => {
-            return Err("GROUP BY modifiers (ROLLUP/CUBE/…) are not yet supported".into());
+            return Err("GROUP BY WITH ROLLUP/CUBE/… modifiers are not yet supported".into());
         }
         other => return Err(format!("unsupported GROUP BY form: {other:?}")),
     };
@@ -506,6 +528,7 @@ fn bind_query(
         slots: b.slots,
         post_filter,
         group,
+        rollup_terms,
         aggs,
         having,
         output,
@@ -1535,6 +1558,7 @@ impl Binder<'_> {
             group: vec![GroupExpr {
                 expr: Expr::Column(key_slot),
             }],
+            rollup_terms: Vec::new(),
             aggs: Vec::new(),
             having: None,
             output: vec![OutputExpr {
@@ -1622,6 +1646,7 @@ impl Binder<'_> {
             group: vec![GroupExpr {
                 expr: Expr::Column(key_slot),
             }],
+            rollup_terms: Vec::new(),
             aggs: vec![
                 AggExpr {
                     func: AggFunc::CountDistinct,

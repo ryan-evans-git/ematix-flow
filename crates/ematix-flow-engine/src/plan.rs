@@ -1150,6 +1150,9 @@ impl Executor<'_> {
             if groups.is_empty() && q.group.is_empty() {
                 groups.insert(Vec::new(), vec![AggState::default(); q.aggs.len()]);
             }
+            if !q.rollup_terms.is_empty() {
+                add_rollup_levels(&mut groups, &q.rollup_terms);
+            }
             self.finalize_groups(groups)?
         };
         // `SELECT DISTINCT` grouping did not fold away (see BoundQuery::
@@ -2148,9 +2151,58 @@ enum GroupKey {
     /// SQL NULL groups with itself and sorts first (declared first so the
     /// derived order puts NULL groups ahead — NULLS FIRST ascending).
     Null,
+    /// A ROLLUP subtotal placeholder for a rolled-up column. Renders as SQL
+    /// NULL like [`GroupKey::Null`] but is a DISTINCT map key, so a subtotal
+    /// row (`[a, Rollup]`) never merges with a genuine NULL group
+    /// (`[a, Null]`) that shares the same display.
+    Rollup,
     Int(i64),
     Float(FOrd),
     Str(std::sync::Arc<str>),
+}
+
+/// Expand base groups (keyed by all `ROLLUP(t₁, …)` term columns) into the
+/// coarser grouping sets: drop the last term, the last two, …, down to the
+/// grand total. Each coarser set re-aggregates the base groups that share
+/// its surviving prefix (SUM/COUNT/MIN/MAX/AVG/… all merge exactly), with
+/// the dropped columns keyed `GroupKey::Rollup` (renders NULL, but distinct
+/// from a genuine NULL group so the subtotal never merges into one).
+fn add_rollup_levels(groups: &mut BTreeMap<Vec<GroupKey>, Vec<AggState>>, term_sizes: &[usize]) {
+    // The base grouping set (all terms) is already present; derive the rest.
+    let base: Vec<(Vec<GroupKey>, Vec<AggState>)> =
+        groups.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // Cumulative column count kept after the first `t` terms.
+    let mut kept_cols = vec![0usize; term_sizes.len() + 1];
+    for (i, &sz) in term_sizes.iter().enumerate() {
+        kept_cols[i + 1] = kept_cols[i] + sz;
+    }
+    for t in (0..term_sizes.len()).rev() {
+        let keep = kept_cols[t];
+        for (k, states) in &base {
+            let mut key = k.clone();
+            for slot in key.iter_mut().skip(keep) {
+                *slot = GroupKey::Rollup;
+            }
+            match groups.entry(key) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(states.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    for (a, b) in e.get_mut().iter_mut().zip(states) {
+                        a.merge(b);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl GroupKey {
+    /// A NULL-rendering key: a genuine SQL NULL or a ROLLUP subtotal
+    /// placeholder — both emit an invalid (NULL) cell.
+    fn is_null_like(&self) -> bool {
+        matches!(self, GroupKey::Null | GroupKey::Rollup)
+    }
 }
 
 /// An f64 with `total_cmp` ordering (bits stored, so `Eq` is exact).
@@ -2189,19 +2241,19 @@ fn build_key_column<'k>(keys: impl Iterator<Item = &'k GroupKey>, ngroups: usize
     debug_assert_eq!(keys.len(), ngroups);
     // NULL keys are their own group: the column stores a type default with
     // a false validity bit; the type witness is the first non-NULL key.
-    let any_null = keys.iter().any(|k| matches!(k, GroupKey::Null));
+    let any_null = keys.iter().any(|k| k.is_null_like());
     let valid = any_null.then(|| {
         keys.iter()
-            .map(|k| !matches!(k, GroupKey::Null))
+            .map(|k| !k.is_null_like())
             .collect::<Vec<bool>>()
     });
-    let witness = keys.iter().find(|k| !matches!(k, GroupKey::Null));
+    let witness = keys.iter().find(|k| !k.is_null_like());
     let out = match witness {
         Some(GroupKey::Float(_)) => Vector::f64(
             keys.iter()
                 .map(|k| match k {
                     GroupKey::Float(f) => f64::from_bits(f.0),
-                    GroupKey::Null => 0.0,
+                    k if k.is_null_like() => 0.0,
                     other => panic!("mixed group-key types: {other:?}"),
                 })
                 .collect(),
@@ -2213,7 +2265,7 @@ fn build_key_column<'k>(keys: impl Iterator<Item = &'k GroupKey>, ngroups: usize
             for k in &keys {
                 match k {
                     GroupKey::Str(s) => data.extend_from_slice(s.as_bytes()),
-                    GroupKey::Null => {}
+                    k if k.is_null_like() => {}
                     other => panic!("mixed group-key types: {other:?}"),
                 }
                 offsets.push(data.len() as u32);
@@ -2224,7 +2276,7 @@ fn build_key_column<'k>(keys: impl Iterator<Item = &'k GroupKey>, ngroups: usize
             keys.iter()
                 .map(|k| match k {
                     GroupKey::Int(i) => *i,
-                    GroupKey::Null => 0,
+                    k if k.is_null_like() => 0,
                     other => panic!("mixed group-key types: {other:?}"),
                 })
                 .collect(),
