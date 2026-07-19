@@ -29,6 +29,12 @@ pub struct ScanColumn {
     pub name: String,
     pub leaf: usize,
     pub ty: LogicalType,
+    /// `Some(s)`: the file stores an INT-backed `DECIMAL(p, s)` — decode
+    /// scales by `10^s` into `Float64` (see [`crate::catalog::ColumnDef`]).
+    pub dec_scale: Option<u8>,
+    /// Declared `optional` in the file — decode reads definition levels
+    /// (routes the table through the def-level-aware stock reader).
+    pub nullable: bool,
 }
 
 /// A global column slot: which table, and which position in that table's

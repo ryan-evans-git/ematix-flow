@@ -109,6 +109,12 @@ fn resolve_subqueries(q: &mut BoundQuery) -> Result<(), String> {
                     ScalarValue::Int64(v) => set.insert(*v),
                     ScalarValue::Int32(v) => set.insert(*v as i64),
                     ScalarValue::Date32(v) => set.insert(*v as i64),
+                    // A NULL element matches nothing by equality. (Strict
+                    // SQL: `x NOT IN (…, NULL)` is UNKNOWN for every x —
+                    // that full three-valued NOT IN is a labelled
+                    // follow-on; membership tests here treat the set as
+                    // its non-NULL elements.)
+                    ScalarValue::Null => continue,
                     other => {
                         return Err(format!("IN subquery must yield integers (got {other:?})"));
                     }
@@ -307,8 +313,15 @@ struct Shard<K> {
     pay: Vec<PayCol>,
 }
 
-/// A columnar payload store (one column of one shard).
-enum PayCol {
+/// A columnar payload store (one column of one shard): typed values plus
+/// a lazily-materialized validity (`None` = no NULLs seen — the common
+/// case pays nothing).
+struct PayCol {
+    data: PayData,
+    valid: Option<Vec<bool>>,
+}
+
+enum PayData {
     /// Integer family — `Int32`/`Date32` widen to `i64` on entry (the
     /// representation the attach step has always produced).
     I64(Vec<i64>),
@@ -321,48 +334,75 @@ enum PayCol {
 
 impl PayCol {
     fn new(ty: LogicalType) -> PayCol {
-        match ty {
-            LogicalType::Utf8 => PayCol::Str {
+        let data = match ty {
+            LogicalType::Utf8 => PayData::Str {
                 offsets: vec![0],
                 data: Vec::new(),
             },
-            LogicalType::Float64 => PayCol::F64(Vec::new()),
-            _ => PayCol::I64(Vec::new()),
-        }
+            LogicalType::Float64 => PayData::F64(Vec::new()),
+            _ => PayData::I64(Vec::new()),
+        };
+        PayCol { data, valid: None }
     }
 
     fn len(&self) -> usize {
-        match self {
-            PayCol::I64(v) => v.len(),
-            PayCol::F64(v) => v.len(),
-            PayCol::Str { offsets, .. } => offsets.len() - 1,
+        match &self.data {
+            PayData::I64(v) => v.len(),
+            PayData::F64(v) => v.len(),
+            PayData::Str { offsets, .. } => offsets.len() - 1,
         }
     }
 
-    /// Append row `i` of a source chunk column (typed, no boxing).
+    /// Is stored row `i` valid (non-NULL)?
+    #[inline]
+    fn row_valid(&self, i: usize) -> bool {
+        self.valid.as_ref().is_none_or(|v| v[i])
+    }
+
+    /// Record one appended row's validity (call AFTER pushing the value).
+    #[inline]
+    fn note_valid(&mut self, ok: bool) {
+        match (&mut self.valid, ok) {
+            (Some(v), _) => v.push(ok),
+            (None, true) => {}
+            (None, false) => {
+                let mut v = vec![true; self.len() - 1];
+                v.push(false);
+                self.valid = Some(v);
+            }
+        }
+    }
+
+    /// Append row `i` of a source chunk column (typed, no boxing; a NULL
+    /// source row stores the type default with a false validity bit).
     #[inline]
     fn push_src(&mut self, src: &PaySrc, i: usize) {
-        match (self, src) {
-            (PayCol::I64(v), PaySrc::I64(s)) => v.push(s[i]),
-            (PayCol::I64(v), PaySrc::I32(s)) => v.push(s[i] as i64),
-            (PayCol::F64(v), PaySrc::F64(s)) => v.push(s[i]),
-            (PayCol::Str { offsets, data }, PaySrc::Str(view)) => {
-                data.extend_from_slice(view.get(i).as_bytes());
+        let ok = src.valid.is_none_or(|v| v[i]);
+        match (&mut self.data, &src.view) {
+            (PayData::I64(v), PayView::I64(s)) => v.push(if ok { s[i] } else { 0 }),
+            (PayData::I64(v), PayView::I32(s)) => v.push(if ok { s[i] as i64 } else { 0 }),
+            (PayData::F64(v), PayView::F64(s)) => v.push(if ok { s[i] } else { 0.0 }),
+            (PayData::Str { offsets, data }, PayView::Str(view)) => {
+                if ok {
+                    data.extend_from_slice(view.get(i).as_bytes());
+                }
                 offsets.push(data.len() as u32);
             }
             _ => panic!("payload type mismatch"),
         }
+        self.note_valid(ok);
     }
 
-    /// Append row `i` of another payload column (a bubbled child value).
+    /// Append row `i` of another payload column (a bubbled child value —
+    /// NULL rows already store type defaults, so values copy verbatim).
     #[inline]
     fn push_from(&mut self, other: &PayCol, i: usize) {
-        match (self, other) {
-            (PayCol::I64(v), PayCol::I64(o)) => v.push(o[i]),
-            (PayCol::F64(v), PayCol::F64(o)) => v.push(o[i]),
+        match (&mut self.data, &other.data) {
+            (PayData::I64(v), PayData::I64(o)) => v.push(o[i]),
+            (PayData::F64(v), PayData::F64(o)) => v.push(o[i]),
             (
-                PayCol::Str { offsets, data },
-                PayCol::Str {
+                PayData::Str { offsets, data },
+                PayData::Str {
                     offsets: oo,
                     data: od,
                 },
@@ -372,16 +412,18 @@ impl PayCol {
             }
             _ => panic!("payload type mismatch"),
         }
+        self.note_valid(other.row_valid(i));
     }
 
     /// Bulk-append a whole emit buffer's column (the shard-merge step).
     fn append(&mut self, other: &PayCol) {
-        match (self, other) {
-            (PayCol::I64(v), PayCol::I64(o)) => v.extend_from_slice(o),
-            (PayCol::F64(v), PayCol::F64(o)) => v.extend_from_slice(o),
+        let len_before = self.len();
+        match (&mut self.data, &other.data) {
+            (PayData::I64(v), PayData::I64(o)) => v.extend_from_slice(o),
+            (PayData::F64(v), PayData::F64(o)) => v.extend_from_slice(o),
             (
-                PayCol::Str { offsets, data },
-                PayCol::Str {
+                PayData::Str { offsets, data },
+                PayData::Str {
                     offsets: oo,
                     data: od,
                 },
@@ -392,11 +434,26 @@ impl PayCol {
             }
             _ => panic!("payload type mismatch"),
         }
+        match (&mut self.valid, &other.valid) {
+            (Some(v), Some(o)) => v.extend_from_slice(o),
+            (Some(v), None) => v.resize(v.len() + other.len(), true),
+            (None, Some(o)) => {
+                let mut v = vec![true; len_before];
+                v.extend_from_slice(o);
+                self.valid = Some(v);
+            }
+            (None, None) => {}
+        }
     }
 }
 
 /// A borrowed typed view of a chunk column feeding payload emission.
-enum PaySrc<'a> {
+struct PaySrc<'a> {
+    view: PayView<'a>,
+    valid: Option<&'a [bool]>,
+}
+
+enum PayView<'a> {
     I64(&'a [i64]),
     I32(&'a [i32]),
     F64(&'a [f64]),
@@ -405,38 +462,65 @@ enum PaySrc<'a> {
 
 fn pay_src(chunk: &DataChunk, col: usize) -> PaySrc<'_> {
     let v = chunk.col(col);
-    match v.logical {
-        LogicalType::Int64 => PaySrc::I64(v.as_i64()),
-        LogicalType::Int32 | LogicalType::Date32 => PaySrc::I32(v.as_i32()),
-        LogicalType::Float64 => PaySrc::F64(v.as_f64()),
-        LogicalType::Utf8 => PaySrc::Str(v.as_utf8()),
+    let view = match v.logical {
+        LogicalType::Int64 => PayView::I64(v.as_i64()),
+        LogicalType::Int32 | LogicalType::Date32 => PayView::I32(v.as_i32()),
+        LogicalType::Float64 => PayView::F64(v.as_f64()),
+        LogicalType::Utf8 => PayView::Str(v.as_utf8()),
+    };
+    PaySrc {
+        view,
+        valid: v.validity.as_deref(),
     }
 }
 
 /// A borrowed integer join-key column — probe loops read keys by direct
-/// slice index instead of per-row interpreter dispatch.
+/// slice index instead of per-row interpreter dispatch. `get` returns
+/// `None` for a NULL key (equality with NULL never matches, so a NULL
+/// key is a guaranteed probe miss / dropped build row).
 enum KeyCol<'a> {
-    I64(&'a [i64]),
-    I32(&'a [i32]),
+    I64(&'a [i64], Option<&'a [bool]>),
+    I32(&'a [i32], Option<&'a [bool]>),
 }
 
 impl KeyCol<'_> {
     #[inline]
-    fn get(&self, i: usize) -> i64 {
+    fn get(&self, i: usize) -> Option<i64> {
         match self {
-            KeyCol::I64(s) => s[i],
-            KeyCol::I32(s) => s[i] as i64,
+            KeyCol::I64(s, valid) => match valid {
+                Some(v) if !v[i] => None,
+                _ => Some(s[i]),
+            },
+            KeyCol::I32(s, valid) => match valid {
+                Some(v) if !v[i] => None,
+                _ => Some(s[i] as i64),
+            },
         }
     }
 }
 
 fn key_col(chunk: &DataChunk, col: usize) -> KeyCol<'_> {
     let v = chunk.col(col);
+    let valid = v.validity.as_deref();
     match v.logical {
-        LogicalType::Int64 => KeyCol::I64(v.as_i64()),
-        LogicalType::Int32 | LogicalType::Date32 => KeyCol::I32(v.as_i32()),
+        LogicalType::Int64 => KeyCol::I64(v.as_i64(), valid),
+        LogicalType::Int32 | LogicalType::Date32 => KeyCol::I32(v.as_i32(), valid),
         other => panic!("join key must be integer-family, got {other:?}"),
     }
+}
+
+/// Fill `kbuf` from `key_cols` at row `i`; `false` = a NULL key
+/// component (the row can never join).
+#[inline]
+fn fill_key(kbuf: &mut Vec<i64>, key_cols: &[KeyCol], i: usize) -> bool {
+    kbuf.clear();
+    for kc in key_cols {
+        match kc.get(i) {
+            Some(v) => kbuf.push(v),
+            None => return false,
+        }
+    }
+    true
 }
 
 /// A dim map sharded by key hash — shards scan-emit AND merge in
@@ -487,15 +571,29 @@ const NO_REF: u64 = u64::MAX;
 /// (rows without a ref get the type default — 0 / 0.0 / "").
 fn gather_payload(map: &DimMap, j: usize, refs: &[u64], ty: LogicalType) -> Vector {
     let cols: Vec<&PayCol> = (0..map.nshards()).map(|s| map.pay_col(s, j)).collect();
-    match ty {
+    // Rows without a ref (unselected, or LEFT-join misses) and rows whose
+    // stored payload value is NULL both get a false validity bit; a fully
+    // valid gather drops the mask (branch-free downstream).
+    let mut valid: Vec<bool> = Vec::with_capacity(refs.len());
+    let mut any_null = false;
+    let mut ok = |b: bool, valid: &mut Vec<bool>| {
+        valid.push(b);
+        any_null |= !b;
+    };
+    let out = match ty {
         LogicalType::Float64 => {
             let mut v = vec![0.0f64; refs.len()];
             for (r, &e) in refs.iter().enumerate() {
                 if e != NO_REF {
-                    let PayCol::F64(c) = cols[(e >> 32) as usize] else {
+                    let col = cols[(e >> 32) as usize];
+                    let i = (e & 0xffff_ffff) as usize;
+                    let PayData::F64(c) = &col.data else {
                         panic!("payload type mismatch");
                     };
-                    v[r] = c[(e & 0xffff_ffff) as usize];
+                    v[r] = c[i];
+                    ok(col.row_valid(i), &mut valid);
+                } else {
+                    ok(false, &mut valid);
                 }
             }
             Vector::f64(v)
@@ -506,15 +604,19 @@ fn gather_payload(map: &DimMap, j: usize, refs: &[u64], ty: LogicalType) -> Vect
             offsets.push(0u32);
             for &e in refs {
                 if e != NO_REF {
-                    let PayCol::Str {
+                    let col = cols[(e >> 32) as usize];
+                    let i = (e & 0xffff_ffff) as usize;
+                    let PayData::Str {
                         offsets: oo,
                         data: od,
-                    } = cols[(e >> 32) as usize]
+                    } = &col.data
                     else {
                         panic!("payload type mismatch");
                     };
-                    let i = (e & 0xffff_ffff) as usize;
                     data.extend_from_slice(&od[oo[i] as usize..oo[i + 1] as usize]);
+                    ok(col.row_valid(i), &mut valid);
+                } else {
+                    ok(false, &mut valid);
                 }
                 offsets.push(data.len() as u32);
             }
@@ -526,15 +628,21 @@ fn gather_payload(map: &DimMap, j: usize, refs: &[u64], ty: LogicalType) -> Vect
             let mut v = vec![0i64; refs.len()];
             for (r, &e) in refs.iter().enumerate() {
                 if e != NO_REF {
-                    let PayCol::I64(c) = cols[(e >> 32) as usize] else {
+                    let col = cols[(e >> 32) as usize];
+                    let i = (e & 0xffff_ffff) as usize;
+                    let PayData::I64(c) = &col.data else {
                         panic!("payload type mismatch");
                     };
-                    v[r] = c[(e & 0xffff_ffff) as usize];
+                    v[r] = c[i];
+                    ok(col.row_valid(i), &mut valid);
+                } else {
+                    ok(false, &mut valid);
                 }
             }
             Vector::i64(v)
         }
-    }
+    };
+    out.with_validity(any_null.then_some(valid))
 }
 
 /// A processed dim subtree: (composite) join key → (match weight,
@@ -974,16 +1082,15 @@ impl Executor<'_> {
                         let mut hits: Vec<(u32, u32)> = Vec::with_capacity(cr_ref.len());
                         sel.for_each(|i| {
                             let i = i as usize;
-                            // Probe each child; a miss drops the row, hits
-                            // multiply.
+                            // Probe each child; a miss (including a NULL
+                            // key) drops the row, hits multiply.
                             let mut weight = 1u64;
                             hits.clear();
                             for (kcs, (_, r)) in child_keys.iter().zip(cr_ref) {
-                                kbuf.clear();
-                                for kc in kcs {
-                                    kbuf.push(kc.get(i));
-                                }
-                                match r.map.get(&kbuf) {
+                                match fill_key(&mut kbuf, kcs, i)
+                                    .then(|| r.map.get(&kbuf))
+                                    .flatten()
+                                {
                                     None => {
                                         weight = 0;
                                         break;
@@ -997,9 +1104,10 @@ impl Executor<'_> {
                             if weight == 0 {
                                 return;
                             }
-                            kbuf.clear();
-                            for kc in &key_cols {
-                                kbuf.push(kc.get(i));
+                            // A NULL own-key row can never be matched by
+                            // any probe — skip it entirely.
+                            if !fill_key(&mut kbuf, &key_cols, i) {
+                                return;
                             }
                             let buf = &mut bufs[shard_of(&kbuf, nshards)];
                             buf.keys.extend_from_slice(&kbuf);
@@ -1133,20 +1241,28 @@ impl Executor<'_> {
                 RootSrc::One(vec![result_to_chunk(&r, ti)?])
             }
             TableSource::Parquet(path) => {
-                let has_strings = ti
-                    .projection
-                    .iter()
-                    .any(|c| matches!(c.ty, LogicalType::Utf8));
-                if has_strings {
+                // The native ematix-parquet path handles the required
+                // numeric fast case (the TPC-H hot scans); strings,
+                // `optional` columns (validity), and INT-backed decimals
+                // route through the def-level-aware stock reader.
+                let needs_stock = ti.projection.iter().any(|c| {
+                    matches!(c.ty, LogicalType::Utf8) || c.dec_scale.is_some() || c.nullable
+                });
+                if needs_stock {
                     let cols: Vec<(String, ColKind)> = ti
                         .projection
                         .iter()
                         .map(|c| {
-                            let kind = match c.ty {
-                                LogicalType::Utf8 => ColKind::Utf8,
-                                LogicalType::Int64 => ColKind::I64,
-                                LogicalType::Float64 => ColKind::F64,
-                                LogicalType::Int32 | LogicalType::Date32 => ColKind::I32(c.ty),
+                            let kind = match (c.dec_scale, c.ty) {
+                                // The reader resolves the INT32/INT64
+                                // backing width from the footer itself.
+                                (Some(s), _) => ColKind::Dec(s),
+                                (None, LogicalType::Utf8) => ColKind::Utf8,
+                                (None, LogicalType::Int64) => ColKind::I64,
+                                (None, LogicalType::Float64) => ColKind::F64,
+                                (None, LogicalType::Int32 | LogicalType::Date32) => {
+                                    ColKind::I32(c.ty)
+                                }
                             };
                             (c.name.clone(), kind)
                         })
@@ -1250,11 +1366,12 @@ impl Executor<'_> {
             let mut matched: Vec<i64> = if *left { vec![0; nrows] } else { Vec::new() };
             sel.for_each(|i| {
                 let iu = i as usize;
-                kbuf.clear();
-                for kc in &key_cols {
-                    kbuf.push(kc.get(iu));
-                }
-                match dim.map.get(&kbuf) {
+                // A NULL root key is a guaranteed miss (kept once by a
+                // LEFT child, dropped by an inner one).
+                let hit = fill_key(&mut kbuf, &key_cols, iu)
+                    .then(|| dim.map.get(&kbuf))
+                    .flatten();
+                match hit {
                     Some((cnt, s, row)) => {
                         for _ in 0..cnt {
                             out.push(i);
@@ -1309,17 +1426,27 @@ impl Executor<'_> {
             for (j, agg) in q.aggs.iter().enumerate() {
                 match agg.func {
                     AggFunc::Sum => states[j].sum += sum_expr_f64(&view, &sel, &agg.arg),
-                    AggFunc::Count => states[j].count += sel.len() as u64,
+                    // count(*) counts rows; count(<expr>) skips NULLs.
+                    AggFunc::Count if matches!(agg.arg, Expr::Literal(_)) => {
+                        states[j].count += sel.len() as u64;
+                    }
+                    AggFunc::Count => sel.for_each(|i| {
+                        states[j].count += u64::from(!agg.arg.eval_is_null(&view, i as usize));
+                    }),
                     AggFunc::CountMatched(t) => {
                         let flags = view.col(ctx.matched_cols[&t]).as_i64();
                         sel.for_each(|i| states[j].count += flags[i as usize] as u64);
                     }
                     AggFunc::CountDistinct => sel.for_each(|i| {
-                        states[j]
-                            .distinct
-                            .insert(agg.arg.eval_i64(&view, i as usize));
+                        if let Some(v) = agg.arg.eval_opt_i64(&view, i as usize) {
+                            states[j].distinct.insert(v);
+                        }
                     }),
-                    _ => sel.for_each(|i| states[j].update(agg.arg.eval_f64(&view, i as usize))),
+                    _ => sel.for_each(|i| {
+                        if let Some(v) = agg.arg.eval_opt_f64(&view, i as usize) {
+                            states[j].update(v);
+                        }
+                    }),
                 }
             }
             return Ok(RgOut::Scalar(states));
@@ -1337,14 +1464,23 @@ impl Executor<'_> {
                 .or_insert_with(|| vec![AggState::default(); q.aggs.len()]);
             for (j, agg) in q.aggs.iter().enumerate() {
                 match agg.func {
-                    AggFunc::Count => states[j].count += 1,
+                    AggFunc::Count if matches!(agg.arg, Expr::Literal(_)) => states[j].count += 1,
+                    AggFunc::Count => {
+                        states[j].count += u64::from(!agg.arg.eval_is_null(&view, i));
+                    }
                     AggFunc::CountMatched(t) => {
                         states[j].count += view.col(ctx.matched_cols[&t]).as_i64()[i] as u64;
                     }
                     AggFunc::CountDistinct => {
-                        states[j].distinct.insert(agg.arg.eval_i64(&view, i));
+                        if let Some(v) = agg.arg.eval_opt_i64(&view, i) {
+                            states[j].distinct.insert(v);
+                        }
                     }
-                    _ => states[j].update(agg.arg.eval_f64(&view, i)),
+                    _ => {
+                        if let Some(v) = agg.arg.eval_opt_f64(&view, i) {
+                            states[j].update(v);
+                        }
+                    }
                 }
             }
         });
@@ -1409,6 +1545,9 @@ impl Executor<'_> {
 /// by bit pattern — exact, NaN-safe.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum GroupKey {
+    /// SQL NULL groups with itself and sorts first (declared first so the
+    /// derived order puts NULL groups ahead — NULLS FIRST ascending).
+    Null,
     Int(i64),
     Float(FOrd),
     Str(std::sync::Arc<str>),
@@ -1438,6 +1577,7 @@ impl From<ScalarValue> for GroupKey {
             ScalarValue::Boolean(b) => GroupKey::Int(i64::from(b)),
             ScalarValue::Float64(f) => GroupKey::Float(FOrd(f.to_bits())),
             ScalarValue::Utf8(s) => GroupKey::Str(s),
+            ScalarValue::Null => GroupKey::Null,
         }
     }
 }
@@ -1447,11 +1587,21 @@ impl From<ScalarValue> for GroupKey {
 fn build_key_column<'k>(keys: impl Iterator<Item = &'k GroupKey>, ngroups: usize) -> Vector {
     let keys: Vec<&GroupKey> = keys.collect();
     debug_assert_eq!(keys.len(), ngroups);
-    match keys.first() {
+    // NULL keys are their own group: the column stores a type default with
+    // a false validity bit; the type witness is the first non-NULL key.
+    let any_null = keys.iter().any(|k| matches!(k, GroupKey::Null));
+    let valid = any_null.then(|| {
+        keys.iter()
+            .map(|k| !matches!(k, GroupKey::Null))
+            .collect::<Vec<bool>>()
+    });
+    let witness = keys.iter().find(|k| !matches!(k, GroupKey::Null));
+    let out = match witness {
         Some(GroupKey::Float(_)) => Vector::f64(
             keys.iter()
                 .map(|k| match k {
                     GroupKey::Float(f) => f64::from_bits(f.0),
+                    GroupKey::Null => 0.0,
                     other => panic!("mixed group-key types: {other:?}"),
                 })
                 .collect(),
@@ -1461,10 +1611,11 @@ fn build_key_column<'k>(keys: impl Iterator<Item = &'k GroupKey>, ngroups: usize
             let mut data = Vec::new();
             offsets.push(0u32);
             for k in &keys {
-                let GroupKey::Str(s) = k else {
-                    panic!("mixed group-key types: {k:?}");
-                };
-                data.extend_from_slice(s.as_bytes());
+                match k {
+                    GroupKey::Str(s) => data.extend_from_slice(s.as_bytes()),
+                    GroupKey::Null => {}
+                    other => panic!("mixed group-key types: {other:?}"),
+                }
                 offsets.push(data.len() as u32);
             }
             Vector::utf8(offsets, data)
@@ -1473,17 +1624,24 @@ fn build_key_column<'k>(keys: impl Iterator<Item = &'k GroupKey>, ngroups: usize
             keys.iter()
                 .map(|k| match k {
                     GroupKey::Int(i) => *i,
+                    GroupKey::Null => 0,
                     other => panic!("mixed group-key types: {other:?}"),
                 })
                 .collect(),
         ),
-    }
+    };
+    out.with_validity(valid)
 }
 
 /// Total order over same-typed output scalars — the ORDER BY comparator.
 fn cmp_scalar(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     use ScalarValue::*;
     match (a, b) {
+        // SQL NULL sorts first ascending (NULLS FIRST — matching the
+        // grouped path's BTreeMap order).
+        (Null, Null) => std::cmp::Ordering::Equal,
+        (Null, _) => std::cmp::Ordering::Less,
+        (_, Null) => std::cmp::Ordering::Greater,
         (Int64(x), Int64(y)) => x.cmp(y),
         (Int32(x), Int32(y)) => x.cmp(y),
         (Date32(x), Date32(y)) => x.cmp(y),
@@ -1566,60 +1724,78 @@ fn result_to_chunk(r: &QueryResult, ti: &TableInput) -> Result<DataChunk, String
     let mut cols = Vec::with_capacity(ti.projection.len());
     for c in &ti.projection {
         let get = |row: usize| &r.rows[row][c.leaf];
+        // NULL result values store the type default with a false validity
+        // bit; an all-valid column drops the mask.
+        let mut valid: Vec<bool> = Vec::with_capacity(nrows);
+        let mut any_null = false;
         let v = match c.ty {
             LogicalType::Utf8 => {
                 let mut offsets = Vec::with_capacity(nrows + 1);
                 let mut data = Vec::new();
                 offsets.push(0u32);
                 for row in 0..nrows {
-                    match get(row) {
-                        ScalarValue::Utf8(s) => data.extend_from_slice(s.as_bytes()),
+                    let ok = match get(row) {
+                        ScalarValue::Utf8(s) => {
+                            data.extend_from_slice(s.as_bytes());
+                            true
+                        }
+                        ScalarValue::Null => false,
                         other => {
                             return Err(format!(
                                 "derived column '{}' expected Utf8, got {other:?}",
                                 c.name
                             ));
                         }
-                    }
+                    };
                     offsets.push(data.len() as u32);
+                    valid.push(ok);
+                    any_null |= !ok;
                 }
                 Vector::utf8(offsets, data)
             }
             LogicalType::Float64 => {
                 let mut v = Vec::with_capacity(nrows);
                 for row in 0..nrows {
-                    v.push(match get(row) {
-                        ScalarValue::Float64(x) => *x,
-                        ScalarValue::Int64(x) => *x as f64,
+                    let (x, ok) = match get(row) {
+                        ScalarValue::Float64(x) => (*x, true),
+                        ScalarValue::Int64(x) => (*x as f64, true),
+                        ScalarValue::Null => (0.0, false),
                         other => {
                             return Err(format!(
                                 "derived column '{}' expected Float64, got {other:?}",
                                 c.name
                             ));
                         }
-                    });
+                    };
+                    v.push(x);
+                    valid.push(ok);
+                    any_null |= !ok;
                 }
                 Vector::f64(v)
             }
             _ => {
                 let mut v = Vec::with_capacity(nrows);
                 for row in 0..nrows {
-                    v.push(match get(row) {
-                        ScalarValue::Int64(x) => *x,
-                        ScalarValue::Int32(x) => *x as i64,
-                        ScalarValue::Date32(x) => *x as i64,
+                    let (x, ok) = match get(row) {
+                        ScalarValue::Int64(x) => (*x, true),
+                        ScalarValue::Int32(x) => (*x as i64, true),
+                        ScalarValue::Date32(x) => (*x as i64, true),
+                        ScalarValue::Null => (0, false),
                         other => {
                             return Err(format!(
                                 "derived column '{}' expected an integer, got {other:?}",
                                 c.name
                             ));
                         }
-                    });
+                    };
+                    v.push(x);
+                    valid.push(ok);
+                    any_null |= !ok;
                 }
                 Vector::i64(v)
             }
         };
-        cols.push(v);
+        cols.push(v.with_validity(any_null.then_some(valid)));
     }
     Ok(DataChunk::new(cols))
 }

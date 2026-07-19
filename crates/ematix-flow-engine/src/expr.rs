@@ -30,6 +30,10 @@ pub enum ScalarValue {
     Date32(i32),
     Boolean(bool),
     Utf8(Arc<str>),
+    /// SQL NULL — produced by NULL-bearing columns (validity) and the
+    /// `NULL` literal. Comparisons with NULL are not-satisfied (filters
+    /// drop the row), arithmetic propagates it, aggregates skip it.
+    Null,
 }
 
 /// A binary operator: arithmetic, comparison, or logical.
@@ -115,6 +119,9 @@ enum Val<'a> {
     Float(f64),
     Bool(bool),
     Str(&'a str),
+    /// SQL NULL (three-valued-logic lite: a NULL condition is
+    /// not-satisfied, NULL arithmetic propagates).
+    Null,
 }
 
 impl Val<'_> {
@@ -125,14 +132,26 @@ impl Val<'_> {
             Val::Float(f) => f,
             Val::Bool(b) => i64::from(b) as f64,
             Val::Str(_) => panic!("string value in numeric context"),
+            Val::Null => panic!("NULL in a must-be-non-null numeric context"),
         }
     }
 
+    /// A condition's truth: NULL counts as not-satisfied (the filter /
+    /// CASE-branch semantics of SQL's UNKNOWN).
     #[inline]
     fn expect_bool(self) -> bool {
         match self {
             Val::Bool(b) => b,
+            Val::Null => false,
             other => panic!("expected a boolean operand, got {other:?}"),
+        }
+    }
+
+    #[inline]
+    fn expect_int(self, what: &str) -> i64 {
+        match self {
+            Val::Int(i) => i,
+            other => panic!("{what}: expected an integer, got {other:?}"),
         }
     }
 }
@@ -144,6 +163,11 @@ impl Expr {
         match self {
             Expr::Column(i) => {
                 let v = chunk.col(*i);
+                if let Some(valid) = &v.validity
+                    && !valid[row]
+                {
+                    return Val::Null;
+                }
                 match v.logical {
                     LogicalType::Int32 | LogicalType::Date32 => Val::Int(v.as_i32()[row] as i64),
                     LogicalType::Int64 => Val::Int(v.as_i64()[row]),
@@ -158,6 +182,7 @@ impl Expr {
                 ScalarValue::Float64(x) => Val::Float(*x),
                 ScalarValue::Boolean(b) => Val::Bool(*b),
                 ScalarValue::Utf8(s) => Val::Str(s),
+                ScalarValue::Null => Val::Null,
             },
             Expr::Binary { op, lhs, rhs } => {
                 let l = lhs.eval(chunk, row);
@@ -166,6 +191,7 @@ impl Expr {
             }
             Expr::ExtractYear(e) => match e.eval(chunk, row) {
                 Val::Int(days) => Val::Int(year_of_days(days as i32) as i64),
+                Val::Null => Val::Null,
                 other => panic!("EXTRACT(YEAR) needs a date operand, got {other:?}"),
             },
             Expr::Case { whens, else_ } => {
@@ -182,14 +208,17 @@ impl Expr {
                 negated,
             } => match expr.eval(chunk, row) {
                 Val::Str(s) => Val::Bool(like_match(s.as_bytes(), pattern.as_bytes()) != *negated),
+                Val::Null => Val::Null,
                 other => panic!("LIKE needs a string operand, got {other:?}"),
             },
             Expr::ScalarSub(_) | Expr::InSub { .. } => {
                 panic!("unresolved subquery in evaluation — executor substitution missed it")
             }
-            Expr::InSet { expr, set, negated } => {
-                Val::Bool(set.contains(&expr.eval_i64(chunk, row)) != *negated)
-            }
+            Expr::InSet { expr, set, negated } => match expr.eval(chunk, row) {
+                // NULL [NOT] IN (…) is UNKNOWN — not satisfied either way.
+                Val::Null => Val::Null,
+                v => Val::Bool(set.contains(&v.expect_int("IN operand")) != *negated),
+            },
             Expr::Substr { expr, from, len } => match expr.eval(chunk, row) {
                 Val::Str(s) => {
                     let start = ((*from - 1).max(0) as usize).min(s.len());
@@ -199,6 +228,7 @@ impl Expr {
                     };
                     Val::Str(&s[start..end])
                 }
+                Val::Null => Val::Null,
                 other => panic!("SUBSTRING needs a string operand, got {other:?}"),
             },
         }
@@ -238,13 +268,50 @@ impl Expr {
             Val::Float(f) => ScalarValue::Float64(f),
             Val::Bool(b) => ScalarValue::Boolean(b),
             Val::Str(s) => ScalarValue::Utf8(Arc::from(s)),
+            Val::Null => ScalarValue::Null,
         }
+    }
+
+    /// Evaluate to `f64`, or `None` on SQL NULL — the aggregate-input
+    /// path (aggregates skip NULL arguments).
+    #[inline]
+    pub fn eval_opt_f64(&self, chunk: &DataChunk, row: usize) -> Option<f64> {
+        match self.eval(chunk, row) {
+            Val::Null => None,
+            v => Some(v.as_f64()),
+        }
+    }
+
+    /// Evaluate to `i64`, or `None` on SQL NULL (COUNT DISTINCT skips
+    /// NULLs like every aggregate).
+    #[inline]
+    pub fn eval_opt_i64(&self, chunk: &DataChunk, row: usize) -> Option<i64> {
+        match self.eval(chunk, row) {
+            Val::Null => None,
+            v => Some(v.expect_int("integer aggregate input")),
+        }
+    }
+
+    /// Is this expression SQL NULL at `row`?
+    #[inline]
+    pub fn eval_is_null(&self, chunk: &DataChunk, row: usize) -> bool {
+        matches!(self.eval(chunk, row), Val::Null)
     }
 }
 
 #[inline]
 fn eval_binary<'a>(op: BinaryOp, l: Val<'a>, r: Val<'a>) -> Val<'a> {
     use BinaryOp::*;
+    // NULL propagation: arithmetic and comparison with a NULL operand
+    // yield NULL (a comparison's UNKNOWN — `expect_bool` maps it to
+    // not-satisfied). AND/OR treat NULL conditions as not-satisfied.
+    if matches!(l, Val::Null) || matches!(r, Val::Null) {
+        return match op {
+            And => Val::Bool(l.expect_bool() && r.expect_bool()),
+            Or => Val::Bool(l.expect_bool() || r.expect_bool()),
+            _ => Val::Null,
+        };
+    }
     match op {
         Add | Sub | Mul | Div => arith(op, l, r),
         Eq | NotEq | Lt | LtEq | Gt | GtEq => Val::Bool(compare(op, l, r)),
@@ -361,7 +428,9 @@ pub fn filter_expr(chunk: &DataChunk, pred: &Expr) -> Selection {
 pub fn sum_expr_f64(chunk: &DataChunk, sel: &Selection, arg: &Expr) -> f64 {
     let mut acc = 0.0_f64;
     sel.for_each(|i| {
-        acc += arg.eval_f64(chunk, i as usize);
+        if let Some(v) = arg.eval_opt_f64(chunk, i as usize) {
+            acc += v;
+        }
     });
     acc
 }

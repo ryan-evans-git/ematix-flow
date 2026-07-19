@@ -101,6 +101,15 @@ impl Vector {
         }
     }
 
+    /// Attach (or clear) a validity mask — `false` marks a NULL row. The
+    /// decode paths call this with the mask expanded from parquet
+    /// definition levels; all-valid columns pass `None` so downstream
+    /// hot loops stay branch-free.
+    pub fn with_validity(mut self, validity: Option<Vec<bool>>) -> Self {
+        self.validity = validity.map(Arc::from);
+        self
+    }
+
     pub fn len(&self) -> usize {
         match &self.storage {
             Storage::I32(v) => v.len(),

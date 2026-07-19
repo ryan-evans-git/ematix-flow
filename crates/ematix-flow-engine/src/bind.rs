@@ -585,6 +585,8 @@ impl Binder<'_> {
                                 name: n.clone(),
                                 leaf: i,
                                 ty: *ty,
+                                dec_scale: None,
+                                nullable: false,
                             })
                             .collect(),
                     };
@@ -689,6 +691,8 @@ impl Binder<'_> {
                                 name: n,
                                 leaf: i,
                                 ty,
+                                dec_scale: None,
+                                nullable: false,
                             })
                             .collect(),
                     };
@@ -861,6 +865,8 @@ impl Binder<'_> {
                     name: def.name.clone(),
                     leaf: def.leaf,
                     ty: def.ty,
+                    dec_scale: def.dec_scale,
+                    nullable: def.nullable,
                 });
                 bt.used.len() - 1
             }
@@ -1059,12 +1065,16 @@ impl Binder<'_> {
                 name: c.clone(),
                 leaf: i,
                 ty: tys[i],
+                dec_scale: None,
+                nullable: false,
             })
             .collect();
         columns.push(crate::catalog::ColumnDef {
             name: "__val".into(),
             leaf: corr.len(),
             ty: tys[corr.len()],
+            dec_scale: None,
+            nullable: false,
         });
         let def = TableDef {
             path: PathBuf::new(),
@@ -1349,21 +1359,29 @@ impl Binder<'_> {
                     name: inner_col.clone(),
                     leaf: 0,
                     ty: key_ty,
+                    dec_scale: None,
+                    nullable: false,
                 },
                 crate::catalog::ColumnDef {
                     name: "__m".into(),
                     leaf: 1,
                     ty: LogicalType::Int64,
+                    dec_scale: None,
+                    nullable: false,
                 },
                 crate::catalog::ColumnDef {
                     name: "__cd".into(),
                     leaf: 2,
                     ty: LogicalType::Int64,
+                    dec_scale: None,
+                    nullable: false,
                 },
                 crate::catalog::ColumnDef {
                     name: "__ms".into(),
                     leaf: 3,
                     ty: LogicalType::Float64,
+                    dec_scale: None,
+                    nullable: false,
                 },
             ],
         };
