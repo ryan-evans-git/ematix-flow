@@ -194,8 +194,14 @@ pub struct BoundQuery {
     /// Trailing outputs appended only to serve ORDER BY expressions —
     /// dropped from the final rows after sorting.
     pub hidden_outputs: usize,
+    /// `GROUPING(col)` is used — the executor appends one 0/1 flag column
+    /// per GROUP BY key (1 = that key is a ROLLUP subtotal), so row space is
+    /// `[group keys…, agg values…, grouping flags…, window values…]`. The
+    /// flags sit before windows so a window `PARTITION BY grouping(a)` reads
+    /// them (q36/q70).
+    pub has_grouping: bool,
     /// Window expressions — row space extends to `[group keys…, agg
-    /// values…, window values…]` after HAVING.
+    /// values…, grouping flags…, window values…]` after HAVING.
     pub windows: Vec<WindowExpr>,
     /// `SELECT DISTINCT` that grouping did not already absorb — dedup the
     /// final output rows before ORDER BY / LIMIT. Zero-cost when false, and

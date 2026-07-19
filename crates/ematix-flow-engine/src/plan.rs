@@ -253,7 +253,7 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
                 walk(lhs, f);
                 walk(rhs, f);
             }
-            Expr::ExtractYear(i) => walk(i, f),
+            Expr::ExtractYear(i) | Expr::CastInt(i) => walk(i, f),
             Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
             | Expr::InSet { expr, .. }
@@ -306,7 +306,7 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
                 walk(lhs, f);
                 walk(rhs, f);
             }
-            Expr::ExtractYear(i) => walk(i, f),
+            Expr::ExtractYear(i) | Expr::CastInt(i) => walk(i, f),
             Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
             | Expr::InSet { expr, .. }
@@ -2025,6 +2025,20 @@ impl Executor<'_> {
                 }
             }
         }
+        // GROUPING flags: one 0/1 column per key (1 = this key is a ROLLUP
+        // subtotal, i.e. aggregated away). Appended after the aggs so row
+        // space is [keys…, aggs…, grouping flags…] — the positions the
+        // binder's GROUPING references were remapped to.
+        if q.has_grouping {
+            for k in 0..nkeys {
+                cols.push(Vector::i64(
+                    groups
+                        .keys()
+                        .map(|key| i64::from(matches!(key[k], GroupKey::Rollup)))
+                        .collect(),
+                ));
+            }
+        }
         let row_chunk = DataChunk::new(cols);
 
         // HAVING filters groups; the output projection runs per survivor.
@@ -2660,7 +2674,7 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
             collect_slots(lhs, out);
             collect_slots(rhs, out);
         }
-        Expr::ExtractYear(i) => collect_slots(i, out),
+        Expr::ExtractYear(i) | Expr::CastInt(i) => collect_slots(i, out),
         Expr::Like { expr, .. } => collect_slots(expr, out),
         Expr::ScalarSub(_) => {}
         Expr::InSub { expr, .. }

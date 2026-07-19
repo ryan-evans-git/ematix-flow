@@ -126,6 +126,8 @@ fn bind_query(
         pending_conjuncts: Vec::new(),
         left_tables: BTreeSet::new(),
         plain_passthrough: false,
+        uses_grouping: false,
+        output_aliases: Vec::new(),
     };
     for twj in &select.from {
         b.add_from_item(&twj.relation)?;
@@ -455,7 +457,12 @@ fn bind_query(
 
     // ORDER BY: an output column (alias or name), an ordinal, or an
     // arbitrary expression — the latter appends a HIDDEN output column
-    // used only for ordering (dropped from the final rows).
+    // used only for ordering (dropped from the final rows). SELECT aliases
+    // become visible to expression binding for this pass only.
+    b.output_aliases = output
+        .iter()
+        .map(|o| (o.name.clone(), o.expr.clone()))
+        .collect();
     let mut order_by = Vec::new();
     let mut hidden_outputs = 0usize;
     if let Some(ob) = &query.order_by {
@@ -497,6 +504,7 @@ fn bind_query(
             order_by.push(OrderByKey { output: idx, desc });
         }
     }
+    b.output_aliases.clear();
 
     // LIMIT n.
     let limit = match &query.limit_clause {
@@ -547,25 +555,42 @@ fn bind_query(
         })
         .collect();
 
-    // Window references were bound against the WINDOW_BASE sentinel (the
-    // agg count wasn't final): remap to their true row-space positions
-    // `[keys…, aggs…, windows…]`.
+    // Synthetic columns were bound against sentinels (agg count wasn't final
+    // yet): remap them to true row-space positions. Layout is
+    // `[keys…, aggs…, grouping flags…, windows…]`. GROUPING flags (one per
+    // key) sit before windows so a window spec can read them; they exist
+    // only when GROUPING is used.
     let mut output = output;
     let mut having = having;
-    if !b.windows.is_empty() {
-        // Row space is `[keys…, aggs…, windows…]`; in a no-GROUP-BY window
-        // query (`windowed_plain`) the base row space IS the slot space, so
-        // windows append after every scan slot.
-        let base = if group.is_empty() && aggs.is_empty() {
+    let has_grouping = b.uses_grouping;
+    let mut windows = b.windows;
+    if has_grouping || !windows.is_empty() {
+        let group_base = group.len() + aggs.len();
+        let flag_count = if has_grouping { group.len() } else { 0 };
+        // A no-GROUP-BY window query (`windowed_plain`) has no grouping flags
+        // and its base row space IS the slot space.
+        let win_base = if group.is_empty() && aggs.is_empty() {
             b.slots.len()
         } else {
-            group.len() + aggs.len()
+            group_base + flag_count
         };
         for o in &mut output {
-            remap_window_cols(&mut o.expr, base);
+            remap_window_cols(&mut o.expr, win_base, group_base);
         }
         if let Some(h) = &mut having {
-            remap_window_cols(h, base);
+            remap_window_cols(h, win_base, group_base);
+        }
+        // Window specs may reference GROUPING flags (q36/q70's `PARTITION BY
+        // grouping(a) + grouping(b)`); remap those (they carry no window
+        // sentinels of their own).
+        for w in &mut windows {
+            remap_window_cols(&mut w.arg, win_base, group_base);
+            for p in &mut w.partition {
+                remap_window_cols(p, win_base, group_base);
+            }
+            for (o, _) in &mut w.order {
+                remap_window_cols(o, win_base, group_base);
+            }
         }
     }
 
@@ -580,7 +605,8 @@ fn bind_query(
         having,
         output,
         hidden_outputs,
-        windows: b.windows,
+        has_grouping,
+        windows,
         distinct,
         order_by,
         limit,
@@ -590,38 +616,42 @@ fn bind_query(
     })
 }
 
-/// Rewrite `Column(WINDOW_BASE + i)` → `Column(base + i)` (see
-/// [`WINDOW_BASE`]).
-fn remap_window_cols(e: &mut Expr, base: usize) {
+/// Rewrite the synthetic-column sentinels to their true row-space
+/// positions: `Column(GROUPING_BASE + k)` → `Column(group_base + k)` and
+/// `Column(WINDOW_BASE + i)` → `Column(win_base + i)`. Grouping is checked
+/// first because `GROUPING_BASE > WINDOW_BASE`.
+fn remap_window_cols(e: &mut Expr, win_base: usize, group_base: usize) {
     match e {
         Expr::Column(i) => {
-            if *i >= WINDOW_BASE {
-                *i = base + (*i - WINDOW_BASE);
+            if *i >= GROUPING_BASE {
+                *i = group_base + (*i - GROUPING_BASE);
+            } else if *i >= WINDOW_BASE {
+                *i = win_base + (*i - WINDOW_BASE);
             }
         }
         Expr::Literal(_) | Expr::ScalarSub(_) => {}
         Expr::Binary { lhs, rhs, .. } => {
-            remap_window_cols(lhs, base);
-            remap_window_cols(rhs, base);
+            remap_window_cols(lhs, win_base, group_base);
+            remap_window_cols(rhs, win_base, group_base);
         }
-        Expr::ExtractYear(i) => remap_window_cols(i, base),
+        Expr::ExtractYear(i) | Expr::CastInt(i) => remap_window_cols(i, win_base, group_base),
         Expr::Like { expr, .. }
         | Expr::InSub { expr, .. }
         | Expr::InSet { expr, .. }
         | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
-        | Expr::Substr { expr, .. } => remap_window_cols(expr, base),
+        | Expr::Substr { expr, .. } => remap_window_cols(expr, win_base, group_base),
         Expr::Concat(parts) => {
             for p in parts {
-                remap_window_cols(p, base);
+                remap_window_cols(p, win_base, group_base);
             }
         }
         Expr::Case { whens, else_ } => {
             for (c, v) in whens {
-                remap_window_cols(c, base);
-                remap_window_cols(v, base);
+                remap_window_cols(c, win_base, group_base);
+                remap_window_cols(v, win_base, group_base);
             }
-            remap_window_cols(else_, base);
+            remap_window_cols(else_, win_base, group_base);
         }
     }
 }
@@ -839,8 +869,14 @@ impl ViewMap {
 /// Per-query binding state.
 /// Sentinel row-space base for window references while binding (the agg
 /// count isn't final until the whole block binds); remapped to
-/// `group.len() + aggs.len() + i` at the end of `bind_query`.
+/// `group.len() + aggs.len() + grouping_flags + i` at the end of
+/// `bind_query`.
 const WINDOW_BASE: usize = 1 << 20;
+
+/// Sentinel row-space base for `GROUPING(col)` references — remapped to
+/// `group.len() + aggs.len() + key_index`. Above [`WINDOW_BASE`] so the
+/// remap can disambiguate the two by magnitude (grouping checked first).
+const GROUPING_BASE: usize = 1 << 21;
 
 struct Binder<'a> {
     catalog: &'a Catalog,
@@ -873,6 +909,14 @@ struct Binder<'a> {
     /// non-window projections are slot-space passthroughs, so `bind_output`
     /// returns a plain column reference instead of demanding a GROUP BY key.
     plain_passthrough: bool,
+    /// `GROUPING(col)` appeared — the executor must append the per-key
+    /// grouping-flag columns (see [`BoundQuery::has_grouping`]).
+    uses_grouping: bool,
+    /// Output (SELECT) aliases in row space, consulted only while binding
+    /// ORDER BY: an alias may appear *inside* an ORDER BY expression
+    /// (`CASE WHEN lochierarchy = 0 THEN … END`, q36/q70), not just as a
+    /// bare key. Empty except during that pass.
+    output_aliases: Vec<(String, Expr)>,
 }
 
 /// A partially-bound expression: either a real bound expression, or a
@@ -1264,24 +1308,57 @@ impl Binder<'_> {
         group: &[GroupExpr],
         aggs: &mut Vec<AggExpr>,
     ) -> Result<Expr, String> {
+        // While binding ORDER BY, a bare identifier that names a SELECT
+        // alias resolves to that output's (row-space) expression — the alias
+        // may sit inside a larger ORDER BY expression, not just be the whole
+        // key. A real GROUP BY column takes precedence (checked below).
+        if let Some(name) = ident_parts(e).and_then(|p| p.last().map(|s| s.to_string()))
+            && !self.is_real_column(&[name.as_str()])
+            && let Some((_, ex)) = self
+                .output_aliases
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+        {
+            return Ok(ex.clone());
+        }
         if !contains_function(e) {
-            let bound = materialize(self.bind(e)?);
-            if let Some(g) = group.iter().position(|ge| ge.expr == bound) {
-                return Ok(Expr::Column(g));
+            // Fast path: the whole expression is a single GROUP BY key or a
+            // constant. `bind` may fail here (an ORDER BY expression can
+            // embed a SELECT alias that is not a real column) — on failure,
+            // fall through to structural recursion below.
+            if let Ok(bnd) = self.bind(e) {
+                let bound = materialize(bnd);
+                if let Some(g) = group.iter().position(|ge| ge.expr == bound) {
+                    return Ok(Expr::Column(g));
+                }
+                // In a no-GROUP-BY window query the row space IS the slot
+                // space, so a plain column reference is a valid passthrough
+                // output (it becomes a scan column the window stage reads
+                // alongside the window results).
+                if self.plain_passthrough || !references_columns(&bound) {
+                    return Ok(bound);
+                }
+                // A BARE non-group column is an error; a COMPOUND expression
+                // over group keys / aliases (`CASE WHEN alias=0 THEN key END`
+                // in ORDER BY) recurses structurally below.
+                if matches!(
+                    e,
+                    ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)
+                ) {
+                    return Err(format!("'{e}' is neither an aggregate nor a GROUP BY key"));
+                }
             }
-            // In a no-GROUP-BY window query the row space IS the slot space,
-            // so a plain column reference is a valid passthrough output (it
-            // becomes a scan column the window stage reads alongside the
-            // window results).
-            if self.plain_passthrough || !references_columns(&bound) {
-                return Ok(bound);
-            }
-            return Err(format!("'{e}' is neither an aggregate nor a GROUP BY key"));
         }
         match e {
             ast::Expr::Function(f) => {
                 if f.over.is_some() {
                     return self.bind_window(f, group, aggs);
+                }
+                if let Some(k) = self.bind_grouping(f, group)? {
+                    // GROUPING(col) → the grouping-flag column for that key;
+                    // remapped to its true row-space position at block end.
+                    self.uses_grouping = true;
+                    return Ok(Expr::Column(GROUPING_BASE + k));
                 }
                 if let Some(rewritten) = rewrite_scalar_fn(f)? {
                     return self.bind_output(&rewritten, group, aggs);
@@ -1642,6 +1719,8 @@ impl Binder<'_> {
             pending_conjuncts: Vec::new(),
             left_tables: BTreeSet::new(),
             plain_passthrough: false,
+            uses_grouping: false,
+            output_aliases: Vec::new(),
         };
         let key_slot = inner.resolve_parts(&[&inner_col])?;
         let mut inner_filters: Vec<Expr> = Vec::new();
@@ -1674,6 +1753,7 @@ impl Binder<'_> {
             order_by: Vec::new(),
             limit: None,
             subqueries: inner.subs,
+            has_grouping: false,
             windows: Vec::new(),
             set_ops: Vec::new(),
             derived: inner.derived,
@@ -1729,6 +1809,8 @@ impl Binder<'_> {
             pending_conjuncts: Vec::new(),
             left_tables: BTreeSet::new(),
             plain_passthrough: false,
+            uses_grouping: false,
+            output_aliases: Vec::new(),
         };
         let key_slot = inner.resolve_parts(&[&inner_col])?;
         let s_slot = inner.resolve_parts(&[&ineq_col])?;
@@ -1786,6 +1868,7 @@ impl Binder<'_> {
             order_by: Vec::new(),
             limit: None,
             subqueries: inner.subs,
+            has_grouping: false,
             windows: Vec::new(),
             set_ops: Vec::new(),
             derived: inner.derived,
@@ -1862,6 +1945,33 @@ impl Binder<'_> {
             )
         };
         Ok(Bound::Expr(pred))
+    }
+
+    /// If `f` is `GROUPING(col)`, resolve `col` to its GROUP BY key index —
+    /// `GROUPING` returns 1 when that key is a ROLLUP subtotal (aggregated
+    /// away), 0 otherwise, so its argument must be a grouping column.
+    /// `Ok(None)` = not a `GROUPING` call.
+    fn bind_grouping(
+        &mut self,
+        f: &ast::Function,
+        group: &[GroupExpr],
+    ) -> Result<Option<usize>, String> {
+        if f.name.to_string().to_lowercase() != "grouping" {
+            return Ok(None);
+        }
+        let ast::FunctionArguments::List(list) = &f.args else {
+            return Err("GROUPING needs an argument".into());
+        };
+        let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg))] = list.args.as_slice()
+        else {
+            return Err("GROUPING takes exactly one column".into());
+        };
+        let bound = self.bind_scalar(arg)?;
+        let k = group
+            .iter()
+            .position(|g| g.expr == bound)
+            .ok_or_else(|| format!("GROUPING argument '{arg}' must be a GROUP BY key"))?;
+        Ok(Some(k))
     }
 
     /// Bind a window call `fn(...) OVER (PARTITION BY … [ORDER BY …]
@@ -2087,10 +2197,20 @@ impl Binder<'_> {
                     | DT::DoublePrecision => {
                         Ok(Bound::Expr(float_cast_expr(materialize(self.bind(expr)?))))
                     }
-                    // Integer casts pass through: the engine keeps integer
-                    // numerics integral.
+                    // CAST to an integer type rounds a fractional value to
+                    // the nearest integer (DuckDB semantics); an integer
+                    // operand is unchanged. A literal folds now.
                     DT::Int(_) | DT::Integer(_) | DT::BigInt(_) | DT::SmallInt(_) => {
-                        Ok(self.bind(expr)?)
+                        let inner = materialize(self.bind(expr)?);
+                        Ok(Bound::Expr(match inner {
+                            Expr::Literal(ScalarValue::Float64(f)) => {
+                                Expr::Literal(ScalarValue::Int64(f.round() as i64))
+                            }
+                            Expr::Literal(ScalarValue::Int32(_))
+                            | Expr::Literal(ScalarValue::Int64(_))
+                            | Expr::Literal(ScalarValue::Date32(_)) => inner,
+                            other => Expr::CastInt(Box::new(other)),
+                        }))
                     }
                     DT::Char(_) | DT::Varchar(_) | DT::Text => Ok(self.bind(expr)?),
                     other => Err(format!("unsupported CAST target: {other}")),
@@ -2421,7 +2541,7 @@ fn infer_slot_type(q: &BoundQuery, e: &Expr) -> LogicalType {
         Expr::Binary { op, lhs, rhs } => {
             binary_type(*op, infer_slot_type(q, lhs), infer_slot_type(q, rhs))
         }
-        Expr::ExtractYear(_) => LogicalType::Int64,
+        Expr::ExtractYear(_) | Expr::CastInt(_) => LogicalType::Int64,
         Expr::Substr { .. } | Expr::Concat(_) => LogicalType::Utf8,
         Expr::Case { whens, .. } => whens
             .first()
@@ -2458,7 +2578,7 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
             infer_row_type(q, key_tys, lhs),
             infer_row_type(q, key_tys, rhs),
         ),
-        Expr::ExtractYear(_) => LogicalType::Int64,
+        Expr::ExtractYear(_) | Expr::CastInt(_) => LogicalType::Int64,
         Expr::Substr { .. } | Expr::Concat(_) => LogicalType::Utf8,
         Expr::Case { whens, .. } => whens
             .first()
@@ -2715,7 +2835,7 @@ fn references_columns(e: &Expr) -> bool {
         Expr::Column(_) => true,
         Expr::Literal(_) => false,
         Expr::Binary { lhs, rhs, .. } => references_columns(lhs) || references_columns(rhs),
-        Expr::ExtractYear(i) => references_columns(i),
+        Expr::ExtractYear(i) | Expr::CastInt(i) => references_columns(i),
         Expr::Like { expr, .. } => references_columns(expr),
         Expr::ScalarSub(_) => false,
         Expr::InSub { expr, .. }

@@ -398,6 +398,30 @@ window-over-derived is the q49 prerequisite.
     exactly an INNER join. The binder now clears the edge's `preserved`
     marking and routes the predicate as that table's filter instead of
     erroring; an `IS NULL` conjunct (the anti-join case) is still refused.
+- **GROUPING() + int-cast rounding + alias-in-ORDER-BY-expr (2026-07-19):
+  q27/q36/q54/q70 (+q22-family) → exec 66→71/102, 71/71 parity, 0
+  MISMATCH.** The ROLLUP-adjacent cluster, four coupled features:
+  - **`GROUPING(col)`** — 1 when `col` is a ROLLUP subtotal (aggregated
+    away), else 0. Falls straight out of the ROLLUP design: a dropped
+    column's group key is the `GroupKey::Rollup` sentinel, so
+    `GROUPING(col_k) = (key[k] == Rollup)`. Row space becomes `[keys, aggs,
+    grouping-flags, windows]` — the executor appends one 0/1 flag column per
+    key (before windows, so a window `PARTITION BY grouping(a)+grouping(b)`
+    reads them: q36/q70). Bound via a `GROUPING_BASE` sentinel remapped
+    alongside `WINDOW_BASE` at block end. `BoundQuery::has_grouping` gates
+    the flag columns.
+  - **`CAST(<fractional> AS INT)` rounds to nearest** (`Expr::CastInt`,
+    DuckDB semantics: `10714.82 → 10715`). Integer casts had passed the
+    float straight through — a latent bug q54 surfaced (its
+    `cast(revenue/50 AS INT)` segment differed from DuckDB by the fraction).
+  - **SELECT alias inside an ORDER BY expression** — `ORDER BY CASE WHEN
+    lochierarchy = 0 THEN i_category END` (q36/q70) references the alias
+    `lochierarchy` *within* an expression, not as a bare key. The binder now
+    exposes output aliases (`Binder::output_aliases`) during the ORDER BY
+    pass, and `bind_output`'s fast path falls through to structural
+    recursion (instead of erroring) when the whole expression isn't itself a
+    single GROUP BY key — so a compound expression over keys/aliases binds.
+  Regression `tests/sql_grouping_and_intcast.rs`.
 
 ## Next (P4 tail → P5/P6)
 

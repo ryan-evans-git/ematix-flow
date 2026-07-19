@@ -69,6 +69,10 @@ pub enum Expr {
     },
     /// `EXTRACT(YEAR FROM <date expr>)` — Date32 days → calendar year.
     ExtractYear(Box<Expr>),
+    /// `CAST(<expr> AS INT/INTEGER/BIGINT/SMALLINT)` on a fractional value —
+    /// rounds to the nearest integer (DuckDB `CAST` semantics: `10714.82` →
+    /// `10715`). An already-integer operand is unchanged.
+    CastInt(Box<Expr>),
     /// `CASE WHEN c₁ THEN v₁ [WHEN c₂ THEN v₂ …] ELSE e END` (the `ELSE` is
     /// required by the binder — no NULLs yet).
     Case {
@@ -210,6 +214,12 @@ impl Expr {
                 Val::Int(days) => Val::Int(year_of_days(days as i32) as i64),
                 Val::Null => Val::Null,
                 other => panic!("EXTRACT(YEAR) needs a date operand, got {other:?}"),
+            },
+            Expr::CastInt(e) => match e.eval(chunk, row) {
+                Val::Int(i) => Val::Int(i),
+                Val::Float(f) => Val::Int(f.round() as i64),
+                Val::Null => Val::Null,
+                other => panic!("CAST AS INT needs a numeric operand, got {other:?}"),
             },
             Expr::Case { whens, else_ } => {
                 for (cond, val) in whens {
