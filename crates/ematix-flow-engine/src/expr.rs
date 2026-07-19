@@ -189,6 +189,40 @@ impl Val<'_> {
 }
 
 impl Expr {
+    /// Visit every column slot this expression references. Exhaustive over
+    /// the variants (no wildcard arm) so a new variant fails to compile
+    /// here rather than silently escaping a slot analysis.
+    pub fn for_each_col(&self, f: &mut impl FnMut(usize)) {
+        match self {
+            Expr::Column(c) => f(*c),
+            Expr::Literal(_) | Expr::ScalarSub(_) => {}
+            Expr::Binary { lhs, rhs, .. } => {
+                lhs.for_each_col(f);
+                rhs.for_each_col(f);
+            }
+            Expr::ExtractYear(e) | Expr::CastInt(e) | Expr::Upper(e) => e.for_each_col(f),
+            Expr::Round { expr, .. }
+            | Expr::Like { expr, .. }
+            | Expr::InSub { expr, .. }
+            | Expr::InSet { expr, .. }
+            | Expr::InSetStr { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::Substr { expr, .. } => expr.for_each_col(f),
+            Expr::Case { whens, else_ } => {
+                for (c, v) in whens {
+                    c.for_each_col(f);
+                    v.for_each_col(f);
+                }
+                else_.for_each_col(f);
+            }
+            Expr::Concat(es) => {
+                for e in es {
+                    e.for_each_col(f);
+                }
+            }
+        }
+    }
+
     /// Evaluate this expression at `row` of `chunk`.
     #[inline]
     fn eval<'e>(&'e self, chunk: &'e DataChunk, row: usize) -> Val<'e> {

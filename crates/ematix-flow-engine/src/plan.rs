@@ -31,7 +31,7 @@ use ematix_parquet_io::ParquetFile;
 
 use crate::chunk::{DataChunk, Selection};
 use crate::expr::{Expr, ScalarValue, filter_expr, sum_expr_f64};
-use crate::logical::{AggFunc, BoundQuery, OrderByKey, Slot, TableInput, TableSource};
+use crate::logical::{AggExpr, AggFunc, BoundQuery, OrderByKey, Slot, TableInput, TableSource};
 use crate::scan::{ColKind, StockScan};
 use crate::scan_native::{NativeColKind, decode_row_group};
 use crate::sched::MorselQueue;
@@ -1242,7 +1242,7 @@ impl Executor<'_> {
                         }
                     }
                 }
-                let mut groups = kway_merge_groups(maps);
+                let mut groups = kway_merge_groups(maps, self.nthreads);
                 if let Some(states) = scalar {
                     let entry = groups
                         .entry(Vec::new())
@@ -2224,10 +2224,46 @@ impl Executor<'_> {
     /// Merged groups → the row-space chunk → HAVING → output projection.
     fn finalize_groups(
         &self,
-        groups: BTreeMap<Vec<GroupKey>, Vec<AggState>>,
+        mut groups: BTreeMap<Vec<GroupKey>, Vec<AggState>>,
     ) -> Result<(Vec<String>, Vec<Vec<ScalarValue>>), String> {
         let q = self.q;
         let nkeys = q.group.len();
+        // ---- A HAVING that references only AGGREGATE slots pre-filters
+        // the groups BEFORE the key columns materialize: evaluating it
+        // needs just the (numeric) agg columns, so the expensive key
+        // materialization — string clones per group — runs only for
+        // survivors. q23a's frequent_ss_items at sf10: 13.8M groups,
+        // HAVING count(*) > 4 keeps 4,202.
+        if let Some(h) = &q.having {
+            let mut only_aggs = true;
+            h.for_each_col(&mut |c| only_aggs &= c >= nkeys && c < nkeys + q.aggs.len());
+            if only_aggs && groups.len() > (1 << 16) {
+                // Probe chunk: empty placeholders where the keys would sit
+                // (never read — the slot analysis above guarantees it).
+                let mut pcols: Vec<Vector> = (0..nkeys).map(|_| Vector::i64(Vec::new())).collect();
+                pcols.extend(agg_columns(&q.aggs, &groups));
+                let probe = DataChunk::new(pcols);
+                let keep: Vec<bool> = (0..groups.len()).map(|r| h.eval_bool(&probe, r)).collect();
+                // Consume-and-split rather than retain(): into_iter keeps
+                // the probe's sorted order (so `keep` zips positionally),
+                // survivors bulk-rebuild, and the rejected majority — often
+                // millions of string keys — deallocates on a detached
+                // thread, off the query path.
+                let mut live = Vec::new();
+                let mut dead = Vec::with_capacity(groups.len());
+                for (pair, f) in std::mem::take(&mut groups).into_iter().zip(keep) {
+                    if f {
+                        live.push(pair);
+                    } else {
+                        dead.push(pair);
+                    }
+                }
+                groups = BTreeMap::from_iter(live);
+                std::thread::spawn(move || drop(dead));
+                // The main HAVING pass below re-evaluates over survivors —
+                // idempotent, and cheap at survivor count.
+            }
+        }
         // ---- Build the row-space chunk [keys…, agg values…] with typed
         // key columns (Int / Float / Utf8, from the key values themselves).
         let ngroups = groups.len();
@@ -2235,29 +2271,7 @@ impl Executor<'_> {
         for k in 0..nkeys {
             cols.push(build_key_column(groups.keys().map(|key| &key[k]), ngroups));
         }
-        for (j, agg) in q.aggs.iter().enumerate() {
-            match agg.func {
-                AggFunc::Count | AggFunc::CountMatched(_) => cols.push(Vector::i64(
-                    groups.values().map(|st| st[j].count as i64).collect(),
-                )),
-                AggFunc::CountDistinct => cols.push(Vector::i64(
-                    groups
-                        .values()
-                        .map(|st| st[j].distinct.len() as i64)
-                        .collect(),
-                )),
-                // SUM / MIN / MAX / AVG / STDDEV over zero contributing
-                // (non-NULL) values is SQL NULL, not 0.0 — carry validity.
-                _ => {
-                    let vals: Vec<f64> =
-                        groups.values().map(|st| st[j].finalize(agg.func)).collect();
-                    let valid: Vec<bool> =
-                        groups.values().map(|st| !st[j].is_null(agg.func)).collect();
-                    let any_null = valid.iter().any(|&b| !b);
-                    cols.push(Vector::f64(vals).with_validity(any_null.then_some(valid)));
-                }
-            }
-        }
+        cols.extend(agg_columns(&q.aggs, &groups));
         // GROUPING flags: one 0/1 column per key (1 = this key is a ROLLUP
         // subtotal, i.e. aggregated away). Appended after the aggs so row
         // space is [keys…, aggs…, grouping flags…] — the positions the
@@ -2318,6 +2332,33 @@ impl Executor<'_> {
             .collect();
         Ok((columns, rows))
     }
+}
+
+/// The typed aggregate-value columns of a merged group map, in agg order —
+/// SUM/MIN/MAX/AVG/STDDEV over zero contributing (non-NULL) values is SQL
+/// NULL, not 0.0, so those carry validity.
+fn agg_columns(aggs: &[AggExpr], groups: &BTreeMap<Vec<GroupKey>, Vec<AggState>>) -> Vec<Vector> {
+    let mut cols = Vec::with_capacity(aggs.len());
+    for (j, agg) in aggs.iter().enumerate() {
+        match agg.func {
+            AggFunc::Count | AggFunc::CountMatched(_) => cols.push(Vector::i64(
+                groups.values().map(|st| st[j].count as i64).collect(),
+            )),
+            AggFunc::CountDistinct => cols.push(Vector::i64(
+                groups
+                    .values()
+                    .map(|st| st[j].distinct.len() as i64)
+                    .collect(),
+            )),
+            _ => {
+                let vals: Vec<f64> = groups.values().map(|st| st[j].finalize(agg.func)).collect();
+                let valid: Vec<bool> = groups.values().map(|st| !st[j].is_null(agg.func)).collect();
+                let any_null = valid.iter().any(|&b| !b);
+                cols.push(Vector::f64(vals).with_validity(any_null.then_some(valid)));
+            }
+        }
+    }
+    cols
 }
 
 /// Gather rows `idx` of a column into a new dense vector (typed, validity
@@ -2563,9 +2604,68 @@ enum GroupKey {
 /// heap pass is ~log-k).
 fn kway_merge_groups(
     maps: Vec<BTreeMap<Vec<GroupKey>, Vec<AggState>>>,
+    nthreads: usize,
 ) -> BTreeMap<Vec<GroupKey>, Vec<AggState>> {
     if maps.len() <= 1 {
         return maps.into_iter().next().unwrap_or_default();
+    }
+    // Large inputs merge in parallel by KEY RANGE: pivots sampled from the
+    // largest run split every map (BTreeMap::split_off — O(log n), no data
+    // copy) into disjoint ranges, each range k-way merges on its own
+    // thread, and the concatenation is globally sorted because the ranges
+    // are. q23a's 13.8M-group frequent_ss_items merge: 9s serial → the
+    // slowest range.
+    let total: usize = maps.iter().map(BTreeMap::len).sum();
+    let nparts = nthreads.clamp(1, 32);
+    if total >= 1 << 18 && nparts > 1 {
+        let largest = maps
+            .iter()
+            .max_by_key(|m| m.len())
+            .expect("maps nonempty here");
+        let step = (largest.len() / nparts).max(1);
+        let pivots: Vec<Vec<GroupKey>> = largest
+            .keys()
+            .skip(step)
+            .step_by(step)
+            .take(nparts - 1)
+            .cloned()
+            .collect();
+        let mut parts: Vec<Vec<BTreeMap<Vec<GroupKey>, Vec<AggState>>>> =
+            (0..=pivots.len()).map(|_| Vec::new()).collect();
+        for mut m in maps {
+            for (i, p) in pivots.iter().enumerate().rev() {
+                let hi = m.split_off(p);
+                if !hi.is_empty() {
+                    parts[i + 1].push(hi);
+                }
+            }
+            if !m.is_empty() {
+                parts[0].push(m);
+            }
+        }
+        let mut outs: Vec<Vec<(Vec<GroupKey>, Vec<AggState>)>> =
+            (0..parts.len()).map(|_| Vec::new()).collect();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (part, out) in parts.into_iter().zip(outs.iter_mut()) {
+                handles.push(scope.spawn(move || *out = kway_merge_runs(part)));
+            }
+            for h in handles {
+                h.join().expect("merge worker panicked");
+            }
+        });
+        return BTreeMap::from_iter(outs.into_iter().flatten());
+    }
+    BTreeMap::from_iter(kway_merge_runs(maps))
+}
+
+/// Serial k-way run merge: sorted maps → globally sorted, unique
+/// (key, states) pairs, equal keys merged on the fly.
+fn kway_merge_runs(
+    maps: Vec<BTreeMap<Vec<GroupKey>, Vec<AggState>>>,
+) -> Vec<(Vec<GroupKey>, Vec<AggState>)> {
+    if maps.len() == 1 {
+        return maps.into_iter().next().expect("len 1").into_iter().collect();
     }
     // Min-heap of run heads, ordered by (key, run). States ride along —
     // moved, never cloned.
@@ -2620,8 +2720,7 @@ fn kway_merge_groups(
             _ => out.push((h.key, h.states)),
         }
     }
-    // Sorted + unique input → BTreeMap's bulk-build path.
-    BTreeMap::from_iter(out)
+    out
 }
 
 fn add_rollup_levels(groups: &mut BTreeMap<Vec<GroupKey>, Vec<AggState>>, term_sizes: &[usize]) {

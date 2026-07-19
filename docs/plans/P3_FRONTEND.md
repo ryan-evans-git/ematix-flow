@@ -508,6 +508,40 @@ window-over-derived is the q49 prerequisite.
   q39ab 24→12s. Both parity gates + suite re-run green. Remaining heavy
   sf10 shapes (different bottlenecks): q78 48s, q67 36s, q23ab 23s.
 
+- **Heavy-tail perf campaign (2026-07-19, `e9a6cae0`+`d97a040d`+
+  `f1ac6f19`): the three worst sf10 shapes, 4 general levers.** The
+  oracle now prints per-side timing in single-query mode (`native N ms,
+  duck M ms`); `EMAT_TRACE_AGG=1` prints merge/rollup/finalize phases.
+  1. **Constant pushdown into single-referenced CTE group keys**
+     (bind.rs pre-pass): outer `WHERE cte_col = const` — directly or
+     transitively via join equalities, LEFT-ON edges flowing only into
+     the nullable side — injects into the CTE's own WHERE. q78's `ss`
+     CTE stopped materializing 24.4M groups for one wanted year
+     (48.7s→8.8s). Shared CTEs are never touched;
+     `tests/sql_cte_const_pushdown.rs` pins IR + results + the
+     shared-CTE guard.
+  2. **Cascaded ROLLUP levels** (plan.rs): level t re-aggregates level
+     t+1 with a linear run-merge (sorted iteration keeps equal prefixes
+     contiguous) instead of re-probing the whole map per level. q67's
+     8-level rollup: 16.5s→1.9s. `tests/sql_rollup_levels.rs` pins
+     ROLLUP ≡ union of its prefix GROUP BYs (multi-col terms, merged
+     avg; floats compared at 9 sig digits — subtotal avg legitimately
+     differs in the last ULPs from a flat GROUP BY).
+  3. **K-way + range-partitioned parallel merge of per-RG partials**:
+     run-head heap over sorted maps, large inputs split by sampled
+     pivots (`BTreeMap::split_off`) and merged per-thread. q23a's 13.8M
+     group merge 9s→2.5s.
+  4. **Agg-only HAVING pre-filter** (new exhaustive `Expr::for_each_col`):
+     when HAVING touches only agg slots, groups filter BEFORE key
+     columns materialize; survivors bulk-rebuild and the rejected
+     majority frees on a detached thread (retain() paid ~4.3s in
+     rebalance+drops; now 0.47s).
+  Final sf10 solo (native incl. DuckDB-side check per run): q78 4.5s,
+  q67 13.5s, q23a 5.1s, q23b 5.3s, q4 8.7s. Full sf1+sf10 sweeps
+  103/103 re-run green after each lever. Remaining q67 tail is
+  kernel-shaped: finalize row materialization, the 5.8M-row rank
+  window (top-K pushdown candidate), string-keyed merge itself.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
