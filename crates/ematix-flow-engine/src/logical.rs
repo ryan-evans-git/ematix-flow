@@ -155,6 +155,13 @@ pub struct WindowExpr {
     /// Explicit `ROWS UNBOUNDED PRECEDING..CURRENT ROW` (strict running);
     /// `false` = RANGE semantics (peers of the current row included).
     pub rows_frame: bool,
+    /// An enclosing `WHERE <this window's output> <= K` proved only the
+    /// top K rows per partition can survive (rank/row_number only —
+    /// set by the binder). The executor prunes each partition to the rows
+    /// ordering at-or-before its K-th best BEFORE sorting/projecting;
+    /// rank values on that prefix are identical, and the still-applied
+    /// outer filter trims threshold ties.
+    pub top_k: Option<usize>,
 }
 
 /// A SQL set operation combining two query blocks' row sets.

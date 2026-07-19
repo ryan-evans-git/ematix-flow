@@ -1197,8 +1197,23 @@ impl Executor<'_> {
                         _ => None,
                     })
                     .collect();
-                let base = concat_chunks(chunks);
-                let n = base.n_rows();
+                let mut base = concat_chunks(chunks);
+                let mut n = base.n_rows();
+                // A lone rank-family window armed with top-K (an outer
+                // `rk <= K` filter): prune each partition to its K best
+                // rows BEFORE the sort/projection — q67's dw2 shrinks a
+                // 5.8M-row window input to ~K·partitions.
+                if let [w] = &q.windows[..] {
+                    if let Some(k) = w.top_k {
+                        let keep = rank_topk_keep(w, &base, n, k);
+                        if keep.len() < n {
+                            base = DataChunk::new(
+                                base.cols.iter().map(|c| gather_rows(c, &keep)).collect(),
+                            );
+                            n = keep.len();
+                        }
+                    }
+                }
                 let mut cols = base.cols.clone();
                 for w in &q.windows {
                     cols.push(compute_window(w, &base, n));
@@ -2455,6 +2470,60 @@ fn concat_chunks(chunks: Vec<DataChunk>) -> DataChunk {
 
 /// Evaluate one window expression over the block's result chunk (`n`
 /// rows): partition, optionally order, then aggregate / rank.
+/// Row indices (in original order) surviving a rank-family top-K prune:
+/// per partition, the K-th best row under the window ordering is found by
+/// LINEAR selection (`select_nth_unstable_by`, no full sort) and every
+/// row ordering at-or-before it is kept. This is a superset of the rows
+/// with rank ≤ K — rank depends only on strictly-better rows (all kept),
+/// row_number additionally on original-order tie position (gathering by
+/// ascending index preserves it, and the stable sort in
+/// [`compute_window`] then reproduces the same tie order) — so the
+/// recomputed values match the full-input values exactly, and the outer
+/// filter trims threshold ties. NOT valid for dense_rank (its rank-≤-K
+/// frontier extends past the K-th best row); the binder never arms it.
+fn rank_topk_keep(
+    w: &crate::logical::WindowExpr,
+    chunk: &DataChunk,
+    n: usize,
+    k: usize,
+) -> Vec<usize> {
+    let mut parts: BTreeMap<Vec<GroupKey>, Vec<usize>> = BTreeMap::new();
+    for r in 0..n {
+        let key: Vec<GroupKey> = w
+            .partition
+            .iter()
+            .map(|e| GroupKey::from(e.eval_value(chunk, r)))
+            .collect();
+        parts.entry(key).or_default().push(r);
+    }
+    let order_cmp = |a: usize, b: usize| {
+        for (e, desc) in &w.order {
+            let ord = cmp_scalar(&e.eval_value(chunk, a), &e.eval_value(chunk, b));
+            let ord = if *desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    };
+    let mut keep = Vec::new();
+    for rows in parts.values_mut() {
+        if rows.len() <= k {
+            keep.extend_from_slice(rows);
+            continue;
+        }
+        rows.select_nth_unstable_by(k - 1, |&a, &b| order_cmp(a, b));
+        let kth = rows[k - 1];
+        for &r in rows.iter() {
+            if order_cmp(r, kth) != std::cmp::Ordering::Greater {
+                keep.push(r);
+            }
+        }
+    }
+    keep.sort_unstable();
+    keep
+}
+
 fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -> Vector {
     use crate::logical::WindowFunc;
     // Partition → member row indices, in row order (deterministic: the

@@ -491,7 +491,13 @@ fn bind_query(
                         filters[t].push(e);
                     }
                 }
-                Attribution::Single(t) => filters[t].push(e),
+                Attribution::Single(t) => {
+                    // `rk <= K` on a derived's rank-family window output
+                    // arms the executor's top-K prune (the filter itself
+                    // still applies — it trims threshold ties).
+                    b.try_window_topk(conj);
+                    filters[t].push(e);
+                }
                 Attribution::Multi => post.push(e),
             }
         }
@@ -2449,6 +2455,70 @@ impl Binder<'_> {
         }
     }
 
+    /// `rk <= K` (or `rk < K`, or the mirrored literal-first forms) where
+    /// `rk` is the LONE rank()/row_number() window output of a
+    /// single-referenced materialized derived: record `top_k = K` on that
+    /// window so the executor prunes each partition to its K best rows
+    /// before sorting/projecting (q67's dw2: a 5.8M-row window input for a
+    /// `rk <= 100` consumer). dense_rank is excluded — its rank-≤-K
+    /// frontier extends past the K-th best ROW. Never changes semantics:
+    /// the conjunct still applies as a filter; this only prunes rows the
+    /// filter was guaranteed to drop.
+    fn try_window_topk(&mut self, conj: &ast::Expr) {
+        use ast::BinaryOperator as B;
+        let ast::Expr::BinaryOp { left, op, right } = conj else {
+            return;
+        };
+        let (ident, num, less_eq) = match (ident_parts(left), ident_parts(right), op) {
+            (Some(_), None, B::LtEq) => (left, right, true),
+            (Some(_), None, B::Lt) => (left, right, false),
+            (None, Some(_), B::GtEq) => (right, left, true),
+            (None, Some(_), B::Gt) => (right, left, false),
+            _ => return,
+        };
+        let ast::Expr::Value(v) = &**num else { return };
+        let ast::Value::Number(s, _) = &v.value else {
+            return;
+        };
+        let Ok(kraw) = s.parse::<i64>() else { return };
+        let k = if less_eq { kraw } else { kraw - 1 };
+        if k < 1 {
+            return;
+        }
+        let parts = ident_parts(ident).expect("matched above");
+        let Ok(slot) = self.resolve_parts(&parts) else {
+            return;
+        };
+        let Slot { table, col } = self.slots[slot];
+        let di = match &self.tables[table].source {
+            TableSource::Derived(i) => *i,
+            _ => return,
+        };
+        let leaf = self.tables[table].used[col].leaf;
+        // A shared (CTE) derived can't take a reference-specific hint.
+        let Some(dq) = std::sync::Arc::get_mut(&mut self.derived[di]) else {
+            return;
+        };
+        // Lone window only: pruning rows must not disturb siblings.
+        if dq.windows.len() != 1
+            || !matches!(dq.windows[0].func, WindowFunc::Rank | WindowFunc::RowNumber)
+        {
+            return;
+        }
+        let win_base = if dq.group.is_empty() && dq.aggs.is_empty() {
+            dq.slots.len()
+        } else {
+            dq.group.len() + dq.aggs.len() + if dq.has_grouping { dq.group.len() } else { 0 }
+        };
+        // The filtered column must BE the window value (not derived math).
+        if !matches!(dq.output.get(leaf), Some(o) if o.expr == Expr::Column(win_base)) {
+            return;
+        }
+        let k = k as usize;
+        let w = &mut dq.windows[0];
+        w.top_k = Some(w.top_k.map_or(k, |old| old.min(k)));
+    }
+
     /// If `f` is `GROUPING(col)`, resolve `col` to its GROUP BY key index —
     /// `GROUPING` returns 1 when that key is a ROLLUP subtotal (aggregated
     /// away), 0 otherwise, so its argument must be a grouping column.
@@ -2553,6 +2623,7 @@ impl Binder<'_> {
             partition,
             order,
             rows_frame,
+            top_k: None,
         });
         Ok(Expr::Column(WINDOW_BASE + self.windows.len() - 1))
     }
