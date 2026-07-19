@@ -780,7 +780,13 @@ struct ViewMap {
 
 impl ViewMap {
     fn get(&self, name: &str) -> Option<&ast::Expr> {
-        self.cols.iter().find(|(n, _)| n == name).map(|(_, e)| e)
+        // Unquoted SQL identifiers are case-insensitive: prefer an exact
+        // hit, fall back to a case-insensitive one.
+        self.cols
+            .iter()
+            .find(|(n, _)| n == name)
+            .or_else(|| self.cols.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)))
+            .map(|(_, e)| e)
     }
 }
 
@@ -1061,8 +1067,14 @@ impl Binder<'_> {
         def: TableDef,
         source: TableSource,
     ) -> Result<(), String> {
-        if self.tables.iter().any(|t| t.display == display)
-            || self.views.iter().any(|v| v.alias == display)
+        if self
+            .tables
+            .iter()
+            .any(|t| t.display.eq_ignore_ascii_case(&display))
+            || self
+                .views
+                .iter()
+                .any(|v| v.alias.eq_ignore_ascii_case(&display))
         {
             return Err(format!(
                 "duplicate table name/alias '{display}' — alias one of them"
@@ -1092,7 +1104,7 @@ impl Binder<'_> {
             [tbl, c] => self
                 .tables
                 .iter()
-                .any(|t| t.display == *tbl && t.def.column(c).is_some()),
+                .any(|t| t.display.eq_ignore_ascii_case(tbl) && t.def.column(c).is_some()),
             _ => false,
         }
     }
@@ -1123,7 +1135,7 @@ impl Binder<'_> {
                 let t = self
                     .tables
                     .iter()
-                    .position(|bt| bt.display == *tbl)
+                    .position(|bt| bt.display.eq_ignore_ascii_case(tbl))
                     .ok_or_else(|| format!("unknown table or alias '{tbl}'"))?;
                 if self.tables[t].def.column(c).is_none() {
                     return Err(format!("unknown column '{tbl}.{c}'"));
@@ -1134,7 +1146,11 @@ impl Binder<'_> {
         };
         self.touched.insert(t);
         let bt = &mut self.tables[t];
-        let col = match bt.used.iter().position(|c| c.name == cname) {
+        let col = match bt
+            .used
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(cname))
+        {
             Some(i) => i,
             None => {
                 let def = bt.def.column(cname).expect("column just checked");
@@ -1167,7 +1183,7 @@ impl Binder<'_> {
             Some(a) => self
                 .views
                 .iter()
-                .find(|v| v.alias == a)
+                .find(|v| v.alias.eq_ignore_ascii_case(a))
                 .and_then(|v| v.get(col).cloned()),
             None => self.views.iter().find_map(|v| v.get(col).cloned()),
         }
@@ -1317,7 +1333,7 @@ impl Binder<'_> {
             [tbl, c] => self
                 .tables
                 .iter()
-                .any(|t| t.display == *tbl && t.def.column(c).is_some()),
+                .any(|t| t.display.eq_ignore_ascii_case(tbl) && t.def.column(c).is_some()),
             _ => false,
         };
 
@@ -1476,7 +1492,9 @@ impl Binder<'_> {
                         // table's alias (`l2.l_suppkey`).
                         let inner_of = |parts: &[&str]| match parts {
                             [c] if def.column(c).is_some() => Some(c.to_string()),
-                            [t, c] if *t == display && def.column(c).is_some() => {
+                            [t, c]
+                                if t.eq_ignore_ascii_case(&display) && def.column(c).is_some() =>
+                            {
                                 Some(c.to_string())
                             }
                             _ => None,
@@ -1974,18 +1992,37 @@ impl Binder<'_> {
                         }
                         Ok(Bound::Expr(inner))
                     }
-                    // Numeric casts pass through: the engine's numerics
-                    // are f64 (decimal precision widening is a no-op) and
-                    // Div already evaluates in f64.
+                    // CAST to a decimal/floating type yields Float64 — the
+                    // engine's fractional numerics are all f64. A numeric
+                    // *literal* is coerced so its static type is Float64
+                    // (`CAST(0 AS DECIMAL(7,2))` is a float 0, not int 0):
+                    // this is what lets a UNION ALL reconcile an int-looking
+                    // padding literal in one branch with a real decimal
+                    // column in another (q5's `salesreturns`).
                     DT::Decimal(_)
                     | DT::Numeric(_)
                     | DT::Float(_)
                     | DT::Double(_)
-                    | DT::DoublePrecision
-                    | DT::Int(_)
-                    | DT::Integer(_)
-                    | DT::BigInt(_)
-                    | DT::SmallInt(_) => Ok(self.bind(expr)?),
+                    | DT::DoublePrecision => {
+                        let inner = materialize(self.bind(expr)?);
+                        let floated = match inner {
+                            Expr::Literal(ScalarValue::Int64(i)) => {
+                                Expr::Literal(ScalarValue::Float64(i as f64))
+                            }
+                            Expr::Literal(ScalarValue::Int32(i)) => {
+                                Expr::Literal(ScalarValue::Float64(i as f64))
+                            }
+                            // Already Float64, or a non-literal expression
+                            // (runtime already evaluates in f64).
+                            other => other,
+                        };
+                        Ok(Bound::Expr(floated))
+                    }
+                    // Integer casts pass through: the engine keeps integer
+                    // numerics integral.
+                    DT::Int(_) | DT::Integer(_) | DT::BigInt(_) | DT::SmallInt(_) => {
+                        Ok(self.bind(expr)?)
+                    }
                     DT::Char(_) | DT::Varchar(_) | DT::Text => Ok(self.bind(expr)?),
                     other => Err(format!("unsupported CAST target: {other}")),
                 }
@@ -2822,7 +2859,13 @@ impl Dec {
                 return ScalarValue::Int64(i);
             }
         }
-        ScalarValue::Float64(self.mant as f64 / 10f64.powi(self.scale as i32))
+        ScalarValue::Float64(self.to_f64())
+    }
+
+    /// The exact decimal value as the nearest f64 — used when a context
+    /// (e.g. `CAST(0 AS DECIMAL)`) forces a floating result even at scale 0.
+    fn to_f64(self) -> f64 {
+        self.mant as f64 / 10f64.powi(self.scale as i32)
     }
 }
 

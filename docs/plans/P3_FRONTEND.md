@@ -350,13 +350,25 @@ window-over-derived is the q49 prerequisite.
     scalar projection (the q5/q80 inner branch) is plain rows. Regression
     `tests/sql_concat.rs`.
   q80's `coalesce(sr_return_amt,0)` over the two-key LEFT join + ROLLUP +
-  concat all reconcile against DuckDB. **q5 still blocked separately**: it
-  aliases `sum(...) AS RETURNS` but references `returns` — needs
-  case-insensitive identifier resolution (q80 uses consistent lowercase).
-  The full native+DuckDB oracle *sweep* now OOMs on this box (cumulative
-  peak with heavy q80 added — a harness scale limit, not a correctness
-  regression; q80 parity confirmed in isolation via `tpcds_native_oracle
-  q80`).
+  concat all reconcile against DuckDB.
+- **Case-insensitive identifiers + decimal-cast typing (2026-07-19): q5
+  executes + parity-matches DuckDB (100 rows) → exec 62→63/102, 63/63
+  parity, 0 MISMATCH.** Two coupled fixes:
+  - **Case-insensitive identifier resolution** — unquoted SQL identifiers
+    are case-insensitive (Spark/DuckDB). q5 aliases `sum(return_amt) AS
+    RETURNS` in a CTE, then references `returns` outer. `Catalog::table`,
+    `TableDef::column`, `ViewMap::get`, the used-projection dedup, and every
+    table-alias/display comparison now prefer an exact hit and fall back to
+    `eq_ignore_ascii_case` (so a repeated mixed-case reference dedups to one
+    projection slot instead of duplicating). Regression
+    `tests/sql_case_insensitive_idents.rs`.
+  - **`CAST(_ AS DECIMAL/NUMERIC/FLOAT/DOUBLE)` types as Float64** — the
+    cast previously passed a bare int literal straight through, so q5's
+    UNION-ALL padding branch `cast(0 AS DECIMAL(7,2)) AS return_amt` was
+    typed integer while the sibling branch's real `sr_return_amt` was
+    Float64 — a materialization type clash. A numeric *literal* under a
+    decimal/float cast is now coerced to `Float64` (int targets still pass
+    through integral). This lets the union reconcile.
 
 ## Next (P4 tail → P5/P6)
 

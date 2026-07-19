@@ -42,9 +42,15 @@ pub struct TableDef {
 }
 
 impl TableDef {
-    /// Look a column up by name.
+    /// Look a column up by name. Unquoted SQL identifiers are
+    /// case-insensitive (Spark/DuckDB semantics), so an exact match is
+    /// preferred but a case-insensitive one is accepted as a fallback.
     pub fn column(&self, name: &str) -> Option<&ColumnDef> {
-        self.columns.iter().find(|c| c.name == name)
+        self.columns.iter().find(|c| c.name == name).or_else(|| {
+            self.columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))
+        })
     }
 }
 
@@ -141,8 +147,14 @@ impl Catalog {
         Ok(())
     }
 
-    /// Look a table up by name.
+    /// Look a table up by name. Exact match first, then a case-insensitive
+    /// scan — unquoted SQL identifiers are case-insensitive.
     pub fn table(&self, name: &str) -> Option<&TableDef> {
-        self.tables.get(name)
+        self.tables.get(name).or_else(|| {
+            self.tables
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+        })
     }
 }
