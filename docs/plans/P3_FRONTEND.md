@@ -304,6 +304,34 @@ SQL text
   (144,067 two-key vs 1,458,686 one-key inner), and the LEFT join
   preserves every driving row (1,441,548 == catalog_sales alone).
 
+- **Interval arithmetic on a date column (2026-07-19, `f7cb0f47`):
+  q72's bind unblocked.** `date_column ± interval N days` (q72's
+  `d3.d_date > d1.d_date + interval 5 days`) previously errored — only
+  literal dates folded. Since Date32 is days-since-epoch and the evaluator
+  compares dates as day counts, a day/week interval is a **constant
+  integer offset**, so it lowers to an integer add — no new evaluator
+  path. Month/year on a column stay literal-only (variable length).
+  Regression `tests/sql_interval_on_column.rs`. **q72 still does not
+  execute**: its `catalog_sales ⋈ inventory ON item_sk` is a fact-to-fact
+  fan-out on a low-cardinality key that blows the intermediate up → OOM
+  (SIGKILL) — a join-planning/scale problem, not this feature.
+
+### Remaining LEFT-JOIN-cluster blockers (each a separate, larger feature)
+The five two-key-LEFT-JOIN queries split after the join-shape + interval
+fixes: **q40 executes+parity** (done). The rest each need substantial,
+*unrelated* features, not a small unblock:
+- **q5, q80**: `concat` mis-routed to `bind_aggregate` (concat is scalar,
+  needs a string-concat Expr) **+ `GROUP BY ROLLUP`** (grouping sets — a
+  major feature, also gating q18/22/27/36/67/77) **+ multi-CTE UNION-ALL
+  feeding an outer aggregate**.
+- **q49**: `rank() OVER` window functions over a **derived table** +
+  aggregates nested inside CAST/division + a WHERE filter on a LEFT join's
+  right side (which changes join semantics).
+- **q72**: interval-on-column done (above), but blocked on the
+  inventory fact-to-fact fan-out join plan (OOM).
+The highest-leverage next unit is **ROLLUP** (unblocks the most queries);
+window-over-derived is the q49 prerequisite.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
