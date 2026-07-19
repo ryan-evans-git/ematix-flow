@@ -247,6 +247,18 @@ SQL text
   pins in `tests/sql_null_semantics.rs`. The lesson: coverage (runs) is
   not correctness (right answer) — only a value-oracle caught these.
 
+- **Fan-out below the root (2026-07-19, `9bab9ea1`): TPC-DS exec
+  48 → 52, all 52 parity-match DuckDB.** A duplicate-key payload dim can
+  now appear as a grandchild, not only as a root child. `build_dim`'s
+  emit gained a cartesian-product path: when a child dim is `multi`, the
+  table's surviving row expands to one dim row per combination of its
+  children's payload rows (an odometer over per-child match lists — a
+  chain contributes several). The parent dim becomes `multi` in turn, so
+  the fan-out composes recursively up to the root's `fanout_child`. The
+  no-multi-child fast path is verbatim, so Q08 SF-10 stays 350 ms and the
+  Q6 bit gate holds. q17/q25/q29/q91 now execute and match DuckDB;
+  regression `tests/dup_key_payload_join.rs::fanout_below_root`.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
