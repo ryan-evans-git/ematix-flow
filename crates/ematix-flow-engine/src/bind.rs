@@ -222,12 +222,13 @@ fn bind_query(
     //   extracted into `aggs`;
     // - PLAIN ROW query (no aggregates, no GROUP BY): items bind in slot
     //   space and the executor emits one output row per joined row — no
-    //   grouping, no dedup (Q2, Q15).
+    //   grouping, no dedup (Q2, Q15). Scalar functions (concat, substr, …)
+    //   are fine here; only an AGGREGATE forces the grouped path.
     let plain_rows = !set_semantics
         && group.is_empty()
         && select.projection.iter().all(|it| match it {
             ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
-                !contains_function(e)
+                !contains_aggregate(e)
             }
             ast::SelectItem::Wildcard(_) => true,
             _ => false,
@@ -564,6 +565,11 @@ fn remap_window_cols(e: &mut Expr, base: usize) {
         | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Substr { expr, .. } => remap_window_cols(expr, base),
+        Expr::Concat(parts) => {
+            for p in parts {
+                remap_window_cols(p, base);
+            }
+        }
         Expr::Case { whens, else_ } => {
             for (c, v) in whens {
                 remap_window_cols(c, base);
@@ -1840,6 +1846,27 @@ impl Binder<'_> {
         Ok(Expr::Column(WINDOW_BASE + self.windows.len() - 1))
     }
 
+    /// If `f` is a `concat(...)` call, bind each argument (slot space) and
+    /// return the parts; otherwise `None` so the caller tries other forms.
+    /// concat produces an owned string, so it only ever lands in a
+    /// projection / group-key slot (see [`Expr::Concat`]).
+    fn bind_concat(&mut self, f: &ast::Function) -> Result<Option<Vec<Expr>>, String> {
+        if f.name.to_string().to_lowercase() != "concat" {
+            return Ok(None);
+        }
+        let ast::FunctionArguments::List(args) = &f.args else {
+            return Err("concat needs an argument list".into());
+        };
+        let mut parts = Vec::with_capacity(args.args.len());
+        for a in &args.args {
+            let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) = a else {
+                return Err("concat arguments must be plain expressions".into());
+            };
+            parts.push(self.bind_scalar(e)?);
+        }
+        Ok(Some(parts))
+    }
+
     /// Bind an aggregate call: `sum/count/min/max/avg(<expr>)` or
     /// `count(*)`.
     fn bind_aggregate(&mut self, e: &ast::Expr) -> Result<AggExpr, String> {
@@ -2209,6 +2236,9 @@ impl Binder<'_> {
                 }))
             }
             ast::Expr::Function(f) => {
+                if let Some(parts) = self.bind_concat(f)? {
+                    return Ok(Bound::Expr(Expr::Concat(parts)));
+                }
                 if let Some(rewritten) = rewrite_scalar_fn(f)? {
                     return self.bind(&rewritten);
                 }
@@ -2255,7 +2285,7 @@ fn infer_slot_type(q: &BoundQuery, e: &Expr) -> LogicalType {
             binary_type(*op, infer_slot_type(q, lhs), infer_slot_type(q, rhs))
         }
         Expr::ExtractYear(_) => LogicalType::Int64,
-        Expr::Substr { .. } => LogicalType::Utf8,
+        Expr::Substr { .. } | Expr::Concat(_) => LogicalType::Utf8,
         Expr::Case { whens, .. } => whens
             .first()
             .map(|(_, v)| infer_slot_type(q, v))
@@ -2292,7 +2322,7 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
             infer_row_type(q, key_tys, rhs),
         ),
         Expr::ExtractYear(_) => LogicalType::Int64,
-        Expr::Substr { .. } => LogicalType::Utf8,
+        Expr::Substr { .. } | Expr::Concat(_) => LogicalType::Utf8,
         Expr::Case { whens, .. } => whens
             .first()
             .map(|(_, v)| infer_row_type(q, key_tys, v))
@@ -2357,6 +2387,63 @@ fn ident_parts(e: &ast::Expr) -> Option<Vec<&str>> {
     }
 }
 
+/// Does the AST expression contain an **aggregate or window** call? Unlike
+/// [`contains_function`], a scalar function (`concat`, `substr`, `coalesce`,
+/// …) is transparent — the walk descends into its arguments so a nested
+/// aggregate (`substr(max(x), 1)`) is still found. Drives the plain-row vs
+/// grouped decision, so a plain projection may carry scalar functions.
+fn contains_aggregate(e: &ast::Expr) -> bool {
+    match e {
+        ast::Expr::Function(f) => {
+            if f.over.is_some() {
+                return true; // a window call needs the grouped/window path
+            }
+            if matches!(
+                f.name.to_string().to_lowercase().as_str(),
+                "sum" | "count" | "min" | "max" | "avg" | "stddev_samp"
+            ) {
+                return true;
+            }
+            // A scalar function: look for aggregates in its arguments.
+            match &f.args {
+                ast::FunctionArguments::List(list) => list.args.iter().any(|a| {
+                    matches!(a,
+                        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                            if contains_aggregate(e))
+                }),
+                _ => false,
+            }
+        }
+        ast::Expr::Nested(i) => contains_aggregate(i),
+        ast::Expr::BinaryOp { left, right, .. } => {
+            contains_aggregate(left) || contains_aggregate(right)
+        }
+        ast::Expr::UnaryOp { expr, .. } => contains_aggregate(expr),
+        ast::Expr::Between {
+            expr, low, high, ..
+        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
+        ast::Expr::InList { expr, list, .. } => {
+            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
+        ast::Expr::Like { expr, pattern, .. } => {
+            contains_aggregate(expr) || contains_aggregate(pattern)
+        }
+        ast::Expr::Extract { expr, .. } => contains_aggregate(expr),
+        ast::Expr::Substring { expr, .. } => contains_aggregate(expr),
+        ast::Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            conditions
+                .iter()
+                .any(|cw| contains_aggregate(&cw.condition) || contains_aggregate(&cw.result))
+                || else_result.as_ref().is_some_and(|e| contains_aggregate(e))
+        }
+        _ => false,
+    }
+}
+
 /// Does the AST expression contain a function call (= an aggregate, since
 /// scalar functions aren't supported yet)?
 fn contains_function(e: &ast::Expr) -> bool {
@@ -2407,6 +2494,7 @@ fn references_columns(e: &Expr) -> bool {
         | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Substr { expr, .. } => references_columns(expr),
+        Expr::Concat(parts) => parts.iter().any(references_columns),
         Expr::Case { whens, else_ } => {
             whens
                 .iter()

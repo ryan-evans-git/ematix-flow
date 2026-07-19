@@ -260,6 +260,11 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
             | Expr::InSetStr { expr, .. }
             | Expr::IsNull { expr, .. }
             | Expr::Substr { expr, .. } => walk(expr, f),
+            Expr::Concat(parts) => {
+                for p in parts {
+                    walk(p, f);
+                }
+            }
             Expr::Case { whens, else_ } => {
                 for (c, v) in whens {
                     walk(c, f);
@@ -308,6 +313,11 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
             | Expr::InSetStr { expr, .. }
             | Expr::IsNull { expr, .. }
             | Expr::Substr { expr, .. } => walk(expr, f),
+            Expr::Concat(parts) => {
+                for p in parts {
+                    walk(p, f);
+                }
+            }
             Expr::Case { whens, else_ } => {
                 for (c, v) in whens {
                     walk(c, f);
@@ -2538,6 +2548,11 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
         | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Substr { expr, .. } => collect_slots(expr, out),
+        Expr::Concat(parts) => {
+            for p in parts {
+                collect_slots(p, out);
+            }
+        }
         Expr::Case { whens, else_ } => {
             for (c, v) in whens {
                 collect_slots(c, out);

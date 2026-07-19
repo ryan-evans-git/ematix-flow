@@ -119,6 +119,11 @@ pub enum Expr {
         from: i64,
         len: Option<i64>,
     },
+    /// `concat(a, b, …)` — string concatenation producing an OWNED string,
+    /// so it is only evaluated via [`Expr::eval_value`] (projection outputs
+    /// and group keys), never in the borrowed `Val` path. NULL arguments
+    /// are skipped (DuckDB `concat` semantics), so the result is never NULL.
+    Concat(Vec<Expr>),
 }
 
 /// A value produced during evaluation. Integer-family logical types
@@ -251,6 +256,12 @@ impl Expr {
                 Val::Null => Val::Null,
                 other => panic!("SUBSTRING needs a string operand, got {other:?}"),
             },
+            // `concat` yields an owned string; the binder only ever places
+            // it in a projection / group-key slot (evaluated by eval_value),
+            // never inside a filter or arithmetic (the borrowed Val path).
+            Expr::Concat(_) => {
+                panic!("concat must be evaluated via eval_value, not the borrowed Val path")
+            }
         }
     }
 
@@ -283,6 +294,24 @@ impl Expr {
     /// Evaluate to a typed [`ScalarValue`] — the output-projection path,
     /// preserving integer-ness (a passed-through group key stays `Int64`).
     pub fn eval_value(&self, chunk: &DataChunk, row: usize) -> ScalarValue {
+        // `concat` builds an owned string — evaluate it here (not in the
+        // borrowed `Val` path). NULL arguments are skipped (DuckDB
+        // semantics), numbers render as their decimal text.
+        if let Expr::Concat(parts) = self {
+            let mut out = String::new();
+            for p in parts {
+                match p.eval_value(chunk, row) {
+                    ScalarValue::Null => {}
+                    ScalarValue::Utf8(s) => out.push_str(&s),
+                    ScalarValue::Int64(i) => out.push_str(&i.to_string()),
+                    ScalarValue::Int32(i) => out.push_str(&i.to_string()),
+                    ScalarValue::Date32(d) => out.push_str(&d.to_string()),
+                    ScalarValue::Boolean(b) => out.push_str(if b { "true" } else { "false" }),
+                    ScalarValue::Float64(f) => out.push_str(&f.to_string()),
+                }
+            }
+            return ScalarValue::Utf8(Arc::from(out.as_str()));
+        }
         match self.eval(chunk, row) {
             Val::Int(i) => ScalarValue::Int64(i),
             Val::Float(f) => ScalarValue::Float64(f),
