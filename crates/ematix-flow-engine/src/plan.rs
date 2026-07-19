@@ -1203,15 +1203,6 @@ impl Executor<'_> {
             }
             let child_cols: Vec<usize> = links.iter().map(|&(_, c)| c).collect();
             let r = self.build_dim(*child, &child_cols, children, needed)?;
-            if r.multi {
-                // A fan-out dim below another join would need this dim's
-                // build to expand too — only root-level fan-out is wired.
-                return Err(format!(
-                    "duplicate-key payload join below the root (table '{}') is not yet \
-                     supported — only at the join-tree root",
-                    q.tables[*child].name
-                ));
-            }
             payload_slots.extend(r.payload_slots.iter().copied());
             child_results.push((links.iter().map(|&(p, _)| p).collect(), r));
         }
@@ -1232,6 +1223,11 @@ impl Executor<'_> {
         let nworkers = self.nthreads.clamp(1, n_rg.max(1));
         let (src_ref, queue_ref, emits_ref) = (&src, &queue, &emits);
         let (cr_ref, tys_ref, own_ref) = (&child_results, &pay_tys, &own_payload);
+        // A multi (fan-out) child forces the general cartesian-product
+        // emit: this table's row expands to one dim row per COMBINATION of
+        // its children's payload rows (a child chain contributes several).
+        // The common case (no multi child) keeps the single-row fast path.
+        let any_multi = child_results.iter().any(|(_, r)| r.multi);
         std::thread::scope(|scope| -> Result<(), String> {
             let mut handles = Vec::with_capacity(nworkers);
             for _ in 0..nworkers {
@@ -1267,54 +1263,143 @@ impl Executor<'_> {
                             .map(|&s| pay_src(&chunk, q.slots[s].col))
                             .collect();
                         let mut kbuf: Vec<i64> = Vec::with_capacity(8);
-                        let mut hits: Vec<(u32, u32)> = Vec::with_capacity(cr_ref.len());
-                        sel.for_each(|i| {
-                            let i = i as usize;
-                            // Probe each child; a miss (including a NULL
-                            // key) drops the row, hits multiply.
-                            let mut weight = 1u64;
-                            hits.clear();
-                            for (kcs, (_, r)) in child_keys.iter().zip(cr_ref) {
-                                match fill_key(&mut kbuf, kcs, i)
-                                    .then(|| r.map.get(&kbuf))
-                                    .flatten()
-                                {
-                                    None => {
-                                        weight = 0;
-                                        break;
-                                    }
-                                    Some((w, s, row)) => {
-                                        weight *= w;
-                                        hits.push((s, row));
+                        if !any_multi {
+                            // FAST PATH: every child contributes one payload
+                            // row, so each surviving row emits exactly one
+                            // dim row (weight = product of match counts).
+                            let mut hits: Vec<(u32, u32)> = Vec::with_capacity(cr_ref.len());
+                            sel.for_each(|i| {
+                                let i = i as usize;
+                                let mut weight = 1u64;
+                                hits.clear();
+                                for (kcs, (_, r)) in child_keys.iter().zip(cr_ref) {
+                                    match fill_key(&mut kbuf, kcs, i)
+                                        .then(|| r.map.get(&kbuf))
+                                        .flatten()
+                                    {
+                                        None => {
+                                            weight = 0;
+                                            break;
+                                        }
+                                        Some((w, s, row)) => {
+                                            weight *= w;
+                                            hits.push((s, row));
+                                        }
                                     }
                                 }
-                            }
-                            if weight == 0 {
-                                return;
-                            }
-                            // A NULL own-key row can never be matched by
-                            // any probe — skip it entirely.
-                            if !fill_key(&mut kbuf, &key_cols, i) {
-                                return;
-                            }
-                            let buf = &mut bufs[shard_of(&kbuf, nshards)];
-                            buf.keys.extend_from_slice(&kbuf);
-                            buf.weights.push(weight);
-                            // Payload in `payload_slots` order: own first,
-                            // then each child's block.
-                            let mut j = 0;
-                            for src in &own_srcs {
-                                buf.pay[j].push_src(src, i);
-                                j += 1;
-                            }
-                            for ((_, r), &(s, row)) in cr_ref.iter().zip(&hits) {
-                                for jc in 0..r.payload_slots.len() {
-                                    buf.pay[j]
-                                        .push_from(r.map.pay_col(s as usize, jc), row as usize);
+                                if weight == 0 {
+                                    return;
+                                }
+                                // A NULL own-key row can never be matched.
+                                if !fill_key(&mut kbuf, &key_cols, i) {
+                                    return;
+                                }
+                                let buf = &mut bufs[shard_of(&kbuf, nshards)];
+                                buf.keys.extend_from_slice(&kbuf);
+                                buf.weights.push(weight);
+                                let mut j = 0;
+                                for src in &own_srcs {
+                                    buf.pay[j].push_src(src, i);
                                     j += 1;
                                 }
-                            }
-                        });
+                                for ((_, r), &(s, row)) in cr_ref.iter().zip(&hits) {
+                                    for jc in 0..r.payload_slots.len() {
+                                        buf.pay[j]
+                                            .push_from(r.map.pay_col(s as usize, jc), row as usize);
+                                        j += 1;
+                                    }
+                                }
+                            });
+                        } else {
+                            // GENERAL PATH: a child may contribute SEVERAL
+                            // payload rows (its chain); this row emits the
+                            // cartesian product of the children's payload
+                            // rows — walked with an odometer over per-child
+                            // match lists (shard, payload row, weight).
+                            let ncr = cr_ref.len();
+                            let mut matches: Vec<Vec<(u32, u32, u64)>> = vec![Vec::new(); ncr];
+                            let mut idx: Vec<usize> = vec![0; ncr];
+                            sel.for_each(|i| {
+                                let i = i as usize;
+                                let mut ok = true;
+                                for (ci, (kcs, (_, r))) in child_keys.iter().zip(cr_ref).enumerate()
+                                {
+                                    matches[ci].clear();
+                                    let hit = fill_key(&mut kbuf, kcs, i)
+                                        .then(|| r.map.get(&kbuf))
+                                        .flatten();
+                                    let Some((count, s, head)) = hit else {
+                                        ok = false;
+                                        break;
+                                    };
+                                    match r.map.chain_of(s as usize) {
+                                        Some(ch) if ch.next[head as usize] != NO_NEXT => {
+                                            let mut rr = head;
+                                            loop {
+                                                matches[ci].push((
+                                                    s,
+                                                    rr,
+                                                    ch.weight[rr as usize] as u64,
+                                                ));
+                                                let nx = ch.next[rr as usize];
+                                                if nx == NO_NEXT {
+                                                    break;
+                                                }
+                                                rr = nx;
+                                            }
+                                        }
+                                        _ => matches[ci].push((s, head, count)),
+                                    }
+                                }
+                                if !ok || !fill_key(&mut kbuf, &key_cols, i) {
+                                    return;
+                                }
+                                let shard = shard_of(&kbuf, nshards);
+                                for x in idx.iter_mut() {
+                                    *x = 0;
+                                }
+                                loop {
+                                    let mut weight = 1u64;
+                                    for ci in 0..ncr {
+                                        weight *= matches[ci][idx[ci]].2;
+                                    }
+                                    let buf = &mut bufs[shard];
+                                    buf.keys.extend_from_slice(&kbuf);
+                                    buf.weights.push(weight);
+                                    let mut j = 0;
+                                    for src in &own_srcs {
+                                        buf.pay[j].push_src(src, i);
+                                        j += 1;
+                                    }
+                                    for (ci, (_, r)) in cr_ref.iter().enumerate() {
+                                        let (s, row, _) = matches[ci][idx[ci]];
+                                        for jc in 0..r.payload_slots.len() {
+                                            buf.pay[j].push_from(
+                                                r.map.pay_col(s as usize, jc),
+                                                row as usize,
+                                            );
+                                            j += 1;
+                                        }
+                                    }
+                                    // Advance the odometer (least-significant
+                                    // child first); carry-out = done.
+                                    let mut ci = ncr;
+                                    let mut carry = true;
+                                    while ci > 0 {
+                                        ci -= 1;
+                                        idx[ci] += 1;
+                                        if idx[ci] < matches[ci].len() {
+                                            carry = false;
+                                            break;
+                                        }
+                                        idx[ci] = 0;
+                                    }
+                                    if carry {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
                         emits_ref.lock().expect("lock")[rg] = Some(bufs);
                     }
                     Ok(())

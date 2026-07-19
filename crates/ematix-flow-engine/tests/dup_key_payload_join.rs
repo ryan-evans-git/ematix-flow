@@ -61,3 +61,31 @@ fn dup_key_payload_fanout() {
         "revenue sum {total} vs 104159495.71"
     );
 }
+
+/// Fan-out BELOW the root: `store_sales` (root) ⋈ `item` (unique dim) ⋈
+/// the grouped `sc` (many rows per item_sk — a fan-out dim that is now a
+/// GRANDCHILD, not a root child). The dim BUILD must cross-product over
+/// `sc`'s chain when it consumes it. Filtered to one item (13): 336
+/// store_sales rows × 7 stores that sold it = 2352 output rows.
+#[test]
+fn fanout_below_root() {
+    let c = catalog();
+    let q = bind_sql(
+        "select count(*) as n, sum(sc.revenue) as total \
+         from store_sales, item, \
+           (select ss_item_sk, ss_store_sk, sum(ss_sales_price) as revenue \
+            from store_sales group by ss_item_sk, ss_store_sk) sc \
+         where store_sales.ss_item_sk = i_item_sk and i_item_sk = sc.ss_item_sk \
+           and i_item_sk = 13",
+        &c,
+    )
+    .expect("bind");
+    let r = execute(&q).expect("execute");
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(i(&r.rows[0][0]), 2352, "fan-out-below-root row count");
+    let total = f(&r.rows[0][1]);
+    assert!(
+        (total - 4_064_296.32).abs() <= 4_064_296.32 * 1e-9 + 1e-2,
+        "revenue sum {total} vs 4064296.32"
+    );
+}
