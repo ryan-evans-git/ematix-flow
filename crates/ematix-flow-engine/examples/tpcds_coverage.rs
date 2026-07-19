@@ -4,7 +4,10 @@
 //! that drives which front-end capabilities to build next.
 //!
 //! Usage: `cargo run --release -p ematix-flow-engine --example
-//! tpcds_coverage [bind|exec] [sf1|sf10]`
+//! tpcds_coverage [bind|exec] [sf1|sf10] [qNN]`
+//!
+//! With a third `qNN` argument only that query runs and panics stay
+//! loud (backtraces on) — the single-failure debugging mode.
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -77,15 +80,19 @@ fn main() {
             .expect("register table");
     }
 
+    let only: Option<String> = std::env::args().nth(3);
     // Panics inside bind/execute are coverage data, not crashes — capture
-    // them like errors and keep the hook quiet.
-    std::panic::set_hook(Box::new(|_| {}));
+    // them like errors and keep the hook quiet (unless debugging one).
+    if only.is_none() {
+        std::panic::set_hook(Box::new(|_| {}));
+    }
 
     let qdir = root.join("queries/spark");
     let mut names: Vec<String> = std::fs::read_dir(&qdir)
         .expect("query dir")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".sql"))
+        .filter(|n| only.as_ref().is_none_or(|o| n == &format!("{o}.sql")))
         .collect();
     names.sort_by_key(|n| {
         let stem = n.trim_end_matches(".sql").trim_start_matches('q');

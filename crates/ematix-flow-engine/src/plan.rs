@@ -60,12 +60,86 @@ pub fn execute(q: &BoundQuery) -> Result<QueryResult, String> {
                 .map(|n| n.get())
                 .unwrap_or(1)
         });
+    if !q.set_ops.is_empty() {
+        return execute_set(q);
+    }
     if q.subqueries.is_empty() {
         return Executor { q, nthreads }.run();
     }
     let mut q2 = q.clone();
     resolve_subqueries(&mut q2)?;
     Executor { q: &q2, nthreads }.run()
+}
+
+/// Execute a set-operation query: run the base block (its ORDER BY /
+/// LIMIT withheld), fold each side's rows in with the set semantics, then
+/// order and limit the COMBINED rows.
+fn execute_set(q: &BoundQuery) -> Result<QueryResult, String> {
+    use crate::logical::SetOp;
+    let mut base = q.clone();
+    let set_ops = std::mem::take(&mut base.set_ops);
+    let order_by = std::mem::take(&mut base.order_by);
+    let limit = base.limit.take();
+
+    let row_cmp = |a: &Vec<ScalarValue>, b: &Vec<ScalarValue>| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| cmp_scalar(x, y))
+            .find(|o| *o != std::cmp::Ordering::Equal)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let dedup = |mut rows: Vec<Vec<ScalarValue>>| {
+        rows.sort_by(row_cmp);
+        rows.dedup();
+        rows
+    };
+
+    let mut r = execute(&base)?;
+    for (op, side) in &set_ops {
+        let rs = execute(side)?;
+        r.rows = match op {
+            SetOp::UnionAll => {
+                let mut rows = r.rows;
+                rows.extend(rs.rows);
+                rows
+            }
+            SetOp::Union => {
+                let mut rows = r.rows;
+                rows.extend(rs.rows);
+                dedup(rows)
+            }
+            SetOp::Intersect => {
+                let right = dedup(rs.rows);
+                dedup(r.rows)
+                    .into_iter()
+                    .filter(|row| right.binary_search_by(|x| row_cmp(x, row)).is_ok())
+                    .collect()
+            }
+            SetOp::Except => {
+                let right = dedup(rs.rows);
+                dedup(r.rows)
+                    .into_iter()
+                    .filter(|row| right.binary_search_by(|x| row_cmp(x, row)).is_err())
+                    .collect()
+            }
+        };
+    }
+    if !order_by.is_empty() {
+        r.rows.sort_by(|a, b| {
+            for k in &order_by {
+                let ord = cmp_scalar(&a[k.output], &b[k.output]);
+                let ord = if k.desc { ord.reverse() } else { ord };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+    if let Some(l) = limit {
+        r.rows.truncate(l);
+    }
+    Ok(r)
 }
 
 /// Execute every subquery and substitute its result into the outer query's
@@ -155,6 +229,7 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
             Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
             | Expr::InSet { expr, .. }
+            | Expr::IsNull { expr, .. }
             | Expr::Substr { expr, .. } => walk(expr, f),
             Expr::Case { whens, else_ } => {
                 for (c, v) in whens {
@@ -201,6 +276,7 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
             Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
             | Expr::InSet { expr, .. }
+            | Expr::IsNull { expr, .. }
             | Expr::Substr { expr, .. } => walk(expr, f),
             Expr::Case { whens, else_ } => {
                 for (c, v) in whens {
@@ -992,6 +1068,15 @@ impl Executor<'_> {
         if let Some(l) = q.limit {
             rows.truncate(l);
         }
+        // Drop ORDER-BY-only hidden outputs now that sorting is done.
+        let mut columns = columns;
+        if q.hidden_outputs > 0 {
+            let keep = q.output.len() - q.hidden_outputs;
+            columns.truncate(keep);
+            for row in &mut rows {
+                row.truncate(keep);
+            }
+        }
         Ok(QueryResult { columns, rows })
     }
 
@@ -1643,6 +1728,10 @@ fn cmp_scalar(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
         (Null, _) => std::cmp::Ordering::Less,
         (_, Null) => std::cmp::Ordering::Greater,
         (Int64(x), Int64(y)) => x.cmp(y),
+        // Cross-type numeric compare (set-op sides may produce Int64 in
+        // one block and Float64 in another for the same column).
+        (Int64(x), Float64(y)) => (*x as f64).total_cmp(y),
+        (Float64(x), Int64(y)) => x.total_cmp(&(*y as f64)),
         (Int32(x), Int32(y)) => x.cmp(y),
         (Date32(x), Date32(y)) => x.cmp(y),
         (Float64(x), Float64(y)) => x.total_cmp(y),
@@ -1656,6 +1745,8 @@ fn cmp_scalar(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
 #[derive(Clone, Debug)]
 struct AggState {
     sum: f64,
+    /// Sum of squares (stddev only).
+    sumsq: f64,
     count: u64,
     min: f64,
     max: f64,
@@ -1667,6 +1758,7 @@ impl Default for AggState {
     fn default() -> Self {
         AggState {
             sum: 0.0,
+            sumsq: 0.0,
             count: 0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
@@ -1681,6 +1773,7 @@ impl AggState {
     /// sequential per-chunk association exactly.
     fn merge(&mut self, o: &AggState) {
         self.sum += o.sum;
+        self.sumsq += o.sumsq;
         self.count += o.count;
         if o.min < self.min {
             self.min = o.min;
@@ -1694,6 +1787,7 @@ impl AggState {
     #[inline]
     fn update(&mut self, v: f64) {
         self.sum += v;
+        self.sumsq += v * v;
         self.count += 1;
         if v < self.min {
             self.min = v;
@@ -1710,6 +1804,13 @@ impl AggState {
             AggFunc::Min => self.min,
             AggFunc::Max => self.max,
             AggFunc::Avg => self.sum / self.count as f64,
+            // Sample variance via the sum-of-squares identity.
+            AggFunc::StddevSamp => {
+                let n = self.count as f64;
+                ((self.sumsq - self.sum * self.sum / n) / (n - 1.0))
+                    .max(0.0)
+                    .sqrt()
+            }
             AggFunc::CountDistinct => self.distinct.len() as f64,
             AggFunc::CountMatched(_) => self.count as f64,
         }
@@ -1824,9 +1925,10 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
         Expr::ExtractYear(i) => collect_slots(i, out),
         Expr::Like { expr, .. } => collect_slots(expr, out),
         Expr::ScalarSub(_) => {}
-        Expr::InSub { expr, .. } | Expr::InSet { expr, .. } | Expr::Substr { expr, .. } => {
-            collect_slots(expr, out)
-        }
+        Expr::InSub { expr, .. }
+        | Expr::InSet { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Substr { expr, .. } => collect_slots(expr, out),
         Expr::Case { whens, else_ } => {
             for (c, v) in whens {
                 collect_slots(c, out);

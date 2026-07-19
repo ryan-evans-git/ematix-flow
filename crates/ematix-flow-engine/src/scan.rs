@@ -133,13 +133,17 @@ impl StockScan {
                 }
                 ColKind::Utf8 => {
                     let (vals, valid) = read_leaf::<ByteArrayType>(cr, rows, max_def, name)?;
-                    // Pack the byte arrays into one buffer + offsets
-                    // (NULL rows are empty with validity false).
+                    // Pack the byte arrays into one buffer + offsets. NULL
+                    // rows are empty with validity false — and must not be
+                    // touched: a defaulted `ByteArray` has no backing
+                    // buffer and `.data()` panics.
                     let mut offsets: Vec<u32> = Vec::with_capacity(vals.len() + 1);
                     let mut data: Vec<u8> = Vec::new();
                     offsets.push(0);
-                    for ba in &vals {
-                        data.extend_from_slice(ba.data());
+                    for (i, ba) in vals.iter().enumerate() {
+                        if valid.as_ref().is_none_or(|v| v[i]) {
+                            data.extend_from_slice(ba.data());
+                        }
                         offsets.push(data.len() as u32);
                     }
                     Vector::utf8(offsets, data).with_validity(valid)

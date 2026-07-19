@@ -35,8 +35,8 @@ use sqlparser::parser::Parser;
 use crate::catalog::{Catalog, TableDef};
 use crate::expr::{BinaryOp, Expr, ScalarValue};
 use crate::logical::{
-    AggExpr, AggFunc, BoundQuery, GroupExpr, JoinEdge, OrderByKey, OutputExpr, ScanColumn, Slot,
-    TableInput, TableSource,
+    AggExpr, AggFunc, BoundQuery, GroupExpr, JoinEdge, OrderByKey, OutputExpr, ScanColumn, SetOp,
+    Slot, TableInput, TableSource,
 };
 use crate::vector::LogicalType;
 
@@ -100,8 +100,11 @@ fn bind_query(
     }
     let ctes = &ctes;
 
+    if matches!(query.body.as_ref(), ast::SetExpr::SetOperation { .. }) {
+        return bind_set_query(query, catalog, ctes);
+    }
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return Err("only plain SELECT is supported (no set operations yet)".into());
+        return Err("only plain SELECT is supported here".into());
     };
 
     // FROM: comma-separated plain tables (the TPC-H canonical form), with
@@ -184,11 +187,41 @@ fn bind_query(
             ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
                 !contains_function(e)
             }
+            ast::SelectItem::Wildcard(_) => true,
             _ => false,
         });
+    // `SELECT *` expands to every column of every FROM table, in scope
+    // order (inlined view subqueries would need their own expansion —
+    // not yet supported).
+    let projection: Vec<ast::SelectItem> = if select
+        .projection
+        .iter()
+        .any(|it| matches!(it, ast::SelectItem::Wildcard(_)))
+    {
+        if !b.views.is_empty() {
+            return Err("SELECT * over an inlined subquery is not yet supported".into());
+        }
+        let mut items = Vec::new();
+        for item in &select.projection {
+            if matches!(item, ast::SelectItem::Wildcard(_)) {
+                for bt in &b.tables {
+                    for c in &bt.def.columns {
+                        items.push(ast::SelectItem::UnnamedExpr(ast::Expr::Identifier(
+                            ast::Ident::new(c.name.clone()),
+                        )));
+                    }
+                }
+            } else {
+                items.push(item.clone());
+            }
+        }
+        items
+    } else {
+        select.projection.clone()
+    };
     let mut aggs: Vec<AggExpr> = Vec::new();
     let mut output: Vec<OutputExpr> = Vec::new();
-    for (idx, item) in select.projection.iter().enumerate() {
+    for (idx, item) in projection.iter().enumerate() {
         let (expr, alias) = match item {
             ast::SelectItem::UnnamedExpr(e) => (e, None),
             ast::SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
@@ -332,28 +365,48 @@ fn bind_query(
         .map(|e| b.bind_output(e, &group, &mut aggs))
         .transpose()?;
 
-    // ORDER BY: each key must name an output column (alias or column name).
+    // ORDER BY: an output column (alias or name), an ordinal, or an
+    // arbitrary expression — the latter appends a HIDDEN output column
+    // used only for ordering (dropped from the final rows).
     let mut order_by = Vec::new();
+    let mut hidden_outputs = 0usize;
     if let Some(ob) = &query.order_by {
         let ast::OrderByKind::Expressions(exprs) = &ob.kind else {
             return Err("unsupported ORDER BY form".into());
         };
         for oe in exprs {
-            let Some(parts) = ident_parts(&oe.expr) else {
-                return Err(format!(
-                    "ORDER BY must name an output column (so far), got '{}'",
-                    oe.expr
-                ));
-            };
-            let name = parts.last().expect("nonempty ident");
-            let idx = output
-                .iter()
-                .position(|o| o.name == *name)
-                .ok_or_else(|| format!("ORDER BY '{name}' does not match an output column"))?;
-            order_by.push(OrderByKey {
-                output: idx,
-                desc: oe.options.asc == Some(false),
+            let desc = oe.options.asc == Some(false);
+            let named = ident_parts(&oe.expr).and_then(|parts| {
+                let name = parts.last().expect("nonempty ident");
+                output.iter().position(|o| o.name == *name)
             });
+            let idx = if let Some(idx) = named {
+                idx
+            } else if let ast::Expr::Value(v) = &oe.expr
+                && let ast::Value::Number(n, _) = &v.value
+                && let Ok(pos) = n.parse::<usize>()
+                && (1..=output.len()).contains(&pos)
+            {
+                pos - 1
+            } else {
+                let expr = if plain_rows {
+                    b.bind_scalar(&oe.expr)?
+                } else {
+                    b.bind_output(&oe.expr, &group, &mut aggs)?
+                };
+                match output.iter().position(|o| o.expr == expr) {
+                    Some(idx) => idx,
+                    None => {
+                        output.push(OutputExpr {
+                            expr,
+                            name: format!("__ord{}", output.len()),
+                        });
+                        hidden_outputs += 1;
+                        output.len() - 1
+                    }
+                }
+            };
+            order_by.push(OrderByKey { output: idx, desc });
         }
     }
 
@@ -398,11 +451,98 @@ fn bind_query(
         aggs,
         having,
         output,
+        hidden_outputs,
         order_by,
         limit,
         subqueries: b.subs,
         derived: b.derived,
+        set_ops: Vec::new(),
     })
+}
+
+/// Bind a set-operation query (`a UNION ALL b INTERSECT c …`): each side
+/// binds as a standalone block; the tree is left-deep, so the first side
+/// becomes the base block carrying the combined ORDER BY / LIMIT and the
+/// rest attach as [`BoundQuery::set_ops`].
+fn bind_set_query(
+    query: &ast::Query,
+    catalog: &Catalog,
+    ctes: &CteMap,
+) -> Result<BoundQuery, String> {
+    type Tagged<'a> = (
+        Option<(ast::SetOperator, ast::SetQuantifier)>,
+        &'a ast::SetExpr,
+    );
+    fn flatten<'a>(body: &'a ast::SetExpr, out: &mut Vec<Tagged<'a>>) -> Result<(), String> {
+        match body {
+            ast::SetExpr::SetOperation {
+                op,
+                set_quantifier,
+                left,
+                right,
+            } => {
+                flatten(left, out)?;
+                if matches!(right.as_ref(), ast::SetExpr::SetOperation { .. }) {
+                    return Err("right-nested set operations are not yet supported".into());
+                }
+                out.push((Some((*op, *set_quantifier)), right));
+                Ok(())
+            }
+            other => {
+                out.push((None, other));
+                Ok(())
+            }
+        }
+    }
+    let mut sides = Vec::new();
+    flatten(query.body.as_ref(), &mut sides)?;
+
+    let mut base: Option<BoundQuery> = None;
+    let mut ops: Vec<(SetOp, BoundQuery)> = Vec::new();
+    for (i, (op, side)) in sides.iter().enumerate() {
+        // Rebuild the side as a standalone query. The outer ORDER BY /
+        // LIMIT stay with the FIRST side (the executor applies them to
+        // the combined rows); CTEs were already folded into `ctes`.
+        let mut qside = query.clone();
+        qside.with = None;
+        *qside.body = (*side).clone();
+        if i != 0 {
+            qside.order_by = None;
+            qside.limit_clause = None;
+        }
+        let bq = bind_query(&qside, catalog, false, ctes)?;
+        match (i, op) {
+            (0, _) => base = Some(bq),
+            (_, Some((o, quant))) => {
+                use ast::{SetOperator as O, SetQuantifier as Q};
+                let sop = match (o, quant) {
+                    (O::Union, Q::All) => SetOp::UnionAll,
+                    (O::Union, Q::None | Q::Distinct) => SetOp::Union,
+                    (O::Intersect, Q::None | Q::Distinct) => SetOp::Intersect,
+                    (O::Except | O::Minus, Q::None | Q::Distinct) => SetOp::Except,
+                    other => return Err(format!("unsupported set operation: {other:?}")),
+                };
+                ops.push((sop, bq));
+            }
+            _ => unreachable!("non-first side always carries an operator"),
+        }
+    }
+    let mut base = base.expect("at least one side");
+    if base.hidden_outputs > 0 {
+        return Err(
+            "ORDER BY expressions over a set operation are not yet supported — \
+             name an output column"
+                .into(),
+        );
+    }
+    let n = base.output.len();
+    for (_, side) in &ops {
+        if side.output.len() != n {
+            return Err("set-operation sides have different column counts".into());
+        }
+    }
+    base.set_ops = ops;
+    Ok(base)
 }
 
 /// How a bound WHERE conjunct attributes to tables.
@@ -607,22 +747,31 @@ impl Binder<'_> {
                 let Some(alias) = alias else {
                     return Err("FROM subqueries need an alias".into());
                 };
-                let ast::SetExpr::Select(inner) = subquery.body.as_ref() else {
-                    return Err("FROM subquery must be a plain SELECT".into());
+                // A plain select-project body INLINES into this scope;
+                // anything else (aggregates, set operations, DISTINCT,
+                // ORDER/LIMIT) MATERIALIZES as a derived table.
+                let inner_select = match subquery.body.as_ref() {
+                    ast::SetExpr::Select(inner) => Some(inner),
+                    _ => None,
                 };
-                let plain = matches!(
-                    &inner.group_by,
-                    ast::GroupByExpr::Expressions(g, m) if g.is_empty() && m.is_empty()
-                ) && inner.having.is_none()
-                    && subquery.order_by.is_none()
-                    && subquery.limit_clause.is_none()
-                    && inner.distinct.is_none()
-                    && inner.projection.iter().all(|it| match it {
-                        ast::SelectItem::UnnamedExpr(e)
-                        | ast::SelectItem::ExprWithAlias { expr: e, .. } => !contains_function(e),
-                        _ => false,
-                    });
+                let plain = inner_select.is_some_and(|inner| {
+                    matches!(
+                        &inner.group_by,
+                        ast::GroupByExpr::Expressions(g, m) if g.is_empty() && m.is_empty()
+                    ) && inner.having.is_none()
+                        && subquery.order_by.is_none()
+                        && subquery.limit_clause.is_none()
+                        && inner.distinct.is_none()
+                        && inner.projection.iter().all(|it| match it {
+                            ast::SelectItem::UnnamedExpr(e)
+                            | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                                !contains_function(e)
+                            }
+                            _ => false,
+                        })
+                });
                 if plain {
+                    let inner = inner_select.expect("plain implies a Select body");
                     // INLINE: merge its tables + WHERE into this scope, and
                     // expose its select items as view columns.
                     for twj in &inner.from {
@@ -949,6 +1098,29 @@ impl Binder<'_> {
         }
     }
 
+    /// If `e` is a 'YYYY-MM-DD' string literal compared against a
+    /// date-typed expression, fold it to a Date32 literal (the Spark
+    /// query texts elide the `date` keyword).
+    fn coerce_date_literal(&self, e: &mut Expr, other: &Expr) {
+        let Expr::Literal(ScalarValue::Utf8(sv)) = &*e else {
+            return;
+        };
+        if !self.expr_is_date(other) {
+            return;
+        }
+        if let Ok(d) = parse_date32(sv) {
+            *e = Expr::Literal(ScalarValue::Date32(d));
+        }
+    }
+
+    fn expr_is_date(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Column(sl) => self.slot_col(*sl).ty == LogicalType::Date32,
+            Expr::Literal(ScalarValue::Date32(_)) => true,
+            _ => false,
+        }
+    }
+
     /// Bind a table-free AST expression to a literal (substring bounds).
     fn clone_free_literal(&mut self, e: &ast::Expr) -> Result<ScalarValue, String> {
         match materialize(self.bind(e)?) {
@@ -1239,9 +1411,11 @@ impl Binder<'_> {
                 expr: Expr::Column(0),
                 name: inner_col,
             }],
+            hidden_outputs: 0,
             order_by: Vec::new(),
             limit: None,
             subqueries: inner.subs,
+            set_ops: Vec::new(),
             derived: inner.derived,
         };
         self.subs.push(bq);
@@ -1344,9 +1518,11 @@ impl Binder<'_> {
                     name: "__ms".into(),
                 },
             ],
+            hidden_outputs: 0,
             order_by: Vec::new(),
             limit: None,
             subqueries: inner.subs,
+            set_ops: Vec::new(),
             derived: inner.derived,
         };
         let idx = self.derived.len();
@@ -1436,6 +1612,7 @@ impl Binder<'_> {
             "min" => AggFunc::Min,
             "max" => AggFunc::Max,
             "avg" => AggFunc::Avg,
+            "stddev_samp" => AggFunc::StddevSamp,
             other => return Err(format!("unsupported aggregate function '{other}'")),
         };
         let ast::FunctionArguments::List(args) = &f.args else {
@@ -1510,8 +1687,41 @@ impl Binder<'_> {
                 ast::Value::SingleQuotedString(s) => Ok(Bound::Expr(Expr::Literal(
                     ScalarValue::Utf8(s.as_str().into()),
                 ))),
+                ast::Value::Null => Ok(Bound::Expr(Expr::Literal(ScalarValue::Null))),
                 other => Err(format!("unsupported literal: {other}")),
             },
+            ast::Expr::Cast {
+                expr, data_type, ..
+            } => {
+                use ast::DataType as DT;
+                match data_type {
+                    // CAST(<string literal> AS DATE) folds; a date-typed
+                    // expression passes through.
+                    DT::Date => {
+                        let inner = materialize(self.bind(expr)?);
+                        if let Expr::Literal(ScalarValue::Utf8(s)) = &inner {
+                            return Ok(Bound::Expr(Expr::Literal(ScalarValue::Date32(
+                                parse_date32(s)?,
+                            ))));
+                        }
+                        Ok(Bound::Expr(inner))
+                    }
+                    // Numeric casts pass through: the engine's numerics
+                    // are f64 (decimal precision widening is a no-op) and
+                    // Div already evaluates in f64.
+                    DT::Decimal(_)
+                    | DT::Numeric(_)
+                    | DT::Float(_)
+                    | DT::Double(_)
+                    | DT::DoublePrecision
+                    | DT::Int(_)
+                    | DT::Integer(_)
+                    | DT::BigInt(_)
+                    | DT::SmallInt(_) => Ok(self.bind(expr)?),
+                    DT::Char(_) | DT::Varchar(_) | DT::Text => Ok(self.bind(expr)?),
+                    other => Err(format!("unsupported CAST target: {other}")),
+                }
+            }
             ast::Expr::UnaryOp {
                 op: ast::UnaryOperator::Minus,
                 expr,
@@ -1643,8 +1853,32 @@ impl Binder<'_> {
                         _ => {}
                     }
                 }
-                Ok(Bound::Expr(binary(op, materialize(l), materialize(r))))
+                let (mut le, mut re) = (materialize(l), materialize(r));
+                // Comparing a date-typed column with a 'YYYY-MM-DD' string
+                // literal (the Spark texts elide `date`): fold the literal
+                // to Date32.
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq
+                ) {
+                    self.coerce_date_literal(&mut le, &re);
+                    self.coerce_date_literal(&mut re, &le);
+                }
+                Ok(Bound::Expr(binary(op, le, re)))
             }
+            ast::Expr::IsNull(inner) => Ok(Bound::Expr(Expr::IsNull {
+                expr: Box::new(materialize(self.bind(inner)?)),
+                negated: false,
+            })),
+            ast::Expr::IsNotNull(inner) => Ok(Bound::Expr(Expr::IsNull {
+                expr: Box::new(materialize(self.bind(inner)?)),
+                negated: true,
+            })),
             ast::Expr::Substring {
                 expr,
                 substring_from,
@@ -1719,7 +1953,17 @@ pub(crate) fn output_types(q: &BoundQuery) -> Vec<LogicalType> {
         .iter()
         .map(|g| infer_slot_type(q, &g.expr))
         .collect();
-    q.output
+    // Hidden ORDER-BY-only outputs are dropped from the result rows and
+    // must not appear in a derived table's schema.
+    let visible = &q.output[..q.output.len() - q.hidden_outputs];
+    // A PLAIN-ROWS query's outputs live in SLOT space, not row space.
+    if q.group.is_empty() && q.aggs.is_empty() {
+        return visible
+            .iter()
+            .map(|o| infer_slot_type(q, &o.expr))
+            .collect();
+    }
+    visible
         .iter()
         .map(|o| infer_row_type(q, &key_tys, &o.expr))
         .collect()
@@ -1871,9 +2115,10 @@ fn references_columns(e: &Expr) -> bool {
         Expr::ExtractYear(i) => references_columns(i),
         Expr::Like { expr, .. } => references_columns(expr),
         Expr::ScalarSub(_) => false,
-        Expr::InSub { expr, .. } | Expr::InSet { expr, .. } | Expr::Substr { expr, .. } => {
-            references_columns(expr)
-        }
+        Expr::InSub { expr, .. }
+        | Expr::InSet { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Substr { expr, .. } => references_columns(expr),
         Expr::Case { whens, else_ } => {
             whens
                 .iter()
@@ -1897,9 +2142,11 @@ fn shift_date(days: i32, iv: &ast::Interval, sign: i32) -> Result<i32, String> {
     .map_err(|_| format!("bad interval count in {iv}"))?;
     let n = n * sign;
     match iv.leading_field {
-        Some(ast::DateTimeField::Day) => Ok(days + n),
-        Some(ast::DateTimeField::Month) => Ok(shift_months(days, n)),
-        Some(ast::DateTimeField::Year) => Ok(shift_months(days, n * 12)),
+        Some(ast::DateTimeField::Day | ast::DateTimeField::Days) => Ok(days + n),
+        Some(ast::DateTimeField::Month | ast::DateTimeField::Months) => Ok(shift_months(days, n)),
+        Some(ast::DateTimeField::Year | ast::DateTimeField::Years) => {
+            Ok(shift_months(days, n * 12))
+        }
         ref other => Err(format!("unsupported interval field: {other:?}")),
     }
 }

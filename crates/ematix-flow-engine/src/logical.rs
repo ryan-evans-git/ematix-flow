@@ -95,11 +95,14 @@ pub struct AggExpr {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggFunc {
     Sum,
-    /// `COUNT(*)` / `COUNT(expr)` — no NULLs yet, so both count rows.
+    /// `COUNT(*)` counts rows (literal argument); `COUNT(expr)` counts
+    /// non-NULL evaluations.
     Count,
     Min,
     Max,
     Avg,
+    /// Sample standard deviation (`stddev_samp`).
+    StddevSamp,
     /// `COUNT(DISTINCT <int expr>)`.
     CountDistinct,
     /// `COUNT(<col of a LEFT-joined table>)` — counts only row occurrences
@@ -124,6 +127,19 @@ pub struct OrderByKey {
     pub desc: bool,
 }
 
+/// A SQL set operation combining two query blocks' row sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOp {
+    /// `UNION ALL` — concatenate.
+    UnionAll,
+    /// `UNION` — concatenate then deduplicate.
+    Union,
+    /// `INTERSECT` — distinct rows present in both sides.
+    Intersect,
+    /// `EXCEPT` — distinct left rows absent from the right side.
+    Except,
+}
+
 /// The bound, typed query: the flat select-project-join block.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundQuery {
@@ -139,6 +155,9 @@ pub struct BoundQuery {
     /// Row-space predicate over `[group keys…, agg values…]` (HAVING).
     pub having: Option<Expr>,
     pub output: Vec<OutputExpr>,
+    /// Trailing outputs appended only to serve ORDER BY expressions —
+    /// dropped from the final rows after sorting.
+    pub hidden_outputs: usize,
     pub order_by: Vec<OrderByKey>,
     pub limit: Option<usize>,
     /// Uncorrelated subqueries referenced by [`Expr::ScalarSub`] /
@@ -148,4 +167,8 @@ pub struct BoundQuery {
     /// Materialized derived queries (CTEs, aggregate FROM-subqueries,
     /// decorrelated scalars) referenced by [`TableSource::Derived`].
     pub derived: Vec<BoundQuery>,
+    /// Further blocks combined into this one's rows, in order (`a UNION
+    /// ALL b INTERSECT c` = left-deep). This block's ORDER BY / LIMIT
+    /// apply to the COMBINED rows.
+    pub set_ops: Vec<(SetOp, BoundQuery)>,
 }

@@ -100,6 +100,11 @@ pub enum Expr {
         set: std::sync::Arc<std::collections::HashSet<i64>>,
         negated: bool,
     },
+    /// `<expr> IS [NOT] NULL`.
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
     /// `SUBSTRING(<expr> FROM <start> [FOR <len>])` — 1-based, byte
     /// positions (TPC-H strings are ASCII).
     Substr {
@@ -213,6 +218,9 @@ impl Expr {
             },
             Expr::ScalarSub(_) | Expr::InSub { .. } => {
                 panic!("unresolved subquery in evaluation — executor substitution missed it")
+            }
+            Expr::IsNull { expr, negated } => {
+                Val::Bool(matches!(expr.eval(chunk, row), Val::Null) != *negated)
             }
             Expr::InSet { expr, set, negated } => match expr.eval(chunk, row) {
                 // NULL [NOT] IN (…) is UNKNOWN — not satisfied either way.
