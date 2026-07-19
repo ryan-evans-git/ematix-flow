@@ -274,7 +274,7 @@ fn main() {
     // run). Skipped only in a sweep; still runnable by explicit name. q72:
     // catalog_sales ⋈ inventory ON item_sk — a fact-to-fact fan-out on a
     // low-cardinality key; pending join-planning work.
-    const OOM_SKIP: &[&str] = &["q72"];
+    const OOM_SKIP: &[&str] = &[];
     let mut names: Vec<String> = std::fs::read_dir(&qdir)
         .expect("query dir")
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())

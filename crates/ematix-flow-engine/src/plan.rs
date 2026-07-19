@@ -1079,12 +1079,18 @@ impl Executor<'_> {
         // is deterministic — and bit-identical to sequential — at any
         // thread count.
         let ti = &q.tables[root];
+        // Multi (duplicate-key fan-out) children EXPAND the view — process
+        // them LAST (stable partition) so every single-key payload (dates,
+        // demographics) attaches first and the fan-out's early residual
+        // filter can see those columns (q72's week-match + qty predicates).
+        let mut root_children = children[root].clone();
+        root_children.sort_by_key(|(c, _, _)| dim_results[*c].as_ref().is_some_and(|d| d.multi));
         // Matched-flag columns (LEFT children) append past the slot space
-        // in child order — a fixed layout every chunk.
+        // in (processing-order) child order — a fixed layout every chunk.
         let mut matched_cols: HashMap<usize, usize> = HashMap::new();
         {
             let mut next = q.slots.len();
-            for (child, _, left) in &children[root] {
+            for (child, _, left) in &root_children {
                 if *left {
                     matched_cols.insert(*child, next);
                     next += 1;
@@ -1093,7 +1099,7 @@ impl Executor<'_> {
         }
         let ctx = RootCtx {
             root,
-            children: &children[root],
+            children: &root_children,
             dims: &dim_results,
             post: &post,
             matched_cols: &matched_cols,
@@ -1732,6 +1738,10 @@ impl Executor<'_> {
         // the view's own (root) slot columns, uniformly.
         let mut vlen = chunk.n_rows();
         let mut kbuf: Vec<i64> = Vec::with_capacity(8);
+        // Which slots hold real data so far: the root's own columns now,
+        // each child's payloads as it attaches. Drives the fan-out's early
+        // residual filter (only conjuncts over available columns apply).
+        let mut avail: Vec<bool> = q.slots.iter().map(|s| s.table == ctx.root).collect();
         for (child, links, left) in ctx.children {
             let dim = ctx.dims[*child].as_ref().expect("dim built");
             // Root-side keys read from the view's slot columns (survives
@@ -1749,10 +1759,44 @@ impl Executor<'_> {
                 if *left {
                     return Err("LEFT duplicate-key payload join is not yet supported".into());
                 }
-                let (nv, ns, nl) = self.fanout_child(&view, &sel, vlen, dim, &key_cols, &mut kbuf);
+                // Early residual: the post-join conjuncts evaluable over
+                // {already-attached columns} ∪ {this dim's payloads} filter
+                // DURING expansion, so only survivors materialize — the
+                // difference between q72's ~1B-row blowup and a small
+                // result. (The full post predicate still runs afterwards —
+                // re-applying these conjuncts is idempotent.)
+                let residual: Option<Expr> = ctx.post.as_ref().and_then(|p| {
+                    let mut cs: Vec<&Expr> = Vec::new();
+                    split_and_expr(p, &mut cs);
+                    cs.into_iter()
+                        .filter(|c| {
+                            let mut sl = Vec::new();
+                            collect_slots(c, &mut sl);
+                            sl.iter()
+                                .all(|&s| avail[s] || dim.payload_slots.contains(&s))
+                        })
+                        .cloned()
+                        .reduce(|l, r| Expr::Binary {
+                            op: crate::expr::BinaryOp::And,
+                            lhs: Box::new(l),
+                            rhs: Box::new(r),
+                        })
+                });
+                let (nv, ns, nl) = self.fanout_child(
+                    &view,
+                    &sel,
+                    vlen,
+                    dim,
+                    &key_cols,
+                    &mut kbuf,
+                    residual.as_ref(),
+                );
                 view = nv;
                 sel = ns;
                 vlen = nl;
+                for &s in &dim.payload_slots {
+                    avail[s] = true;
+                }
                 continue;
             }
 
@@ -1796,6 +1840,7 @@ impl Executor<'_> {
             // (LEFT misses keep NO_REF → type defaults — 0 / 0.0 / "").
             for (j, &slot) in dim.payload_slots.iter().enumerate() {
                 view.cols[slot] = gather_payload(&dim.map, j, &refs, self.slot_ty(slot));
+                avail[slot] = true;
             }
             if *left {
                 debug_assert_eq!(ctx.matched_cols[child], view.cols.len());
@@ -1914,6 +1959,7 @@ impl Executor<'_> {
     /// length — existing columns gathered by the source root row, this
     /// dim's payload columns gathered by each output row's own dim row.
     /// Returns the new (view, all-selected, length).
+    #[allow(clippy::too_many_arguments)]
     fn fanout_child(
         &self,
         view: &DataChunk,
@@ -1922,18 +1968,29 @@ impl Executor<'_> {
         dim: &DimResult,
         key_cols: &[KeyCol],
         kbuf: &mut Vec<i64>,
+        residual: Option<&Expr>,
     ) -> (DataChunk, Selection, usize) {
+        // Candidate expansions are checked against `residual` in BOUNDED
+        // BATCHES: only the residual's own columns materialize per batch,
+        // and only surviving (source row, dim row) pairs are kept — the
+        // full-width view materializes once, survivors only. Without this
+        // a low-selectivity key (q72's cs⋈inventory on item_sk) inflates
+        // the intermediate ~660× before the taming predicates ever run.
+        const BATCH: usize = 1 << 18;
         // Per output row: the source view row it came from, and the dim
         // payload row it carries (`NO_REF` is unused here — inner only).
         let mut rows: Vec<usize> = Vec::new();
         let mut pay_ref: Vec<u64> = Vec::new();
-        sel.for_each(|i| {
-            let iu = i as usize;
+        let mut keep_rows: Vec<usize> = Vec::new();
+        let mut keep_ref: Vec<u64> = Vec::new();
+        let mut src_rows: Vec<usize> = Vec::with_capacity(sel.len());
+        sel.for_each(|i| src_rows.push(i as usize));
+        for &iu in &src_rows {
             let hit = fill_key(kbuf, key_cols, iu)
                 .then(|| dim.map.get(kbuf))
                 .flatten();
             let Some((count, s, head)) = hit else {
-                return;
+                continue;
             };
             let enc = |r: u32| ((s as u64) << 32) | r as u64;
             match dim.map.chain_of(s as usize) {
@@ -1962,30 +2019,110 @@ impl Executor<'_> {
                     }
                 }
             }
-        });
+            if let Some(res) = residual
+                && rows.len() >= BATCH
+            {
+                self.flush_fanout_batch(
+                    view,
+                    vlen,
+                    dim,
+                    res,
+                    &mut rows,
+                    &mut pay_ref,
+                    &mut keep_rows,
+                    &mut keep_ref,
+                );
+            }
+        }
+        if let Some(res) = residual {
+            self.flush_fanout_batch(
+                view,
+                vlen,
+                dim,
+                res,
+                &mut rows,
+                &mut pay_ref,
+                &mut keep_rows,
+                &mut keep_ref,
+            );
+            rows = keep_rows;
+            pay_ref = keep_ref;
+        }
 
         let len = rows.len();
-        let cols: Vec<Vector> = view
-            .cols
+        let cols = self.materialize_fanout(view, vlen, dim, &rows, &pay_ref, None);
+        (DataChunk::new(cols), Selection::All(len), len)
+    }
+
+    /// Filter one fan-out candidate batch against the early residual: only
+    /// the residual's columns materialize, survivors append to `keep_*`,
+    /// and the batch buffers clear for reuse.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_fanout_batch(
+        &self,
+        view: &DataChunk,
+        vlen: usize,
+        dim: &DimResult,
+        residual: &Expr,
+        rows: &mut Vec<usize>,
+        pay_ref: &mut Vec<u64>,
+        keep_rows: &mut Vec<usize>,
+        keep_ref: &mut Vec<u64>,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut need: Vec<usize> = Vec::new();
+        collect_slots(residual, &mut need);
+        let cols = self.materialize_fanout(view, vlen, dim, rows, pay_ref, Some(&need));
+        let chunk = DataChunk {
+            cols,
+            sel: Selection::All(rows.len()),
+        };
+        let survivors = filter_expr(&chunk, residual);
+        survivors.for_each(|i| {
+            keep_rows.push(rows[i as usize]);
+            keep_ref.push(pay_ref[i as usize]);
+        });
+        rows.clear();
+        pay_ref.clear();
+    }
+
+    /// Materialize the expanded fan-out view for `(rows, pay_ref)` pairs:
+    /// this dim's payload columns gather by dim row, populated columns by
+    /// source row, placeholders stay empty. `only` restricts to the listed
+    /// slots (the batch-filter path) — everything else stays a placeholder.
+    fn materialize_fanout(
+        &self,
+        view: &DataChunk,
+        vlen: usize,
+        dim: &DimResult,
+        rows: &[usize],
+        pay_ref: &[u64],
+        only: Option<&[usize]>,
+    ) -> Vec<Vector> {
+        view.cols
             .iter()
             .enumerate()
             .map(|(c, col)| {
+                if only.is_some_and(|o| !o.contains(&c)) {
+                    return Vector::i64(Vec::new());
+                }
                 if let Some(j) = dim.payload_slots.iter().position(|&s| s == c) {
                     // This dim's payload column: gather by each output
                     // row's own dim row.
-                    gather_payload(&dim.map, j, &pay_ref, self.slot_ty(c))
+                    gather_payload(&dim.map, j, pay_ref, self.slot_ty(c))
                 } else if col.len() == vlen {
                     // A populated column (root data, an earlier payload, a
                     // matched flag): gather by the source root row.
-                    gather_rows(col, &rows)
+                    gather_rows(col, rows)
                 } else {
                     // A not-yet-attached placeholder — stays empty until
                     // its own child attaches it full-length.
                     Vector::i64(Vec::new())
                 }
             })
-            .collect();
-        (DataChunk::new(cols), Selection::All(len), len)
+            .collect()
     }
 
     /// Merged groups → the row-space chunk → HAVING → output projection.
@@ -2206,7 +2343,11 @@ fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -
     };
     match w.func {
         WindowFunc::Agg(af) => {
+            // A frame with zero non-NULL inputs is SQL NULL (q51's
+            // `max(store_sales) OVER …` over a FULL-OUTER NULL run), so the
+            // finalized value carries validity, like the grouped path.
             let mut out = vec![0.0f64; n];
+            let mut valid = vec![true; n];
             for rows in parts.values_mut() {
                 if w.order.is_empty() {
                     // Whole-partition aggregate.
@@ -2217,8 +2358,10 @@ fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -
                         }
                     }
                     let v = st.finalize(af);
+                    let ok = !st.is_null(af);
                     for &r in rows.iter() {
                         out[r] = v;
+                        valid[r] = ok;
                     }
                 } else {
                     rows.sort_by(|&a, &b| order_cmp(a, b));
@@ -2230,6 +2373,7 @@ fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -
                                 st.update(v);
                             }
                             out[r] = st.finalize(af);
+                            valid[r] = !st.is_null(af);
                         }
                     } else {
                         // RANGE (the ordered default): peers of the
@@ -2248,15 +2392,18 @@ fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -
                                 }
                             }
                             let v = st.finalize(af);
+                            let ok = !st.is_null(af);
                             for &r in &rows[i..j] {
                                 out[r] = v;
+                                valid[r] = ok;
                             }
                             i = j;
                         }
                     }
                 }
             }
-            Vector::f64(out)
+            let any_null = valid.iter().any(|&b| !b);
+            Vector::f64(out).with_validity(any_null.then_some(valid))
         }
         WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::RowNumber => {
             let mut out = vec![0i64; n];
@@ -2663,6 +2810,21 @@ fn table_rows(ti: &TableInput) -> Result<u64, String> {
     let f = ParquetFile::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let md = f.metadata().map_err(|e| format!("metadata: {e}"))?;
     Ok(md.row_groups.iter().map(|rg| rg.num_rows as u64).sum())
+}
+
+/// Flatten a bound `AND` tree into its conjuncts (source order).
+fn split_and_expr<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    if let Expr::Binary {
+        op: crate::expr::BinaryOp::And,
+        lhs,
+        rhs,
+    } = e
+    {
+        split_and_expr(lhs, out);
+        split_and_expr(rhs, out);
+    } else {
+        out.push(e);
+    }
 }
 
 /// Collect every slot referenced by a slot-space expression.

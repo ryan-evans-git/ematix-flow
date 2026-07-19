@@ -422,6 +422,37 @@ window-over-derived is the q49 prerequisite.
     recursion (instead of erroring) when the whole expression isn't itself a
     single GROUP BY key — so a compound expression over keys/aliases binds.
   Regression `tests/sql_grouping_and_intcast.rs`.
+- **Join shapes + name resolution + CTE decorrelation (2026-07-19,
+  `e30c46ec`): exec 71→81/102, 81/81 parity, 0 MISMATCH** — q1 q6 q14b q16
+  q30 q41 q75 q81 q93 q94. Three sub-units: (a) inline-derived FROM bodies
+  route JOIN…ON through `add_join`; a WHERE equijoin touching a LEFT
+  join's nullable side demotes it to INNER (q93 was a silent MISMATCH
+  until demoted); bare `LEFT JOIN` accepted; WHERE `IS NULL` on the
+  nullable side = anti-join routed as a post-join filter over the
+  NULL-filled payload (`tests/sql_left_join_shapes.rs` pins the anti+semi
+  partition identity). (b) `SELECT *` expands to table-qualified refs and
+  skips synthetic tables; unqualified names prefer real tables over
+  `__corr`/`__ex` materializations. (c) `try_decorrelate_scalar` accepts
+  aliased/CTE inner tables and inner-qualified correlation refs, and
+  OR-factors the subquery WHERE first (q41's correlation duplicated in
+  every OR branch).
+- **q72 OOM fix (2026-07-19): batched fan-out with early residual
+  filtering.** Multi (duplicate-key) children now process LAST (stable
+  reorder after dim build) so all single-key payloads are attached; the
+  fan-out filters candidate expansions against the post-join conjuncts
+  whose columns are already available, in 256k-candidate batches that
+  materialize ONLY the residual's columns — survivors-only full
+  materialization. q72 (cs⋈inventory on item_sk, ~660×/row ≈ 1B-row
+  intermediate) went OOM-SIGKILL → 100 rows, 1.7GB peak, PARITY_OK;
+  removed from both harnesses' OOM_SKIP. Regression
+  `tests/sql_fanout_residual.rs` (early residual ≡ composite-key join).
+- **FULL OUTER JOIN via rewrite (2026-07-19): q51/q97.** `A FULL OUTER
+  JOIN B ON c` rewrites at the AST to a UNION ALL derived wrapper —
+  `(A LEFT JOIN B ON c)` ∪ `(B LEFT JOIN A ON c WHERE a.key IS NULL)`
+  (the mirrored anti-join) — with side-qualified references in the
+  enclosing select rewritten to the wrapper's prefixed `__fo_{a,b}_col`
+  columns. Zero executor change; reuses the LEFT + anti + UNION ALL
+  machinery hardened above.
 
 ## Next (P4 tail → P5/P6)
 

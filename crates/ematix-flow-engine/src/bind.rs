@@ -107,6 +107,14 @@ fn bind_query(
         return Err("only plain SELECT is supported here".into());
     };
 
+    // FULL OUTER JOIN rewrites to a UNION ALL of a LEFT join and the
+    // mirrored ANTI join (both machinery this binder already has), wrapped
+    // in a derived table; side-qualified references in the enclosing select
+    // rewrite to the wrapper's prefixed columns. See rewrite_full_outer.
+    if let Some(q2) = rewrite_full_outer(query, select, catalog, ctes)? {
+        return bind_query(&q2, catalog, set_semantics, ctes);
+    }
+
     // FROM: comma-separated plain tables (the TPC-H canonical form), with
     // optional aliases for self-joins (`nation n1, nation n2`).
     if select.from.is_empty() {
@@ -1002,6 +1010,13 @@ impl Binder<'_> {
                         && subquery.order_by.is_none()
                         && subquery.limit_clause.is_none()
                         && inner.distinct.is_none()
+                        // A FULL OUTER join must MATERIALIZE so bind_query's
+                        // UNION-ALL rewrite fires (q51's derived wrapper).
+                        && inner.from.iter().all(|twj| {
+                            twj.joins.iter().all(|j| {
+                                !matches!(j.join_operator, ast::JoinOperator::FullOuter(_))
+                            })
+                        })
                         && inner.projection.iter().all(|it| match it {
                             ast::SelectItem::UnnamedExpr(e)
                             | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
@@ -2707,6 +2722,264 @@ fn binary_type(op: BinaryOp, l: LogicalType, r: LogicalType) -> LogicalType {
         }
         Div => LogicalType::Float64,
         _ => LogicalType::Int64, // comparisons/logic used as keys: 0/1
+    }
+}
+
+/// Rewrite `FROM A [a] FULL OUTER JOIN B [b] ON cond` (q51/q97) into
+/// ```text
+/// FROM (SELECT a.c AS __fo_a_c…, b.c AS __fo_b_c…
+///         FROM A LEFT JOIN B ON cond
+///       UNION ALL
+///       SELECT a.c AS __fo_a_c…, b.c AS __fo_b_c…
+///         FROM B LEFT JOIN A ON cond WHERE a.key IS NULL) __fo
+/// ```
+/// — a LEFT join plus its mirrored ANTI join, both machinery the binder
+/// already has. Every `a.c` / `b.c` reference in the enclosing select
+/// rewrites to the wrapper's prefixed column. Returns `None` when the
+/// select has no FULL OUTER join.
+fn rewrite_full_outer(
+    query: &ast::Query,
+    select: &ast::Select,
+    catalog: &Catalog,
+    ctes: &CteMap,
+) -> Result<Option<ast::Query>, String> {
+    let has_full = select.from.iter().any(|twj| {
+        twj.joins
+            .iter()
+            .any(|j| matches!(j.join_operator, ast::JoinOperator::FullOuter(_)))
+    });
+    if !has_full {
+        return Ok(None);
+    }
+    let [twj] = select.from.as_slice() else {
+        return Err("FULL OUTER JOIN alongside other FROM tables is not supported".into());
+    };
+    let [join] = twj.joins.as_slice() else {
+        return Err("FULL OUTER JOIN chained with other joins is not supported".into());
+    };
+    let ast::JoinOperator::FullOuter(ast::JoinConstraint::On(cond)) = &join.join_operator else {
+        return Err("FULL OUTER JOIN requires an ON condition".into());
+    };
+    // Each side: (display name, column list) — a CTE or a catalog table.
+    let side = |rel: &ast::TableFactor| -> Result<(String, Vec<String>), String> {
+        let ast::TableFactor::Table { name, alias, .. } = rel else {
+            return Err("FULL OUTER JOIN sides must be plain tables or CTEs".into());
+        };
+        let tname = name.to_string();
+        let display = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| tname.clone());
+        let cols: Vec<String> = if let Some((_, cs)) = ctes.get(&tname) {
+            cs.iter().map(|(n, _)| n.clone()).collect()
+        } else if let Some(d) = catalog.table(&tname) {
+            d.columns.iter().map(|c| c.name.clone()).collect()
+        } else {
+            return Err(format!("unknown table '{tname}' in FULL OUTER JOIN"));
+        };
+        Ok((display, cols))
+    };
+    let (da, cols_a) = side(&twj.relation)?;
+    let (db, cols_b) = side(&join.relation)?;
+
+    // The A-side key for the anti branch's probe: a matched B row carries a
+    // non-NULL A key, so `a.key IS NULL` is exactly "no A match".
+    let mut conjs = Vec::new();
+    split_and(cond, &mut conjs);
+    let mut akey: Option<String> = None;
+    'outer: for cj in &conjs {
+        if let ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::Eq,
+            right,
+        } = cj
+        {
+            for e in [left.as_ref(), right.as_ref()] {
+                if let Some([t, c]) = ident_parts(e).as_deref()
+                    && t.eq_ignore_ascii_case(&da)
+                {
+                    akey = Some(c.to_string());
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let Some(akey) = akey else {
+        return Err("FULL OUTER JOIN needs an ON equality keyed on the left side".into());
+    };
+
+    // The prefixed projection both branches share (UNION ALL is positional).
+    let qual = |t: &str, c: &str| {
+        ast::Expr::CompoundIdentifier(vec![ast::Ident::new(t), ast::Ident::new(c)])
+    };
+    let proj: Vec<ast::SelectItem> = cols_a
+        .iter()
+        .map(|c| (da.as_str(), "a", c))
+        .chain(cols_b.iter().map(|c| (db.as_str(), "b", c)))
+        .map(|(t, s, c)| ast::SelectItem::ExprWithAlias {
+            expr: qual(t, c),
+            alias: ast::Ident::new(format!("__fo_{s}_{c}")),
+        })
+        .collect();
+    let left_join = |lhs: &ast::TableFactor, rhs: &ast::TableFactor| {
+        vec![ast::TableWithJoins {
+            relation: lhs.clone(),
+            joins: vec![ast::Join {
+                relation: rhs.clone(),
+                global: false,
+                join_operator: ast::JoinOperator::LeftOuter(ast::JoinConstraint::On(cond.clone())),
+            }],
+        }]
+    };
+    let mut b1 = select.clone();
+    b1.projection = proj.clone();
+    b1.from = left_join(&twj.relation, &join.relation);
+    b1.selection = None;
+    b1.group_by = ast::GroupByExpr::Expressions(Vec::new(), Vec::new());
+    b1.having = None;
+    b1.distinct = None;
+    let mut b2 = b1.clone();
+    b2.from = left_join(&join.relation, &twj.relation);
+    b2.selection = Some(ast::Expr::IsNull(Box::new(qual(&da, &akey))));
+
+    let mut union_q = query.clone();
+    union_q.with = None;
+    union_q.order_by = None;
+    union_q.limit_clause = None;
+    union_q.body = Box::new(ast::SetExpr::SetOperation {
+        op: ast::SetOperator::Union,
+        set_quantifier: ast::SetQuantifier::All,
+        left: Box::new(ast::SetExpr::Select(Box::new(b1))),
+        right: Box::new(ast::SetExpr::Select(Box::new(b2))),
+    });
+
+    // The enclosing select reads from the wrapper; its side-qualified
+    // references rewrite to the prefixed columns.
+    let mut outer = select.clone();
+    outer.from = vec![ast::TableWithJoins {
+        relation: ast::TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(union_q),
+            alias: Some(ast::TableAlias {
+                name: ast::Ident::new("__fo"),
+                explicit: false,
+                columns: Vec::new(),
+            }),
+            sample: None,
+        },
+        joins: Vec::new(),
+    }];
+    let rw = |e: &mut ast::Expr| rewrite_side_refs(e, &da, &cols_a, &db, &cols_b);
+    for item in &mut outer.projection {
+        match item {
+            ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                rw(e);
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = &mut outer.selection {
+        rw(s);
+    }
+    if let ast::GroupByExpr::Expressions(gs, _) = &mut outer.group_by {
+        for g in gs {
+            rw(g);
+        }
+    }
+    if let Some(h) = &mut outer.having {
+        rw(h);
+    }
+
+    let mut q2 = query.clone();
+    q2.with = None;
+    q2.body = Box::new(ast::SetExpr::Select(Box::new(outer)));
+    if let Some(ob) = &mut q2.order_by
+        && let ast::OrderByKind::Expressions(exprs) = &mut ob.kind
+    {
+        for oe in exprs {
+            rw(&mut oe.expr);
+        }
+    }
+    Ok(Some(q2))
+}
+
+/// Rewrite side-qualified (`a.c` / `b.c`) and unambiguous unqualified
+/// references to the FULL-OUTER wrapper's prefixed columns (see
+/// [`rewrite_full_outer`]).
+fn rewrite_side_refs(e: &mut ast::Expr, da: &str, cols_a: &[String], db: &str, cols_b: &[String]) {
+    let in_side = |cols: &[String], c: &str| cols.iter().any(|x| x.eq_ignore_ascii_case(c));
+    match e {
+        ast::Expr::CompoundIdentifier(ids) => {
+            if let [t, c] = ids.as_slice() {
+                let side = if t.value.eq_ignore_ascii_case(da) && in_side(cols_a, &c.value) {
+                    Some("a")
+                } else if t.value.eq_ignore_ascii_case(db) && in_side(cols_b, &c.value) {
+                    Some("b")
+                } else {
+                    None
+                };
+                if let Some(s) = side {
+                    *e = ast::Expr::Identifier(ast::Ident::new(format!("__fo_{s}_{}", c.value)));
+                }
+            }
+        }
+        ast::Expr::Identifier(id) => {
+            let ina = in_side(cols_a, &id.value);
+            let inb = in_side(cols_b, &id.value);
+            if ina ^ inb {
+                let s = if ina { "a" } else { "b" };
+                *e = ast::Expr::Identifier(ast::Ident::new(format!("__fo_{s}_{}", id.value)));
+            }
+        }
+        ast::Expr::BinaryOp { left, right, .. } => {
+            rewrite_side_refs(left, da, cols_a, db, cols_b);
+            rewrite_side_refs(right, da, cols_a, db, cols_b);
+        }
+        ast::Expr::UnaryOp { expr, .. }
+        | ast::Expr::Nested(expr)
+        | ast::Expr::IsNull(expr)
+        | ast::Expr::IsNotNull(expr)
+        | ast::Expr::Cast { expr, .. } => rewrite_side_refs(expr, da, cols_a, db, cols_b),
+        ast::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                rewrite_side_refs(op, da, cols_a, db, cols_b);
+            }
+            for cw in conditions {
+                rewrite_side_refs(&mut cw.condition, da, cols_a, db, cols_b);
+                rewrite_side_refs(&mut cw.result, da, cols_a, db, cols_b);
+            }
+            if let Some(el) = else_result {
+                rewrite_side_refs(el, da, cols_a, db, cols_b);
+            }
+        }
+        ast::Expr::Function(f) => {
+            if let ast::FunctionArguments::List(list) = &mut f.args {
+                for a in &mut list.args {
+                    if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(x)) = a {
+                        rewrite_side_refs(x, da, cols_a, db, cols_b);
+                    }
+                }
+            }
+        }
+        ast::Expr::InList { expr, list, .. } => {
+            rewrite_side_refs(expr, da, cols_a, db, cols_b);
+            for x in list {
+                rewrite_side_refs(x, da, cols_a, db, cols_b);
+            }
+        }
+        ast::Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_side_refs(expr, da, cols_a, db, cols_b);
+            rewrite_side_refs(low, da, cols_a, db, cols_b);
+            rewrite_side_refs(high, da, cols_a, db, cols_b);
+        }
+        _ => {}
     }
 }
 

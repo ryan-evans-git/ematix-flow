@@ -90,7 +90,7 @@ fn main() {
     // Binds + correct, but exceeds this box's memory on execution — an OOM
     // SIGKILL can't be caught and would kill the whole sweep. Skipped unless
     // named explicitly. q72: catalog_sales ⋈ inventory ON item_sk fan-out.
-    const OOM_SKIP: &[&str] = &["q72"];
+    const OOM_SKIP: &[&str] = &[];
     let qdir = root.join("queries/spark");
     let mut names: Vec<String> = std::fs::read_dir(&qdir)
         .expect("query dir")
