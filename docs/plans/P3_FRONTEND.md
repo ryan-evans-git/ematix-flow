@@ -214,6 +214,23 @@ SQL text
   ROLLUP, EXISTS multi-table FROM, cross-join blocks, general JOIN…ON,
   ambiguous-name scoping.
 
+- **Duplicate-key payload join (2026-07-18, `a38ea0fb`): TPC-DS exec
+  40 → 48.** A payload dim can now hold several rows per join key (a
+  fact-to-fact or grouped-derived join — e.g. q65's per-(store, item)
+  revenue joined to `item` on item_sk alone). The dim map threads the
+  extra rows onto a per-key singly-linked chain (`Shard.chain`, built
+  lazily on the first duplicate payload key a shard sees), and a fan-out
+  child REMATERIALIZES the root view to the expanded length: each live
+  row emits one output row per matching dim row, existing columns
+  gathered by the source root row and this dim's payloads by each output
+  row's own dim row; later children read keys from the view's slot
+  columns so a second fan-out composes. The unique-key fast path
+  (including Q08's 15M-row dims) is byte-for-byte unchanged — Q08 SF-10
+  still 350 ms. Fan-out **below** the root (a multi dim as a grandchild —
+  q17/q25/q29/q91) and LEFT fan-out remain explicit errors: the dim
+  *build* would have to expand too. Gate: `tests/dup_key_payload_join.rs`
+  (125,811 fanned rows, revenue 104159495.71 vs pyarrow).
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
