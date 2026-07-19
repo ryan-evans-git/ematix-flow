@@ -1612,6 +1612,31 @@ impl Executor<'_> {
             })
             .collect();
         let columns: Vec<String> = q.output.iter().map(|o| o.name.clone()).collect();
+        // Window stage: compact the surviving groups into a dense chunk,
+        // append one computed column per window expression (row space
+        // extends to [keys…, aggs…, windows…]), then project.
+        if !q.windows.is_empty() {
+            let mut cols: Vec<Vector> = row_chunk
+                .cols
+                .iter()
+                .map(|c| gather_rows(c, &keep))
+                .collect();
+            let n = keep.len();
+            let base = DataChunk::new(cols.clone());
+            for w in &q.windows {
+                cols.push(compute_window(w, &base, n));
+            }
+            let full = DataChunk::new(cols);
+            let rows = (0..n)
+                .map(|r| {
+                    q.output
+                        .iter()
+                        .map(|o| o.expr.eval_value(&full, r))
+                        .collect()
+                })
+                .collect();
+            return Ok((columns, rows));
+        }
         let rows = keep
             .into_iter()
             .map(|r| {
@@ -1622,6 +1647,142 @@ impl Executor<'_> {
             })
             .collect();
         Ok((columns, rows))
+    }
+}
+
+/// Gather rows `idx` of a column into a new dense vector (typed, validity
+/// preserved).
+fn gather_rows(v: &Vector, idx: &[usize]) -> Vector {
+    let valid = v
+        .validity
+        .as_ref()
+        .map(|m| idx.iter().map(|&r| m[r]).collect::<Vec<bool>>());
+    let out = match v.logical {
+        LogicalType::Float64 => Vector::f64(idx.iter().map(|&r| v.as_f64()[r]).collect()),
+        LogicalType::Utf8 => {
+            let view = v.as_utf8();
+            let mut offsets = Vec::with_capacity(idx.len() + 1);
+            let mut data = Vec::new();
+            offsets.push(0u32);
+            for &r in idx {
+                data.extend_from_slice(view.get(r).as_bytes());
+                offsets.push(data.len() as u32);
+            }
+            Vector::utf8(offsets, data)
+        }
+        LogicalType::Int32 | LogicalType::Date32 => {
+            Vector::i32(idx.iter().map(|&r| v.as_i32()[r]).collect(), v.logical)
+        }
+        LogicalType::Int64 => Vector::i64(idx.iter().map(|&r| v.as_i64()[r]).collect()),
+    };
+    out.with_validity(valid.filter(|m| m.iter().any(|&b| !b)))
+}
+
+/// Evaluate one window expression over the block's result chunk (`n`
+/// rows): partition, optionally order, then aggregate / rank.
+fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -> Vector {
+    use crate::logical::WindowFunc;
+    // Partition → member row indices, in row order (deterministic: the
+    // grouped rows come out of a BTreeMap).
+    let mut parts: BTreeMap<Vec<GroupKey>, Vec<usize>> = BTreeMap::new();
+    for r in 0..n {
+        let key: Vec<GroupKey> = w
+            .partition
+            .iter()
+            .map(|e| GroupKey::from(e.eval_value(chunk, r)))
+            .collect();
+        parts.entry(key).or_default().push(r);
+    }
+    let order_cmp = |a: usize, b: usize| {
+        for (e, desc) in &w.order {
+            let ord = cmp_scalar(&e.eval_value(chunk, a), &e.eval_value(chunk, b));
+            let ord = if *desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    };
+    match w.func {
+        WindowFunc::Agg(af) => {
+            let mut out = vec![0.0f64; n];
+            for rows in parts.values_mut() {
+                if w.order.is_empty() {
+                    // Whole-partition aggregate.
+                    let mut st = AggState::default();
+                    for &r in rows.iter() {
+                        if let Some(v) = w.arg.eval_opt_f64(chunk, r) {
+                            st.update(v);
+                        }
+                    }
+                    let v = st.finalize(af);
+                    for &r in rows.iter() {
+                        out[r] = v;
+                    }
+                } else {
+                    rows.sort_by(|&a, &b| order_cmp(a, b));
+                    let mut st = AggState::default();
+                    if w.rows_frame {
+                        // ROWS …CURRENT ROW: strict running value.
+                        for &r in rows.iter() {
+                            if let Some(v) = w.arg.eval_opt_f64(chunk, r) {
+                                st.update(v);
+                            }
+                            out[r] = st.finalize(af);
+                        }
+                    } else {
+                        // RANGE (the ordered default): peers of the
+                        // current row are included in its frame.
+                        let mut i = 0;
+                        while i < rows.len() {
+                            let mut j = i + 1;
+                            while j < rows.len()
+                                && order_cmp(rows[i], rows[j]) == std::cmp::Ordering::Equal
+                            {
+                                j += 1;
+                            }
+                            for &r in &rows[i..j] {
+                                if let Some(v) = w.arg.eval_opt_f64(chunk, r) {
+                                    st.update(v);
+                                }
+                            }
+                            let v = st.finalize(af);
+                            for &r in &rows[i..j] {
+                                out[r] = v;
+                            }
+                            i = j;
+                        }
+                    }
+                }
+            }
+            Vector::f64(out)
+        }
+        WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::RowNumber => {
+            let mut out = vec![0i64; n];
+            for rows in parts.values_mut() {
+                rows.sort_by(|&a, &b| order_cmp(a, b));
+                let mut dense = 0i64;
+                let mut i = 0;
+                while i < rows.len() {
+                    let mut j = i + 1;
+                    while j < rows.len() && order_cmp(rows[i], rows[j]) == std::cmp::Ordering::Equal
+                    {
+                        j += 1;
+                    }
+                    dense += 1;
+                    for (k, &r) in rows[i..j].iter().enumerate() {
+                        out[r] = match w.func {
+                            WindowFunc::Rank => (i + 1) as i64,
+                            WindowFunc::DenseRank => dense,
+                            WindowFunc::RowNumber => (i + k + 1) as i64,
+                            WindowFunc::Agg(_) => unreachable!(),
+                        };
+                    }
+                    i = j;
+                }
+            }
+            Vector::i64(out)
+        }
     }
 }
 

@@ -127,6 +127,36 @@ pub struct OrderByKey {
     pub desc: bool,
 }
 
+/// A window function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowFunc {
+    /// An aggregate evaluated over the partition (whole-partition when
+    /// unordered, cumulative when ordered).
+    Agg(AggFunc),
+    /// `rank()` — ties share a rank, gaps follow.
+    Rank,
+    /// `dense_rank()` — ties share a rank, no gaps.
+    DenseRank,
+    /// `row_number()`.
+    RowNumber,
+}
+
+/// One window expression, evaluated over the block's POST-GROUPING result
+/// rows (all component expressions are row space).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowExpr {
+    pub func: WindowFunc,
+    /// Aggregate argument (unused for the rank family).
+    pub arg: Expr,
+    pub partition: Vec<Expr>,
+    /// `(key, desc)` ordering within the partition; empty = whole
+    /// partition.
+    pub order: Vec<(Expr, bool)>,
+    /// Explicit `ROWS UNBOUNDED PRECEDING..CURRENT ROW` (strict running);
+    /// `false` = RANGE semantics (peers of the current row included).
+    pub rows_frame: bool,
+}
+
 /// A SQL set operation combining two query blocks' row sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetOp {
@@ -158,6 +188,9 @@ pub struct BoundQuery {
     /// Trailing outputs appended only to serve ORDER BY expressions —
     /// dropped from the final rows after sorting.
     pub hidden_outputs: usize,
+    /// Window expressions — row space extends to `[group keys…, agg
+    /// values…, window values…]` after HAVING.
+    pub windows: Vec<WindowExpr>,
     pub order_by: Vec<OrderByKey>,
     pub limit: Option<usize>,
     /// Uncorrelated subqueries referenced by [`Expr::ScalarSub`] /

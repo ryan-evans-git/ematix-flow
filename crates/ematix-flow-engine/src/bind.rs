@@ -36,7 +36,7 @@ use crate::catalog::{Catalog, TableDef};
 use crate::expr::{BinaryOp, Expr, ScalarValue};
 use crate::logical::{
     AggExpr, AggFunc, BoundQuery, GroupExpr, JoinEdge, OrderByKey, OutputExpr, ScanColumn, SetOp,
-    Slot, TableInput, TableSource,
+    Slot, TableInput, TableSource, WindowExpr, WindowFunc,
 };
 use crate::vector::LogicalType;
 
@@ -121,6 +121,7 @@ fn bind_query(
         subs: Vec::new(),
         derived: Vec::new(),
         views: Vec::new(),
+        windows: Vec::new(),
         extra_edges: Vec::new(),
         pending_conjuncts: Vec::new(),
         left_tables: BTreeSet::new(),
@@ -442,6 +443,24 @@ fn bind_query(
         })
         .collect();
 
+    // Window references were bound against the WINDOW_BASE sentinel (the
+    // agg count wasn't final): remap to their true row-space positions
+    // `[keys…, aggs…, windows…]`.
+    let mut output = output;
+    let mut having = having;
+    if !b.windows.is_empty() {
+        if group.is_empty() && aggs.is_empty() {
+            return Err("window functions without GROUP BY are not yet supported".into());
+        }
+        let base = group.len() + aggs.len();
+        for o in &mut output {
+            remap_window_cols(&mut o.expr, base);
+        }
+        if let Some(h) = &mut having {
+            remap_window_cols(h, base);
+        }
+    }
+
     Ok(BoundQuery {
         tables,
         edges,
@@ -452,12 +471,43 @@ fn bind_query(
         having,
         output,
         hidden_outputs,
+        windows: b.windows,
         order_by,
         limit,
         subqueries: b.subs,
         derived: b.derived,
         set_ops: Vec::new(),
     })
+}
+
+/// Rewrite `Column(WINDOW_BASE + i)` → `Column(base + i)` (see
+/// [`WINDOW_BASE`]).
+fn remap_window_cols(e: &mut Expr, base: usize) {
+    match e {
+        Expr::Column(i) => {
+            if *i >= WINDOW_BASE {
+                *i = base + (*i - WINDOW_BASE);
+            }
+        }
+        Expr::Literal(_) | Expr::ScalarSub(_) => {}
+        Expr::Binary { lhs, rhs, .. } => {
+            remap_window_cols(lhs, base);
+            remap_window_cols(rhs, base);
+        }
+        Expr::ExtractYear(i) => remap_window_cols(i, base),
+        Expr::Like { expr, .. }
+        | Expr::InSub { expr, .. }
+        | Expr::InSet { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Substr { expr, .. } => remap_window_cols(expr, base),
+        Expr::Case { whens, else_ } => {
+            for (c, v) in whens {
+                remap_window_cols(c, base);
+                remap_window_cols(v, base);
+            }
+            remap_window_cols(else_, base);
+        }
+    }
 }
 
 /// Bind a set-operation query (`a UNION ALL b INTERSECT c …`): each side
@@ -665,6 +715,11 @@ impl ViewMap {
 }
 
 /// Per-query binding state.
+/// Sentinel row-space base for window references while binding (the agg
+/// count isn't final until the whole block binds); remapped to
+/// `group.len() + aggs.len() + i` at the end of `bind_query`.
+const WINDOW_BASE: usize = 1 << 20;
+
 struct Binder<'a> {
     catalog: &'a Catalog,
     ctes: &'a CteMap,
@@ -680,6 +735,9 @@ struct Binder<'a> {
     derived: Vec<BoundQuery>,
     /// Inlined derived tables.
     views: Vec<ViewMap>,
+    /// Window expressions bound so far — referenced as
+    /// `Column(WINDOW_BASE + i)` until the final remap.
+    windows: Vec<WindowExpr>,
     /// Join edges created outside the WHERE loop (correlated-scalar
     /// decorrelation), merged into the query's edges.
     extra_edges: Vec<JoinEdge>,
@@ -1081,10 +1139,40 @@ impl Binder<'_> {
             return Err(format!("'{e}' is neither an aggregate nor a GROUP BY key"));
         }
         match e {
-            ast::Expr::Function(_) => {
+            ast::Expr::Function(f) => {
+                if f.over.is_some() {
+                    return self.bind_window(f, group, aggs);
+                }
+                if let Some(rewritten) = rewrite_scalar_fn(f)? {
+                    return self.bind_output(&rewritten, group, aggs);
+                }
                 let agg = self.bind_aggregate(e)?;
                 aggs.push(agg);
                 Ok(Expr::Column(group.len() + aggs.len() - 1))
+            }
+            ast::Expr::Case {
+                operand: None,
+                conditions,
+                else_result,
+                ..
+            } => {
+                let whens = conditions
+                    .iter()
+                    .map(|cw| {
+                        Ok((
+                            self.bind_output(&cw.condition, group, aggs)?,
+                            self.bind_output(&cw.result, group, aggs)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let else_ = match else_result {
+                    Some(e2) => self.bind_output(e2, group, aggs)?,
+                    None => Expr::Literal(ScalarValue::Null),
+                };
+                Ok(Expr::Case {
+                    whens,
+                    else_: Box::new(else_),
+                })
             }
             ast::Expr::Nested(inner) => self.bind_output(inner, group, aggs),
             ast::Expr::Subquery(_) => Ok(materialize(self.bind(e)?)),
@@ -1382,6 +1470,7 @@ impl Binder<'_> {
             subs: Vec::new(),
             derived: Vec::new(),
             views: Vec::new(),
+            windows: Vec::new(),
             extra_edges: Vec::new(),
             pending_conjuncts: Vec::new(),
             left_tables: BTreeSet::new(),
@@ -1415,6 +1504,7 @@ impl Binder<'_> {
             order_by: Vec::new(),
             limit: None,
             subqueries: inner.subs,
+            windows: Vec::new(),
             set_ops: Vec::new(),
             derived: inner.derived,
         };
@@ -1464,6 +1554,7 @@ impl Binder<'_> {
             subs: Vec::new(),
             derived: Vec::new(),
             views: Vec::new(),
+            windows: Vec::new(),
             extra_edges: Vec::new(),
             pending_conjuncts: Vec::new(),
             left_tables: BTreeSet::new(),
@@ -1522,6 +1613,7 @@ impl Binder<'_> {
             order_by: Vec::new(),
             limit: None,
             subqueries: inner.subs,
+            windows: Vec::new(),
             set_ops: Vec::new(),
             derived: inner.derived,
         };
@@ -1597,6 +1689,87 @@ impl Binder<'_> {
             )
         };
         Ok(Bound::Expr(pred))
+    }
+
+    /// Bind a window call `fn(...) OVER (PARTITION BY … [ORDER BY …]
+    /// [frame])` — all components in row space; the value is referenced
+    /// as `Column(WINDOW_BASE + i)` until the block-level remap.
+    fn bind_window(
+        &mut self,
+        f: &ast::Function,
+        group: &[GroupExpr],
+        aggs: &mut Vec<AggExpr>,
+    ) -> Result<Expr, String> {
+        let Some(ast::WindowType::WindowSpec(spec)) = f.over.as_ref() else {
+            return Err("named WINDOW references are not yet supported".into());
+        };
+        let fname = f.name.to_string().to_lowercase();
+        let (func, arg) = match fname.as_str() {
+            "rank" => (WindowFunc::Rank, Expr::Literal(ScalarValue::Int64(0))),
+            "dense_rank" => (WindowFunc::DenseRank, Expr::Literal(ScalarValue::Int64(0))),
+            "row_number" => (WindowFunc::RowNumber, Expr::Literal(ScalarValue::Int64(0))),
+            name => {
+                let af = match name {
+                    "sum" => AggFunc::Sum,
+                    "avg" => AggFunc::Avg,
+                    "min" => AggFunc::Min,
+                    "max" => AggFunc::Max,
+                    "count" => AggFunc::Count,
+                    "stddev_samp" => AggFunc::StddevSamp,
+                    other => return Err(format!("unsupported window function '{other}'")),
+                };
+                let ast::FunctionArguments::List(args) = &f.args else {
+                    return Err(format!("window '{name}' needs an argument list"));
+                };
+                let arg = match args.args.as_slice() {
+                    [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)] => {
+                        Expr::Literal(ScalarValue::Int64(1))
+                    }
+                    [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(a))] => {
+                        // Row space — the argument may itself extract an
+                        // aggregate (`sum(sum(x)) OVER …`).
+                        self.bind_output(a, group, aggs)?
+                    }
+                    _ => return Err(format!("window '{name}' takes exactly one argument")),
+                };
+                (WindowFunc::Agg(af), arg)
+            }
+        };
+        let partition = spec
+            .partition_by
+            .iter()
+            .map(|e| self.bind_output(e, group, aggs))
+            .collect::<Result<Vec<_>, _>>()?;
+        let order = spec
+            .order_by
+            .iter()
+            .map(|oe| {
+                Ok((
+                    self.bind_output(&oe.expr, group, aggs)?,
+                    oe.options.asc == Some(false),
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let rows_frame = match &spec.window_frame {
+            None => false,
+            Some(fr) => {
+                use ast::WindowFrameBound as B;
+                let start_ok = matches!(fr.start_bound, B::Preceding(None));
+                let end_ok = matches!(fr.end_bound, None | Some(B::CurrentRow));
+                if !start_ok || !end_ok {
+                    return Err(format!("unsupported window frame: {fr:?}"));
+                }
+                matches!(fr.units, ast::WindowFrameUnits::Rows)
+            }
+        };
+        self.windows.push(WindowExpr {
+            func,
+            arg,
+            partition,
+            order,
+            rows_frame,
+        });
+        Ok(Expr::Column(WINDOW_BASE + self.windows.len() - 1))
     }
 
     /// Bind an aggregate call: `sum/count/min/max/avg(<expr>)` or
@@ -1746,9 +1919,11 @@ impl Binder<'_> {
                 if operand.is_some() {
                     return Err("CASE <operand> WHEN … is not yet supported".into());
                 }
-                let else_ = else_result
-                    .as_ref()
-                    .ok_or("CASE requires an ELSE branch (no NULLs yet)")?;
+                let null_else = ast::Expr::Value(ast::Value::Null.into());
+                let else_: &ast::Expr = match else_result {
+                    Some(e2) => e2,
+                    None => &null_else,
+                };
                 let whens = conditions
                     .iter()
                     .map(|cw| {
@@ -1936,7 +2111,10 @@ impl Binder<'_> {
                     negated: *negated,
                 }))
             }
-            ast::Expr::Function(_) => {
+            ast::Expr::Function(f) => {
+                if let Some(rewritten) = rewrite_scalar_fn(f)? {
+                    return self.bind(&rewritten);
+                }
                 Err("aggregate calls are only allowed in the SELECT list (so far)".into())
             }
             other => Err(format!("unsupported expression: {other}")),
@@ -1994,12 +2172,19 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
         Expr::Column(i) => {
             if *i < key_tys.len() {
                 key_tys[*i]
-            } else {
+            } else if *i < key_tys.len() + q.aggs.len() {
                 match q.aggs[*i - key_tys.len()].func {
                     AggFunc::Count | AggFunc::CountDistinct | AggFunc::CountMatched(_) => {
                         LogicalType::Int64
                     }
                     _ => LogicalType::Float64,
+                }
+            } else {
+                match q.windows[*i - key_tys.len() - q.aggs.len()].func {
+                    WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::RowNumber => {
+                        LogicalType::Int64
+                    }
+                    WindowFunc::Agg(_) => LogicalType::Float64,
                 }
             }
         }
@@ -2243,6 +2428,79 @@ fn bind_op(op: &ast::BinaryOperator) -> Result<BinaryOp, String> {
 }
 
 /// Bind a typed string literal — today only `date '<YYYY-MM-DD>'` → `Date32`.
+/// Rewrite a scalar function call into core AST forms (`Ok(None)` = not
+/// a known scalar function — the caller treats it as an aggregate):
+/// `abs(x)` → CASE, `coalesce(a, b, …)` → nested CASE over IS NOT NULL,
+/// `nullif(a, b)` → CASE.
+fn rewrite_scalar_fn(f: &ast::Function) -> Result<Option<ast::Expr>, String> {
+    let fname = f.name.to_string().to_lowercase();
+    if !matches!(fname.as_str(), "abs" | "coalesce" | "nullif") {
+        return Ok(None);
+    }
+    let ast::FunctionArguments::List(list) = &f.args else {
+        return Err(format!("'{fname}' needs an argument list"));
+    };
+    let mut args: Vec<&ast::Expr> = Vec::new();
+    for a in &list.args {
+        match a {
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => args.push(e),
+            other => return Err(format!("unsupported argument in '{fname}': {other}")),
+        }
+    }
+    let case =
+        |conditions: Vec<ast::CaseWhen>, else_result: Option<Box<ast::Expr>>| ast::Expr::Case {
+            case_token: ast::helpers::attached_token::AttachedToken::empty(),
+            end_token: ast::helpers::attached_token::AttachedToken::empty(),
+            operand: None,
+            conditions,
+            else_result,
+        };
+    let zero = || ast::Expr::value(ast::Value::Number("0".into(), false));
+    Ok(Some(match (fname.as_str(), args.as_slice()) {
+        ("abs", [x]) => case(
+            vec![ast::CaseWhen {
+                condition: ast::Expr::BinaryOp {
+                    left: Box::new((*x).clone()),
+                    op: ast::BinaryOperator::GtEq,
+                    right: Box::new(zero()),
+                },
+                result: (*x).clone(),
+            }],
+            Some(Box::new(ast::Expr::BinaryOp {
+                left: Box::new(zero()),
+                op: ast::BinaryOperator::Minus,
+                right: Box::new((*x).clone()),
+            })),
+        ),
+        ("nullif", [a, b]) => case(
+            vec![ast::CaseWhen {
+                condition: ast::Expr::BinaryOp {
+                    left: Box::new((*a).clone()),
+                    op: ast::BinaryOperator::Eq,
+                    right: Box::new((*b).clone()),
+                },
+                result: ast::Expr::Value(ast::Value::Null.into()),
+            }],
+            Some(Box::new((*a).clone())),
+        ),
+        ("coalesce", args) if !args.is_empty() => {
+            let last = (*args.last().expect("nonempty")).clone();
+            let conditions = args[..args.len() - 1]
+                .iter()
+                .map(|a| ast::CaseWhen {
+                    condition: ast::Expr::IsNotNull(Box::new((*a).clone())),
+                    result: (*a).clone(),
+                })
+                .collect::<Vec<_>>();
+            if conditions.is_empty() {
+                return Ok(Some(last));
+            }
+            case(conditions, Some(Box::new(last)))
+        }
+        _ => return Err(format!("'{fname}' called with {} arguments", args.len())),
+    }))
+}
+
 fn bind_typed_string(ts: &ast::TypedString) -> Result<Expr, String> {
     match &ts.data_type {
         ast::DataType::Date => {
