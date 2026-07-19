@@ -190,6 +190,30 @@ SQL text
   decode (bounded decode-ahead queue) — an architecture change, not a
   local optimization.**
 
+- **TPC-DS breadth campaign begun (2026-07-18, commits `680b4d99` →
+  `223a5a5a` → `c00a5a6e` → string-keys): 0 → 40/103 canonical Spark
+  TPC-DS queries EXECUTE engine-native at sf1** (57/103 bind). The
+  harness (`examples/tpcds_coverage.rs`) registers the 24-table catalog
+  from parquet footers and prints a failure taxonomy per run; single-query
+  debug mode `[qNN]`. Substrate added: `Catalog::register_parquet`
+  (schema/decimals/nullability from the footer), INT-backed DECIMAL
+  decode (scaled f64), definition-level validity decode, NULL semantics
+  (3VL-lite predicates, null-skipping aggregates, null join keys never
+  match, NULL group keys, payload validity end-to-end — LEFT misses now
+  attach NULL), set operations (UNION [ALL]/INTERSECT/EXCEPT), window
+  functions (partition aggregates, cumulative ROWS/RANGE frames,
+  rank/dense_rank/row_number) post-HAVING in an extended row space,
+  string join keys via a per-run interner, string IN-sets, CAST folding,
+  ORDER-BY-expression hidden outputs, SELECT * expansion, scalar
+  abs/coalesce/nullif rewrites, stddev_samp, CASE-operand desugar, NULL
+  literal, IS [NOT] NULL. Correctness gates: `tests/tpcds_decode.rs`
+  (pyarrow oracles: decimal sums with 130k NULLs, per-year join sums
+  dropping 129,850 NULL date keys). Remaining top gaps: duplicate-key
+  payload joins (fact-to-fact; needs chained payload rows + compaction
+  at the join), LEFT-ON extra conditions, correlated-scalar over CTEs,
+  ROLLUP, EXISTS multi-table FROM, cross-join blocks, general JOIN…ON,
+  ambiguous-name scoping.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
