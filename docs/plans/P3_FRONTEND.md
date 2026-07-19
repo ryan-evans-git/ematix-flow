@@ -268,7 +268,7 @@ SQL text
   Both desugars now coerce their bounds / elements. Regression in
   `tests/sql_null_semantics.rs`.
 
-- **`SELECT DISTINCT` (2026-07-19, `<pending>`): a correctness fix, not a
+- **`SELECT DISTINCT` (2026-07-19, `815d39ea`): a correctness fix, not a
   coverage bump — exec holds 56/103, parity 56/56.** DISTINCT was silently
   dropped: a plain-row DISTINCT emitted one output row per joined row
   (duplicates and all), wrong-but-hidden only because the queries that use
