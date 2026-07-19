@@ -285,6 +285,25 @@ SQL text
   exec count is unchanged. Regression `tests/sql_distinct.rs` (3 paths:
   fold-into-group, flag-dedup over explicit GROUP BY, DISTINCT+ORDER+LIMIT).
 
+- **Two-key LEFT-JOIN ON (2026-07-19, `2943daf8`): TPC-DS exec
+  56 → 57, all 57 parity-match DuckDB.** The TPC-DS outer-join shape
+  `LEFT OUTER JOIN cr ON (cs.k1 = cr.k1 AND cs.k2 = cr.k2)` (q5/q40/q49/
+  q72/q80) parses the whole ON as **one parenthesized `Nested(a AND b)`
+  node**, and `split_and` didn't descend through parens — so the two
+  equijoins never split into edges; the whole thing hit the non-equi
+  branch and errored as "ON condition on a LEFT JOIN's preserved side."
+  `split_and` now unwraps `Nested` (as `ident_parts` already did), so the
+  conjunction splits into two edges the planner merges into one
+  **composite-key** dim (the `links` path already existed). One-line
+  binder fix, no executor change. q40 now executes + parity-matches
+  (its `coalesce(cr_refunded_cash, 0)` exercises composite-key + LEFT
+  NULL-fill together). The other four stay gated by unrelated features
+  (unsupported agg fn q5/q80; agg in ORDER BY q49; interval-on-column
+  q72) — this was the join-shape fix, not those. Regression
+  `tests/sql_left_join_composite_key.rs`: both keys discriminate
+  (144,067 two-key vs 1,458,686 one-key inner), and the LEFT join
+  preserves every driving row (1,441,548 == catalog_sales alone).
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
