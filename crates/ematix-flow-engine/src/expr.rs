@@ -584,8 +584,352 @@ fn year_of_days(days: i32) -> i32 {
 /// Narrow `chunk`'s current selection to the rows satisfying boolean
 /// predicate `pred`. No-materialization: columns are never compacted — this
 /// is the general-expression form of [`crate::pipeline::filter`].
+///
+/// COLUMN-AT-A-TIME fast path: the common predicate algebra (And/Or,
+/// comparisons against literals and columns, IS NULL, IN sets, LIKE)
+/// evaluates as typed whole-column boolean masks — tight monomorphized
+/// loops — instead of walking the recursive [`Val`] interpreter per row
+/// (q28 sf10: per-row eval was 20× the next-hottest symbol). Unsupported
+/// subtrees fall back to per-row evaluation, restricted to the rows the
+/// surrounding mask still leaves live. Masks encode SQL three-valued
+/// logic as NULL→false, which composes exactly through And/Or (there is
+/// no NOT node — negation lives in per-leaf flags, handled per leaf).
+/// Skipped when the live selection is sparse (whole-column loops would
+/// out-cost the survivors).
 pub fn filter_expr(chunk: &DataChunk, pred: &Expr) -> Selection {
+    let n = chunk.n_rows();
+    if chunk.sel.len() * 4 >= n
+        && let Some(mask) = try_mask(chunk, pred, n)
+    {
+        return filter(chunk, |i| mask[i]);
+    }
     filter(chunk, |i| pred.eval_bool(chunk, i))
+}
+
+/// Build the boolean mask for `e` over rows `0..n`, or `None` if some
+/// part of the subtree has no columnar kernel (the caller decides where
+/// to fall back — a maskable sibling under And/Or still pays off).
+fn try_mask(chunk: &DataChunk, e: &Expr, n: usize) -> Option<Vec<bool>> {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            lhs,
+            rhs,
+        } => match (try_mask(chunk, lhs, n), try_mask(chunk, rhs, n)) {
+            (Some(mut a), Some(b)) => {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    *x &= y;
+                }
+                Some(a)
+            }
+            // Hybrid: the unmaskable side evaluates per row, but only
+            // where the masked side already passed.
+            (Some(mut a), None) => {
+                for (i, x) in a.iter_mut().enumerate() {
+                    if *x {
+                        *x = rhs.eval_bool(chunk, i);
+                    }
+                }
+                Some(a)
+            }
+            (None, Some(mut b)) => {
+                for (i, x) in b.iter_mut().enumerate() {
+                    if *x {
+                        *x = lhs.eval_bool(chunk, i);
+                    }
+                }
+                Some(b)
+            }
+            (None, None) => None,
+        },
+        Expr::Binary {
+            op: BinaryOp::Or,
+            lhs,
+            rhs,
+        } => match (try_mask(chunk, lhs, n), try_mask(chunk, rhs, n)) {
+            (Some(mut a), Some(b)) => {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    *x |= y;
+                }
+                Some(a)
+            }
+            (Some(mut a), None) => {
+                for (i, x) in a.iter_mut().enumerate() {
+                    if !*x {
+                        *x = rhs.eval_bool(chunk, i);
+                    }
+                }
+                Some(a)
+            }
+            (None, Some(mut b)) => {
+                for (i, x) in b.iter_mut().enumerate() {
+                    if !*x {
+                        *x = lhs.eval_bool(chunk, i);
+                    }
+                }
+                Some(b)
+            }
+            (None, None) => None,
+        },
+        Expr::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) =>
+        {
+            cmp_mask(chunk, *op, lhs, rhs, n)
+        }
+        Expr::IsNull { expr, negated } => {
+            let Expr::Column(c) = expr.as_ref() else {
+                return None;
+            };
+            let v = chunk.col(*c);
+            if v.len() != n {
+                return None;
+            }
+            Some(match &v.validity {
+                Some(m) => m.iter().map(|&ok| ok == *negated).collect(),
+                None => vec![*negated; n],
+            })
+        }
+        Expr::InSet { expr, set, negated } => {
+            let Expr::Column(c) = expr.as_ref() else {
+                return None;
+            };
+            let v = chunk.col(*c);
+            if v.len() != n {
+                return None;
+            }
+            let get = IntGet::of(v)?;
+            let (set, neg) = (set.as_ref(), *negated);
+            Some(mask_valid(v.validity.as_deref(), n, |i| {
+                set.contains(&get.at(i)) != neg
+            }))
+        }
+        Expr::InSetStr { expr, set, negated } => {
+            let Expr::Column(c) = expr.as_ref() else {
+                return None;
+            };
+            let v = chunk.col(*c);
+            if v.len() != n || v.logical != LogicalType::Utf8 {
+                return None;
+            }
+            let view = v.as_utf8();
+            let (set, neg) = (set.as_ref(), *negated);
+            Some(mask_valid(v.validity.as_deref(), n, |i| {
+                set.contains(view.get(i)) != neg
+            }))
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let Expr::Column(c) = expr.as_ref() else {
+                return None;
+            };
+            let v = chunk.col(*c);
+            if v.len() != n || v.logical != LogicalType::Utf8 {
+                return None;
+            }
+            let view = v.as_utf8();
+            let (pat, neg) = (pattern.as_bytes(), *negated);
+            Some(mask_valid(v.validity.as_deref(), n, |i| {
+                like_match(view.get(i).as_bytes(), pat) != neg
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// `f(i)` gated by validity: an invalid (NULL) row is `false` (a NULL
+/// operand makes every leaf here UNKNOWN → not-satisfied, matching the
+/// interpreter's `Val::Null` handling — including the negated forms,
+/// where the interpreter also yields `Val::Null` before negation applies).
+#[inline]
+fn mask_valid(valid: Option<&[bool]>, n: usize, f: impl Fn(usize) -> bool) -> Vec<bool> {
+    match valid {
+        None => (0..n).map(f).collect(),
+        Some(m) => (0..n).map(|i| m[i] && f(i)).collect(),
+    }
+}
+
+/// Typed access to an integer-family column as `i64` (the interpreter's
+/// promotion rule).
+#[derive(Clone, Copy)]
+enum IntGet<'a> {
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+}
+
+impl<'a> IntGet<'a> {
+    fn of(v: &'a crate::vector::Vector) -> Option<Self> {
+        match v.logical {
+            LogicalType::Int32 | LogicalType::Date32 => Some(IntGet::I32(v.as_i32())),
+            LogicalType::Int64 => Some(IntGet::I64(v.as_i64())),
+            _ => None,
+        }
+    }
+    #[inline]
+    fn at(self, i: usize) -> i64 {
+        match self {
+            IntGet::I32(s) => s[i] as i64,
+            IntGet::I64(s) => s[i],
+        }
+    }
+}
+
+/// Typed access to any numeric column as `f64` (the promotion target when
+/// a float is involved).
+#[derive(Clone, Copy)]
+enum NumGet<'a> {
+    F64(&'a [f64]),
+    Int(IntGet<'a>),
+}
+
+impl<'a> NumGet<'a> {
+    fn of(v: &'a crate::vector::Vector) -> Option<Self> {
+        match v.logical {
+            LogicalType::Float64 => Some(NumGet::F64(v.as_f64())),
+            _ => IntGet::of(v).map(NumGet::Int),
+        }
+    }
+    #[inline]
+    fn at(self, i: usize) -> f64 {
+        match self {
+            NumGet::F64(s) => s[i],
+            NumGet::Int(g) => g.at(i) as f64,
+        }
+    }
+}
+
+/// Comparison-op test over an `Ordering`, monomorphized per op so each
+/// mask loop is a tight closure (`None` = unordered float compare —
+/// matches nothing, like the interpreter).
+#[inline]
+fn ord_mask(
+    op: BinaryOp,
+    valid: Option<&[bool]>,
+    n: usize,
+    f: impl Fn(usize) -> Option<std::cmp::Ordering> + Copy,
+) -> Vec<bool> {
+    use std::cmp::Ordering::*;
+    match op {
+        BinaryOp::Eq => mask_valid(valid, n, |i| f(i) == Some(Equal)),
+        BinaryOp::NotEq => mask_valid(valid, n, |i| f(i).is_some_and(|o| o != Equal)),
+        BinaryOp::Lt => mask_valid(valid, n, |i| f(i) == Some(Less)),
+        BinaryOp::LtEq => mask_valid(valid, n, |i| f(i).is_some_and(|o| o != Greater)),
+        BinaryOp::Gt => mask_valid(valid, n, |i| f(i) == Some(Greater)),
+        BinaryOp::GtEq => mask_valid(valid, n, |i| f(i).is_some_and(|o| o != Less)),
+        _ => unreachable!("non-comparison op in ord_mask"),
+    }
+}
+
+/// Flip a comparison for `literal op column` → `column op' literal`.
+fn flip_cmp(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
+}
+
+/// Columnar kernel for a comparison node: column-vs-literal (either
+/// side) and column-vs-column, with the interpreter's exact promotion
+/// rules — int/int exact in `i64`, strings byte-ordered, any float
+/// involvement compares in `f64` via `partial_cmp`.
+fn cmp_mask(
+    chunk: &DataChunk,
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    n: usize,
+) -> Option<Vec<bool>> {
+    let (c, lit, op) = match (lhs, rhs) {
+        (Expr::Column(c), Expr::Literal(v)) => (*c, v, op),
+        (Expr::Literal(v), Expr::Column(c)) => (*c, v, flip_cmp(op)),
+        (Expr::Column(a), Expr::Column(b)) => return cmp_cols_mask(chunk, op, *a, *b, n),
+        _ => return None,
+    };
+    let v = chunk.col(c);
+    if v.len() != n {
+        return None;
+    }
+    let valid = v.validity.as_deref();
+    let int_lit = match lit {
+        ScalarValue::Int64(x) => Some(*x),
+        ScalarValue::Int32(x) => Some(*x as i64),
+        ScalarValue::Date32(x) => Some(*x as i64),
+        _ => None,
+    };
+    match (v.logical, lit) {
+        (LogicalType::Utf8, ScalarValue::Utf8(b)) => {
+            let view = v.as_utf8();
+            let b: &str = b;
+            Some(ord_mask(op, valid, n, |i| Some(view.get(i).cmp(b))))
+        }
+        (LogicalType::Float64, _) => {
+            let b = match lit {
+                ScalarValue::Float64(x) => *x,
+                _ => int_lit? as f64,
+            };
+            let s = v.as_f64();
+            Some(ord_mask(op, valid, n, |i| s[i].partial_cmp(&b)))
+        }
+        (_, ScalarValue::Float64(b)) => {
+            let g = IntGet::of(v)?;
+            let b = *b;
+            Some(ord_mask(op, valid, n, |i| (g.at(i) as f64).partial_cmp(&b)))
+        }
+        _ => {
+            let g = IntGet::of(v)?;
+            let b = int_lit?;
+            Some(ord_mask(op, valid, n, |i| Some(g.at(i).cmp(&b))))
+        }
+    }
+}
+
+/// Column-vs-column comparison mask. A NULL on either side is UNKNOWN →
+/// false, so the two validity masks AND together.
+fn cmp_cols_mask(
+    chunk: &DataChunk,
+    op: BinaryOp,
+    a: usize,
+    b: usize,
+    n: usize,
+) -> Option<Vec<bool>> {
+    let (va, vb) = (chunk.col(a), chunk.col(b));
+    if va.len() != n || vb.len() != n {
+        return None;
+    }
+    let combined: Option<Vec<bool>> = match (&va.validity, &vb.validity) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m.to_vec()),
+        (Some(x), Some(y)) => Some(x.iter().zip(y.iter()).map(|(&p, &q)| p && q).collect()),
+    };
+    let valid = combined.as_deref();
+    match (va.logical, vb.logical) {
+        (LogicalType::Utf8, LogicalType::Utf8) => {
+            let (x, y) = (va.as_utf8(), vb.as_utf8());
+            Some(ord_mask(op, valid, n, |i| Some(x.get(i).cmp(y.get(i)))))
+        }
+        (LogicalType::Utf8, _) | (_, LogicalType::Utf8) => None,
+        (LogicalType::Float64, _) | (_, LogicalType::Float64) => {
+            let (x, y) = (NumGet::of(va)?, NumGet::of(vb)?);
+            Some(ord_mask(op, valid, n, |i| x.at(i).partial_cmp(&y.at(i))))
+        }
+        _ => {
+            let (x, y) = (IntGet::of(va)?, IntGet::of(vb)?);
+            Some(ord_mask(op, valid, n, |i| Some(x.at(i).cmp(&y.at(i)))))
+        }
+    }
 }
 
 /// Sum a numeric expression `arg` over the live rows of `sel`, as `f64` — the
