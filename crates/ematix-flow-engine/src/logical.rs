@@ -216,7 +216,7 @@ pub struct BoundQuery {
     pub subqueries: Vec<BoundQuery>,
     /// Materialized derived queries (CTEs, aggregate FROM-subqueries,
     /// decorrelated scalars) referenced by [`TableSource::Derived`].
-    pub derived: Vec<BoundQuery>,
+    pub derived: Vec<std::sync::Arc<BoundQuery>>,
     /// Further blocks combined into this one's rows, in order (`a UNION
     /// ALL b INTERSECT c` = left-deep). This block's ORDER BY / LIMIT
     /// apply to the COMBINED rows.

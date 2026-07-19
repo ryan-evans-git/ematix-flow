@@ -499,6 +499,15 @@ window-over-derived is the q49 prerequisite.
   guards added; `tests/sql_exists_neq_nulls.rs` pins both counts against
   an independent python row-walk oracle.
 
+- **CTE-sharing perf (2026-07-19, `e4e83c4a`): q4 sf10 62s→13s.** CTE
+  references share one `Arc<BoundQuery>`; a per-execute `DerivedMemo`
+  (pointer-keyed) materializes each shared CTE once (q4 ran `year_total`
+  6×; measured via `EMAT_TRACE_DERIVED`). Only `strong_count > 1` Arcs
+  memoize — caching single-reference deriveds would pin their row
+  vectors for nothing. q11/q14ab/q51 dropped under 10s; q23ab 50→23s;
+  q39ab 24→12s. Both parity gates + suite re-run green. Remaining heavy
+  sf10 shapes (different bottlenecks): q78 48s, q67 36s, q23ab 23s.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead

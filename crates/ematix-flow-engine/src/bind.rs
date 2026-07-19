@@ -61,7 +61,14 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<BoundQuery, String> {
 /// (name, type), defining AST). CTE references materialize as derived
 /// tables; the AST enables the scalar-aggregate cross-join view rewrite
 /// (q77's `FROM cs, cr` with a 1-row cr).
-type CteMap = HashMap<String, (BoundQuery, Vec<(String, LogicalType)>, ast::Query)>;
+type CteMap = HashMap<
+    String,
+    (
+        std::sync::Arc<BoundQuery>,
+        Vec<(String, LogicalType)>,
+        ast::Query,
+    ),
+>;
 
 fn bind_query(
     query: &ast::Query,
@@ -97,7 +104,7 @@ fn bind_query(
             ctes.insert(
                 cte.alias.name.value.clone(),
                 (
-                    bq,
+                    std::sync::Arc::new(bq),
                     names.into_iter().zip(tys).collect(),
                     cte.query.as_ref().clone(),
                 ),
@@ -915,7 +922,7 @@ struct Binder<'a> {
     /// Subqueries bound so far (referenced by `Expr::ScalarSub` / `InSub`).
     subs: Vec<BoundQuery>,
     /// Materialized derived queries (`TableSource::Derived` indices).
-    derived: Vec<BoundQuery>,
+    derived: Vec<std::sync::Arc<BoundQuery>>,
     /// Inlined derived tables.
     views: Vec<ViewMap>,
     /// Window expressions bound so far — referenced as
@@ -1119,7 +1126,7 @@ impl Binder<'_> {
                         ));
                     }
                     let idx = self.derived.len();
-                    self.derived.push(bq);
+                    self.derived.push(std::sync::Arc::new(bq));
                     let def = TableDef {
                         path: PathBuf::new(),
                         columns: names
@@ -1836,7 +1843,7 @@ impl Binder<'_> {
         let bq = bind_query(&q2, self.catalog, false, self.ctes)?;
         let tys = output_types(&bq);
         let idx = self.derived.len();
-        self.derived.push(bq);
+        self.derived.push(std::sync::Arc::new(bq));
         let display = format!("__corr{idx}");
         let mut columns: Vec<crate::catalog::ColumnDef> = corr
             .iter()
@@ -2288,7 +2295,7 @@ impl Binder<'_> {
             derived: inner.derived,
         };
         let idx = self.derived.len();
-        self.derived.push(bq);
+        self.derived.push(std::sync::Arc::new(bq));
         let dname = format!("__ex{idx}");
         let ddef = TableDef {
             path: PathBuf::new(),

@@ -48,6 +48,10 @@ pub struct QueryResult {
 /// (recursively), then substitute into the outer query as constants /
 /// membership sets before the main pipeline runs.
 pub fn execute(q: &BoundQuery) -> Result<QueryResult, String> {
+    execute_with(q, &DerivedMemo::default())
+}
+
+fn execute_with(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, String> {
     // Worker count: EMAT_ENGINE_THREADS overrides; default = all cores.
     // Results are BIT-IDENTICAL at any thread count — each row group's
     // partial is computed independently and partials merge in row-group
@@ -61,22 +65,24 @@ pub fn execute(q: &BoundQuery) -> Result<QueryResult, String> {
                 .unwrap_or(1)
         });
     if !q.set_ops.is_empty() {
-        return execute_set(q);
+        return execute_set(q, memo);
     }
     if q.subqueries.is_empty() {
         return Executor {
             q,
             nthreads,
             interner: StrInterner::default(),
+            memo,
         }
         .run();
     }
     let mut q2 = q.clone();
-    resolve_subqueries(&mut q2)?;
+    resolve_subqueries(&mut q2, memo)?;
     Executor {
         q: &q2,
         nthreads,
         interner: StrInterner::default(),
+        memo,
     }
     .run()
 }
@@ -84,7 +90,7 @@ pub fn execute(q: &BoundQuery) -> Result<QueryResult, String> {
 /// Execute a set-operation query: run the base block (its ORDER BY /
 /// LIMIT withheld), fold each side's rows in with the set semantics, then
 /// order and limit the COMBINED rows.
-fn execute_set(q: &BoundQuery) -> Result<QueryResult, String> {
+fn execute_set(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, String> {
     use crate::logical::SetOp;
     let mut base = q.clone();
     let set_ops = std::mem::take(&mut base.set_ops);
@@ -104,9 +110,9 @@ fn execute_set(q: &BoundQuery) -> Result<QueryResult, String> {
         rows
     };
 
-    let mut r = execute(&base)?;
+    let mut r = execute_with(&base, memo)?;
     for (op, side) in &set_ops {
-        let rs = execute(side)?;
+        let rs = execute_with(side, memo)?;
         r.rows = match op {
             SetOp::UnionAll => {
                 let mut rows = r.rows;
@@ -144,7 +150,7 @@ fn execute_set(q: &BoundQuery) -> Result<QueryResult, String> {
 /// Execute every subquery and substitute its result into the outer query's
 /// expressions: `ScalarSub(i)` → the computed literal, `InSub(i)` → a
 /// materialized [`Expr::InSet`].
-fn resolve_subqueries(q: &mut BoundQuery) -> Result<(), String> {
+fn resolve_subqueries(q: &mut BoundQuery, memo: &DerivedMemo) -> Result<(), String> {
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -166,7 +172,7 @@ fn resolve_subqueries(q: &mut BoundQuery) -> Result<(), String> {
         if !want_scalar[i] && !want_set[i] {
             continue;
         }
-        let r = execute(sub)?; // recursion handles subs-of-subs
+        let r = execute_with(sub, memo)?; // recursion handles subs-of-subs
         if want_scalar[i] {
             let [row] = r.rows.as_slice() else {
                 return Err(format!(
@@ -364,7 +370,18 @@ struct Executor<'q> {
     /// per-lookup lock is fine: string-keyed joins are dim-sized in
     /// practice (fact-side hot keys stay integer, lock untouched).
     interner: StrInterner,
+    /// The top-level call's derived-result memo (see [`DerivedMemo`]).
+    memo: &'q DerivedMemo,
 }
+
+/// One top-level `execute` call's derived-query memo, keyed by the
+/// `Arc<BoundQuery>` POINTER: every reference to a CTE shares one Arc (the
+/// CteMap clones it per reference), so a CTE referenced N times — q4's six
+/// `year_total` aliases, q23's cross-branch CTEs — materializes ONCE and
+/// the other N−1 references reuse the rows. Non-CTE deriveds are unique
+/// Arcs and simply miss. Dropped with the call, so no cross-query reuse.
+#[derive(Default)]
+struct DerivedMemo(Mutex<HashMap<usize, std::sync::Arc<QueryResult>>>);
 
 /// One run's string-key interner (equal strings ⇒ equal ids).
 #[derive(Default)]
@@ -1644,7 +1661,46 @@ impl Executor<'_> {
         let ti = &q.tables[t];
         Ok(match &ti.source {
             TableSource::Derived(i) => {
-                let r = execute(&q.derived[*i])?;
+                // Memoized by Arc pointer: every reference to one CTE shares
+                // an Arc, so it materializes once per top-level execute. A
+                // derived referenced only ONCE (strong_count 1 — its Arc
+                // lives nowhere else) skips the memo entirely: caching it
+                // would pin the fat row vector until query end for nothing.
+                let shared = std::sync::Arc::strong_count(&q.derived[*i]) > 1;
+                let key = std::sync::Arc::as_ptr(&q.derived[*i]) as usize;
+                let cached = if shared {
+                    self.memo.0.lock().expect("memo lock").get(&key).cloned()
+                } else {
+                    None
+                };
+                let r = match cached {
+                    Some(r) => {
+                        if std::env::var("EMAT_TRACE_DERIVED").is_ok() {
+                            eprintln!("derived '{}': memo hit ({} rows)", ti.name, r.rows.len());
+                        }
+                        r
+                    }
+                    None => {
+                        let t0 = std::time::Instant::now();
+                        let r = std::sync::Arc::new(execute_with(&q.derived[*i], self.memo)?);
+                        if std::env::var("EMAT_TRACE_DERIVED").is_ok() {
+                            eprintln!(
+                                "derived '{}': {} rows in {:?}",
+                                ti.name,
+                                r.rows.len(),
+                                t0.elapsed()
+                            );
+                        }
+                        if shared {
+                            self.memo
+                                .0
+                                .lock()
+                                .expect("memo lock")
+                                .insert(key, r.clone());
+                        }
+                        r
+                    }
+                };
                 RootSrc::One(vec![result_to_chunk(&r, ti)?])
             }
             TableSource::Parquet(path) => {
