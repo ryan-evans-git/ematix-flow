@@ -438,11 +438,28 @@ fn bind_query(
         .tables
         .into_iter()
         .zip(filters)
-        .map(|(bt, fs)| TableInput {
-            name: bt.display,
-            source: bt.source,
-            projection: bt.used,
-            filter: fs.into_iter().reduce(and),
+        .map(|(bt, fs)| {
+            // A table referenced only by `count(*)` (no column touched)
+            // still needs one projected column, or the scan can't report
+            // a row count (an empty chunk reads as zero rows).
+            let mut projection = bt.used;
+            if projection.is_empty()
+                && let Some(c0) = bt.def.columns.first()
+            {
+                projection.push(ScanColumn {
+                    name: c0.name.clone(),
+                    leaf: c0.leaf,
+                    ty: c0.ty,
+                    dec_scale: c0.dec_scale,
+                    nullable: c0.nullable,
+                });
+            }
+            TableInput {
+                name: bt.display,
+                source: bt.source,
+                projection,
+                filter: fs.into_iter().reduce(and),
+            }
         })
         .collect();
 

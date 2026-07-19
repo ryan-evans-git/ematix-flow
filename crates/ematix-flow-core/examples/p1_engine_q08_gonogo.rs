@@ -50,8 +50,8 @@ const C_DISCOUNT: usize = 6;
 
 /// The three Q08 dimension reductions as engine/push probe structures.
 struct Probes {
-    part: Arc<ProbeStructure>,     // p_partkey survivors (membership → DenseSet)
-    orders: Arc<ProbeStructure>,   // o_orderkey -> year-bucket (0=1995,1=1996)
+    part: Arc<ProbeStructure>,   // p_partkey survivors (membership → DenseSet)
+    orders: Arc<ProbeStructure>, // o_orderkey -> year-bucket (0=1995,1=1996)
     supplier: Arc<ProbeStructure>, // s_suppkey -> is_brazil (1/0)
 }
 
@@ -147,7 +147,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gate = (1.0 - eng_m / pull_m) * 100.0;
     println!("\nKILL-GATE: engine is {gate:.1}% faster than the DF pull path.");
     if gate >= 12.0 {
-        println!("  GO (≥12%) — the −16% no-materialization win survives in the clean-room engine.");
+        println!(
+            "  GO (≥12%) — the −16% no-materialization win survives in the clean-room engine."
+        );
     } else {
         println!("  NO-GO (<12%) — the win did not transfer; stop and reassess before committing.");
     }

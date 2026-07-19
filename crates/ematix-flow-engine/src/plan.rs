@@ -31,7 +31,7 @@ use ematix_parquet_io::ParquetFile;
 
 use crate::chunk::{DataChunk, Selection};
 use crate::expr::{Expr, ScalarValue, filter_expr, sum_expr_f64};
-use crate::logical::{AggFunc, BoundQuery, Slot, TableInput, TableSource};
+use crate::logical::{AggFunc, BoundQuery, OrderByKey, Slot, TableInput, TableSource};
 use crate::scan::{ColKind, StockScan};
 use crate::scan_native::{NativeColKind, decode_row_group};
 use crate::sched::MorselQueue;
@@ -134,18 +134,7 @@ fn execute_set(q: &BoundQuery) -> Result<QueryResult, String> {
             }
         };
     }
-    if !order_by.is_empty() {
-        r.rows.sort_by(|a, b| {
-            for k in &order_by {
-                let ord = cmp_scalar(&a[k.output], &b[k.output]);
-                let ord = if k.desc { ord.reverse() } else { ord };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-    }
+    order_rows(&mut r.rows, &order_by);
     if let Some(l) = limit {
         r.rows.truncate(l);
     }
@@ -1163,18 +1152,7 @@ impl Executor<'_> {
             }
             self.finalize_groups(groups)?
         };
-        if !q.order_by.is_empty() {
-            rows.sort_by(|a, b| {
-                for k in &q.order_by {
-                    let ord = cmp_scalar(&a[k.output], &b[k.output]);
-                    let ord = if k.desc { ord.reverse() } else { ord };
-                    if ord != std::cmp::Ordering::Equal {
-                        return ord;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
-        }
+        order_rows(&mut rows, &q.order_by);
         if let Some(l) = q.limit {
             rows.truncate(l);
         }
@@ -1692,7 +1670,16 @@ impl Executor<'_> {
             let mut states = vec![AggState::default(); q.aggs.len()];
             for (j, agg) in q.aggs.iter().enumerate() {
                 match agg.func {
-                    AggFunc::Sum => states[j].sum += sum_expr_f64(&view, &sel, &agg.arg),
+                    AggFunc::Sum => {
+                        // `count` doubles as the SUM's non-NULL tally so
+                        // finalize can distinguish 0.0 from an all-NULL
+                        // (SQL-NULL) sum; the summation order is unchanged
+                        // (the Q6 bit-equality gate depends on it).
+                        states[j].sum += sum_expr_f64(&view, &sel, &agg.arg);
+                        sel.for_each(|i| {
+                            states[j].count += u64::from(!agg.arg.eval_is_null(&view, i as usize));
+                        });
+                    }
                     // count(*) counts rows; count(<expr>) skips NULLs.
                     AggFunc::Count if matches!(agg.arg, Expr::Literal(_)) => {
                         states[j].count += sel.len() as u64;
@@ -1859,9 +1846,16 @@ impl Executor<'_> {
                         .map(|st| st[j].distinct.len() as i64)
                         .collect(),
                 )),
-                _ => cols.push(Vector::f64(
-                    groups.values().map(|st| st[j].finalize(agg.func)).collect(),
-                )),
+                // SUM / MIN / MAX / AVG / STDDEV over zero contributing
+                // (non-NULL) values is SQL NULL, not 0.0 — carry validity.
+                _ => {
+                    let vals: Vec<f64> =
+                        groups.values().map(|st| st[j].finalize(agg.func)).collect();
+                    let valid: Vec<bool> =
+                        groups.values().map(|st| !st[j].is_null(agg.func)).collect();
+                    let any_null = valid.iter().any(|&b| !b);
+                    cols.push(Vector::f64(vals).with_validity(any_null.then_some(valid)));
+                }
             }
         }
         let row_chunk = DataChunk::new(cols);
@@ -2141,6 +2135,37 @@ fn build_key_column<'k>(keys: impl Iterator<Item = &'k GroupKey>, ngroups: usize
     out.with_validity(valid)
 }
 
+/// Sort result rows by an ORDER BY key list, **NULLS LAST** in both
+/// directions (the DuckDB / Postgres default) — a NULL sorts after every
+/// value regardless of ASC/DESC, so it never displaces a real row from a
+/// `LIMIT`.
+fn order_rows(rows: &mut [Vec<ScalarValue>], order_by: &[OrderByKey]) {
+    if order_by.is_empty() {
+        return;
+    }
+    rows.sort_by(|a, b| {
+        for k in order_by {
+            let (x, y) = (&a[k.output], &b[k.output]);
+            let ord = match (
+                matches!(x, ScalarValue::Null),
+                matches!(y, ScalarValue::Null),
+            ) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => {
+                    let o = cmp_scalar(x, y);
+                    if k.desc { o.reverse() } else { o }
+                }
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
 /// Total order over same-typed output scalars — the ORDER BY comparator.
 fn cmp_scalar(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     use ScalarValue::*;
@@ -2217,6 +2242,16 @@ impl AggState {
         }
         if v > self.max {
             self.max = v;
+        }
+    }
+
+    /// SQL NULL result: SUM/MIN/MAX/AVG over zero non-NULL values, or a
+    /// sample stddev of fewer than two. (COUNT family is never NULL.)
+    fn is_null(&self, func: AggFunc) -> bool {
+        match func {
+            AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Avg => self.count == 0,
+            AggFunc::StddevSamp => self.count < 2,
+            AggFunc::Count | AggFunc::CountDistinct | AggFunc::CountMatched(_) => false,
         }
     }
 
