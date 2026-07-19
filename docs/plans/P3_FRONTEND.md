@@ -610,6 +610,27 @@ window-over-derived is the q49 prerequisite.
   session: q67 8.4s (dw1 merge/rollup/finalize kernels), q14ab ~8s,
   q4 6.2s — all kernel/CTE-internal now, no plan-shape lever visible.
 
+- **Set-flavored side dedup (2026-07-19, `ded80a8a`): q14a 8.2→1.8s,
+  q14b→1.7s, q38→0.9s, q87→1.0s.** The agg-kernel dig started at q14a
+  and the SAMPLE overturned the assumption: its 7s was execute_set's
+  single-threaded row sort — the INTERSECT sides arrived as ~28.8M raw
+  fact rows. A side combined by UNION/INTERSECT/EXCEPT (anything but
+  UNION ALL) contributes only its DISTINCT rows, so `bind_set_query`
+  binds those sides (and the base when the first op is flavored) with
+  set semantics → the projection folds into a GROUP BY and dedup runs
+  in the parallel aggregation. The fold fires only for PLAIN-IDENTIFIER
+  projections: the first cut (window-guard only) broke q75's
+  `cs_quantity - COALESCE(…)` UNION sides — caught by the
+  sweep-after-commit discipline as a 102/103, root-caused
+  ("neither an aggregate nor a GROUP BY key"), narrowed. execute_set's
+  combine-time dedup still applies everywhere, so the fold is purely an
+  optimization. `tests/sql_setop_side_dedup.rs` (folded IR; INTERSECT ≡
+  IN-subquery and EXCEPT ≡ NOT-IN — independent machinery; UNION ALL
+  multiplicity pin). Final sweeps sf1+sf10 103/103. Tail: q67 10s
+  (dw1: merge 1.8 + rollup 2.1 + row_chunk build 3.2 — the true
+  agg-kernel unit: hash agg + string interning), q4 7s, 6s cluster
+  (q72/q51/q28/q23ab).
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead

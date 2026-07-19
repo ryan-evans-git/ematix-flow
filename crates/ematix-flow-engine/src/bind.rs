@@ -761,6 +761,34 @@ fn bind_set_query(
     let mut sides = Vec::new();
     flatten(query.body.as_ref(), &mut sides)?;
 
+    // A side combined by a SET-flavored operator (UNION / INTERSECT /
+    // EXCEPT — everything but UNION ALL) contributes only its DISTINCT
+    // rows, so it binds with set semantics: a plain projection folds into
+    // a GROUP BY and dedup runs in the PARALLEL aggregation, instead of
+    // execute_set sorting the side's raw rows on one thread (q14's
+    // INTERSECT sides arrived as 28.8M raw fact rows — 7s of sort). The
+    // base pre-dedups when the FIRST operator is set-flavored (that op
+    // dedups the combination anyway). The fold reroutes the side through
+    // the grouped path, so it only fires for PLAIN-IDENTIFIER projections
+    // (q75's `cs_quantity - COALESCE(…)` UNION sides don't re-bind as
+    // group keys); everything else keeps row semantics — execute_set's
+    // combine-time dedup still enforces the set semantics there.
+    let flavored = |t: &Tagged| {
+        !matches!(
+            t.0,
+            None | Some((ast::SetOperator::Union, ast::SetQuantifier::All))
+        )
+    };
+    let foldable = |body: &ast::SetExpr| match body {
+        ast::SetExpr::Select(s) => s.projection.iter().all(|it| match it {
+            ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                ident_parts(e).is_some()
+            }
+            _ => false,
+        }),
+        _ => false,
+    };
+
     let mut base: Option<BoundQuery> = None;
     let mut ops: Vec<(SetOp, BoundQuery)> = Vec::new();
     for (i, (op, side)) in sides.iter().enumerate() {
@@ -774,7 +802,12 @@ fn bind_set_query(
             qside.order_by = None;
             qside.limit_clause = None;
         }
-        let bq = bind_query(&qside, catalog, false, ctes)?;
+        let set_sem = if i == 0 {
+            sides.get(1).is_some_and(&flavored)
+        } else {
+            flavored(&(*op, *side))
+        } && foldable(side);
+        let bq = bind_query(&qside, catalog, set_sem, ctes)?;
         match (i, op) {
             (0, _) => base = Some(bq),
             (_, Some((o, quant))) => {
