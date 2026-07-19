@@ -332,6 +332,32 @@ fixes: **q40 executes+parity** (done). The rest each need substantial,
 The highest-leverage next unit is **ROLLUP** (unblocks the most queries);
 window-over-derived is the q49 prerequisite.
 
+- **GROUP BY ROLLUP + concat (2026-07-19, `9146be23` + `9839a287`): q80
+  executes + parity-matches DuckDB (100 rows).** Two features:
+  - **ROLLUP** — after the base groups are built over all term columns,
+    each coarser grouping set is derived by re-merging the base groups that
+    share its surviving prefix (`AggState::merge` — SUM/COUNT/MIN/MAX/AVG
+    all merge exactly), dropped columns keyed `GroupKey::Rollup` (renders
+    NULL but is a DISTINCT map key, so a subtotal never collapses into a
+    genuine-NULL group). No change to the hot per-row grouping path.
+    Regression `tests/sql_rollup.rs` (grand total = sum of parts; row-count
+    identity `|ROLLUP(a,b)| = |(a,b)| + |(a)| + 1`).
+  - **concat + scalar-fn plain projections** — `concat(...)` builds an
+    owned string, so `Expr::Concat` is evaluated only via `eval_value`
+    (never the borrowed `Val` path); NULL args skipped (DuckDB). AND the
+    plain-row gate now keys off a new `contains_aggregate` (transparent to
+    scalar functions) instead of `contains_function`, so a group-less
+    scalar projection (the q5/q80 inner branch) is plain rows. Regression
+    `tests/sql_concat.rs`.
+  q80's `coalesce(sr_return_amt,0)` over the two-key LEFT join + ROLLUP +
+  concat all reconcile against DuckDB. **q5 still blocked separately**: it
+  aliases `sum(...) AS RETURNS` but references `returns` — needs
+  case-insensitive identifier resolution (q80 uses consistent lowercase).
+  The full native+DuckDB oracle *sweep* now OOMs on this box (cumulative
+  peak with heavy q80 added — a harness scale limit, not a correctness
+  regression; q80 parity confirmed in isolation via `tpcds_native_oracle
+  q80`).
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
