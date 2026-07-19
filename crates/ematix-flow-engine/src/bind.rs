@@ -2291,16 +2291,21 @@ fn binary_type(op: BinaryOp, l: LogicalType, r: LogicalType) -> LogicalType {
 
 /// Flatten an `AND` tree into its conjuncts (leaves kept in source order).
 fn split_and<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Expr>) {
-    if let ast::Expr::BinaryOp {
-        left,
-        op: ast::BinaryOperator::And,
-        right,
-    } = e
-    {
-        split_and(left, out);
-        split_and(right, out);
-    } else {
-        out.push(e);
+    match e {
+        ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::And,
+            right,
+        } => {
+            split_and(left, out);
+            split_and(right, out);
+        }
+        // A parenthesized conjunction — `ON (a = b AND c = d)`, the TPC-DS
+        // two-key outer-join shape — is one `Nested` node; descend so the
+        // equijoins split into separate edges instead of one multi-table
+        // conjunct that a LEFT JOIN can't route.
+        ast::Expr::Nested(inner) => split_and(inner, out),
+        _ => out.push(e),
     }
 }
 
