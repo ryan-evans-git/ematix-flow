@@ -83,6 +83,11 @@ fn bind_query(
     if let Some(q2) = rewrite_cte_const_pushdown(query, catalog) {
         return bind_query(&q2, catalog, set_semantics, outer_ctes);
     }
+    // CTE set-narrowing (q95's sf10 lever): a CTE referenced ONLY from
+    // IN-subqueries narrows to SELECT DISTINCT of its used columns.
+    if let Some(q2) = rewrite_cte_set_narrowing(query) {
+        return bind_query(&q2, catalog, set_semantics, outer_ctes);
+    }
     // Offset-equijoin promotion (q59/q2's sf10 lever): `WHERE a = b ± N`
     // between two derived FROM items becomes a real join edge via a hidden
     // computed column on b's side; both participants must materialize.
@@ -3967,6 +3972,207 @@ fn rewrite_offset_equijoin(query: &ast::Query) -> Option<(ast::Query, BTreeSet<S
         right: Box::new(b),
     });
     Some((q2, force))
+}
+
+/// CTE set-narrowing — q95's sf10 lever. Its `ws_wh` CTE (a web_sales
+/// self-join) materialized 74.8M `(order, wh1, wh2)` rows, but both
+/// consumers are IN-subqueries that use only `ws_order_number`: under set
+/// semantics row multiplicity can never matter, so the CTE legally
+/// narrows to `SELECT DISTINCT ws_order_number …` (~600k rows) — and the
+/// downstream `web_returns ⋈ ws_wh` stops fanning out ~125 duplicate rows
+/// per order. Conditions, all conservative:
+///
+/// - every textual occurrence of the CTE's name (word-boundary count over
+///   the body and every other CTE definition) is accounted for by a
+///   structural reference inside an `IN (SELECT …)` conjunct of the
+///   top-level WHERE whose FROM is a plain comma list — any unaccounted
+///   occurrence (outer FROM, EXISTS, join shapes, another CTE) blocks the
+///   rewrite, so a row-context consumer keeps full width and duplicates;
+/// - the used-column set comes from the subqueries' projections and WHERE
+///   clauses via [`collect_idents`], which returns false on any expression
+///   variant it doesn't model (blocking the rewrite rather than guessing);
+/// - the rewrite must PRUNE something (`used ⊂ outputs`); the injected
+///   `DISTINCT` then terminates the re-bind recursion via the
+///   `distinct.is_some()` skip.
+fn rewrite_cte_set_narrowing(query: &ast::Query) -> Option<ast::Query> {
+    let with = query.with.as_ref()?;
+    if with.recursive {
+        return None;
+    }
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let selection = select.selection.as_ref()?;
+    let body_text = query.body.to_string();
+    let mut conjs: Vec<&ast::Expr> = Vec::new();
+    split_and(selection, &mut conjs);
+
+    let mut q2: Option<ast::Query> = None;
+    'ctes: for (ci, cte) in with.cte_tables.iter().enumerate() {
+        let name = &cte.alias.name.value;
+        if !cte.alias.columns.is_empty() {
+            continue; // a declared column list fixes the arity
+        }
+        let ast::SetExpr::Select(inner) = cte.query.body.as_ref() else {
+            continue;
+        };
+        if inner.distinct.is_some() {
+            continue;
+        }
+        let outs: Vec<Option<String>> = inner
+            .projection
+            .iter()
+            .map(|it| match it {
+                ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                ast::SelectItem::UnnamedExpr(e) => {
+                    ident_parts(e).map(|p| p.last().expect("nonempty").to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        if outs.iter().any(Option::is_none) {
+            continue;
+        }
+        let outs: Vec<String> = outs.into_iter().flatten().collect();
+
+        let mut accounted = 0usize; // word occurrences inside accounted refs
+        let mut nrefs = 0usize;
+        let mut used: BTreeSet<usize> = BTreeSet::new();
+        for conj in &conjs {
+            let ast::Expr::InSubquery { subquery, .. } = conj else {
+                continue;
+            };
+            let ast::SetExpr::Select(sub) = subquery.body.as_ref() else {
+                continue;
+            };
+            if subquery.with.is_some() || sub.from.iter().any(|t| !t.joins.is_empty()) {
+                continue; // not accountable; the count guard blocks below
+            }
+            // The CTE's display name(s) in this FROM.
+            let mut displays: Vec<(String, bool)> = Vec::new();
+            let mut refs_here = 0usize;
+            for twj in &sub.from {
+                let ast::TableFactor::Table { name: tn, alias, .. } = &twj.relation else {
+                    continue;
+                };
+                let tname = tn.to_string();
+                let display = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| tname.clone());
+                let is_cte = tname.eq_ignore_ascii_case(name);
+                refs_here += usize::from(is_cte);
+                displays.push((display, is_cte));
+            }
+            if refs_here == 0 {
+                continue;
+            }
+            nrefs += refs_here;
+            accounted += count_word(&subquery.to_string(), name);
+            let mut idents: Vec<Vec<&str>> = Vec::new();
+            let mut ok = true;
+            for it in &sub.projection {
+                match it {
+                    ast::SelectItem::UnnamedExpr(e)
+                    | ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                        ok &= collect_idents(e, &mut idents);
+                    }
+                    _ => used.extend(0..outs.len()), // wildcard → all columns
+                }
+            }
+            if let Some(w) = &sub.selection {
+                ok &= collect_idents(w, &mut idents);
+            }
+            if !ok {
+                continue 'ctes;
+            }
+            for parts in idents {
+                match parts.as_slice() {
+                    [col] => {
+                        if let Some(j) = outs.iter().position(|o| o.eq_ignore_ascii_case(col)) {
+                            used.insert(j);
+                        }
+                    }
+                    [tab, col] => {
+                        if displays
+                            .iter()
+                            .any(|(d, is)| *is && d.eq_ignore_ascii_case(tab))
+                        {
+                            match outs.iter().position(|o| o.eq_ignore_ascii_case(col)) {
+                                Some(j) => {
+                                    used.insert(j);
+                                }
+                                None => continue 'ctes,
+                            }
+                        }
+                    }
+                    _ => continue 'ctes,
+                }
+            }
+        }
+        if nrefs == 0 || used.is_empty() || used.len() == outs.len() {
+            continue;
+        }
+        // Every occurrence accounted: none elsewhere in the body, none in
+        // any other CTE definition.
+        if count_word(&body_text, name) != accounted
+            || with
+                .cte_tables
+                .iter()
+                .enumerate()
+                .any(|(j, c)| j != ci && count_word(&c.query.to_string(), name) > 0)
+        {
+            continue;
+        }
+        let q = q2.get_or_insert_with(|| query.clone());
+        let target = &mut q.with.as_mut().expect("cloned WITH").cte_tables[ci];
+        let ast::SetExpr::Select(tsel) = target.query.body.as_mut() else {
+            unreachable!("checked Select above");
+        };
+        tsel.projection = used.iter().map(|&j| tsel.projection[j].clone()).collect();
+        tsel.distinct = Some(ast::Distinct::Distinct);
+    }
+    q2
+}
+
+/// Collect identifier paths appearing in an expression. Returns `false`
+/// on any variant it doesn't model — callers must treat that as "unknown
+/// column usage" and skip their rewrite rather than guess.
+fn collect_idents<'e>(e: &'e ast::Expr, out: &mut Vec<Vec<&'e str>>) -> bool {
+    if let Some(p) = ident_parts(e) {
+        out.push(p);
+        return true;
+    }
+    match e {
+        ast::Expr::Value(_) => true,
+        ast::Expr::BinaryOp { left, right, .. } => {
+            collect_idents(left, out) && collect_idents(right, out)
+        }
+        ast::Expr::UnaryOp { expr, .. }
+        | ast::Expr::IsNull(expr)
+        | ast::Expr::IsNotNull(expr)
+        | ast::Expr::Cast { expr, .. } => collect_idents(expr, out),
+        ast::Expr::Like { expr, .. } => collect_idents(expr, out),
+        ast::Expr::Between {
+            expr, low, high, ..
+        } => collect_idents(expr, out) && collect_idents(low, out) && collect_idents(high, out),
+        ast::Expr::InList { expr, list, .. } => {
+            collect_idents(expr, out) && list.iter().all(|x| collect_idents(x, out))
+        }
+        ast::Expr::Function(f) => {
+            let ast::FunctionArguments::List(list) = &f.args else {
+                return matches!(f.args, ast::FunctionArguments::None);
+            };
+            list.args.iter().all(|a| match a {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(x)) => {
+                    collect_idents(x, out)
+                }
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) => true,
+                _ => false,
+            })
+        }
+        _ => false,
+    }
 }
 
 /// `ident ± Number`, decomposed as (ident, op, literal) — the compound

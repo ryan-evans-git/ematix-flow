@@ -564,6 +564,27 @@ window-over-derived is the q49 prerequisite.
      Construction-rejects-invalid tests pin the invariant.
   Post-lever sweep 103/103; new sf10 tail: q67 14s, q95 13s, q4/q14ab 9s.
 
+- **q95 set-narrowing + chunked deriveds (2026-07-19, `49aaeaf0`):
+  11.5s→1.2s (10×).** Sample profile: ~10s in a SINGLE-THREADED
+  BTreeMap dedup over the 74.8M-row `ws_wh` self-join CTE (a derived
+  scans as ONE row group), plus the web_returns join fanning ~125 dup
+  rows per order. Two levers:
+  1. **Bounded derived chunks** — `result_to_chunks` slices a
+     materialized derived into ≤2^21-row chunks; per-RG parallelism now
+     applies to every big-derived scan (11.5→5.2s alone).
+     `tests/sql_derived_chunking.rs` gates identity at sf1 (2.88M-row
+     derived = 2 chunks).
+  2. **CTE set-narrowing** (bind pre-pass) — a CTE whose EVERY reference
+     sits inside an IN-subquery (set semantics: multiplicity can't
+     matter) and uses only some columns narrows to `SELECT DISTINCT
+     <used>`. Reference accounting is word-boundary counting over body +
+     other CTE defs; `collect_idents` refuses unmodeled expr variants
+     (blocks rather than guesses). ws_wh → 600k rows; the fan join
+     vanishes (5.2→1.2s). `tests/sql_cte_set_narrowing.rs` pins narrowed
+     IR width, result equivalence, and the row-context blocker.
+  Sweep 103/103. sf10 tail now: q67 14s (kernel-shaped, rank top-K
+  designed), then the 9s cluster (q4/q14ab).
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead

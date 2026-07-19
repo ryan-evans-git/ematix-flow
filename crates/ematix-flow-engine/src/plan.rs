@@ -1711,7 +1711,7 @@ impl Executor<'_> {
                         r
                     }
                 };
-                RootSrc::One(vec![result_to_chunk(&r, ti)?])
+                RootSrc::One(result_to_chunks(&r, ti)?)
             }
             TableSource::Parquet(path) => {
                 // The native ematix-parquet path handles the required
@@ -3013,11 +3013,37 @@ impl AggState {
     }
 }
 
-/// Convert a materialized [`QueryResult`] into a chunk shaped like `ti`'s
-/// projection (`leaf` = the result's output-column position; values coerced
-/// to the declared type).
-fn result_to_chunk(r: &QueryResult, ti: &TableInput) -> Result<DataChunk, String> {
-    let nrows = r.rows.len();
+/// Convert a materialized [`QueryResult`] into BOUNDED chunks shaped like
+/// `ti`'s projection. Emitting several chunks (not one) lets the per-row-
+/// group machinery downstream parallelize scans over big deriveds — q95's
+/// 74.8M-row CTE dedup ran as ONE row group on one thread (a 10s
+/// single-threaded BTreeMap build in the sample profile).
+fn result_to_chunks(r: &QueryResult, ti: &TableInput) -> Result<Vec<DataChunk>, String> {
+    const CHUNK: usize = 1 << 21;
+    let n = r.rows.len();
+    let mut chunks = Vec::with_capacity(n / CHUNK + 1);
+    let mut lo = 0;
+    loop {
+        let hi = (lo + CHUNK).min(n);
+        chunks.push(result_to_chunk(r, ti, lo, hi)?);
+        if hi == n {
+            break;
+        }
+        lo = hi;
+    }
+    Ok(chunks)
+}
+
+/// Rows `lo..hi` of a materialized [`QueryResult`] as a chunk shaped like
+/// `ti`'s projection (`leaf` = the result's output-column position; values
+/// coerced to the declared type).
+fn result_to_chunk(
+    r: &QueryResult,
+    ti: &TableInput,
+    lo: usize,
+    hi: usize,
+) -> Result<DataChunk, String> {
+    let nrows = hi - lo;
     let mut cols = Vec::with_capacity(ti.projection.len());
     for c in &ti.projection {
         let get = |row: usize| &r.rows[row][c.leaf];
@@ -3030,7 +3056,7 @@ fn result_to_chunk(r: &QueryResult, ti: &TableInput) -> Result<DataChunk, String
                 let mut offsets = Vec::with_capacity(nrows + 1);
                 let mut data = Vec::new();
                 offsets.push(0u32);
-                for row in 0..nrows {
+                for row in lo..hi {
                     let ok = match get(row) {
                         ScalarValue::Utf8(s) => {
                             data.extend_from_slice(s.as_bytes());
@@ -3052,7 +3078,7 @@ fn result_to_chunk(r: &QueryResult, ti: &TableInput) -> Result<DataChunk, String
             }
             LogicalType::Float64 => {
                 let mut v = Vec::with_capacity(nrows);
-                for row in 0..nrows {
+                for row in lo..hi {
                     let (x, ok) = match get(row) {
                         ScalarValue::Float64(x) => (*x, true),
                         ScalarValue::Int64(x) => (*x as f64, true),
@@ -3072,7 +3098,7 @@ fn result_to_chunk(r: &QueryResult, ti: &TableInput) -> Result<DataChunk, String
             }
             _ => {
                 let mut v = Vec::with_capacity(nrows);
-                for row in 0..nrows {
+                for row in lo..hi {
                     let (x, ok) = match get(row) {
                         ScalarValue::Int64(x) => (*x, true),
                         ScalarValue::Int32(x) => (*x as i64, true),
