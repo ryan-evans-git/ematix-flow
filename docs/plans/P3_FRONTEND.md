@@ -886,8 +886,28 @@ lands a case here.
   injects NULLs via `nullif(l_linenumber,1)`; covers NOT over
   comparisons/IN/LIKE/IS NULL, NOT over AND/OR with NULLs, double negation,
   projected NOT-bool NULL. 9/9 parity, sf1 103/103, suite green.
-- **Tier-3 residuals (structural / robustness):** `RIGHT`/non-equi/
-  unrestricted-FULL joins; `GROUPING SETS`/`CUBE`; recursive CTEs.
+- **Tier-3 join residuals — SHIPPED (`7cc285a7`).** `RIGHT`/`RIGHT OUTER
+  JOIN` as a mirrored LEFT: the joined table is preserved (roots the tree),
+  the OLD table it is keyed against becomes nullable, so all LEFT machinery
+  (grouped NULL-extension, matched-only `COUNT`, WHERE-side demote-to-INNER)
+  applies. `add_join` now walks the ON in two passes — equi conjuncts →
+  edges (preserved = joined table for RIGHT / old side for LEFT / none for
+  INNER), discovering the single nullable old table from the equi key; then
+  non-equi conjuncts route (nullable single-table → pre-join filter; INNER
+  multi → post-filter; preserved-side → error). A RIGHT keyed to two
+  different old tables is rejected (two preserved roots). **Non-equi joins
+  already worked** — a cross-table inequality is a post-join filter; a pure
+  non-equi ON is a filtered cross join — now locked with gate tests. Gates:
+  `right_outer_join` + `non_equi_join` (native == DuckDB over orders ⋈
+  lineitem, a 1-to-many key with a filtered ON), `right_outer_mirrors_left`
+  (data-driven RIGHT == LEFT over store_sales ⋈ store_returns),
+  `check_rejected` on the two-old-table boundary. Parity 11/11, sf1 103/103
+  0 MISMATCH, suite green.
+- **Tier-3 residuals still open:** FULL OUTER on a fan-out key and outer
+  anti-joins that fan out hit the pre-existing **"LEFT duplicate-key payload"
+  materialization gap** (LEFT and RIGHT identically — a separate executor
+  unit: fan-out on the preserved side of a materialized outer join);
+  `GROUPING SETS`/`CUBE`; recursive CTEs.
 
 ## Next (P4 tail → P5/P6)
 
