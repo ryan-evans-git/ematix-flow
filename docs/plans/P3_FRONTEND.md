@@ -9,6 +9,67 @@ unlock: today exactly one query (Q08) runs engine-native and it is hand-wired.
 pipelines. First concrete gate: **Q6 from a SQL string == the hand-built
 `run_tpch_q6_native`** (revenue `123141078.2283`, matched `114160`), then Q08.
 
+## Perf campaign — CLOSEOUT (2026-07-19): at the structural floor
+
+The native engine runs **TPC-H 22/22** and **TPC-DS 103/103 (sf1 + sf10)**
+engine-native, parity-clean vs in-process DuckDB, **no query > ~5 s solo at
+sf10**, zero DataFusion in the path. After a long lever campaign the
+incremental perf frontier is **spent** — the remaining gaps are not reachable
+by incremental optimization. Evidence, from this session's four consecutive
+digs (each profiled-first, gated, measured):
+
+1. **Hash-agg grouped merge** → net-NEGATIVE (+5.3 s), reverted. Sorted
+   grouped output is load-bearing (rollup contiguity + sort amortized into the
+   parallel per-RG build); a "faster merge" that drops it pays downstream.
+2. **Interned / vectorized group-key build** → INERT, reverted. The premise
+   (string-compare cost) was refuted by profiling — q39 is MERGE-bound
+   (26.5 M-entry k-way merge), not build-bound; the per-row `Arc<str>` alloc
+   is real waste but never on the critical path.
+3. **Dim-build / root-decode overlap** → MARGINAL (~2.5 %), banked opt-in
+   (`EMAT_OVERLAP`, default off). Overlap SHIFTS time rather than saving it:
+   dim-build 75→176 ms as root-scan 221→115 ms, ~1:1 — the dim build is
+   memory-BANDWIDTH-bound, so the "idle" cores are not free.
+4. **Decode-bandwidth** → floor-bound (scoped, not built). Native decode is
+   ~80 % Snappy **decompress** for numeric columns (Q08 dim-build sample) and
+   **dictionary-expansion / `ByteArray` materialization** for strings (Q1:
+   `get_batch_with_dict<ByteArray>` + `extend_with` + `Vector::utf8` ≫
+   decompress). The levers:
+   - **RG/page stats pruning — DEAD on this data.** Probed sf10
+     `store_sales.ss_sold_date_sk`, `orders.o_orderdate`,
+     `lineitem.l_shipdate`, `store_sales.ss_item_sk`: **every** RG's min/max
+     spans 100 % of the column range, so a range predicate touches ALL row
+     groups. TPC-H/DS generators don't cluster; nothing is prunable (the
+     general form of the Q14 page-index dead-end).
+   - **Faster decompress kernel — no.** Hand-rolled Snappy already rejected
+     (microbench win, −12 % real); decompress is bound on output-write
+     bandwidth, not the algorithm, so no drop-in codec helps.
+   - **Projection pushdown — already tight** (only registered columns decode).
+   - **Late materialization — ~3 % ceiling** (pages decompress as a unit).
+   - **Writer-side codec (LZ4/uncompressed)** — real, but *different data*, not
+     comparable to DuckDB-on-Snappy: a product/deployment lever, not a
+     benchmark win.
+
+This aligns with the standing SF=100 finding: **all headroom is plan
+structure, not decode.** And at sf10 the plan structure is already tight.
+
+**The one genuine remaining headroom is a PROJECT, not a lever:** dictionary
+preservation for low-cardinality string columns (keep `(dict, indices)`
+instead of expanding) — real bandwidth + index-domain filter/group-by wins,
+but multi-week, and the prior attempt (Σ.K.2) was **+41 % per-table yet a
+GLOBAL regression**, so it needs deliberate per-table dict routing, not a
+global flip.
+
+**Recommendation.** Treat the perf campaign as CLOSED at the structural floor.
+Marginal effort now yields more from **breadth / robustness** (more SQL
+surface, NULL semantics, correctness edges) than from speed. Reopen perf only
+for (a) the dictionary-preservation project if string-heavy workloads become a
+priority, or (b) a genuinely new shape the current gate doesn't cover.
+
+Banked, correct, opt-in levers available if a specific deployment wants them:
+`EMAT_OVERLAP` (bandwidth-rich boxes), order-preserving-i64 merge interning
+(q39-shaped, ~0.5 s, unbuilt), FD-recognition (redundant group-key drop,
+scoped/unbuilt).
+
 ## Pipeline
 
 ```
