@@ -903,11 +903,24 @@ lands a case here.
   (data-driven RIGHT == LEFT over store_sales ⋈ store_returns),
   `check_rejected` on the two-old-table boundary. Parity 11/11, sf1 103/103
   0 MISMATCH, suite green.
-- **Tier-3 residuals still open:** FULL OUTER on a fan-out key and outer
-  anti-joins that fan out hit the pre-existing **"LEFT duplicate-key payload"
-  materialization gap** (LEFT and RIGHT identically — a separate executor
-  unit: fan-out on the preserved side of a materialized outer join);
-  `GROUPING SETS`/`CUBE`; recursive CTEs.
+- **Fan-out payload materialization — SHIPPED (`e6195738`).** Lifted the
+  "LEFT duplicate-key payload" limit: an outer join whose preserved side
+  fans out (one preserved row → many dim rows on a filtered ON) now
+  materializes. `fanout_child` gained a `left` flag — an unmatched source
+  row survives once with a `NO_REF` payload (`gather_payload` already renders
+  that NULL-filled) and a 0 matched-flag; matched expansions carry 1, and the
+  matched-flag column appends in the same fixed layout the non-multi LEFT
+  path uses (CountMatched + final post-filter unchanged). A LEFT fan-out
+  skips the early residual (which only tames INNER blow-up and would wrongly
+  drop kept misses); INNER fan-out is behavior-identical. **Unblocks FULL
+  OUTER on real 1-to-many keys** (the UNION-ALL rewrite's LEFT branch) **and
+  fan-out anti-joins** (LEFT + RIGHT mirror). Gate:
+  `outer_join_fanout_materialization` (nullable-column projection across the
+  fan-out, COUNT/matched-COUNT/SUM, LEFT+RIGHT anti-joins, FULL OUTER count +
+  projection). Parity 12/12, sf1 103/103 0 MISMATCH (q72 INNER fan-out
+  unchanged), suite green.
+- **Tier-3 residuals still open:** `GROUPING SETS`/`CUBE`; recursive CTEs;
+  the Tier-2 aggregate tail.
 
 ## Next (P4 tail → P5/P6)
 
