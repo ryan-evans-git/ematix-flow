@@ -919,8 +919,22 @@ lands a case here.
   fan-out, COUNT/matched-COUNT/SUM, LEFT+RIGHT anti-joins, FULL OUTER count +
   projection). Parity 12/12, sf1 103/103 0 MISMATCH (q72 INNER fan-out
   unchanged), suite green.
-- **Tier-3 residuals still open:** `GROUPING SETS`/`CUBE`; recursive CTEs;
-  the Tier-2 aggregate tail.
+- **CUBE / GROUPING SETS — SHIPPED (`d03fd49d`).** The general grouping-set
+  forms ROLLUP's prefix cascade cannot express. New `BoundQuery.grouping_sets`
+  (each set = active group-column indices). Binder: `CUBE(t₁..tₙ)` → all 2ⁿ
+  subsets of the terms; `GROUPING SETS((…),…)` → the listed sets verbatim
+  (duplicates kept per SQL); both intern distinct columns into `group` (a
+  column repeated across terms/sets shares one slot); CUBE capped at 20 terms.
+  Executor `build_grouping_sets` re-aggregates the base groups (keyed by all
+  columns) into each set — kept columns retained, the rest re-keyed
+  `GroupKey::Rollup` (renders NULL, distinct from a real NULL group), one
+  sorted BTreeMap pass per set; the base's raw rows are replaced by the union
+  over all sets. `GROUPING(col)` flags read the Rollup markers unchanged;
+  ROLLUP keeps its dedicated cascade (q67 untouched). Gate:
+  `grouping_sets_and_cube` (CUBE over 2/3 dims, GROUPING SETS incl. grand
+  total + a repeated set, GROUPING() flags, multi-column CUBE term). Parity
+  13/13, sf1 103/103 0 MISMATCH, suite green.
+- **Tier-3 residuals still open:** recursive CTEs; the Tier-2 aggregate tail.
 
 ## Next (P4 tail → P5/P6)
 
