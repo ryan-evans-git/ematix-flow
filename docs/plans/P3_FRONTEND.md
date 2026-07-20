@@ -865,9 +865,16 @@ lands a case here.
   (`-x`→`0-x`); positional `GROUP BY 1`; function-valued GROUP BY keys bind
   as group refs in the projection. 4/4 parity tests, sf1 103/103 no
   regression, suite green.
-- **Tier-2 (next candidates):** window fns `LEAD/LAG/NTILE/FIRST_VALUE/
-  LAST_VALUE`; aggregates `VAR_SAMP/VAR_POP/STDDEV_POP` (sumsq already
-  tracked), `MEDIAN/PERCENTILE`, `STRING_AGG`, `BOOL_AND/OR`; `date_trunc`.
+- **Tier-2 bundle — SHIPPED (`4df978d2`).** *2a:* `var_samp`/`variance`,
+  `var_pop`, `stddev_pop` (a shared `AggState::variance` off sum/sumsq/count;
+  var_pop(1 row)=0, var_samp=NULL); `date_trunc('unit', date)`→Date32
+  (year/quarter/month/ISO-week/day, new `Expr::DateTrunc`). *2b:* navigation
+  windows `lag`/`lead`(offset, NULL past edge), `first_value`, `ntile`(even
+  buckets) — new `WindowFunc` variants. 8/8 parity, sf1 103/103, suite green.
+  **Deferred:** `last_value` (default RANGE-frame peer semantics — own unit);
+  `string_agg` (needs in-agg ORDER BY); `bool_and`/`bool_or` (boolean output
+  typing); `median`/`percentile_cont` (per-group ordering); named `WINDOW`
+  clause; string/date-typed `lag`/`lead` (numeric-only today).
 - **Tier-3 (structural / robustness):** a `NOT` node + full three-valued
   NULL logic (the IR has no NOT today — the highest-value *robustness* item,
   needs a NULL truth-table gate); `RIGHT`/non-equi/unrestricted-FULL joins;
