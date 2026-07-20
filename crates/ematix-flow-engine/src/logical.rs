@@ -211,6 +211,14 @@ pub struct BoundQuery {
     /// the executor emits one grouping set per term prefix (all terms, drop
     /// the last, …, drop all = grand total), NULL-filling dropped columns.
     pub rollup_terms: Vec<usize>,
+    /// `GROUP BY CUBE(…)` / `GROUPING SETS(…)` — the general form ROLLUP
+    /// cannot express. Each inner vec is one requested grouping set as the
+    /// **active** column indices into `group` (kept in that set; the rest
+    /// render as subtotals). Empty for a plain GROUP BY or ROLLUP (which use
+    /// `rollup_terms`). The executor re-aggregates the base groups into each
+    /// set. `CUBE(a,b)` → `[[0,1],[0],[1],[]]`; `GROUPING SETS((a,b),(c),())`
+    /// → `[[0,1],[2],[]]`.
+    pub grouping_sets: Vec<Vec<usize>>,
     pub aggs: Vec<AggExpr>,
     /// Row-space predicate over `[group keys…, agg values…]` (HAVING).
     pub having: Option<Expr>,

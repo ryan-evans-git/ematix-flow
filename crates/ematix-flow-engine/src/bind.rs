@@ -201,6 +201,7 @@ fn bind_query(
     // may be integer, float, or string valued (the executor's typed group
     // keys); booleans group as 0/1.
     let mut rollup_terms: Vec<usize> = Vec::new();
+    let mut grouping_sets: Vec<Vec<usize>> = Vec::new();
     let group: Vec<GroupExpr> = match &select.group_by {
         ast::GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => {
             // `GROUP BY ROLLUP(t₁, …)` parses as a single `Expr::Rollup`
@@ -217,11 +218,25 @@ fn bind_query(
                     }
                 }
                 out
-            } else if exprs
-                .iter()
-                .any(|e| matches!(e, ast::Expr::Cube(_) | ast::Expr::GroupingSets(_)))
-            {
-                return Err("GROUP BY CUBE / GROUPING SETS are not yet supported".into());
+            } else if let [ast::Expr::Cube(terms)] = exprs.as_slice() {
+                // CUBE(t₁, …, tₙ): every one of the 2ⁿ subsets of the terms.
+                let (grp, sets) = b.bind_cube(terms)?;
+                grouping_sets = sets;
+                grp
+            } else if let [ast::Expr::GroupingSets(sets_ast)] = exprs.as_slice() {
+                // GROUPING SETS ((…), …): the sets as given (duplicates kept).
+                let (grp, sets) = b.bind_grouping_sets(sets_ast)?;
+                grouping_sets = sets;
+                grp
+            } else if exprs.iter().any(|e| {
+                matches!(
+                    e,
+                    ast::Expr::Cube(_) | ast::Expr::GroupingSets(_) | ast::Expr::Rollup(_)
+                )
+            }) {
+                return Err(
+                    "ROLLUP / CUBE / GROUPING SETS must be the sole GROUP BY term".into(),
+                );
             } else {
                 let mut out = Vec::new();
                 for e in exprs {
@@ -673,6 +688,7 @@ fn bind_query(
         post_filter,
         group,
         rollup_terms,
+        grouping_sets,
         aggs,
         having,
         output,
@@ -1342,6 +1358,80 @@ impl Binder<'_> {
     /// single-table ON conditions on the joined table become its pre-join
     /// filter (correct outer-join semantics), and conditions on the
     /// preserved side error (they are not WHERE filters).
+    /// Bind a group column and return its index in `group`, reusing an
+    /// existing slot when the same bound expression already appears (a column
+    /// may repeat across CUBE terms / GROUPING SETS — `GROUPING SETS
+    /// ((a,b),(a))` shares `a`).
+    fn intern_group_col(
+        &mut self,
+        group: &mut Vec<GroupExpr>,
+        e: &ast::Expr,
+    ) -> Result<usize, String> {
+        let bound = self.bind_scalar(e)?;
+        Ok(match group.iter().position(|g| g.expr == bound) {
+            Some(i) => i,
+            None => {
+                group.push(GroupExpr { expr: bound });
+                group.len() - 1
+            }
+        })
+    }
+
+    /// `CUBE(t₁, …, tₙ)` → the flat distinct group columns plus every one of
+    /// the 2ⁿ subsets of the terms (each set = the union of its terms'
+    /// column indices).
+    fn bind_cube(
+        &mut self,
+        terms: &[Vec<ast::Expr>],
+    ) -> Result<(Vec<GroupExpr>, Vec<Vec<usize>>), String> {
+        if terms.len() > 20 {
+            return Err("CUBE with more than 20 terms is not supported".into());
+        }
+        let mut group = Vec::new();
+        let mut term_cols: Vec<Vec<usize>> = Vec::new();
+        for term in terms {
+            let mut cols = Vec::new();
+            for e in term {
+                cols.push(self.intern_group_col(&mut group, e)?);
+            }
+            term_cols.push(cols);
+        }
+        let mut sets = Vec::new();
+        for mask in 0u32..(1u32 << terms.len()) {
+            let mut set = Vec::new();
+            for (ti, cols) in term_cols.iter().enumerate() {
+                if mask & (1 << ti) != 0 {
+                    set.extend(cols.iter().copied());
+                }
+            }
+            set.sort_unstable();
+            set.dedup();
+            sets.push(set);
+        }
+        Ok((group, sets))
+    }
+
+    /// `GROUPING SETS ((…), …)` → the flat distinct group columns plus one
+    /// active-index set per listed set (order and duplicates preserved — a
+    /// repeated set yields repeated result rows, per SQL).
+    fn bind_grouping_sets(
+        &mut self,
+        sets_ast: &[Vec<ast::Expr>],
+    ) -> Result<(Vec<GroupExpr>, Vec<Vec<usize>>), String> {
+        let mut group = Vec::new();
+        let mut sets = Vec::new();
+        for set in sets_ast {
+            let mut cols = Vec::new();
+            for e in set {
+                cols.push(self.intern_group_col(&mut group, e)?);
+            }
+            cols.sort_unstable();
+            cols.dedup();
+            sets.push(cols);
+        }
+        Ok((group, sets))
+    }
+
     fn add_join(&mut self, join: &ast::Join) -> Result<(), String> {
         // `dir`: None = INNER; Some(false) = LEFT (the joined table is the
         // nullable side); Some(true) = RIGHT (the joined table is preserved,
@@ -2199,6 +2289,7 @@ impl Binder<'_> {
                 expr: Expr::Column(key_slot),
             }],
             rollup_terms: Vec::new(),
+            grouping_sets: Vec::new(),
             aggs: Vec::new(),
             having: None,
             output: vec![OutputExpr {
@@ -2421,6 +2512,7 @@ impl Binder<'_> {
                 expr: Expr::Column(key_slot),
             }],
             rollup_terms: Vec::new(),
+            grouping_sets: Vec::new(),
             aggs: vec![
                 AggExpr {
                     func: AggFunc::CountDistinct,

@@ -512,6 +512,56 @@ fn outer_join_fanout_materialization() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier-3 GROUPING SETS / CUBE: the general grouping-set form (ROLLUP only
+// does prefix cascades). Excluded columns render NULL (a subtotal); l_returnflag
+// / l_linestatus have no genuine NULLs, so a NULL is unambiguously a subtotal.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn grouping_sets_and_cube() {
+    if !have_data() {
+        eprintln!("SKIP grouping_sets_and_cube: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // CUBE over two low-card dims: {rf,ls}, {rf}, {ls}, {} — 4 sets.
+    p.check(
+        "select l_returnflag, l_linestatus, count(*) n, sum(l_quantity) q \
+         from lineitem group by cube(l_returnflag, l_linestatus)",
+    );
+    // GROUPING SETS with an explicit list incl the grand total ().
+    p.check(
+        "select l_returnflag, l_linestatus, count(*) n \
+         from lineitem group by grouping sets ((l_returnflag, l_linestatus), (l_returnflag), ())",
+    );
+    // A single grouping column repeated across sets + a disjoint set.
+    p.check(
+        "select l_returnflag, l_linestatus, sum(l_extendedprice) e \
+         from lineitem group by grouping sets ((l_returnflag), (l_linestatus), (l_returnflag))",
+    );
+    // Grand total only.
+    p.check("select count(*) n, avg(l_discount) d from lineitem group by grouping sets (())");
+    // CUBE over three dims (8 sets), with a WHERE to keep it small.
+    p.check(
+        "select l_returnflag, l_linestatus, l_shipmode, count(*) n \
+         from lineitem where l_shipmode in ('AIR', 'RAIL') \
+         group by cube(l_returnflag, l_linestatus, l_shipmode)",
+    );
+    // GROUPING(col) flags alongside CUBE (1 = the column is a subtotal here).
+    p.check(
+        "select l_returnflag, l_linestatus, \
+                grouping(l_returnflag) gr, grouping(l_linestatus) gl, count(*) n \
+         from lineitem group by cube(l_returnflag, l_linestatus)",
+    );
+    // A multi-column CUBE term: CUBE((rf,ls), sm) → 4 sets over 2 terms.
+    p.check(
+        "select l_returnflag, l_linestatus, l_shipmode, count(*) n \
+         from lineitem where l_shipmode = 'AIR' \
+         group by cube((l_returnflag, l_linestatus), l_shipmode)",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tier-3: NOT + three-valued NULL logic. NULLs are injected with
 // nullif(l_linenumber, 1) (NULL when linenumber == 1) since SF1 lineitem
 // has no NULL columns. The point is that NOT over a NULL is NULL (drops at

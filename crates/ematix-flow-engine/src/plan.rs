@@ -1665,6 +1665,15 @@ impl Executor<'_> {
                             t1.elapsed()
                         );
                     }
+                } else if !q.grouping_sets.is_empty() {
+                    groups = build_grouping_sets(&groups, &q.grouping_sets, q.group.len());
+                    if trace {
+                        eprintln!(
+                            "agg: grouping-sets -> {} groups in {:?}",
+                            groups.len(),
+                            t1.elapsed()
+                        );
+                    }
                 }
                 let t2 = std::time::Instant::now();
                 let r = self.finalize_groups(groups)?;
@@ -3673,6 +3682,49 @@ fn add_rollup_levels(groups: &mut GroupsVec, term_sizes: &[usize]) {
     for level in levels {
         groups.extend(level);
     }
+}
+
+/// Re-aggregate the base groups (keyed by all `ncols` group columns) into
+/// each requested grouping set — the general `CUBE` / `GROUPING SETS` form
+/// ROLLUP's prefix cascade cannot express. Each set names the ACTIVE column
+/// indices it keeps; the rest are re-keyed `GroupKey::Rollup` (render NULL,
+/// distinct from a real NULL group) and their base groups merge. The base's
+/// raw rows are REPLACED by the union over all sets (the full set, if
+/// requested, re-projects to itself → identity). Duplicate sets emit
+/// duplicate rows (SQL semantics). Each set is one sorted BTreeMap pass over
+/// the base; a downstream consumer needs only per-set sorted iteration (like
+/// the ROLLUP levels), never a global sort.
+fn build_grouping_sets(base: &GroupsVec, sets: &[Vec<usize>], ncols: usize) -> GroupsVec {
+    let mut out: GroupsVec = Vec::new();
+    for set in sets {
+        let mut kept = vec![false; ncols];
+        for &c in set {
+            if c < ncols {
+                kept[c] = true;
+            }
+        }
+        let mut map: BTreeMap<Vec<GroupKey>, Vec<AggState>> = BTreeMap::new();
+        for (k, states) in base {
+            let mut key = k.clone();
+            for (c, slot) in key.iter_mut().enumerate() {
+                if !kept[c] {
+                    *slot = GroupKey::Rollup;
+                }
+            }
+            match map.entry(key) {
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    for (a, b) in e.get_mut().iter_mut().zip(states) {
+                        a.merge(b);
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(states.clone());
+                }
+            }
+        }
+        out.extend(map);
+    }
+    out
 }
 
 impl GroupKey {
