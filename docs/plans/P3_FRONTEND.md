@@ -875,10 +875,19 @@ lands a case here.
   `string_agg` (needs in-agg ORDER BY); `bool_and`/`bool_or` (boolean output
   typing); `median`/`percentile_cont` (per-group ordering); named `WINDOW`
   clause; string/date-typed `lag`/`lead` (numeric-only today).
-- **Tier-3 (structural / robustness):** a `NOT` node + full three-valued
-  NULL logic (the IR has no NOT today — the highest-value *robustness* item,
-  needs a NULL truth-table gate); `RIGHT`/non-equi/unrestricted-FULL joins;
-  `GROUPING SETS`/`CUBE`; recursive CTEs.
+- **Tier-3 (NOT + 3VL) — SHIPPED (`88ebb6c4`).** New `Expr::Not(Box<Expr>)`
+  (eval inverts Bool, passes Null through) plus the *enabling* fix: rewrote
+  `eval_binary` AND/OR from 2VL to 3VL — AND FALSE-dominant, OR TRUE-dominant,
+  unknown → `Val::Null` instead of collapsing to `Bool(false)`. Safe because
+  `expect_bool` still collapses `Null→false` at bool consumers (WHERE keeps
+  only TRUE), so only *projected* boolean values change — to the correct NULL.
+  Design: `Not` returns `None` from `try_mask`, so the filter path falls back
+  to per-row `eval_bool` (the typed mask path is untouched). Parity test
+  injects NULLs via `nullif(l_linenumber,1)`; covers NOT over
+  comparisons/IN/LIKE/IS NULL, NOT over AND/OR with NULLs, double negation,
+  projected NOT-bool NULL. 9/9 parity, sf1 103/103, suite green.
+- **Tier-3 residuals (structural / robustness):** `RIGHT`/non-equi/
+  unrestricted-FULL joins; `GROUPING SETS`/`CUBE`; recursive CTEs.
 
 ## Next (P4 tail → P5/P6)
 
