@@ -87,6 +87,16 @@ fn execute_with(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, Strin
 /// `columnar` requests the chunked result representation — legal only for
 /// derived consumers ([`result_to_chunks`] handles both forms); the
 /// top-level entry always uses rows.
+/// Read a `usize` tuning knob from the environment, or fall back to
+/// `default` (0 is clamped up to 1).
+fn flag_usize(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+        .max(1)
+}
+
 fn execute_mode(q: &BoundQuery, memo: &DerivedMemo, columnar: bool) -> Result<QueryResult, String> {
     // Worker count: EMAT_ENGINE_THREADS overrides; default = all cores.
     // Results are BIT-IDENTICAL at any thread count — each row group's
@@ -1366,27 +1376,84 @@ impl Executor<'_> {
             widen_order.clear();
         }
 
+        // ---- Root source opened UP FRONT so its row groups can decode
+        // while the dims build (below). The dim build under-utilizes the
+        // pool — small dims can't saturate every core — so spare threads
+        // pre-decode a bounded prefix of root row groups into `cache`, and
+        // the main scan then TAKES a cached chunk instead of decoding it.
+        let trace_phase = std::env::var("EMAT_TRACE_PHASE").is_ok();
+        let src = self.table_src(root)?;
+        let n_rg = src.n_rg();
+        let overlap = std::env::var("EMAT_OVERLAP").is_ok() && n_rg > 0;
+        let cache: Vec<Mutex<Option<DataChunk>>> = if overlap {
+            (0..n_rg).map(|_| Mutex::new(None)).collect()
+        } else {
+            Vec::new()
+        };
+
         // ---- Process every dim subtree bottom-up.
+        let t_dims = std::time::Instant::now();
         let mut dim_results: Vec<Option<DimResult>> = Vec::with_capacity(n);
         for _ in 0..n {
             dim_results.push(None);
         }
-        for (child, links, _) in &children[root] {
-            let child_cols: Vec<usize> = links.iter().map(|&(_, c)| c).collect();
-            let extra: Vec<usize> = widen
-                .get(child)
-                .map(|v| v.iter().map(|&(_, sub)| sub).collect())
-                .unwrap_or_default();
-            let t0 = std::time::Instant::now();
-            dim_results[*child] =
-                Some(self.build_dim(*child, &child_cols, &children, &needed, &extra)?);
-            if std::env::var("EMAT_TRACE_JOIN").is_ok() {
-                eprintln!(
-                    "join: built dim '{}' in {:?}",
-                    q.tables[*child].name,
-                    t0.elapsed()
-                );
+        let trace_join = std::env::var("EMAT_TRACE_JOIN").is_ok();
+        // The bottom-up dim build (unchanged), factored out so the overlap
+        // arm can run it on the main thread while decoders prefetch.
+        let build_all_dims = |dim_results: &mut Vec<Option<DimResult>>| -> Result<(), String> {
+            for (child, links, _) in &children[root] {
+                let child_cols: Vec<usize> = links.iter().map(|&(_, c)| c).collect();
+                let extra: Vec<usize> = widen
+                    .get(child)
+                    .map(|v| v.iter().map(|&(_, sub)| sub).collect())
+                    .unwrap_or_default();
+                let t0 = std::time::Instant::now();
+                dim_results[*child] =
+                    Some(self.build_dim(*child, &child_cols, &children, &needed, &extra)?);
+                if trace_join {
+                    eprintln!("join: built dim '{}' in {:?}", q.tables[*child].name, t0.elapsed());
+                }
             }
+            Ok(())
+        };
+        if overlap {
+            // Decode-ahead: `ndec` decoders claim the first `cap` row groups
+            // and decode them into `cache` while the dims build on this
+            // thread; they stop as soon as the dims are ready (a scope-join
+            // barrier), so the main scan below runs at the normal thread
+            // count — no oversubscription. `cap` bounds buffered chunks.
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let cap = flag_usize("EMAT_OVERLAP_CAP", (2 * self.nthreads).max(1)).min(n_rg);
+            let ndec = flag_usize("EMAT_OVERLAP_DEC", (self.nthreads / 2).max(1));
+            let dims_ready = AtomicBool::new(false);
+            let pq = MorselQueue::new(cap);
+            let (src_p, cache_p, pq_p, ready_p) = (&src, &cache, &pq, &dims_ready);
+            let mut build_err: Option<String> = None;
+            std::thread::scope(|scope| {
+                for _ in 0..ndec {
+                    scope.spawn(move || {
+                        // Prefetch is best-effort: a reader-open or decode
+                        // error just leaves the slot empty and the main scan
+                        // decodes it (surfacing the real error there).
+                        let Ok(local) = src_p.open_local_stock() else {
+                            return;
+                        };
+                        while !ready_p.load(Ordering::Relaxed) {
+                            let Some(rg) = pq_p.next() else { break };
+                            if let Ok(chunk) = src_p.decode(rg, local.as_ref()) {
+                                *cache_p[rg].lock().expect("lock") = Some(chunk);
+                            }
+                        }
+                    });
+                }
+                build_err = build_all_dims(&mut dim_results).err();
+                dims_ready.store(true, Ordering::Relaxed);
+            });
+            if let Some(e) = build_err {
+                return Err(e);
+            }
+        } else {
+            build_all_dims(&mut dim_results)?;
         }
 
         // ---- Root: MORSEL-PARALLEL per row group. Each worker decodes a
@@ -1439,13 +1506,20 @@ impl Executor<'_> {
             widen: &widen,
         };
 
-        let src = self.table_src(root)?;
-        let n_rg = src.n_rg();
+        if trace_phase {
+            eprintln!(
+                "PHASE dim-build(serial)={:?} root='{}' n_rg={n_rg}",
+                t_dims.elapsed(),
+                q.tables[root].name
+            );
+        }
+        let t_root = std::time::Instant::now();
 
         let outputs: Mutex<Vec<Option<RgOut>>> = Mutex::new((0..n_rg).map(|_| None).collect());
         let queue = MorselQueue::new(n_rg);
         let nworkers = self.nthreads.clamp(1, n_rg.max(1));
-        let (src_ref, ctx_ref, queue_ref, out_ref) = (&src, &ctx, &queue, &outputs);
+        let (src_ref, ctx_ref, queue_ref, out_ref, cache_ref) =
+            (&src, &ctx, &queue, &outputs, &cache);
         std::thread::scope(|scope| -> Result<(), String> {
             let mut handles = Vec::with_capacity(nworkers);
             for _ in 0..nworkers {
@@ -1454,7 +1528,13 @@ impl Executor<'_> {
                     // footer parse is cheap; no shared-reader locking).
                     let local_stock = src_ref.open_local_stock()?;
                     while let Some(rg) = queue_ref.next() {
-                        let chunk = src_ref.decode(rg, local_stock.as_ref())?;
+                        // Take a pre-decoded chunk if the overlap prefetch
+                        // produced one (barrier-separated, so no race);
+                        // otherwise decode it here.
+                        let chunk = match cache_ref.get(rg).and_then(|c| c.lock().expect("lock").take()) {
+                            Some(c) => c,
+                            None => src_ref.decode(rg, local_stock.as_ref())?,
+                        };
                         let out = self.process_root_rg(chunk, ctx_ref)?;
                         out_ref.lock().expect("lock")[rg] = Some(out);
                     }
@@ -1467,6 +1547,9 @@ impl Executor<'_> {
             }
             Ok(())
         })?;
+        if trace_phase {
+            eprintln!("PHASE root-scan(parallel)={:?}", t_root.elapsed());
+        }
 
         // ---- Merge partials in row-group order, then HAVING → ORDER BY →
         // LIMIT.

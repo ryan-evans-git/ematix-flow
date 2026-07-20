@@ -760,12 +760,38 @@ window-over-derived is the q49 prerequisite.
   group key (it's 1:1 with `w_warehouse_sk` and not in q39a's SELECT), so
   the merge keys go all-integer.
 
+- **Dim-build / root-decode OVERLAP — BUILT, MEASURED MARGINAL, BANKED
+  OPT-IN (2026-07-19, `EMAT_OVERLAP`, default OFF).** The last named
+  structural lever toward Q08's hand-built 141 ms. Phase split (native
+  Q08 sf10): the dim build is a ~75 ms SERIAL prefix (orders ~46 ms, part
+  ~28 ms) before the ~220 ms morsel-parallel `lineitem` scan. Kill-gate
+  passed — the dim build is only ~40% parallel-efficient at 14 threads
+  (1-thread 425 ms → 76 ms; but 4→14 threads only 1.8×), so cores look
+  idle. Built a bounded decode-ahead: while the dims build, `ndec` spare
+  threads prefetch a bounded (`cap`) prefix of root row groups into a
+  per-RG cache; a scope-join barrier stops them before the main scan (no
+  oversubscription), which then TAKES a cached chunk or decodes. sf1
+  parity **103/103 with overlap ON and OFF**; engine suite green. ★ WHY
+  ONLY MARGINAL: the `EMAT_TRACE_PHASE` split shows overlap SHIFTS time,
+  it doesn't save it — dim-build 75→176 ms (+101) as root-scan 221→115 ms
+  (−106), ~1:1. The prefetch decoders contend with the dim build for
+  **memory BANDWIDTH** — the "idle" cores were bandwidth-bound, not free.
+  Net: **~2.5% Q08, ~3% q19** (122→118 ms warm interleaved), neutral on
+  small fact scans (q42/q52/q55), no regressions. ★ LESSON (for the
+  multi-month morsel engine): the dim-build phase is bandwidth-bound, so
+  the classic "overlap I/O with compute" win is near-zero-sum here — the
+  real prize is reducing total bandwidth demand (codec / late-mat) or the
+  probe cost, NOT adding concurrent bandwidth-hungry decode. Same shape as
+  the rejected "2× parallelism budget," but gated OFF so it never touches
+  the default path. Kept opt-in for bandwidth-rich deployments; NOT
+  default-on (win is at the noise floor and bandwidth-fragile).
+
 ## Next (P4 tail → P5/P6)
 
-- Overlap the dim-build phase with root decode (bounded decode-ahead
-  queue) — the last named structural lever toward the hand-built 141 ms;
-  vectorized expression eval for the grouped-agg per-row path (Q1-shaped
-  queries) remains banked.
+- Vectorized expression eval for the grouped-agg per-row path (Q1-shaped
+  queries) remains banked. Morsel-engine direction: attack total memory
+  bandwidth (codec / late-materialization) or probe cost, not concurrency
+  (dim-build is bandwidth-bound — overlap is near-zero-sum, see above).
 - **TPC-DS breadth** through the same front-end.
 - Re-home the Σ rules onto `BoundQuery`; CTE result sharing (Q15
   materializes twice); NULL semantics beyond the outer-join stand-ins;
