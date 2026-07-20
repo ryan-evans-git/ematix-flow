@@ -728,6 +728,38 @@ window-over-derived is the q49 prerequisite.
   k-way merge (attacks q39's actual cost — string compares — WITHOUT
   losing sort), or a per-consumer "needs-sorted" signal.
 
+- **Interned/vectorized group-key build — BUILT, MEASURED INERT, REVERTED
+  (2026-07-19).** Followed the hash-agg retry precondition ("intern string
+  group keys to attack q39's cost while keeping the sorted merge"). PROFILE
+  FIRST refuted the premise: in q39a's per-RG BUILD, string comparison
+  (memcmp+Head::cmp) is only ~5% — the real per-row waste is a fresh
+  `Arc<str>` allocation for the string group key on *every* row
+  (`GroupKey::from(eval_value)` → `Arc::from(s)` at expr.rs:422), q39a's ~20
+  distinct `w_warehouse_name`s over millions of rows. Built a bit-identical
+  vectorized key build: per-chunk `KeyColumn` (numeric widened in bulk,
+  strings deduped so one Arc per distinct value), per-row indexes it;
+  `EMAT_NO_VEC_KEY` A/B hatch; gated dense; a bit-identity test (vec ≡
+  per-row, incl. row order — sorted spine preserved). sf1 103/103, A/B
+  identical. **Result: INERT** — q39a 3900→3900ms, q67 2986↔2996ms, TPC-H
+  Q1 interleaved 1291↔1271ms (per-row marginally *faster*; ±200ms noise
+  swamps it). ★ WHY: the per-row Arc alloc is real waste but NEVER on the
+  critical path — the `EMAT_TRACE_MERGE` trace showed q39a is MERGE-bound
+  (1084 runs, **26.5M** partial entries → the k-way merge dominated by
+  leading-string memcmp + `AggState::merge`), q67 is merge/window-bound,
+  and TPC-H Q1's build is dominated by agg arithmetic + the 59M BTreeMap
+  *probes* (which still compare strings). Killing the string cost safely
+  means order-preserving *integer* keys in the MERGE+probe (not just
+  deduped Arc alloc in the build) — the heavy path the hash-agg lesson
+  warns against. ★ LESSON (again): a "should-help" string lever must be
+  aimed at the phase the profile says is hot; the group-KEY *build* isn't
+  it. Reverted (inert code in the hot group-build path = complexity +
+  codegen risk for zero win). Retry only with: (a) order-preserving i64
+  interning threaded through the MERGE comparison (keeps sorted output;
+  ~0.5s optimistic on q39a alone — likely not worth the merge-machinery
+  risk), or (b) FD-recognition that drops the redundant `w_warehouse_name`
+  group key (it's 1:1 with `w_warehouse_sk` and not in q39a's SELECT), so
+  the merge keys go all-integer.
+
 ## Next (P4 tail → P5/P6)
 
 - Overlap the dim-build phase with root decode (bounded decode-ahead
