@@ -372,3 +372,48 @@ fn window_ntile() {
          from lineitem where l_orderkey < 400",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tier-3: NOT + three-valued NULL logic. NULLs are injected with
+// nullif(l_linenumber, 1) (NULL when linenumber == 1) since SF1 lineitem
+// has no NULL columns. The point is that NOT over a NULL is NULL (drops at
+// WHERE), NOT over AND/OR follows De Morgan under 3VL, and projected NOT
+// values are NULL (not false) where the operand is unknown.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn not_and_three_valued_null_logic() {
+    if !have_data() {
+        eprintln!("SKIP not_and_three_valued_null_logic: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // NOT over comparisons / IS NULL / IN / LIKE (row counts must match).
+    p.check("select count(*) n from lineitem where not (l_discount > 0.05)");
+    p.check("select count(*) n from lineitem where not (nullif(l_linenumber, 1) > 3)");
+    p.check("select count(*) n from lineitem where not (l_returnflag in ('A', 'N'))");
+    p.check("select count(*) n from lineitem where not (l_shipinstruct like 'DELIVER%')");
+    p.check("select count(*) n from lineitem where not (nullif(l_linenumber, 1) is null)");
+    // NOT over AND / OR with a NULL-bearing operand (De Morgan under 3VL).
+    p.check(
+        "select count(*) n from lineitem \
+         where not (nullif(l_linenumber, 1) > 3 and l_discount > 0.05)",
+    );
+    p.check(
+        "select count(*) n from lineitem \
+         where not (nullif(l_linenumber, 1) > 3 or l_discount > 0.09)",
+    );
+    // Double negation and nested.
+    p.check("select count(*) n from lineitem where not (not (l_quantity > 25))");
+    p.check(
+        "select count(*) n from lineitem \
+         where l_tax > 0.04 and not (l_returnflag = 'A' or nullif(l_linenumber,1) = 2)",
+    );
+    // Projected boolean: NOT over a NULL operand must render NULL, not false.
+    p.check(
+        "select l_orderkey, l_linenumber, \
+                not (nullif(l_linenumber, 1) > 3) f, \
+                not (l_linenumber > 2 and nullif(l_linenumber, 1) > 3) g \
+         from lineitem where l_orderkey < 60",
+    );
+}

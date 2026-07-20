@@ -79,6 +79,11 @@ pub enum Expr {
         unit: DateTruncUnit,
         arg: Box<Expr>,
     },
+    /// `NOT <bool expr>` — three-valued: `NOT TRUE`=FALSE, `NOT FALSE`=TRUE,
+    /// `NOT NULL`=NULL. Stays on the per-row path (no typed mask kernel), so
+    /// a filter containing it falls back to `eval_bool` (NULL→drop) — correct
+    /// because the inner AND/OR/compare are all three-valued.
+    Not(Box<Expr>),
     /// `CAST(<expr> AS INT/INTEGER/BIGINT/SMALLINT)` on a fractional value —
     /// rounds to the nearest integer (DuckDB `CAST` semantics: `10714.82` →
     /// `10715`). An already-integer operand is unchanged.
@@ -226,6 +231,7 @@ impl Expr {
             Expr::Extract { arg: e, .. }
             | Expr::DateTrunc { arg: e, .. }
             | Expr::CastInt(e)
+            | Expr::Not(e)
             | Expr::Upper(e) => e.for_each_col(f),
             Expr::Round { expr, .. }
             | Expr::Like { expr, .. }
@@ -323,6 +329,11 @@ impl Expr {
                 Val::Int(days) => Val::Int(trunc_days(*unit, days as i32) as i64),
                 Val::Null => Val::Null,
                 other => panic!("date_trunc needs a date operand, got {other:?}"),
+            },
+            Expr::Not(e) => match e.eval(chunk, row) {
+                Val::Bool(b) => Val::Bool(!b),
+                Val::Null => Val::Null,
+                other => panic!("NOT needs a boolean operand, got {other:?}"),
             },
             Expr::CastInt(e) => match e.eval(chunk, row) {
                 Val::Int(i) => Val::Int(i),
@@ -516,21 +527,40 @@ impl Expr {
 #[inline]
 fn eval_binary<'a>(op: BinaryOp, l: Val<'a>, r: Val<'a>) -> Val<'a> {
     use BinaryOp::*;
-    // NULL propagation: arithmetic and comparison with a NULL operand
-    // yield NULL (a comparison's UNKNOWN — `expect_bool` maps it to
-    // not-satisfied). AND/OR treat NULL conditions as not-satisfied.
-    if matches!(l, Val::Null) || matches!(r, Val::Null) {
-        return match op {
-            And => Val::Bool(l.expect_bool() && r.expect_bool()),
-            Or => Val::Bool(l.expect_bool() || r.expect_bool()),
-            _ => Val::Null,
+    // AND/OR are THREE-VALUED (so a NOT over them is correct): AND is FALSE
+    // if either side is FALSE (even when the other is NULL), TRUE only if
+    // both TRUE, else NULL; OR is the dual. Every boolean consumer collapses
+    // NULL→false via `expect_bool`, so filter/CASE behavior is unchanged —
+    // only a projected boolean value is now correctly NULL instead of false.
+    if matches!(op, And | Or) {
+        let b = |v: Val| match v {
+            Val::Bool(x) => Some(x),
+            Val::Null => None,
+            other => panic!("expected a boolean operand, got {other:?}"),
         };
+        let (lb, rb) = (b(l), b(r));
+        return match op {
+            And => match (lb, rb) {
+                (Some(false), _) | (_, Some(false)) => Val::Bool(false),
+                (Some(true), Some(true)) => Val::Bool(true),
+                _ => Val::Null,
+            },
+            _ => match (lb, rb) {
+                (Some(true), _) | (_, Some(true)) => Val::Bool(true),
+                (Some(false), Some(false)) => Val::Bool(false),
+                _ => Val::Null,
+            },
+        };
+    }
+    // Arithmetic and comparison with a NULL operand yield NULL (a
+    // comparison's UNKNOWN — `expect_bool` maps it to not-satisfied).
+    if matches!(l, Val::Null) || matches!(r, Val::Null) {
+        return Val::Null;
     }
     match op {
         Add | Sub | Mul | Div => arith(op, l, r),
         Eq | NotEq | Lt | LtEq | Gt | GtEq => Val::Bool(compare(op, l, r)),
-        And => Val::Bool(l.expect_bool() && r.expect_bool()),
-        Or => Val::Bool(l.expect_bool() || r.expect_bool()),
+        And | Or => unreachable!("handled above"),
     }
 }
 

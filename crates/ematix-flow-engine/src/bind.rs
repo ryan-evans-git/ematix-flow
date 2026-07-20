@@ -706,7 +706,7 @@ fn remap_window_cols(e: &mut Expr, win_base: usize, group_base: usize) {
             remap_window_cols(lhs, win_base, group_base);
             remap_window_cols(rhs, win_base, group_base);
         }
-        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Not(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
             remap_window_cols(i, win_base, group_base)
         }
         Expr::Like { expr, .. }
@@ -2951,6 +2951,12 @@ impl Binder<'_> {
                     rhs: Box::new(e),
                 })),
             },
+            // `NOT <bool expr>` — three-valued (see [`Expr::Not`]). Double
+            // negation folds; a NOT over a constant folds through `bind`.
+            ast::Expr::UnaryOp {
+                op: ast::UnaryOperator::Not,
+                expr,
+            } => Ok(Bound::Expr(Expr::Not(Box::new(materialize(self.bind(expr)?))))),
             ast::Expr::TypedString(ts) => bind_typed_string(ts).map(Bound::Expr),
             ast::Expr::Extract { field, expr, .. } => {
                 let f = bind_date_field(field)?;
@@ -4687,7 +4693,7 @@ fn references_columns(e: &Expr) -> bool {
         Expr::Column(_) => true,
         Expr::Literal(_) => false,
         Expr::Binary { lhs, rhs, .. } => references_columns(lhs) || references_columns(rhs),
-        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Not(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
             references_columns(i)
         }
         Expr::Like { expr, .. } => references_columns(expr),

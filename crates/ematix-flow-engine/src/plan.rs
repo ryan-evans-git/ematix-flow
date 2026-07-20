@@ -330,7 +330,7 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
             }
             Expr::Extract { arg: i, .. }
             | Expr::DateTrunc { arg: i, .. }
-            | Expr::CastInt(i)
+            | Expr::CastInt(i) | Expr::Not(i)
             | Expr::Round { expr: i, .. }
             | Expr::Upper(i) => walk(i, f),
             Expr::Like { expr, .. }
@@ -389,7 +389,7 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
             }
             Expr::Extract { arg: i, .. }
             | Expr::DateTrunc { arg: i, .. }
-            | Expr::CastInt(i)
+            | Expr::CastInt(i) | Expr::Not(i)
             | Expr::Round { expr: i, .. }
             | Expr::Upper(i) => walk(i, f),
             Expr::Like { expr, .. }
@@ -4079,7 +4079,7 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
             collect_slots(lhs, out);
             collect_slots(rhs, out);
         }
-        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Not(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
             collect_slots(i, out)
         }
         Expr::Like { expr, .. } => collect_slots(expr, out),
