@@ -1343,26 +1343,35 @@ impl Binder<'_> {
     /// filter (correct outer-join semantics), and conditions on the
     /// preserved side error (they are not WHERE filters).
     fn add_join(&mut self, join: &ast::Join) -> Result<(), String> {
-        let (on, left) = match &join.join_operator {
+        // `dir`: None = INNER; Some(false) = LEFT (the joined table is the
+        // nullable side); Some(true) = RIGHT (the joined table is preserved,
+        // an OLD table becomes nullable). `LEFT`/`LEFT OUTER` (and the RIGHT
+        // pair) parse as distinct variants but mean the same thing.
+        let (on, dir) = match &join.join_operator {
             ast::JoinOperator::Inner(ast::JoinConstraint::On(e))
-            | ast::JoinOperator::Join(ast::JoinConstraint::On(e)) => (e, false),
-            // `LEFT JOIN` and `LEFT OUTER JOIN` parse as distinct variants
-            // but mean the same thing.
+            | ast::JoinOperator::Join(ast::JoinConstraint::On(e)) => (e, None),
             ast::JoinOperator::LeftOuter(ast::JoinConstraint::On(e))
-            | ast::JoinOperator::Left(ast::JoinConstraint::On(e)) => (e, true),
+            | ast::JoinOperator::Left(ast::JoinConstraint::On(e)) => (e, Some(false)),
+            ast::JoinOperator::RightOuter(ast::JoinConstraint::On(e))
+            | ast::JoinOperator::Right(ast::JoinConstraint::On(e)) => (e, Some(true)),
             other => return Err(format!("unsupported join: {other:?}")),
         };
+        let outer = dir.is_some();
         let ntables_before = self.tables.len();
         self.add_from_item(&join.relation)?;
         if self.tables.len() != ntables_before + 1 {
             return Err("a joined relation must be a single table".into());
         }
         let new_t = ntables_before;
-        if left {
-            self.left_tables.insert(new_t);
-        }
+
         let mut conjuncts = Vec::new();
         split_and(on, &mut conjuncts);
+        // Pass 1 — equi conjuncts become join edges. `nullable` is the one
+        // table whose rows may be NULL-extended: the joined table under LEFT,
+        // or (under RIGHT) the single OLD table the joined table is preserved
+        // against, discovered here from the equi key.
+        let mut nullable: Option<usize> = if dir == Some(false) { Some(new_t) } else { None };
+        let mut nonequi: Vec<&ast::Expr> = Vec::new();
         for conj in conjuncts {
             if let ast::Expr::BinaryOp {
                 left: l,
@@ -1376,11 +1385,25 @@ impl Binder<'_> {
                         let bb = self.resolve_parts(&rp)?;
                         let (ta, tb) = (self.slots[a].table, self.slots[bb].table);
                         if ta != tb {
-                            let preserved = if left {
-                                Some(if ta == new_t { tb } else { ta })
-                            } else {
-                                None
+                            let old = if ta == new_t { tb } else { ta };
+                            // RIGHT preserves the joined table (root at it);
+                            // LEFT preserves the old side; INNER neither.
+                            let preserved = match dir {
+                                None => None,
+                                Some(false) => Some(old),
+                                Some(true) => Some(new_t),
                             };
+                            if dir == Some(true) {
+                                match nullable {
+                                    None => nullable = Some(old),
+                                    Some(x) if x == old => {}
+                                    Some(_) => {
+                                        return Err("RIGHT JOIN keyed on more than one left \
+                                                    table is not yet supported"
+                                            .into())
+                                    }
+                                }
+                            }
                             self.extra_edges.push(JoinEdge {
                                 a,
                                 b: bb,
@@ -1391,21 +1414,30 @@ impl Binder<'_> {
                     }
                 }
             }
-            // Non-equi ON conjunct: must belong to the joined table (its
-            // pre-join filter under LEFT semantics).
+            nonequi.push(conj);
+        }
+        if let Some(nt) = nullable {
+            self.left_tables.insert(nt);
+        }
+        // Pass 2 — non-equi ON conjuncts. A single-table conjunct on the
+        // nullable side is that table's pre-join filter (outer-join
+        // semantics); any other conjunct is a post-join filter for an INNER
+        // join, but on an outer join a preserved-side condition is not a
+        // filter, so it errors.
+        for conj in nonequi {
             let (e, attr) = self.bind_multi(conj)?;
             match attr {
-                Attribution::Single(t) if t == new_t => {
+                Attribution::Single(t) if Some(t) == nullable => {
                     self.pending_conjuncts.push((conj.clone(), true));
                     let _ = e; // re-bound in the WHERE pass
                 }
-                _ if !left => {
+                _ if !outer => {
                     self.pending_conjuncts.push((conj.clone(), true));
                     let _ = e;
                 }
                 _ => {
                     return Err(format!(
-                        "ON condition '{conj}' on a LEFT JOIN's preserved side is not yet \
+                        "ON condition '{conj}' on an outer join's preserved side is not yet \
                          supported"
                     ));
                 }

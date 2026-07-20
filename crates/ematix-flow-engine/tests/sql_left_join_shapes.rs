@@ -55,3 +55,36 @@ fn anti_join_plus_semi_join_covers_all_rows() {
     // join is row-preserving and the two filters partition it exactly.
     assert_eq!(matched + unmatched, total, "anti + semi partition the rows");
 }
+
+/// RIGHT OUTER is a mirrored LEFT: `store_returns RIGHT JOIN store_sales`
+/// preserves store_sales exactly as `store_sales LEFT JOIN store_returns`
+/// does, so the same anti/semi partition identity must hold, and each
+/// RIGHT form must equal its LEFT twin row-for-row (here: the count).
+#[test]
+fn right_outer_mirrors_left() {
+    let total = count("select count(*) from store_sales");
+    // Same predicates, sides swapped: store_sales is the preserved side.
+    let matched = count(
+        "select count(*) from store_returns right outer join store_sales \
+           on (ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk) \
+         where sr_ticket_number is not null",
+    );
+    let unmatched = count(
+        "select count(*) from store_returns right outer join store_sales \
+           on (ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk) \
+         where sr_ticket_number is null",
+    );
+    assert!(matched > 0 && unmatched > 0);
+    assert_eq!(matched + unmatched, total, "RIGHT anti + semi partition all rows");
+
+    // RIGHT twin equals the LEFT original exactly (matched-only count).
+    let left_matched = count(
+        "select count(sr_ticket_number) from store_sales left outer join store_returns \
+           on (ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk)",
+    );
+    let right_matched = count(
+        "select count(sr_ticket_number) from store_returns right outer join store_sales \
+           on (ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk)",
+    );
+    assert_eq!(left_matched, right_matched, "RIGHT == mirrored LEFT (matched count)");
+}

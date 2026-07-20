@@ -19,8 +19,13 @@ use ematix_flow_engine::catalog::Catalog;
 use ematix_flow_engine::expr::ScalarValue;
 use ematix_flow_engine::plan::execute;
 
+fn sf1(table: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../examples/tpch/data/sf1/{table}.parquet"))
+}
+
 fn lineitem() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tpch/data/sf1/lineitem.parquet")
+    sf1("lineitem")
 }
 
 fn have_data() -> bool {
@@ -163,16 +168,24 @@ struct Parity {
 
 impl Parity {
     fn new() -> Self {
+        Self::with_tables(&["lineitem"])
+    }
+
+    /// Register the named SF1 tables into BOTH the native catalog and DuckDB
+    /// (as views over the same parquet), so join parity is over identical data.
+    fn with_tables(tables: &[&str]) -> Self {
         let mut catalog = Catalog::new();
-        catalog
-            .register_parquet("lineitem", lineitem())
-            .expect("register lineitem");
         let duck = duckdb::Connection::open_in_memory().expect("duckdb");
-        duck.execute_batch(&format!(
-            "CREATE VIEW lineitem AS SELECT * FROM read_parquet('{}');",
-            lineitem().display()
-        ))
-        .expect("duck view");
+        for &t in tables {
+            catalog
+                .register_parquet(t, sf1(t))
+                .unwrap_or_else(|e| panic!("register {t}: {e}"));
+            duck.execute_batch(&format!(
+                "CREATE VIEW {t} AS SELECT * FROM read_parquet('{}');",
+                sf1(t).display()
+            ))
+            .unwrap_or_else(|e| panic!("duck view {t}: {e}"));
+        }
         Self { catalog, duck }
     }
 
@@ -370,6 +383,88 @@ fn window_ntile() {
                 ntile(4) over (order by l_orderkey, l_linenumber) q, \
                 ntile(7) over (partition by l_returnflag order by l_orderkey, l_linenumber) q7 \
          from lineitem where l_orderkey < 400",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier-3 join residuals: RIGHT [OUTER] JOIN + non-equi joins. Over
+// orders ⋈ lineitem (a 1-to-many key) with a filtered ON so preserved rows
+// go unmatched (NULL-extended). RIGHT is implemented as a mirrored LEFT
+// (the joined table is preserved, the keyed OLD table becomes nullable), so
+// every LEFT capability — grouped NULL-extension, matched-only COUNT, and
+// WHERE-side demote-to-INNER — must hold for RIGHT too.
+// ---------------------------------------------------------------------------
+
+fn have_joins() -> bool {
+    sf1("orders").exists() && sf1("customer").exists()
+}
+
+#[test]
+fn right_outer_join() {
+    if !have_joins() {
+        eprintln!("SKIP right_outer_join: SF1 orders/customer absent");
+        return;
+    }
+    let p = Parity::with_tables(&["lineitem", "orders", "customer"]);
+    // RIGHT preserves orders; a filtered ON leaves many orders unmatched.
+    let on = "on l.l_orderkey = o.o_orderkey and l.l_quantity > 49";
+    // Plain count over the preserved side.
+    p.check(&format!(
+        "select count(*) n from lineitem l right join orders o {on} where o.o_orderkey < 3000"
+    ));
+    // Grouped, with matched-only COUNT(l.col) vs total COUNT(*): exercises the
+    // NULL-extension projection and the CountMatched path together.
+    p.check(&format!(
+        "select o.o_orderpriority pr, count(*) n, count(l.l_orderkey) m \
+         from lineitem l right join orders o {on} where o.o_orderkey < 3000 group by 1"
+    ));
+    // A WHERE predicate on the (nullable) lineitem side that rejects NULLs
+    // must demote RIGHT → INNER.
+    p.check(
+        "select count(*) n from lineitem l right join orders o \
+         on l.l_orderkey = o.o_orderkey where o.o_orderkey < 3000 and l.l_quantity > 40",
+    );
+    // RIGHT join first, then an inner cross-linked third table.
+    p.check(&format!(
+        "select count(*) n from lineitem l right join orders o {on}, customer c \
+         where c.c_custkey = o.o_custkey and o.o_orderkey < 3000"
+    ));
+    // RIGHT/RIGHT OUTER are the same operator.
+    p.check(&format!(
+        "select count(*) n from lineitem l right outer join orders o {on} where o.o_orderkey < 3000"
+    ));
+    // Boundary: a RIGHT join whose joined table is keyed to TWO different old
+    // tables would need two preserved-root tables — intentionally rejected.
+    p.check_rejected(
+        "select count(*) n from customer c, orders o right join lineitem l \
+         on l.l_orderkey = o.o_orderkey and l.l_suppkey = c.c_custkey",
+    );
+}
+
+#[test]
+fn non_equi_join() {
+    if !have_joins() {
+        eprintln!("SKIP non_equi_join: SF1 orders/customer absent");
+        return;
+    }
+    let p = Parity::with_tables(&["lineitem", "orders"]);
+    // A cross-table inequality alongside the equi key (post-join filter).
+    p.check(
+        "select count(*) n from orders o join lineitem l \
+         on l.l_orderkey = o.o_orderkey and o.o_orderdate < l.l_shipdate \
+         where o.o_orderkey < 3000",
+    );
+    // A pure non-equi ON (no equi key at all) — a filtered cross join whose
+    // ON inequality prunes post-expansion.
+    p.check(
+        "select count(*) n from orders o join lineitem l \
+         on o.o_totalprice < l.l_extendedprice where o.o_orderkey < 6 and l.l_orderkey < 6",
+    );
+    // Non-equi with an extra BETWEEN-style range and a grouped result.
+    p.check(
+        "select o.o_orderstatus s, count(*) n from orders o join lineitem l \
+         on l.l_orderkey = o.o_orderkey and l.l_extendedprice > o.o_totalprice * 0.1 \
+         where o.o_orderkey < 3000 group by 1",
     );
 }
 
