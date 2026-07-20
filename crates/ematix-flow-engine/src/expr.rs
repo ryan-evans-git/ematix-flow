@@ -73,6 +73,12 @@ pub enum Expr {
         field: DateField,
         arg: Box<Expr>,
     },
+    /// `date_trunc('<unit>', <date expr>)` — Date32 truncated down to the
+    /// start of its year/quarter/month/week/day (a Date32 result).
+    DateTrunc {
+        unit: DateTruncUnit,
+        arg: Box<Expr>,
+    },
     /// `CAST(<expr> AS INT/INTEGER/BIGINT/SMALLINT)` on a fractional value —
     /// rounds to the nearest integer (DuckDB `CAST` semantics: `10714.82` →
     /// `10715`). An already-integer operand is unchanged.
@@ -217,7 +223,10 @@ impl Expr {
                 lhs.for_each_col(f);
                 rhs.for_each_col(f);
             }
-            Expr::Extract { arg: e, .. } | Expr::CastInt(e) | Expr::Upper(e) => e.for_each_col(f),
+            Expr::Extract { arg: e, .. }
+            | Expr::DateTrunc { arg: e, .. }
+            | Expr::CastInt(e)
+            | Expr::Upper(e) => e.for_each_col(f),
             Expr::Round { expr, .. }
             | Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
@@ -306,6 +315,14 @@ impl Expr {
                 Val::Int(days) => Val::Int(extract_field(*field, days as i32)),
                 Val::Null => Val::Null,
                 other => panic!("EXTRACT needs a date operand, got {other:?}"),
+            },
+            // Borrowed path yields the day-number (comparisons vs date
+            // literals, which are also day-numbers); `eval_value` types it
+            // back to Date32 for projection/group-key output.
+            Expr::DateTrunc { unit, arg } => match arg.eval(chunk, row) {
+                Val::Int(days) => Val::Int(trunc_days(*unit, days as i32) as i64),
+                Val::Null => Val::Null,
+                other => panic!("date_trunc needs a date operand, got {other:?}"),
             },
             Expr::CastInt(e) => match e.eval(chunk, row) {
                 Val::Int(i) => Val::Int(i),
@@ -437,6 +454,14 @@ impl Expr {
         }
         if let Expr::StrFn { func, args } = self {
             return eval_str_fn(*func, args, chunk, row);
+        }
+        // date_trunc yields a Date32 (not a bare day-number) in value space.
+        if let Expr::DateTrunc { unit, arg } = self {
+            return match arg.eval(chunk, row) {
+                Val::Int(days) => ScalarValue::Date32(trunc_days(*unit, days as i32)),
+                Val::Null => ScalarValue::Null,
+                other => panic!("date_trunc needs a date operand, got {other:?}"),
+            };
         }
         match self.eval(chunk, row) {
             Val::Int(i) => ScalarValue::Int64(i),
@@ -626,6 +651,35 @@ pub enum DateField {
     Doy,
     /// ISO-8601 week number, 1..=53 (DuckDB `week`).
     Week,
+}
+
+/// `date_trunc` granularity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DateTruncUnit {
+    Year,
+    Quarter,
+    Month,
+    Week,
+    Day,
+}
+
+/// Truncate a Date32 (days since epoch) down to the start of `unit` (ISO
+/// week = Monday), matching DuckDB's `date_trunc`.
+fn trunc_days(unit: DateTruncUnit, days: i32) -> i32 {
+    let (y, m, _) = civil_of_days(days);
+    match unit {
+        DateTruncUnit::Day => days,
+        DateTruncUnit::Year => days_from_civil(y, 1, 1),
+        DateTruncUnit::Month => days_from_civil(y, m, 1),
+        DateTruncUnit::Quarter => days_from_civil(y, (m - 1) / 3 * 3 + 1, 1),
+        DateTruncUnit::Week => {
+            let iso_dow = {
+                let dow = (days as i64 + 4).rem_euclid(7);
+                if dow == 0 { 7 } else { dow }
+            };
+            days - (iso_dow as i32 - 1)
+        }
+    }
 }
 
 /// Days since the Unix epoch → proleptic-Gregorian `(year, month, day)` (the

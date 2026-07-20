@@ -33,7 +33,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::catalog::{Catalog, TableDef};
-use crate::expr::{BinaryOp, DateField, Expr, NumFn, ScalarValue, StrFn};
+use crate::expr::{BinaryOp, DateField, DateTruncUnit, Expr, NumFn, ScalarValue, StrFn};
 use crate::logical::{
     AggExpr, AggFunc, BoundQuery, GroupExpr, JoinEdge, OrderByKey, OutputExpr, ScanColumn, SetOp,
     Slot, TableInput, TableSource, WindowExpr, WindowFunc,
@@ -706,7 +706,7 @@ fn remap_window_cols(e: &mut Expr, win_base: usize, group_base: usize) {
             remap_window_cols(lhs, win_base, group_base);
             remap_window_cols(rhs, win_base, group_base);
         }
-        Expr::Extract { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
             remap_window_cols(i, win_base, group_base)
         }
         Expr::Like { expr, .. }
@@ -1239,7 +1239,7 @@ impl Binder<'_> {
         let fname = f.name.to_string().to_lowercase();
         const KNOWN: &[&str] = &[
             "round", "upper", "lower", "lcase", "replace", "length", "char_length",
-            "character_length", "len", "mod",
+            "character_length", "len", "mod", "date_trunc", "datetrunc",
         ];
         if !KNOWN.contains(&fname.as_str()) {
             return Ok(None);
@@ -1278,6 +1278,16 @@ impl Binder<'_> {
                 func: NumFn::Mod,
                 args: vec![self.bind_scalar(a)?, self.bind_scalar(b)?],
             })),
+            ("date_trunc" | "datetrunc", [u, d]) => {
+                let unit = match self.clone_free_literal(u)? {
+                    ScalarValue::Utf8(s) => bind_trunc_unit(&s)?,
+                    other => return Err(format!("date_trunc unit must be a string: {other:?}")),
+                };
+                Ok(Some(Expr::DateTrunc {
+                    unit,
+                    arg: Box::new(self.bind_scalar(d)?),
+                }))
+            }
             ("round", [x]) => Ok(Some(Expr::Round {
                 expr: Box::new(self.bind_scalar(x)?),
                 digits: 0,
@@ -2640,6 +2650,62 @@ impl Binder<'_> {
             "rank" => (WindowFunc::Rank, Expr::Literal(ScalarValue::Int64(0))),
             "dense_rank" => (WindowFunc::DenseRank, Expr::Literal(ScalarValue::Int64(0))),
             "row_number" => (WindowFunc::RowNumber, Expr::Literal(ScalarValue::Int64(0))),
+            "lag" | "lead" => {
+                let ast::FunctionArguments::List(args) = &f.args else {
+                    return Err(format!("window '{fname}' needs an argument list"));
+                };
+                let a = args.args.as_slice();
+                let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(x)) =
+                    a.first().ok_or(format!("{fname} needs a value argument"))?
+                else {
+                    return Err(format!("unsupported {fname} argument"));
+                };
+                let val = self.bind_output(x, group, aggs)?;
+                let off = match a.get(1) {
+                    None => 1,
+                    Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(o))) => {
+                        match self.clone_free_literal(o)? {
+                            ScalarValue::Int64(v) if v >= 0 => v as u32,
+                            other => {
+                                return Err(format!("{fname} offset must be a non-negative integer: {other:?}"));
+                            }
+                        }
+                    }
+                    _ => return Err(format!("{fname} takes (value[, offset])")),
+                };
+                let wf = if fname == "lag" {
+                    WindowFunc::Lag(off)
+                } else {
+                    WindowFunc::Lead(off)
+                };
+                (wf, val)
+            }
+            "first_value" => {
+                let ast::FunctionArguments::List(args) = &f.args else {
+                    return Err("first_value needs an argument list".into());
+                };
+                let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(x))] =
+                    args.args.as_slice()
+                else {
+                    return Err("first_value takes exactly one argument".into());
+                };
+                (WindowFunc::FirstValue, self.bind_output(x, group, aggs)?)
+            }
+            "ntile" => {
+                let ast::FunctionArguments::List(args) = &f.args else {
+                    return Err("ntile needs an argument list".into());
+                };
+                let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(nb))] =
+                    args.args.as_slice()
+                else {
+                    return Err("ntile takes exactly one argument".into());
+                };
+                let nb = match self.clone_free_literal(nb)? {
+                    ScalarValue::Int64(v) if v > 0 => v as u32,
+                    other => return Err(format!("ntile bucket count must be a positive integer: {other:?}")),
+                };
+                (WindowFunc::Ntile(nb), Expr::Literal(ScalarValue::Int64(0)))
+            }
             name => {
                 let af = match name {
                     "sum" => AggFunc::Sum,
@@ -2647,7 +2713,10 @@ impl Binder<'_> {
                     "min" => AggFunc::Min,
                     "max" => AggFunc::Max,
                     "count" => AggFunc::Count,
-                    "stddev_samp" => AggFunc::StddevSamp,
+                    "stddev_samp" | "stddev" | "stddev_sample" => AggFunc::StddevSamp,
+                    "stddev_pop" => AggFunc::StddevPop,
+                    "var_samp" | "variance" | "var" => AggFunc::VarSamp,
+                    "var_pop" => AggFunc::VarPop,
                     other => return Err(format!("unsupported window function '{other}'")),
                 };
                 let ast::FunctionArguments::List(args) = &f.args else {
@@ -2739,7 +2808,10 @@ impl Binder<'_> {
             "min" => AggFunc::Min,
             "max" => AggFunc::Max,
             "avg" => AggFunc::Avg,
-            "stddev_samp" => AggFunc::StddevSamp,
+            "stddev_samp" | "stddev" | "stddev_sample" => AggFunc::StddevSamp,
+            "stddev_pop" => AggFunc::StddevPop,
+            "var_samp" | "variance" | "var" => AggFunc::VarSamp,
+            "var_pop" => AggFunc::VarPop,
             other => return Err(format!("unsupported aggregate function '{other}'")),
         };
         let ast::FunctionArguments::List(args) = &f.args else {
@@ -3207,8 +3279,14 @@ pub(crate) fn output_types(q: &BoundQuery) -> Vec<LogicalType> {
 fn infer_windowed_slot_type(q: &BoundQuery, nslots: usize, e: &Expr) -> LogicalType {
     match e {
         Expr::Column(i) if *i >= nslots => match q.windows[*i - nslots].func {
-            WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::RowNumber => LogicalType::Int64,
-            WindowFunc::Agg(_) => LogicalType::Float64,
+            WindowFunc::Rank
+            | WindowFunc::DenseRank
+            | WindowFunc::RowNumber
+            | WindowFunc::Ntile(_) => LogicalType::Int64,
+            WindowFunc::Agg(_)
+            | WindowFunc::Lag(_)
+            | WindowFunc::Lead(_)
+            | WindowFunc::FirstValue => LogicalType::Float64,
         },
         Expr::Binary { op, lhs, rhs } => binary_type(
             *op,
@@ -3235,6 +3313,7 @@ fn infer_slot_type(q: &BoundQuery, e: &Expr) -> LogicalType {
             binary_type(*op, infer_slot_type(q, lhs), infer_slot_type(q, rhs))
         }
         Expr::Extract { .. } | Expr::CastInt(_) => LogicalType::Int64,
+        Expr::DateTrunc { .. } => LogicalType::Date32,
         Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) | Expr::StrFn { .. } => {
             LogicalType::Utf8
         }
@@ -3264,10 +3343,14 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
                 }
             } else {
                 match q.windows[*i - key_tys.len() - q.aggs.len()].func {
-                    WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::RowNumber => {
-                        LogicalType::Int64
-                    }
-                    WindowFunc::Agg(_) => LogicalType::Float64,
+                    WindowFunc::Rank
+                    | WindowFunc::DenseRank
+                    | WindowFunc::RowNumber
+                    | WindowFunc::Ntile(_) => LogicalType::Int64,
+                    WindowFunc::Agg(_)
+                    | WindowFunc::Lag(_)
+                    | WindowFunc::Lead(_)
+                    | WindowFunc::FirstValue => LogicalType::Float64,
                 }
             }
         }
@@ -3278,6 +3361,7 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
             infer_row_type(q, key_tys, rhs),
         ),
         Expr::Extract { .. } | Expr::CastInt(_) => LogicalType::Int64,
+        Expr::DateTrunc { .. } => LogicalType::Date32,
         Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) | Expr::StrFn { .. } => {
             LogicalType::Utf8
         }
@@ -4425,7 +4509,7 @@ fn contains_aggregate(e: &ast::Expr) -> bool {
             }
             if matches!(
                 f.name.to_string().to_lowercase().as_str(),
-                "sum" | "count" | "min" | "max" | "avg" | "stddev_samp"
+                "sum" | "count" | "min" | "max" | "avg" | "stddev_samp" | "stddev" | "stddev_sample" | "stddev_pop" | "var_samp" | "variance" | "var" | "var_pop"
             ) {
                 return true;
             }
@@ -4526,7 +4610,7 @@ fn contains_nonwindow_agg(e: &ast::Expr) -> bool {
             }
             if matches!(
                 f.name.to_string().to_lowercase().as_str(),
-                "sum" | "count" | "min" | "max" | "avg" | "stddev_samp"
+                "sum" | "count" | "min" | "max" | "avg" | "stddev_samp" | "stddev" | "stddev_sample" | "stddev_pop" | "var_samp" | "variance" | "var" | "var_pop"
             ) {
                 return true;
             }
@@ -4603,7 +4687,7 @@ fn references_columns(e: &Expr) -> bool {
         Expr::Column(_) => true,
         Expr::Literal(_) => false,
         Expr::Binary { lhs, rhs, .. } => references_columns(lhs) || references_columns(rhs),
-        Expr::Extract { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
             references_columns(i)
         }
         Expr::Like { expr, .. } => references_columns(expr),
@@ -4870,6 +4954,18 @@ fn select_item_expr(item: &ast::SelectItem) -> Result<&ast::Expr, String> {
         ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => Ok(e),
         other => Err(format!("positional GROUP BY can't reference {other}")),
     }
+}
+
+/// Map a `date_trunc` unit string to [`DateTruncUnit`] (DuckDB spellings).
+fn bind_trunc_unit(s: &str) -> Result<DateTruncUnit, String> {
+    Ok(match s.to_lowercase().as_str() {
+        "year" | "years" | "yr" => DateTruncUnit::Year,
+        "quarter" | "quarters" => DateTruncUnit::Quarter,
+        "month" | "months" | "mon" => DateTruncUnit::Month,
+        "week" | "weeks" => DateTruncUnit::Week,
+        "day" | "days" => DateTruncUnit::Day,
+        other => return Err(format!("unsupported date_trunc unit '{other}'")),
+    })
 }
 
 /// Map a parsed `EXTRACT` field to the engine's [`DateField`] (DuckDB

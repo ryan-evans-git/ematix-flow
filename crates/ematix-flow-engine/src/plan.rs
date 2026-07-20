@@ -329,6 +329,7 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
                 walk(rhs, f);
             }
             Expr::Extract { arg: i, .. }
+            | Expr::DateTrunc { arg: i, .. }
             | Expr::CastInt(i)
             | Expr::Round { expr: i, .. }
             | Expr::Upper(i) => walk(i, f),
@@ -387,6 +388,7 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
                 walk(rhs, f);
             }
             Expr::Extract { arg: i, .. }
+            | Expr::DateTrunc { arg: i, .. }
             | Expr::CastInt(i)
             | Expr::Round { expr: i, .. }
             | Expr::Upper(i) => walk(i, f),
@@ -3341,10 +3343,71 @@ fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -
                             WindowFunc::Rank => (i + 1) as i64,
                             WindowFunc::DenseRank => dense,
                             WindowFunc::RowNumber => (i + k + 1) as i64,
-                            WindowFunc::Agg(_) => unreachable!(),
+                            _ => unreachable!("non-rank window in rank arm"),
                         };
                     }
                     i = j;
+                }
+            }
+            Vector::i64(out)
+        }
+        // Navigation windows: sort the partition, then pull the arg from an
+        // offset/positional row. lead/lag/first_value are numeric (f64 +
+        // validity — NULL past the partition edge or when the source is
+        // NULL); ntile is an integer bucket label (never NULL).
+        WindowFunc::Lag(off) | WindowFunc::Lead(off) => {
+            let off = off as usize;
+            let lead = matches!(w.func, WindowFunc::Lead(_));
+            let mut out = vec![0.0f64; n];
+            let mut valid = vec![true; n];
+            for rows in parts.values_mut() {
+                rows.sort_by(|&a, &b| order_cmp(a, b));
+                for (p, &r) in rows.iter().enumerate() {
+                    let src = if lead { p.checked_add(off) } else { p.checked_sub(off) };
+                    match src
+                        .filter(|&s| s < rows.len())
+                        .and_then(|s| w.arg.eval_opt_f64(chunk, rows[s]))
+                    {
+                        Some(v) => out[r] = v,
+                        None => valid[r] = false,
+                    }
+                }
+            }
+            let any_null = valid.iter().any(|&b| !b);
+            Vector::f64(out).with_validity(any_null.then_some(valid))
+        }
+        WindowFunc::FirstValue => {
+            let mut out = vec![0.0f64; n];
+            let mut valid = vec![true; n];
+            for rows in parts.values_mut() {
+                rows.sort_by(|&a, &b| order_cmp(a, b));
+                let first = rows.first().and_then(|&r0| w.arg.eval_opt_f64(chunk, r0));
+                for &r in rows.iter() {
+                    match first {
+                        Some(v) => out[r] = v,
+                        None => valid[r] = false,
+                    }
+                }
+            }
+            let any_null = valid.iter().any(|&b| !b);
+            Vector::f64(out).with_validity(any_null.then_some(valid))
+        }
+        WindowFunc::Ntile(nb) => {
+            let nb = (nb as usize).max(1);
+            let mut out = vec![0i64; n];
+            for rows in parts.values_mut() {
+                rows.sort_by(|&a, &b| order_cmp(a, b));
+                let len = rows.len();
+                let (base, rem) = (len / nb, len % nb);
+                // The first `rem` buckets hold base+1 rows; the rest base.
+                let big = rem * (base + 1);
+                for (p, &r) in rows.iter().enumerate() {
+                    let bucket = if p < big {
+                        p / (base + 1)
+                    } else {
+                        rem + (p - big) / base.max(1)
+                    };
+                    out[r] = bucket as i64 + 1;
                 }
             }
             Vector::i64(out)
@@ -3784,9 +3847,22 @@ impl AggState {
     fn is_null(&self, func: AggFunc) -> bool {
         match func {
             AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Avg => self.count == 0,
-            AggFunc::StddevSamp => self.count < 2,
+            // Population variance/stddev of one row is 0 (not NULL); sample
+            // forms need ≥ 2 rows.
+            AggFunc::StddevPop | AggFunc::VarPop => self.count == 0,
+            AggFunc::StddevSamp | AggFunc::VarSamp => self.count < 2,
             AggFunc::Count | AggFunc::CountDistinct | AggFunc::CountMatched(_) => false,
         }
+    }
+
+    /// Variance via the sum-of-squares identity: `sample` divides the
+    /// centered sum of squares by `n−1`, population by `n`. Clamped at 0 to
+    /// absorb floating-point cancellation on near-constant inputs.
+    fn variance(&self, sample: bool) -> f64 {
+        let n = self.count as f64;
+        let ss = self.sumsq - self.sum * self.sum / n;
+        let denom = if sample { n - 1.0 } else { n };
+        (ss / denom).max(0.0)
     }
 
     fn finalize(&self, func: AggFunc) -> f64 {
@@ -3796,13 +3872,12 @@ impl AggState {
             AggFunc::Min => self.min,
             AggFunc::Max => self.max,
             AggFunc::Avg => self.sum / self.count as f64,
-            // Sample variance via the sum-of-squares identity.
-            AggFunc::StddevSamp => {
-                let n = self.count as f64;
-                ((self.sumsq - self.sum * self.sum / n) / (n - 1.0))
-                    .max(0.0)
-                    .sqrt()
-            }
+            // Variance via the sum-of-squares identity (`ss = Σx² − (Σx)²/n`),
+            // sample divides by n−1, population by n; stddev = √variance.
+            AggFunc::StddevSamp => self.variance(true).sqrt(),
+            AggFunc::VarSamp => self.variance(true),
+            AggFunc::StddevPop => self.variance(false).sqrt(),
+            AggFunc::VarPop => self.variance(false),
             AggFunc::CountDistinct => self.distinct.len() as f64,
             AggFunc::CountMatched(_) => self.count as f64,
         }
@@ -4004,7 +4079,7 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
             collect_slots(lhs, out);
             collect_slots(rhs, out);
         }
-        Expr::Extract { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
             collect_slots(i, out)
         }
         Expr::Like { expr, .. } => collect_slots(expr, out),

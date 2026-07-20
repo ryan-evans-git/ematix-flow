@@ -103,6 +103,12 @@ pub enum AggFunc {
     Avg,
     /// Sample standard deviation (`stddev_samp`).
     StddevSamp,
+    /// Population standard deviation (`stddev_pop`).
+    StddevPop,
+    /// Sample variance (`var_samp` / `variance`).
+    VarSamp,
+    /// Population variance (`var_pop`).
+    VarPop,
     /// `COUNT(DISTINCT <int expr>)`.
     CountDistinct,
     /// `COUNT(<col of a LEFT-joined table>)` — counts only row occurrences
@@ -139,6 +145,17 @@ pub enum WindowFunc {
     DenseRank,
     /// `row_number()`.
     RowNumber,
+    /// `lag(arg, offset)` — the arg `offset` rows earlier in the ordered
+    /// partition (SQL NULL past the partition edge). Default offset 1.
+    Lag(u32),
+    /// `lead(arg, offset)` — the arg `offset` rows later.
+    Lead(u32),
+    /// `ntile(n)` — 1..=n bucket label, rows split as evenly as possible
+    /// (the first `len % n` buckets get one extra row).
+    Ntile(u32),
+    /// `first_value(arg)` — arg at the partition's first ordered row (the
+    /// default `UNBOUNDED PRECEDING..CURRENT ROW` frame always starts there).
+    FirstValue,
 }
 
 /// One window expression, evaluated over the block's POST-GROUPING result

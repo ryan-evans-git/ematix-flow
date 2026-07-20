@@ -132,6 +132,10 @@ fn duck_cell(row: &duckdb::Row, idx: usize) -> Cell {
             ValueRef::Double(f) => Cell::Float(f),
             ValueRef::Text(b) => Cell::Str(String::from_utf8_lossy(b).into_owned()),
             ValueRef::Date32(d) => Cell::Date(d),
+            // DuckDB's date_trunc on a DATE returns a TIMESTAMP (micros);
+            // a whole-day timestamp is the same instant as the engine's
+            // Date32 day-number, so normalize it to Date for comparison.
+            ValueRef::Timestamp(tu, t) => Cell::Date((tu.to_micros(t) / 86_400_000_000) as i32),
             ValueRef::Decimal(d) => Cell::Float(d.to_string().parse().unwrap_or(0.0)),
             other => Cell::Str(format!("{other:?}")),
         },
@@ -285,4 +289,86 @@ fn positional_group_order() {
          from lineitem group by 1, 2 order by 2, 1",
     );
     p.check("select l_linestatus, count(*) n from lineitem group by 1 order by 2 desc");
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2a: aggregate variants + date_trunc.
+// ---------------------------------------------------------------------------
+
+/// Population/sample variance + population stddev (all from sum/sumsq/count).
+#[test]
+fn variance_aggregates() {
+    if !have_data() {
+        eprintln!("SKIP variance_aggregates: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    p.check(
+        "select l_returnflag, \
+                var_samp(l_quantity) vs, var_pop(l_quantity) vp, \
+                stddev_pop(l_extendedprice) sp, stddev_samp(l_discount) ss, \
+                variance(l_tax) v \
+         from lineitem group by 1",
+    );
+    // A single-row group: var_pop = 0, var_samp = NULL.
+    p.check(
+        "select l_orderkey, var_pop(l_quantity) vp, var_samp(l_quantity) vs \
+         from lineitem where l_orderkey = 1 group by 1",
+    );
+}
+
+/// date_trunc to year/quarter/month/week/day.
+#[test]
+fn date_trunc_units() {
+    if !have_data() {
+        eprintln!("SKIP date_trunc_units: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    for unit in ["year", "quarter", "month", "week", "day"] {
+        p.check(&format!(
+            "select date_trunc('{unit}', l_shipdate) d, count(*) n \
+             from lineitem group by date_trunc('{unit}', l_shipdate)"
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2b: navigation/positional window functions. A TOTAL order in each
+// OVER (l_orderkey, l_linenumber unique per lineitem) keeps lead/lag/ntile
+// deterministic so parity is meaningful. (last_value deferred — default
+// RANGE-frame peer semantics is a separate careful unit.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn window_lead_lag_first_value() {
+    if !have_data() {
+        eprintln!("SKIP window_lead_lag_first_value: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    let over = "over (partition by l_returnflag order by l_orderkey, l_linenumber)";
+    p.check(&format!(
+        "select l_orderkey, l_linenumber, \
+                lag(l_quantity) {over} lg, \
+                lag(l_quantity, 2) {over} lg2, \
+                lead(l_extendedprice) {over} ld, \
+                first_value(l_discount) {over} fv \
+         from lineitem where l_orderkey < 800"
+    ));
+}
+
+#[test]
+fn window_ntile() {
+    if !have_data() {
+        eprintln!("SKIP window_ntile: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    p.check(
+        "select l_orderkey, l_linenumber, \
+                ntile(4) over (order by l_orderkey, l_linenumber) q, \
+                ntile(7) over (partition by l_returnflag order by l_orderkey, l_linenumber) q7 \
+         from lineitem where l_orderkey < 400",
+    );
 }
