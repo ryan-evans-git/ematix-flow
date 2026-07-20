@@ -847,13 +847,38 @@ window-over-derived is the q49 prerequisite.
   the default path. Kept opt-in for bandwidth-rich deployments; NOT
   default-on (win is at the noise floor and bandwidth-fragile).
 
+## SQL-surface breadth (pivot from perf, 2026-07-19)
+
+Perf is closed at the structural floor (see closeout). Effort now goes to
+**breadth / robustness** — the binder implemented exactly the TPC-H + TPC-DS
+subset; general analytical SQL had broad gaps. Durable asset built:
+`crates/ematix-flow-core/tests/sql_parity.rs` — a **general engine-vs-DuckDB
+parity harness** for arbitrary SQL (sorted-multiset compare over the same
+parquet, the `tpcds_native_oracle` contract generalized). Every new feature
+lands a case here.
+
+- **Tier-1 bundle — SHIPPED (`bc99f566`).** `EXTRACT` beyond YEAR
+  (`Extract{field}` — month/day/quarter/dow/isodow/doy + ISO-8601 week,
+  DuckDB-matched); scalar fns `lower/floor/ceil/mod/length/trim/replace`
+  (new `NumFn`/`StrFn` nodes; string fns work in `WHERE` via the generalized
+  owned-string comparison-inline path); unary minus on runtime exprs
+  (`-x`→`0-x`); positional `GROUP BY 1`; function-valued GROUP BY keys bind
+  as group refs in the projection. 4/4 parity tests, sf1 103/103 no
+  regression, suite green.
+- **Tier-2 (next candidates):** window fns `LEAD/LAG/NTILE/FIRST_VALUE/
+  LAST_VALUE`; aggregates `VAR_SAMP/VAR_POP/STDDEV_POP` (sumsq already
+  tracked), `MEDIAN/PERCENTILE`, `STRING_AGG`, `BOOL_AND/OR`; `date_trunc`.
+- **Tier-3 (structural / robustness):** a `NOT` node + full three-valued
+  NULL logic (the IR has no NOT today — the highest-value *robustness* item,
+  needs a NULL truth-table gate); `RIGHT`/non-equi/unrestricted-FULL joins;
+  `GROUPING SETS`/`CUBE`; recursive CTEs.
+
 ## Next (P4 tail → P5/P6)
 
 - Vectorized expression eval for the grouped-agg per-row path (Q1-shaped
   queries) remains banked. Morsel-engine direction: attack total memory
   bandwidth (codec / late-materialization) or probe cost, not concurrency
   (dim-build is bandwidth-bound — overlap is near-zero-sum, see above).
-- **TPC-DS breadth** through the same front-end.
 - Re-home the Σ rules onto `BoundQuery`; CTE result sharing (Q15
   materializes twice); NULL semantics beyond the outer-join stand-ins;
   date display formatting.
