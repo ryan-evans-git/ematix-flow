@@ -33,7 +33,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::catalog::{Catalog, TableDef};
-use crate::expr::{BinaryOp, Expr, ScalarValue};
+use crate::expr::{BinaryOp, DateField, Expr, NumFn, ScalarValue, StrFn};
 use crate::logical::{
     AggExpr, AggFunc, BoundQuery, GroupExpr, JoinEdge, OrderByKey, OutputExpr, ScanColumn, SetOp,
     Slot, TableInput, TableSource, WindowExpr, WindowFunc,
@@ -225,7 +225,13 @@ fn bind_query(
             } else {
                 let mut out = Vec::new();
                 for e in exprs {
-                    let bound = b.bind_scalar(e)?;
+                    // Positional GROUP BY (`GROUP BY 1`): an integer literal
+                    // refers to the n-th SELECT item, like ORDER BY ordinals.
+                    let target = positional_ref(e, select.projection.len())
+                        .map(|pos| select_item_expr(&select.projection[pos]))
+                        .transpose()?
+                        .unwrap_or(e);
+                    let bound = b.bind_scalar(target)?;
                     out.push(GroupExpr { expr: bound });
                 }
                 out
@@ -700,7 +706,7 @@ fn remap_window_cols(e: &mut Expr, win_base: usize, group_base: usize) {
             remap_window_cols(lhs, win_base, group_base);
             remap_window_cols(rhs, win_base, group_base);
         }
-        Expr::ExtractYear(i) | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+        Expr::Extract { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
             remap_window_cols(i, win_base, group_base)
         }
         Expr::Like { expr, .. }
@@ -709,7 +715,7 @@ fn remap_window_cols(e: &mut Expr, win_base: usize, group_base: usize) {
         | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Substr { expr, .. } => remap_window_cols(expr, win_base, group_base),
-        Expr::Concat(parts) => {
+        Expr::Concat(parts) | Expr::NumFn { args: parts, .. } | Expr::StrFn { args: parts, .. } => {
             for p in parts {
                 remap_window_cols(p, win_base, group_base);
             }
@@ -1231,7 +1237,11 @@ impl Binder<'_> {
     /// `Ok(None)` = neither.
     fn bind_round_or_upper(&mut self, f: &ast::Function) -> Result<Option<Expr>, String> {
         let fname = f.name.to_string().to_lowercase();
-        if fname != "round" && fname != "upper" {
+        const KNOWN: &[&str] = &[
+            "round", "upper", "lower", "lcase", "replace", "length", "char_length",
+            "character_length", "len", "mod",
+        ];
+        if !KNOWN.contains(&fname.as_str()) {
             return Ok(None);
         }
         let ast::FunctionArguments::List(list) = &f.args else {
@@ -1246,6 +1256,28 @@ impl Binder<'_> {
         }
         match (fname.as_str(), args.as_slice()) {
             ("upper", [x]) => Ok(Some(Expr::Upper(Box::new(self.bind_scalar(x)?)))),
+            ("lower" | "lcase", [x]) => Ok(Some(Expr::StrFn {
+                func: StrFn::Lower,
+                args: vec![self.bind_scalar(x)?],
+            })),
+            ("replace", [s, a, b]) => Ok(Some(Expr::StrFn {
+                func: StrFn::Replace,
+                args: vec![
+                    self.bind_scalar(s)?,
+                    self.bind_scalar(a)?,
+                    self.bind_scalar(b)?,
+                ],
+            })),
+            ("length" | "char_length" | "character_length" | "len", [x]) => {
+                Ok(Some(Expr::NumFn {
+                    func: NumFn::Length,
+                    args: vec![self.bind_scalar(x)?],
+                }))
+            }
+            ("mod", [a, b]) => Ok(Some(Expr::NumFn {
+                func: NumFn::Mod,
+                args: vec![self.bind_scalar(a)?, self.bind_scalar(b)?],
+            })),
             ("round", [x]) => Ok(Some(Expr::Round {
                 expr: Box::new(self.bind_scalar(x)?),
                 digits: 0,
@@ -1577,6 +1609,18 @@ impl Binder<'_> {
                 ) {
                     return Err(format!("'{e}' is neither an aggregate nor a GROUP BY key"));
                 }
+            }
+        }
+        // A function-VALUED GROUP BY key used in the projection (`lower(x)`,
+        // `mod(x, k)`, a scalar builtin) binds as a group reference — the
+        // `!contains_function` fast path above only catches non-function keys
+        // (a bare column or `EXTRACT`, which isn't an AST `Function`).
+        if contains_function(e)
+            && let Ok(bnd) = self.bind(e)
+        {
+            let bound = materialize(bnd);
+            if let Some(g) = group.iter().position(|ge| ge.expr == bound) {
+                return Ok(Expr::Column(g));
             }
         }
         match e {
@@ -2827,16 +2871,53 @@ impl Binder<'_> {
                 expr,
             } => match self.bind(expr)? {
                 Bound::Dec(d) => Ok(Bound::Dec(d.neg())),
-                Bound::Expr(_) => Err("unary minus on non-literals is not yet supported".into()),
+                // `-e` on a runtime expression = `0 - e` (arith promotes the
+                // literal to the operand's type; NULL propagates).
+                Bound::Expr(e) => Ok(Bound::Expr(Expr::Binary {
+                    op: BinaryOp::Sub,
+                    lhs: Box::new(Expr::Literal(ScalarValue::Int64(0))),
+                    rhs: Box::new(e),
+                })),
             },
             ast::Expr::TypedString(ts) => bind_typed_string(ts).map(Bound::Expr),
             ast::Expr::Extract { field, expr, .. } => {
-                if !matches!(field, ast::DateTimeField::Year) {
-                    return Err(format!("unsupported EXTRACT field: {field}"));
-                }
+                let f = bind_date_field(field)?;
                 let inner = materialize(self.bind(expr)?);
-                Ok(Bound::Expr(Expr::ExtractYear(Box::new(inner))))
+                Ok(Bound::Expr(Expr::Extract {
+                    field: f,
+                    arg: Box::new(inner),
+                }))
             }
+            // FLOOR/CEIL parse as their own AST nodes (not Function calls).
+            // Only the numeric form is supported — reject `FLOOR(x TO field)`.
+            ast::Expr::Floor { expr, field } | ast::Expr::Ceil { expr, field } => {
+                // Plain `FLOOR(x)` carries a `NoDateTime` sentinel; only a
+                // real `FLOOR(x TO <field>)` datetime-truncation is rejected.
+                if matches!(field, ast::CeilFloorKind::DateTimeField(f)
+                    if !matches!(f, ast::DateTimeField::NoDateTime))
+                {
+                    return Err(format!("unsupported {e} (only numeric floor/ceil)"));
+                }
+                let func = if matches!(e, ast::Expr::Floor { .. }) {
+                    NumFn::Floor
+                } else {
+                    NumFn::Ceil
+                };
+                Ok(Bound::Expr(Expr::NumFn {
+                    func,
+                    args: vec![materialize(self.bind(expr)?)],
+                }))
+            }
+            // TRIM likewise; only plain `TRIM(x)` (both-side whitespace).
+            ast::Expr::Trim {
+                expr,
+                trim_where: None,
+                trim_what: None,
+                trim_characters: None,
+            } => Ok(Bound::Expr(Expr::StrFn {
+                func: StrFn::Trim,
+                args: vec![materialize(self.bind(expr)?)],
+            })),
             ast::Expr::Case {
                 operand,
                 conditions,
@@ -3153,8 +3234,14 @@ fn infer_slot_type(q: &BoundQuery, e: &Expr) -> LogicalType {
         Expr::Binary { op, lhs, rhs } => {
             binary_type(*op, infer_slot_type(q, lhs), infer_slot_type(q, rhs))
         }
-        Expr::ExtractYear(_) | Expr::CastInt(_) => LogicalType::Int64,
-        Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) => LogicalType::Utf8,
+        Expr::Extract { .. } | Expr::CastInt(_) => LogicalType::Int64,
+        Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) | Expr::StrFn { .. } => {
+            LogicalType::Utf8
+        }
+        Expr::NumFn { func, .. } => match func {
+            crate::expr::NumFn::Floor | crate::expr::NumFn::Ceil => LogicalType::Float64,
+            crate::expr::NumFn::Mod | crate::expr::NumFn::Length => LogicalType::Int64,
+        },
         Expr::Case { whens, .. } => whens
             .first()
             .map(|(_, v)| infer_slot_type(q, v))
@@ -3190,8 +3277,14 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
             infer_row_type(q, key_tys, lhs),
             infer_row_type(q, key_tys, rhs),
         ),
-        Expr::ExtractYear(_) | Expr::CastInt(_) => LogicalType::Int64,
-        Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) => LogicalType::Utf8,
+        Expr::Extract { .. } | Expr::CastInt(_) => LogicalType::Int64,
+        Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) | Expr::StrFn { .. } => {
+            LogicalType::Utf8
+        }
+        Expr::NumFn { func, .. } => match func {
+            crate::expr::NumFn::Floor | crate::expr::NumFn::Ceil => LogicalType::Float64,
+            crate::expr::NumFn::Mod | crate::expr::NumFn::Length => LogicalType::Int64,
+        },
         Expr::Case { whens, .. } => whens
             .first()
             .map(|(_, v)| infer_row_type(q, key_tys, v))
@@ -4510,7 +4603,7 @@ fn references_columns(e: &Expr) -> bool {
         Expr::Column(_) => true,
         Expr::Literal(_) => false,
         Expr::Binary { lhs, rhs, .. } => references_columns(lhs) || references_columns(rhs),
-        Expr::ExtractYear(i) | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+        Expr::Extract { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
             references_columns(i)
         }
         Expr::Like { expr, .. } => references_columns(expr),
@@ -4520,7 +4613,9 @@ fn references_columns(e: &Expr) -> bool {
         | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Substr { expr, .. } => references_columns(expr),
-        Expr::Concat(parts) => parts.iter().any(references_columns),
+        Expr::Concat(parts) | Expr::NumFn { args: parts, .. } | Expr::StrFn { args: parts, .. } => {
+            parts.iter().any(references_columns)
+        }
         Expr::Case { whens, else_ } => {
             whens
                 .iter()
@@ -4752,6 +4847,47 @@ fn rewrite_scalar_fn(f: &ast::Function) -> Result<Option<ast::Expr>, String> {
         }
         _ => return Err(format!("'{fname}' called with {} arguments", args.len())),
     }))
+}
+
+/// A positional ordinal (`GROUP BY 1`) as a 0-based index into a SELECT list
+/// of `n` items, or `None` if `e` isn't an in-range integer literal.
+fn positional_ref(e: &ast::Expr, n: usize) -> Option<usize> {
+    if let ast::Expr::Value(v) = e
+        && let ast::Value::Number(s, _) = &v.value
+        && let Ok(pos) = s.parse::<usize>()
+        && (1..=n).contains(&pos)
+    {
+        Some(pos - 1)
+    } else {
+        None
+    }
+}
+
+/// The underlying expression of a SELECT item (positional GROUP BY resolves
+/// to it). `SELECT *` can't be grouped positionally.
+fn select_item_expr(item: &ast::SelectItem) -> Result<&ast::Expr, String> {
+    match item {
+        ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => Ok(e),
+        other => Err(format!("positional GROUP BY can't reference {other}")),
+    }
+}
+
+/// Map a parsed `EXTRACT` field to the engine's [`DateField`] (DuckDB
+/// spellings). Time-of-day fields are out of scope — the engine has only
+/// Date32, no timestamps.
+fn bind_date_field(field: &ast::DateTimeField) -> Result<DateField, String> {
+    use ast::DateTimeField as F;
+    Ok(match field {
+        F::Year => DateField::Year,
+        F::Month => DateField::Month,
+        F::Day => DateField::Day,
+        F::Quarter => DateField::Quarter,
+        F::Dow => DateField::Dow,
+        F::Isodow => DateField::IsoDow,
+        F::Doy => DateField::Doy,
+        F::Week(_) => DateField::Week,
+        other => return Err(format!("unsupported EXTRACT field: {other}")),
+    })
 }
 
 fn bind_typed_string(ts: &ast::TypedString) -> Result<Expr, String> {

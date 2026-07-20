@@ -67,8 +67,12 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
-    /// `EXTRACT(YEAR FROM <date expr>)` — Date32 days → calendar year.
-    ExtractYear(Box<Expr>),
+    /// `EXTRACT(<field> FROM <date expr>)` — Date32 days → a calendar field
+    /// (year/month/day/quarter/dow/doy/week), matching DuckDB's `extract`.
+    Extract {
+        field: DateField,
+        arg: Box<Expr>,
+    },
     /// `CAST(<expr> AS INT/INTEGER/BIGINT/SMALLINT)` on a fractional value —
     /// rounds to the nearest integer (DuckDB `CAST` semantics: `10714.82` →
     /// `10715`). An already-integer operand is unchanged.
@@ -84,6 +88,19 @@ pub enum Expr {
     /// it are handled inline in the `Binary` arm (no owned value escapes
     /// the borrowed `Val` path). q24's `c_birth_country = upper(ca_country)`.
     Upper(Box<Expr>),
+    /// A numeric-returning scalar builtin (`floor`/`ceil`/`mod`/`length`) —
+    /// flows through the borrowed `Val` path like arithmetic.
+    NumFn {
+        func: NumFn,
+        args: Vec<Expr>,
+    },
+    /// A string-returning scalar builtin (`lower`/`trim`/`replace`) — yields
+    /// an OWNED string, so like [`Expr::Upper`] it evaluates via `eval_value`
+    /// and comparisons containing it are handled inline in the `Binary` arm.
+    StrFn {
+        func: StrFn,
+        args: Vec<Expr>,
+    },
     /// `CASE WHEN c₁ THEN v₁ [WHEN c₂ THEN v₂ …] ELSE e END` (the `ELSE` is
     /// required by the binder — no NULLs yet).
     Case {
@@ -200,7 +217,7 @@ impl Expr {
                 lhs.for_each_col(f);
                 rhs.for_each_col(f);
             }
-            Expr::ExtractYear(e) | Expr::CastInt(e) | Expr::Upper(e) => e.for_each_col(f),
+            Expr::Extract { arg: e, .. } | Expr::CastInt(e) | Expr::Upper(e) => e.for_each_col(f),
             Expr::Round { expr, .. }
             | Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
@@ -215,7 +232,9 @@ impl Expr {
                 }
                 else_.for_each_col(f);
             }
-            Expr::Concat(es) => {
+            Expr::Concat(es)
+            | Expr::NumFn { args: es, .. }
+            | Expr::StrFn { args: es, .. } => {
                 for e in es {
                     e.for_each_col(f);
                 }
@@ -254,20 +273,20 @@ impl Expr {
                 // upper() yields an OWNED string; a comparison containing it
                 // evaluates both sides here (transform applied inline) so no
                 // owned value escapes the borrowed path.
-                if matches!(lhs.as_ref(), Expr::Upper(_)) || matches!(rhs.as_ref(), Expr::Upper(_))
-                {
+                if is_owned_str_fn(lhs) || is_owned_str_fn(rhs) {
                     let side = |e: &Expr| -> Option<String> {
-                        match e {
-                            Expr::Upper(inner) => match inner.eval(chunk, row) {
-                                Val::Str(s) => Some(s.to_uppercase()),
-                                Val::Null => None,
-                                other => panic!("upper needs a string, got {other:?}"),
-                            },
-                            _ => match e.eval(chunk, row) {
+                        if is_owned_str_fn(e) {
+                            match e.eval_value(chunk, row) {
+                                ScalarValue::Utf8(s) => Some(s.to_string()),
+                                ScalarValue::Null => None,
+                                other => panic!("string fn needs a string, got {other:?}"),
+                            }
+                        } else {
+                            match e.eval(chunk, row) {
                                 Val::Str(s) => Some(s.to_string()),
                                 Val::Null => None,
                                 other => panic!("string comparison got {other:?}"),
-                            },
+                            }
                         }
                     };
                     let (Some(a), Some(b)) = (side(lhs), side(rhs)) else {
@@ -283,10 +302,10 @@ impl Expr {
                 let r = rhs.eval(chunk, row);
                 eval_binary(*op, l, r)
             }
-            Expr::ExtractYear(e) => match e.eval(chunk, row) {
-                Val::Int(days) => Val::Int(year_of_days(days as i32) as i64),
+            Expr::Extract { field, arg } => match arg.eval(chunk, row) {
+                Val::Int(days) => Val::Int(extract_field(*field, days as i32)),
                 Val::Null => Val::Null,
-                other => panic!("EXTRACT(YEAR) needs a date operand, got {other:?}"),
+                other => panic!("EXTRACT needs a date operand, got {other:?}"),
             },
             Expr::CastInt(e) => match e.eval(chunk, row) {
                 Val::Int(i) => Val::Int(i),
@@ -303,9 +322,10 @@ impl Expr {
                 Val::Null => Val::Null,
                 other => panic!("round needs a numeric operand, got {other:?}"),
             },
-            Expr::Upper(_) => {
-                panic!("upper() must be evaluated via eval_value or inside a comparison")
+            Expr::Upper(_) | Expr::StrFn { .. } => {
+                panic!("string fn must be evaluated via eval_value or inside a comparison")
             }
+            Expr::NumFn { func, args } => eval_num_fn(*func, args, chunk, row),
             Expr::Case { whens, else_ } => {
                 for (cond, val) in whens {
                     if cond.eval(chunk, row).expect_bool() {
@@ -414,6 +434,9 @@ impl Expr {
                 ScalarValue::Null => ScalarValue::Null,
                 other => panic!("upper needs a string, got {other:?}"),
             };
+        }
+        if let Expr::StrFn { func, args } = self {
+            return eval_str_fn(*func, args, chunk, row);
         }
         match self.eval(chunk, row) {
             Val::Int(i) => ScalarValue::Int64(i),
@@ -567,9 +590,47 @@ fn like_match(s: &[u8], p: &[u8]) -> bool {
     pi == p.len()
 }
 
-/// Days since the Unix epoch → calendar year (proleptic Gregorian; the
-/// inverse direction of the binder's `days_from_civil`).
-fn year_of_days(days: i32) -> i32 {
+/// Numeric-returning scalar builtins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumFn {
+    Floor,
+    Ceil,
+    /// `mod(a, b)` — truncated remainder (SQL `%`), integer or float.
+    Mod,
+    /// `length(s)` — character count (bytes for ASCII).
+    Length,
+}
+
+/// String-returning scalar builtins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrFn {
+    Lower,
+    /// `trim(s)` — strip leading/trailing ASCII whitespace.
+    Trim,
+    /// `replace(s, from, to)` — replace every occurrence.
+    Replace,
+}
+
+/// A calendar field pulled out of a Date32 by `EXTRACT` (DuckDB semantics).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DateField {
+    Year,
+    Month,
+    Day,
+    Quarter,
+    /// Day of week, 0 = Sunday … 6 = Saturday (DuckDB `dow`).
+    Dow,
+    /// ISO day of week, 1 = Monday … 7 = Sunday (DuckDB `isodow`).
+    IsoDow,
+    /// Day of year, 1-based (DuckDB `doy`).
+    Doy,
+    /// ISO-8601 week number, 1..=53 (DuckDB `week`).
+    Week,
+}
+
+/// Days since the Unix epoch → proleptic-Gregorian `(year, month, day)` (the
+/// inverse of the binder's `days_from_civil`).
+fn civil_of_days(days: i32) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u32; // [0, 146096]
@@ -577,8 +638,139 @@ fn year_of_days(days: i32) -> i32 {
     let y = yoe as i32 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    if m <= 2 { y + 1 } else { y }
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn year_of_days(days: i32) -> i32 {
+    civil_of_days(days).0
+}
+
+/// 1-based day-of-year for a Date32.
+fn day_of_year(days: i32) -> i32 {
+    let (y, _, _) = civil_of_days(days);
+    days - days_from_civil(y, 1, 1) + 1
+}
+
+/// Days since the Unix epoch for a calendar date (Howard Hinnant's algorithm;
+/// mirrors the binder's own `days_from_civil`).
+fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i32 - 719_468
+}
+
+/// ISO weeks in a year: 53 if it starts on Thursday or is a leap year
+/// starting on Wednesday, else 52 (via the p(y) parity of Dec 31).
+fn iso_weeks_in_year(y: i32) -> i32 {
+    let p = |y: i32| (y + y / 4 - y / 100 + y / 400).rem_euclid(7);
+    if p(y) == 4 || p(y - 1) == 3 { 53 } else { 52 }
+}
+
+/// Extract `field` from a Date32 (days since epoch), matching DuckDB.
+fn extract_field(field: DateField, days: i32) -> i64 {
+    let dow = (days as i64 + 4).rem_euclid(7); // epoch (day 0) is a Thursday
+    let iso_dow = if dow == 0 { 7 } else { dow }; // Mon=1..Sun=7
+    let v: i64 = match field {
+        DateField::Year => year_of_days(days) as i64,
+        DateField::Month => civil_of_days(days).1 as i64,
+        DateField::Day => civil_of_days(days).2 as i64,
+        DateField::Quarter => ((civil_of_days(days).1 - 1) / 3 + 1) as i64,
+        DateField::Dow => dow,
+        DateField::IsoDow => iso_dow,
+        DateField::Doy => day_of_year(days) as i64,
+        DateField::Week => {
+            let (y, _, _) = civil_of_days(days);
+            let doy = day_of_year(days) as i64;
+            let week = (doy - iso_dow + 10) / 7;
+            if week < 1 {
+                iso_weeks_in_year(y - 1) as i64
+            } else if week > iso_weeks_in_year(y) as i64 {
+                1
+            } else {
+                week
+            }
+        }
+    };
+    v
+}
+
+/// Does `e` produce an OWNED string that only `eval_value` can build (so a
+/// comparison containing it must route through the inline string path)?
+fn is_owned_str_fn(e: &Expr) -> bool {
+    matches!(e, Expr::Upper(_) | Expr::StrFn { .. } | Expr::Concat(_))
+}
+
+/// Evaluate a numeric-returning scalar builtin on the borrowed `Val` path.
+fn eval_num_fn<'a>(func: NumFn, args: &'a [Expr], chunk: &'a DataChunk, row: usize) -> Val<'a> {
+    match func {
+        NumFn::Floor | NumFn::Ceil => match args[0].eval(chunk, row) {
+            Val::Int(i) => Val::Int(i),
+            Val::Float(f) => Val::Float(if matches!(func, NumFn::Floor) {
+                f.floor()
+            } else {
+                f.ceil()
+            }),
+            Val::Null => Val::Null,
+            other => panic!("{func:?} needs a numeric operand, got {other:?}"),
+        },
+        NumFn::Mod => match (args[0].eval(chunk, row), args[1].eval(chunk, row)) {
+            (Val::Null, _) | (_, Val::Null) => Val::Null,
+            (Val::Int(a), Val::Int(b)) => {
+                if b == 0 {
+                    Val::Null
+                } else {
+                    Val::Int(a % b)
+                }
+            }
+            (a, b) => {
+                let (a, b) = (a.as_f64(), b.as_f64());
+                if b == 0.0 {
+                    Val::Null
+                } else {
+                    Val::Float(a % b)
+                }
+            }
+        },
+        NumFn::Length => match args[0].eval(chunk, row) {
+            Val::Str(s) => Val::Int(s.chars().count() as i64),
+            Val::Null => Val::Null,
+            other => panic!("length needs a string, got {other:?}"),
+        },
+    }
+}
+
+/// Evaluate a string-returning scalar builtin, producing an owned value.
+fn eval_str_fn(func: StrFn, args: &[Expr], chunk: &DataChunk, row: usize) -> ScalarValue {
+    let s0 = || match args[0].eval_value(chunk, row) {
+        ScalarValue::Utf8(s) => Some(s),
+        ScalarValue::Null => None,
+        other => panic!("{func:?} needs a string, got {other:?}"),
+    };
+    match func {
+        StrFn::Lower => match s0() {
+            Some(s) => ScalarValue::Utf8(Arc::from(s.to_lowercase().as_str())),
+            None => ScalarValue::Null,
+        },
+        StrFn::Trim => match s0() {
+            Some(s) => ScalarValue::Utf8(Arc::from(s.trim())),
+            None => ScalarValue::Null,
+        },
+        StrFn::Replace => {
+            let (Some(s), from, to) = (s0(), args[1].eval_value(chunk, row), args[2].eval_value(chunk, row))
+            else {
+                return ScalarValue::Null;
+            };
+            let (ScalarValue::Utf8(from), ScalarValue::Utf8(to)) = (from, to) else {
+                return ScalarValue::Null;
+            };
+            ScalarValue::Utf8(Arc::from(s.replace(&*from, &to).as_str()))
+        }
+    }
 }
 
 /// Narrow `chunk`'s current selection to the rows satisfying boolean
@@ -1137,7 +1329,10 @@ mod tests {
             vec![0, 8766, 9131, 9495, 9496, 9861],
             LogicalType::Date32,
         )]);
-        let e = Expr::ExtractYear(Box::new(Expr::Column(0)));
+        let e = Expr::Extract {
+            field: DateField::Year,
+            arg: Box::new(Expr::Column(0)),
+        };
         let years: Vec<i64> = (0..6).map(|r| e.eval_i64(&chunk, r)).collect();
         // 1970-01-01, 1994-01-01, 1995-01-01, 1995-12-31, 1996-01-01,
         // 1996-12-31.

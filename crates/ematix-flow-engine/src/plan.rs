@@ -328,7 +328,7 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
                 walk(lhs, f);
                 walk(rhs, f);
             }
-            Expr::ExtractYear(i)
+            Expr::Extract { arg: i, .. }
             | Expr::CastInt(i)
             | Expr::Round { expr: i, .. }
             | Expr::Upper(i) => walk(i, f),
@@ -338,7 +338,9 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
             | Expr::InSetStr { expr, .. }
             | Expr::IsNull { expr, .. }
             | Expr::Substr { expr, .. } => walk(expr, f),
-            Expr::Concat(parts) => {
+            Expr::Concat(parts)
+                | Expr::NumFn { args: parts, .. }
+                | Expr::StrFn { args: parts, .. } => {
                 for p in parts {
                     walk(p, f);
                 }
@@ -384,7 +386,7 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
                 walk(lhs, f);
                 walk(rhs, f);
             }
-            Expr::ExtractYear(i)
+            Expr::Extract { arg: i, .. }
             | Expr::CastInt(i)
             | Expr::Round { expr: i, .. }
             | Expr::Upper(i) => walk(i, f),
@@ -394,7 +396,9 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
             | Expr::InSetStr { expr, .. }
             | Expr::IsNull { expr, .. }
             | Expr::Substr { expr, .. } => walk(expr, f),
-            Expr::Concat(parts) => {
+            Expr::Concat(parts)
+                | Expr::NumFn { args: parts, .. }
+                | Expr::StrFn { args: parts, .. } => {
                 for p in parts {
                     walk(p, f);
                 }
@@ -4000,7 +4004,7 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
             collect_slots(lhs, out);
             collect_slots(rhs, out);
         }
-        Expr::ExtractYear(i) | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
+        Expr::Extract { arg: i, .. } | Expr::CastInt(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
             collect_slots(i, out)
         }
         Expr::Like { expr, .. } => collect_slots(expr, out),
@@ -4010,7 +4014,9 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
         | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Substr { expr, .. } => collect_slots(expr, out),
-        Expr::Concat(parts) => {
+        Expr::Concat(parts)
+        | Expr::NumFn { args: parts, .. }
+        | Expr::StrFn { args: parts, .. } => {
             for p in parts {
                 collect_slots(p, out);
             }
