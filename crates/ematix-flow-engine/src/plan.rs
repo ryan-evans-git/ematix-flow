@@ -2393,33 +2393,37 @@ impl Executor<'_> {
             }
 
             if dim.multi {
-                if *left {
-                    return Err("LEFT duplicate-key payload join is not yet supported".into());
-                }
-                // Early residual: the post-join conjuncts evaluable over
-                // {already-attached columns} ∪ {this dim's payloads} filter
-                // DURING expansion, so only survivors materialize — the
-                // difference between q72's ~1B-row blowup and a small
-                // result. (The full post predicate still runs afterwards —
-                // re-applying these conjuncts is idempotent.)
-                let residual: Option<Expr> = ctx.post.as_ref().and_then(|p| {
-                    let mut cs: Vec<&Expr> = Vec::new();
-                    split_and_expr(p, &mut cs);
-                    cs.into_iter()
-                        .filter(|c| {
-                            let mut sl = Vec::new();
-                            collect_slots(c, &mut sl);
-                            sl.iter()
-                                .all(|&s| avail[s] || dim.payload_slots.contains(&s))
-                        })
-                        .cloned()
-                        .reduce(|l, r| Expr::Binary {
-                            op: crate::expr::BinaryOp::And,
-                            lhs: Box::new(l),
-                            rhs: Box::new(r),
-                        })
-                });
-                let (nv, ns, nl) = self.fanout_child(
+                // Early residual (INNER fan-out only): the post-join
+                // conjuncts evaluable over {already-attached columns} ∪
+                // {this dim's payloads} filter DURING expansion, so only
+                // survivors materialize — the difference between q72's
+                // ~1B-row blowup and a small result. (The full post
+                // predicate still runs afterwards — re-applying these
+                // conjuncts is idempotent.) A LEFT fan-out must KEEP
+                // unmatched preserved rows, so it skips the residual and
+                // leans on the final post-filter (correct, less taming).
+                let residual: Option<Expr> = if *left {
+                    None
+                } else {
+                    ctx.post.as_ref().and_then(|p| {
+                        let mut cs: Vec<&Expr> = Vec::new();
+                        split_and_expr(p, &mut cs);
+                        cs.into_iter()
+                            .filter(|c| {
+                                let mut sl = Vec::new();
+                                collect_slots(c, &mut sl);
+                                sl.iter()
+                                    .all(|&s| avail[s] || dim.payload_slots.contains(&s))
+                            })
+                            .cloned()
+                            .reduce(|l, r| Expr::Binary {
+                                op: crate::expr::BinaryOp::And,
+                                lhs: Box::new(l),
+                                rhs: Box::new(r),
+                            })
+                    })
+                };
+                let (nv, ns, nl, matched) = self.fanout_child(
                     &view,
                     &sel,
                     vlen,
@@ -2427,10 +2431,17 @@ impl Executor<'_> {
                     &key_cols,
                     &mut kbuf,
                     residual.as_ref(),
+                    *left,
                 );
                 view = nv;
                 sel = ns;
                 vlen = nl;
+                // A LEFT fan-out appends its matched-flag column past the
+                // slot space (same fixed layout the non-multi path uses).
+                if let Some(m) = matched {
+                    debug_assert_eq!(ctx.matched_cols[child], view.cols.len());
+                    view.cols.push(Vector::i64(m));
+                }
                 for &s in &dim.payload_slots {
                     avail[s] = true;
                 }
@@ -2653,7 +2664,12 @@ impl Executor<'_> {
     /// the shard chain), and the whole view REMATERIALIZES to the expanded
     /// length — existing columns gathered by the source root row, this
     /// dim's payload columns gathered by each output row's own dim row.
-    /// Returns the new (view, all-selected, length).
+    /// Returns the new (view, all-selected, length, matched-flags). When
+    /// `left`, an unmatched source row is KEPT ONCE with a `NO_REF` payload
+    /// (→ NULL-filled dim columns) and a 0 matched flag; matched expansions
+    /// carry a 1. The returned `Some(flags)` (LEFT only) is the child's
+    /// matched-flag column. A LEFT fan-out never applies `residual` (the
+    /// caller passes `None`), so `rows`/`flags` stay aligned.
     #[allow(clippy::too_many_arguments)]
     fn fanout_child(
         &self,
@@ -2664,7 +2680,8 @@ impl Executor<'_> {
         key_cols: &[KeyCol],
         kbuf: &mut Vec<i64>,
         residual: Option<&Expr>,
-    ) -> (DataChunk, Selection, usize) {
+        left: bool,
+    ) -> (DataChunk, Selection, usize, Option<Vec<i64>>) {
         // Candidate expansions are checked against `residual` in BOUNDED
         // BATCHES: only the residual's own columns materialize per batch,
         // and only surviving (source row, dim row) pairs are kept — the
@@ -2678,6 +2695,9 @@ impl Executor<'_> {
         let mut pay_ref: Vec<u64> = Vec::new();
         let mut keep_rows: Vec<usize> = Vec::new();
         let mut keep_ref: Vec<u64> = Vec::new();
+        // LEFT: one matched flag per emitted output row (1 = a real match,
+        // 0 = a kept miss). Unused (stays empty) for an INNER fan-out.
+        let mut matched: Vec<i64> = Vec::new();
         let mut src_rows: Vec<usize> = Vec::with_capacity(sel.len());
         sel.for_each(|i| src_rows.push(i as usize));
         for &iu in &src_rows {
@@ -2685,6 +2705,12 @@ impl Executor<'_> {
                 .then(|| dim.map.get(kbuf))
                 .flatten();
             let Some((count, s, head)) = hit else {
+                // A LEFT miss survives once with NULL-filled payloads.
+                if left {
+                    rows.push(iu);
+                    pay_ref.push(NO_REF);
+                    matched.push(0);
+                }
                 continue;
             };
             let enc = |r: u32| ((s as u64) << 32) | r as u64;
@@ -2713,6 +2739,11 @@ impl Executor<'_> {
                         pay_ref.push(enc(head));
                     }
                 }
+            }
+            // These expansions are all matches (residual is None when left,
+            // so `rows` and `matched` never drift).
+            if left {
+                matched.resize(rows.len(), 1);
             }
             if let Some(res) = residual
                 && rows.len() >= BATCH
@@ -2746,7 +2777,7 @@ impl Executor<'_> {
 
         let len = rows.len();
         let cols = self.materialize_fanout(view, vlen, dim, &rows, &pay_ref, None);
-        (DataChunk::new(cols), Selection::All(len), len)
+        (DataChunk::new(cols), Selection::All(len), len, left.then_some(matched))
     }
 
     /// Filter one fan-out candidate batch against the early residual: only

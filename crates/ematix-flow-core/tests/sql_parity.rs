@@ -469,6 +469,49 @@ fn non_equi_join() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier-3 fan-out payload materialization: an outer join whose preserved side
+// fans out (orders → many lineitems on a filtered ON) must materialize —
+// each match expands, each unmatched preserved row survives ONCE with
+// NULL-filled nullable columns. Unblocks FULL OUTER on real 1-to-many keys
+// and fan-out anti-joins (previously "LEFT duplicate-key payload" errors).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn outer_join_fanout_materialization() {
+    if !have_joins() {
+        eprintln!("SKIP outer_join_fanout_materialization: SF1 orders/customer absent");
+        return;
+    }
+    let p = Parity::with_tables(&["lineitem", "orders", "customer"]);
+    let on = "on l.l_orderkey = o.o_orderkey and l.l_quantity > 45";
+    // Project the nullable side's columns across a fan-out — the core
+    // materialization path (matched rows fan, unmatched go NULL).
+    p.check(&format!(
+        "select o.o_orderkey, l.l_partkey, l.l_quantity \
+         from orders o left join lineitem l {on} where o.o_orderkey < 500"
+    ));
+    // Aggregate over the fan-out: COUNT(*) (all preserved rows) vs matched
+    // COUNT(l.col) vs SUM over the NULL-extended column.
+    p.check(&format!(
+        "select o.o_orderpriority pr, count(*) n, count(l.l_orderkey) m, sum(l.l_quantity) q \
+         from orders o left join lineitem l {on} where o.o_orderkey < 4000 group by 1"
+    ));
+    // Fan-out anti-join: keep only the unmatched preserved rows (LEFT and its
+    // RIGHT mirror).
+    p.check(&format!(
+        "select count(*) n from orders o left join lineitem l {on} \
+         where o.o_orderkey < 4000 and l.l_orderkey is null"
+    ));
+    p.check(&format!(
+        "select count(*) n from lineitem l right join orders o {on} \
+         where o.o_orderkey < 4000 and l.l_orderkey is null"
+    ));
+    // FULL OUTER on a 1-to-many key: count, and a column projection.
+    p.check("select count(*) n from orders o full outer join lineitem l on l.l_orderkey = o.o_orderkey where o.o_orderkey < 2000");
+    p.check("select o.o_orderkey, l.l_partkey from orders o full outer join lineitem l on l.l_orderkey = o.o_orderkey where o.o_orderkey < 400");
+}
+
+// ---------------------------------------------------------------------------
 // Tier-3: NOT + three-valued NULL logic. NULLs are injected with
 // nullif(l_linenumber, 1) (NULL when linenumber == 1) since SF1 lineitem
 // has no NULL columns. The point is that NOT over a NULL is NULL (drops at
