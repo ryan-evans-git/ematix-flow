@@ -75,7 +75,11 @@ fn right_outer_mirrors_left() {
          where sr_ticket_number is null",
     );
     assert!(matched > 0 && unmatched > 0);
-    assert_eq!(matched + unmatched, total, "RIGHT anti + semi partition all rows");
+    assert_eq!(
+        matched + unmatched,
+        total,
+        "RIGHT anti + semi partition all rows"
+    );
 
     // RIGHT twin equals the LEFT original exactly (matched-only count).
     let left_matched = count(
@@ -86,5 +90,8 @@ fn right_outer_mirrors_left() {
         "select count(sr_ticket_number) from store_returns right outer join store_sales \
            on (ss_ticket_number = sr_ticket_number and ss_item_sk = sr_item_sk)",
     );
-    assert_eq!(left_matched, right_matched, "RIGHT == mirrored LEFT (matched count)");
+    assert_eq!(
+        left_matched, right_matched,
+        "RIGHT == mirrored LEFT (matched count)"
+    );
 }

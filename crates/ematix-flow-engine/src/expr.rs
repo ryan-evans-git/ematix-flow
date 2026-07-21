@@ -247,9 +247,7 @@ impl Expr {
                 }
                 else_.for_each_col(f);
             }
-            Expr::Concat(es)
-            | Expr::NumFn { args: es, .. }
-            | Expr::StrFn { args: es, .. } => {
+            Expr::Concat(es) | Expr::NumFn { args: es, .. } | Expr::StrFn { args: es, .. } => {
                 for e in es {
                     e.for_each_col(f);
                 }
@@ -845,8 +843,11 @@ fn eval_str_fn(func: StrFn, args: &[Expr], chunk: &DataChunk, row: usize) -> Sca
             None => ScalarValue::Null,
         },
         StrFn::Replace => {
-            let (Some(s), from, to) = (s0(), args[1].eval_value(chunk, row), args[2].eval_value(chunk, row))
-            else {
+            let (Some(s), from, to) = (
+                s0(),
+                args[1].eval_value(chunk, row),
+                args[2].eval_value(chunk, row),
+            ) else {
                 return ScalarValue::Null;
             };
             let (ScalarValue::Utf8(from), ScalarValue::Utf8(to)) = (from, to) else {

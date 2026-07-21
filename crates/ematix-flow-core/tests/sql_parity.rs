@@ -196,17 +196,26 @@ impl Parity {
             Err(e) => panic!("NATIVE BIND FAILED for `{sql}`:\n  {e}"),
         };
         let native: Vec<Vec<Cell>> = match execute(&bq) {
-            Ok(r) => r.rows.iter().map(|r| r.iter().map(native_cell).collect()).collect(),
+            Ok(r) => r
+                .rows
+                .iter()
+                .map(|r| r.iter().map(native_cell).collect())
+                .collect(),
             Err(e) => panic!("NATIVE EXEC FAILED for `{sql}`:\n  {e}"),
         };
-        let duck = duck_rows(&self.duck, sql).unwrap_or_else(|e| panic!("DUCK FAILED for `{sql}`:\n  {e}"));
+        let duck = duck_rows(&self.duck, sql)
+            .unwrap_or_else(|e| panic!("DUCK FAILED for `{sql}`:\n  {e}"));
 
         let mut n = native.clone();
         let mut d = duck.clone();
         n.sort_by(|a, b| row_lt(a, b));
         d.sort_by(|a, b| row_lt(a, b));
         if n.len() != d.len() {
-            panic!("ROW COUNT DIFFERS for `{sql}`: native {} vs duck {}", n.len(), d.len());
+            panic!(
+                "ROW COUNT DIFFERS for `{sql}`: native {} vs duck {}",
+                n.len(),
+                d.len()
+            );
         }
         for (i, (nr, dr)) in n.iter().zip(&d).enumerate() {
             let same = nr.len() == dr.len() && nr.iter().zip(dr).all(|(a, b)| cell_eq(a, b));
@@ -260,9 +269,13 @@ fn scalar_functions() {
     let p = Parity::new();
     p.check("select lower(l_returnflag) f, count(*) n from lineitem group by lower(l_returnflag)");
     p.check("select floor(l_quantity) f, count(*) n from lineitem group by floor(l_quantity)");
-    p.check("select ceil(l_discount * 100) f, count(*) n from lineitem group by ceil(l_discount * 100)");
+    p.check(
+        "select ceil(l_discount * 100) f, count(*) n from lineitem group by ceil(l_discount * 100)",
+    );
     p.check("select mod(l_orderkey, 7) m, count(*) n from lineitem group by mod(l_orderkey, 7)");
-    p.check("select length(l_returnflag) f, count(*) n from lineitem group by length(l_returnflag)");
+    p.check(
+        "select length(l_returnflag) f, count(*) n from lineitem group by length(l_returnflag)",
+    );
     p.check("select trim(l_returnflag) f, count(*) n from lineitem group by trim(l_returnflag)");
     p.check(
         "select replace(l_shipinstruct, ' ', '_') f, count(*) n \
@@ -603,5 +616,54 @@ fn not_and_three_valued_null_logic() {
                 not (nullif(l_linenumber, 1) > 3) f, \
                 not (l_linenumber > 2 and nullif(l_linenumber, 1) > 3) g \
          from lineitem where l_orderkey < 60",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2 aggregate tail: median / percentile_cont (buffered, continuous
+// interpolation → Float64) and bool_and / bool_or (foldable → BOOLEAN, NULL
+// over an empty/all-NULL group). All plain GROUP-BY aggregates — no window
+// frame — so parity is deterministic. (last_value needs an UNBOUNDED FOLLOWING
+// frame and string_agg needs an ordered string buffer; both are separate
+// sub-units.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tier2_aggregate_tail() {
+    if !have_data() {
+        eprintln!("SKIP tier2_aggregate_tail: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // median — grouped and scalar (continuous interpolation over even/odd n).
+    p.check("select l_returnflag, median(l_quantity) m from lineitem group by l_returnflag");
+    p.check("select median(l_extendedprice) m from lineitem");
+    // percentile_cont(p) WITHIN GROUP (ORDER BY x) — the classic quantiles.
+    p.check(
+        "select l_returnflag, \
+                percentile_cont(0.25) within group (order by l_extendedprice) p25, \
+                percentile_cont(0.5)  within group (order by l_extendedprice) p50, \
+                percentile_cont(0.9)  within group (order by l_extendedprice) p90 \
+         from lineitem group by l_returnflag",
+    );
+    p.check("select percentile_cont(0.5) within group (order by l_discount) med from lineitem");
+    // bool_and / bool_or — BOOLEAN output, grouped and scalar.
+    p.check(
+        "select l_returnflag, \
+                bool_and(l_quantity > 0)  allpos, \
+                bool_and(l_quantity > 30) allbig, \
+                bool_or(l_quantity > 45)  anyhuge, \
+                bool_or(l_discount > 0.9) anydeep \
+         from lineitem group by l_returnflag",
+    );
+    p.check("select bool_and(l_tax >= 0) b1, bool_or(l_tax > 0.07) b2 from lineitem");
+    // Empty group: median → NULL, bool_and/bool_or → NULL (no non-NULL inputs).
+    p.check(
+        "select median(l_quantity) m, bool_and(l_quantity > 0) b, bool_or(l_quantity > 0) o \
+         from lineitem where l_orderkey < 0",
+    );
+    // bool aggregate reused in HAVING (boolean predicate over the group).
+    p.check(
+        "select l_returnflag from lineitem group by l_returnflag having bool_or(l_quantity > 49)",
     );
 }

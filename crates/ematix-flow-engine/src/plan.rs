@@ -330,7 +330,8 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
             }
             Expr::Extract { arg: i, .. }
             | Expr::DateTrunc { arg: i, .. }
-            | Expr::CastInt(i) | Expr::Not(i)
+            | Expr::CastInt(i)
+            | Expr::Not(i)
             | Expr::Round { expr: i, .. }
             | Expr::Upper(i) => walk(i, f),
             Expr::Like { expr, .. }
@@ -340,8 +341,8 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
             | Expr::IsNull { expr, .. }
             | Expr::Substr { expr, .. } => walk(expr, f),
             Expr::Concat(parts)
-                | Expr::NumFn { args: parts, .. }
-                | Expr::StrFn { args: parts, .. } => {
+            | Expr::NumFn { args: parts, .. }
+            | Expr::StrFn { args: parts, .. } => {
                 for p in parts {
                     walk(p, f);
                 }
@@ -389,7 +390,8 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
             }
             Expr::Extract { arg: i, .. }
             | Expr::DateTrunc { arg: i, .. }
-            | Expr::CastInt(i) | Expr::Not(i)
+            | Expr::CastInt(i)
+            | Expr::Not(i)
             | Expr::Round { expr: i, .. }
             | Expr::Upper(i) => walk(i, f),
             Expr::Like { expr, .. }
@@ -399,8 +401,8 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
             | Expr::IsNull { expr, .. }
             | Expr::Substr { expr, .. } => walk(expr, f),
             Expr::Concat(parts)
-                | Expr::NumFn { args: parts, .. }
-                | Expr::StrFn { args: parts, .. } => {
+            | Expr::NumFn { args: parts, .. }
+            | Expr::StrFn { args: parts, .. } => {
                 for p in parts {
                     walk(p, f);
                 }
@@ -1417,7 +1419,11 @@ impl Executor<'_> {
                 dim_results[*child] =
                     Some(self.build_dim(*child, &child_cols, &children, &needed, &extra)?);
                 if trace_join {
-                    eprintln!("join: built dim '{}' in {:?}", q.tables[*child].name, t0.elapsed());
+                    eprintln!(
+                        "join: built dim '{}' in {:?}",
+                        q.tables[*child].name,
+                        t0.elapsed()
+                    );
                 }
             }
             Ok(())
@@ -1537,7 +1543,10 @@ impl Executor<'_> {
                         // Take a pre-decoded chunk if the overlap prefetch
                         // produced one (barrier-separated, so no race);
                         // otherwise decode it here.
-                        let chunk = match cache_ref.get(rg).and_then(|c| c.lock().expect("lock").take()) {
+                        let chunk = match cache_ref
+                            .get(rg)
+                            .and_then(|c| c.lock().expect("lock").take())
+                        {
                             Some(c) => c,
                             None => src_ref.decode(rg, local_stock.as_ref())?,
                         };
@@ -2609,6 +2618,12 @@ impl Executor<'_> {
                             states[j].distinct.insert(v);
                         }
                     }),
+                    // Buffered aggregates retain each non-NULL value.
+                    AggFunc::PercentileCont(_) => sel.for_each(|i| {
+                        if let Some(v) = agg.arg.eval_opt_f64(&view, i as usize) {
+                            states[j].buf.push(v);
+                        }
+                    }),
                     _ => {
                         if let Some(col) = &arg_cols[j] {
                             sel.for_each(|i| {
@@ -2651,6 +2666,11 @@ impl Executor<'_> {
                     AggFunc::CountDistinct => {
                         if let Some(v) = agg.arg.eval_opt_distinct_key(&view, i) {
                             states[j].distinct.insert(v);
+                        }
+                    }
+                    AggFunc::PercentileCont(_) => {
+                        if let Some(v) = agg.arg.eval_opt_f64(&view, i) {
+                            states[j].buf.push(v);
                         }
                     }
                     _ => {
@@ -2786,7 +2806,12 @@ impl Executor<'_> {
 
         let len = rows.len();
         let cols = self.materialize_fanout(view, vlen, dim, &rows, &pay_ref, None);
-        (DataChunk::new(cols), Selection::All(len), len, left.then_some(matched))
+        (
+            DataChunk::new(cols),
+            Selection::All(len),
+            len,
+            left.then_some(matched),
+        )
     }
 
     /// Filter one fan-out candidate batch against the early residual: only
@@ -3121,6 +3146,15 @@ fn agg_column(agg: &AggExpr, j: usize, groups: &[(Vec<GroupKey>, Vec<AggState>)]
         AggFunc::CountDistinct => {
             Vector::i64(states().map(|st| st.distinct.len() as i64).collect())
         }
+        // bool_and/bool_or land in a 0/1 Int64 column (validity = false over
+        // an empty group); the binder's `slot = 1` reference renders it as a
+        // NULL-propagating BOOLEAN.
+        AggFunc::BoolAnd | AggFunc::BoolOr => {
+            let vals: Vec<i64> = states().map(|st| st.finalize(agg.func) as i64).collect();
+            let valid: Vec<bool> = states().map(|st| !st.is_null(agg.func)).collect();
+            let any_null = valid.iter().any(|&b| !b);
+            Vector::i64(vals).with_validity(any_null.then_some(valid))
+        }
         _ => {
             let vals: Vec<f64> = states().map(|st| st.finalize(agg.func)).collect();
             let valid: Vec<bool> = states().map(|st| !st.is_null(agg.func)).collect();
@@ -3403,7 +3437,11 @@ fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -
             for rows in parts.values_mut() {
                 rows.sort_by(|&a, &b| order_cmp(a, b));
                 for (p, &r) in rows.iter().enumerate() {
-                    let src = if lead { p.checked_add(off) } else { p.checked_sub(off) };
+                    let src = if lead {
+                        p.checked_add(off)
+                    } else {
+                        p.checked_sub(off)
+                    };
                     match src
                         .filter(|&s| s < rows.len())
                         .and_then(|s| w.arg.eval_opt_f64(chunk, rows[s]))
@@ -3880,6 +3918,12 @@ struct AggState {
     max: f64,
     /// Distinct integer values (only fed by `COUNT(DISTINCT …)`).
     distinct: std::collections::HashSet<i64>,
+    /// Retained non-NULL argument values (only fed by the buffered
+    /// aggregates — `median` / `percentile_cont`). Empty and unallocated for
+    /// every foldable aggregate, so the hot perf-gated queries pay nothing
+    /// beyond the 24-byte header (same "only some aggregates use it" shape as
+    /// `distinct`).
+    buf: Vec<f64>,
 }
 
 impl Default for AggState {
@@ -3891,6 +3935,7 @@ impl Default for AggState {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             distinct: std::collections::HashSet::new(),
+            buf: Vec::new(),
         }
     }
 }
@@ -3910,6 +3955,9 @@ impl AggState {
             self.max = o.max;
         }
         self.distinct.extend(o.distinct.iter().copied());
+        // Buffered aggregates concatenate their retained values; the buffer
+        // is sorted only at finalize, so the merge order is irrelevant.
+        self.buf.extend_from_slice(&o.buf);
     }
 
     #[inline]
@@ -3934,8 +3982,33 @@ impl AggState {
             // forms need ≥ 2 rows.
             AggFunc::StddevPop | AggFunc::VarPop => self.count == 0,
             AggFunc::StddevSamp | AggFunc::VarSamp => self.count < 2,
+            // Buffered percentile / median: NULL only over an empty buffer.
+            AggFunc::PercentileCont(_) => self.buf.is_empty(),
+            // bool_and/bool_or: NULL over an empty/all-NULL group (count is
+            // the non-NULL tally).
+            AggFunc::BoolAnd | AggFunc::BoolOr => self.count == 0,
             AggFunc::Count | AggFunc::CountDistinct | AggFunc::CountMatched(_) => false,
         }
+    }
+
+    /// Continuous percentile at fraction `p` over the retained buffer: sort,
+    /// then linearly interpolate between the two ranks straddling `p·(n−1)`
+    /// (the standard `PERCENTILE_CONT` / `median` definition). Caller
+    /// guarantees a non-empty buffer.
+    fn percentile(&self, p: f64) -> f64 {
+        let mut v = self.buf.clone();
+        v.sort_by(f64::total_cmp);
+        let n = v.len();
+        // Empty groups still reach here (agg_column finalizes every state and
+        // masks NULLs by validity afterwards) — return a placeholder.
+        if n <= 1 {
+            return v.first().copied().unwrap_or(0.0);
+        }
+        let rank = p * (n - 1) as f64;
+        let lo = rank.floor() as usize;
+        let hi = rank.ceil() as usize;
+        let frac = rank - lo as f64;
+        v[lo] + frac * (v[hi] - v[lo])
     }
 
     /// Variance via the sum-of-squares identity: `sample` divides the
@@ -3963,6 +4036,10 @@ impl AggState {
             AggFunc::VarPop => self.variance(false),
             AggFunc::CountDistinct => self.distinct.len() as f64,
             AggFunc::CountMatched(_) => self.count as f64,
+            AggFunc::PercentileCont(bits) => self.percentile(f64::from_bits(bits)),
+            // Foldable booleans: all-true ⟺ min == 1; any-true ⟺ max == 1.
+            AggFunc::BoolAnd => self.min,
+            AggFunc::BoolOr => self.max,
         }
     }
 }
@@ -4162,9 +4239,12 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
             collect_slots(lhs, out);
             collect_slots(rhs, out);
         }
-        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Not(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
-            collect_slots(i, out)
-        }
+        Expr::Extract { arg: i, .. }
+        | Expr::DateTrunc { arg: i, .. }
+        | Expr::CastInt(i)
+        | Expr::Not(i)
+        | Expr::Round { expr: i, .. }
+        | Expr::Upper(i) => collect_slots(i, out),
         Expr::Like { expr, .. } => collect_slots(expr, out),
         Expr::ScalarSub(_) => {}
         Expr::InSub { expr, .. }
@@ -4172,9 +4252,7 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
         | Expr::InSetStr { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Substr { expr, .. } => collect_slots(expr, out),
-        Expr::Concat(parts)
-        | Expr::NumFn { args: parts, .. }
-        | Expr::StrFn { args: parts, .. } => {
+        Expr::Concat(parts) | Expr::NumFn { args: parts, .. } | Expr::StrFn { args: parts, .. } => {
             for p in parts {
                 collect_slots(p, out);
             }

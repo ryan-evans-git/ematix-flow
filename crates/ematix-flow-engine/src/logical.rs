@@ -111,6 +111,20 @@ pub enum AggFunc {
     VarPop,
     /// `COUNT(DISTINCT <int expr>)`.
     CountDistinct,
+    /// Continuous percentile / median. The buffered non-NULL argument values
+    /// are sorted and linearly interpolated at fraction `p` (the `u64` is
+    /// `f64::to_bits(p)`; `median(x)` binds `p = 0.5`, `percentile_cont(p)
+    /// WITHIN GROUP (ORDER BY x)` binds the given `p`). Output is Float64;
+    /// NULL over an empty/all-NULL group. Buffered — not foldable — so it
+    /// carries [`AggState::buf`].
+    PercentileCont(u64),
+    /// `bool_and(x)` — TRUE iff every non-NULL input is truthy, else FALSE;
+    /// NULL over an empty/all-NULL group. Foldable as `min(0/1)`. Output
+    /// BOOLEAN (the binder wraps the reference as `slot = 1`).
+    BoolAnd,
+    /// `bool_or(x)` — TRUE iff any non-NULL input is truthy. Foldable as
+    /// `max(0/1)`; same BOOLEAN rendering as [`AggFunc::BoolAnd`].
+    BoolOr,
     /// `COUNT(<col of a LEFT-joined table>)` — counts only row occurrences
     /// where that table matched (the no-NULL engine's outer-join counting;
     /// unmatched preserved rows contribute 0).

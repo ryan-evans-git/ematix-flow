@@ -234,9 +234,7 @@ fn bind_query(
                     ast::Expr::Cube(_) | ast::Expr::GroupingSets(_) | ast::Expr::Rollup(_)
                 )
             }) {
-                return Err(
-                    "ROLLUP / CUBE / GROUPING SETS must be the sole GROUP BY term".into(),
-                );
+                return Err("ROLLUP / CUBE / GROUPING SETS must be the sole GROUP BY term".into());
             } else {
                 let mut out = Vec::new();
                 for e in exprs {
@@ -722,9 +720,12 @@ fn remap_window_cols(e: &mut Expr, win_base: usize, group_base: usize) {
             remap_window_cols(lhs, win_base, group_base);
             remap_window_cols(rhs, win_base, group_base);
         }
-        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Not(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
-            remap_window_cols(i, win_base, group_base)
-        }
+        Expr::Extract { arg: i, .. }
+        | Expr::DateTrunc { arg: i, .. }
+        | Expr::CastInt(i)
+        | Expr::Not(i)
+        | Expr::Round { expr: i, .. }
+        | Expr::Upper(i) => remap_window_cols(i, win_base, group_base),
         Expr::Like { expr, .. }
         | Expr::InSub { expr, .. }
         | Expr::InSet { expr, .. }
@@ -1254,8 +1255,18 @@ impl Binder<'_> {
     fn bind_round_or_upper(&mut self, f: &ast::Function) -> Result<Option<Expr>, String> {
         let fname = f.name.to_string().to_lowercase();
         const KNOWN: &[&str] = &[
-            "round", "upper", "lower", "lcase", "replace", "length", "char_length",
-            "character_length", "len", "mod", "date_trunc", "datetrunc",
+            "round",
+            "upper",
+            "lower",
+            "lcase",
+            "replace",
+            "length",
+            "char_length",
+            "character_length",
+            "len",
+            "mod",
+            "date_trunc",
+            "datetrunc",
         ];
         if !KNOWN.contains(&fname.as_str()) {
             return Ok(None);
@@ -1284,12 +1295,10 @@ impl Binder<'_> {
                     self.bind_scalar(b)?,
                 ],
             })),
-            ("length" | "char_length" | "character_length" | "len", [x]) => {
-                Ok(Some(Expr::NumFn {
-                    func: NumFn::Length,
-                    args: vec![self.bind_scalar(x)?],
-                }))
-            }
+            ("length" | "char_length" | "character_length" | "len", [x]) => Ok(Some(Expr::NumFn {
+                func: NumFn::Length,
+                args: vec![self.bind_scalar(x)?],
+            })),
             ("mod", [a, b]) => Ok(Some(Expr::NumFn {
                 func: NumFn::Mod,
                 args: vec![self.bind_scalar(a)?, self.bind_scalar(b)?],
@@ -1460,7 +1469,11 @@ impl Binder<'_> {
         // table whose rows may be NULL-extended: the joined table under LEFT,
         // or (under RIGHT) the single OLD table the joined table is preserved
         // against, discovered here from the equi key.
-        let mut nullable: Option<usize> = if dir == Some(false) { Some(new_t) } else { None };
+        let mut nullable: Option<usize> = if dir == Some(false) {
+            Some(new_t)
+        } else {
+            None
+        };
         let mut nonequi: Vec<&ast::Expr> = Vec::new();
         for conj in conjuncts {
             if let ast::Expr::BinaryOp {
@@ -1490,7 +1503,7 @@ impl Binder<'_> {
                                     Some(_) => {
                                         return Err("RIGHT JOIN keyed on more than one left \
                                                     table is not yet supported"
-                                            .into())
+                                            .into());
                                     }
                                 }
                             }
@@ -1828,8 +1841,22 @@ impl Binder<'_> {
                     return self.bind_output(&rewritten, group, aggs);
                 }
                 let agg = self.bind_aggregate(e)?;
+                let is_bool = matches!(agg.func, AggFunc::BoolAnd | AggFunc::BoolOr);
                 aggs.push(agg);
-                Ok(Expr::Column(group.len() + aggs.len() - 1))
+                let slot = Expr::Column(group.len() + aggs.len() - 1);
+                // bool_and/bool_or accumulate a 0/1 Int64 column; render it as
+                // BOOLEAN by referencing it as `slot = 1` — a comparison
+                // evaluates to Val::Bool and propagates SQL NULL (an empty
+                // group's NULL slot → `NULL = 1` → NULL), matching DuckDB.
+                Ok(if is_bool {
+                    Expr::Binary {
+                        op: crate::expr::BinaryOp::Eq,
+                        lhs: Box::new(slot),
+                        rhs: Box::new(Expr::Literal(ScalarValue::Int64(1))),
+                    }
+                } else {
+                    slot
+                })
             }
             ast::Expr::Case {
                 operand: None,
@@ -2791,7 +2818,9 @@ impl Binder<'_> {
                         match self.clone_free_literal(o)? {
                             ScalarValue::Int64(v) if v >= 0 => v as u32,
                             other => {
-                                return Err(format!("{fname} offset must be a non-negative integer: {other:?}"));
+                                return Err(format!(
+                                    "{fname} offset must be a non-negative integer: {other:?}"
+                                ));
                             }
                         }
                     }
@@ -2826,7 +2855,11 @@ impl Binder<'_> {
                 };
                 let nb = match self.clone_free_literal(nb)? {
                     ScalarValue::Int64(v) if v > 0 => v as u32,
-                    other => return Err(format!("ntile bucket count must be a positive integer: {other:?}")),
+                    other => {
+                        return Err(format!(
+                            "ntile bucket count must be a positive integer: {other:?}"
+                        ));
+                    }
                 };
                 (WindowFunc::Ntile(nb), Expr::Literal(ScalarValue::Int64(0)))
             }
@@ -2926,6 +2959,12 @@ impl Binder<'_> {
             return Err(format!("expected an aggregate call, got: {e}"));
         };
         let fname = f.name.to_string().to_lowercase();
+        // percentile_cont(p) WITHIN GROUP (ORDER BY x): the aggregated value
+        // is the ORDER BY key, and `p` is the (constant) call argument — a
+        // different shape from every other aggregate, so it binds separately.
+        if fname == "percentile_cont" {
+            return self.bind_percentile_cont(f);
+        }
         let func = match fname.as_str() {
             "sum" => AggFunc::Sum,
             "count" => AggFunc::Count,
@@ -2936,6 +2975,10 @@ impl Binder<'_> {
             "stddev_pop" => AggFunc::StddevPop,
             "var_samp" | "variance" | "var" => AggFunc::VarSamp,
             "var_pop" => AggFunc::VarPop,
+            // median(x) is percentile_cont(0.5) over the argument itself.
+            "median" => AggFunc::PercentileCont(0.5f64.to_bits()),
+            "bool_and" | "booland" => AggFunc::BoolAnd,
+            "bool_or" | "boolor" => AggFunc::BoolOr,
             other => return Err(format!("unsupported aggregate function '{other}'")),
         };
         let ast::FunctionArguments::List(args) = &f.args else {
@@ -2973,6 +3016,44 @@ impl Binder<'_> {
             }
         }
         Ok(AggExpr { func, arg })
+    }
+
+    /// Bind `percentile_cont(p) WITHIN GROUP (ORDER BY x)` — the fraction `p`
+    /// is the call argument, the aggregated value is the ORDER BY key.
+    fn bind_percentile_cont(&mut self, f: &ast::Function) -> Result<AggExpr, String> {
+        let ast::FunctionArguments::List(args) = &f.args else {
+            return Err("percentile_cont needs a fraction argument".into());
+        };
+        let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(pe))] = args.args.as_slice()
+        else {
+            return Err("percentile_cont takes exactly one fraction argument".into());
+        };
+        let p = match self.clone_free_literal(pe)? {
+            ScalarValue::Float64(p) => p,
+            ScalarValue::Int64(i) => i as f64,
+            ScalarValue::Int32(i) => i as f64,
+            other => {
+                return Err(format!(
+                    "percentile_cont fraction must be numeric: {other:?}"
+                ));
+            }
+        };
+        if !(0.0..=1.0).contains(&p) {
+            return Err(format!("percentile_cont fraction {p} is outside [0, 1]"));
+        }
+        let [oe] = f.within_group.as_slice() else {
+            return Err(
+                "percentile_cont requires WITHIN GROUP (ORDER BY <expr>) with one key".into(),
+            );
+        };
+        if oe.options.asc == Some(false) {
+            return Err("percentile_cont WITHIN GROUP ... DESC is not yet supported".into());
+        }
+        let arg = self.bind_scalar(&oe.expr)?;
+        Ok(AggExpr {
+            func: AggFunc::PercentileCont(p.to_bits()),
+            arg,
+        })
     }
 
     /// Bind an AST expression bottom-up (slot space), folding literal
@@ -3080,7 +3161,9 @@ impl Binder<'_> {
             ast::Expr::UnaryOp {
                 op: ast::UnaryOperator::Not,
                 expr,
-            } => Ok(Bound::Expr(Expr::Not(Box::new(materialize(self.bind(expr)?))))),
+            } => Ok(Bound::Expr(Expr::Not(Box::new(materialize(
+                self.bind(expr)?,
+            ))))),
             ast::Expr::TypedString(ts) => bind_typed_string(ts).map(Bound::Expr),
             ast::Expr::Extract { field, expr, .. } => {
                 let f = bind_date_field(field)?;
@@ -3466,9 +3549,14 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
                 key_tys[*i]
             } else if *i < key_tys.len() + q.aggs.len() {
                 match q.aggs[*i - key_tys.len()].func {
-                    AggFunc::Count | AggFunc::CountDistinct | AggFunc::CountMatched(_) => {
-                        LogicalType::Int64
-                    }
+                    // Counts and the 0/1 boolean folds materialize as Int64
+                    // columns (bool_and/bool_or are rendered BOOLEAN by the
+                    // binder's `slot = 1` wrapper, not by the slot type).
+                    AggFunc::Count
+                    | AggFunc::CountDistinct
+                    | AggFunc::CountMatched(_)
+                    | AggFunc::BoolAnd
+                    | AggFunc::BoolOr => LogicalType::Int64,
                     _ => LogicalType::Float64,
                 }
             } else {
@@ -4639,7 +4727,25 @@ fn contains_aggregate(e: &ast::Expr) -> bool {
             }
             if matches!(
                 f.name.to_string().to_lowercase().as_str(),
-                "sum" | "count" | "min" | "max" | "avg" | "stddev_samp" | "stddev" | "stddev_sample" | "stddev_pop" | "var_samp" | "variance" | "var" | "var_pop"
+                "sum"
+                    | "count"
+                    | "min"
+                    | "max"
+                    | "avg"
+                    | "stddev_samp"
+                    | "stddev"
+                    | "stddev_sample"
+                    | "stddev_pop"
+                    | "var_samp"
+                    | "variance"
+                    | "var"
+                    | "var_pop"
+                    | "median"
+                    | "percentile_cont"
+                    | "bool_and"
+                    | "booland"
+                    | "bool_or"
+                    | "boolor"
             ) {
                 return true;
             }
@@ -4740,7 +4846,25 @@ fn contains_nonwindow_agg(e: &ast::Expr) -> bool {
             }
             if matches!(
                 f.name.to_string().to_lowercase().as_str(),
-                "sum" | "count" | "min" | "max" | "avg" | "stddev_samp" | "stddev" | "stddev_sample" | "stddev_pop" | "var_samp" | "variance" | "var" | "var_pop"
+                "sum"
+                    | "count"
+                    | "min"
+                    | "max"
+                    | "avg"
+                    | "stddev_samp"
+                    | "stddev"
+                    | "stddev_sample"
+                    | "stddev_pop"
+                    | "var_samp"
+                    | "variance"
+                    | "var"
+                    | "var_pop"
+                    | "median"
+                    | "percentile_cont"
+                    | "bool_and"
+                    | "booland"
+                    | "bool_or"
+                    | "boolor"
             ) {
                 return true;
             }
@@ -4817,9 +4941,12 @@ fn references_columns(e: &Expr) -> bool {
         Expr::Column(_) => true,
         Expr::Literal(_) => false,
         Expr::Binary { lhs, rhs, .. } => references_columns(lhs) || references_columns(rhs),
-        Expr::Extract { arg: i, .. } | Expr::DateTrunc { arg: i, .. } | Expr::CastInt(i) | Expr::Not(i) | Expr::Round { expr: i, .. } | Expr::Upper(i) => {
-            references_columns(i)
-        }
+        Expr::Extract { arg: i, .. }
+        | Expr::DateTrunc { arg: i, .. }
+        | Expr::CastInt(i)
+        | Expr::Not(i)
+        | Expr::Round { expr: i, .. }
+        | Expr::Upper(i) => references_columns(i),
         Expr::Like { expr, .. } => references_columns(expr),
         Expr::ScalarSub(_) => false,
         Expr::InSub { expr, .. }
