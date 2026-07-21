@@ -934,7 +934,24 @@ lands a case here.
   `grouping_sets_and_cube` (CUBE over 2/3 dims, GROUPING SETS incl. grand
   total + a repeated set, GROUPING() flags, multi-column CUBE term). Parity
   13/13, sf1 103/103 0 MISMATCH, suite green.
-- **Tier-3 residuals still open:** recursive CTEs; the Tier-2 aggregate tail.
+- **Tier-2 aggregate tail (median / percentile_cont / bool_and / bool_or) —
+  SHIPPED (`11d47d78`).** *Buffered:* `median(x)` and `percentile_cont(p)
+  WITHIN GROUP (ORDER BY x)` retain non-NULL values in a new `AggState::buf`
+  (empty/unallocated for every foldable aggregate — the perf-gated queries
+  pay only the 24-byte header, like the existing `distinct` set), sort at
+  finalize, and linearly interpolate at `p` (median = 0.5); Float64, NULL over
+  an empty group; `buf` concatenates on merge (sorted at finalize, so order-
+  independent). *Foldable booleans:* `bool_and`/`bool_or` fold via `min`/`max`
+  of the 0/1-coerced input into an Int64 0/1 column, rendered BOOLEAN by
+  wrapping the reference as `slot = 1` at the single agg-reference site — a
+  comparison → `Val::Bool` that propagates SQL NULL (`NULL = 1 → NULL`), so no
+  `LogicalType::Boolean` / hot-eval-match change. `percentile_cont` reads the
+  fraction from `f.args` and the value from `f.within_group`. Gate:
+  `tier2_aggregate_tail` (median/percentile grouped+scalar, bool_and/bool_or
+  grouped+scalar+HAVING, empty-group NULLs). Parity 14/14, sf1 103/103 0
+  MISMATCH (foldable hot path untouched), suite green.
+- **Tier-3 residuals still open:** recursive CTEs; `last_value` (needs an
+  UNBOUNDED FOLLOWING window frame) and `string_agg` (ordered Utf8 buffer).
 
 ## Next (P4 tail → P5/P6)
 
