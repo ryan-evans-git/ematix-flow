@@ -170,6 +170,11 @@ pub enum WindowFunc {
     /// `first_value(arg)` — arg at the partition's first ordered row (the
     /// default `UNBOUNDED PRECEDING..CURRENT ROW` frame always starts there).
     FirstValue,
+    /// `last_value(arg)` — arg at the frame's last row. Under the default
+    /// `..CURRENT ROW` frame that is the current row's peer group's last
+    /// member; under an `UNBOUNDED FOLLOWING` (or unordered whole-partition)
+    /// frame it is the partition's last ordered row.
+    LastValue,
 }
 
 /// One window expression, evaluated over the block's POST-GROUPING result
@@ -186,6 +191,11 @@ pub struct WindowExpr {
     /// Explicit `ROWS UNBOUNDED PRECEDING..CURRENT ROW` (strict running);
     /// `false` = RANGE semantics (peers of the current row included).
     pub rows_frame: bool,
+    /// The frame ends at `UNBOUNDED FOLLOWING` — the frame spans the whole
+    /// partition regardless of ORDER BY, so aggregate windows produce the
+    /// partition total on every row (not a running value) and `last_value`
+    /// returns the partition's last ordered row.
+    pub frame_end_unbounded: bool,
     /// An enclosing `WHERE <this window's output> <= K` proved only the
     /// top K rows per partition can survive (rank/row_number only —
     /// set by the binder). The executor prunes each partition to the rows

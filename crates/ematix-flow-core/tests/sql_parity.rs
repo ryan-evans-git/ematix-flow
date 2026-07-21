@@ -667,3 +667,50 @@ fn tier2_aggregate_tail() {
         "select l_returnflag from lineitem group by l_returnflag having bool_or(l_quantity > 49)",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Window-frame breadth: UNBOUNDED FOLLOWING frames (whole-partition, distinct
+// from the cumulative default) and last_value. The default RANGE ..CURRENT ROW
+// frame keeps its cumulative meaning; UNBOUNDED..UNBOUNDED means whole
+// partition for both the aggregate windows and last_value.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn window_last_value_and_frames() {
+    if !have_data() {
+        eprintln!("SKIP window_last_value_and_frames: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    let part = "partition by l_returnflag order by l_orderkey, l_linenumber";
+    let whole = "rows between unbounded preceding and unbounded following";
+    // last_value over the whole partition (the deterministic, common form),
+    // beside first_value over the default frame.
+    p.check(&format!(
+        "select l_orderkey, l_linenumber, \
+                last_value(l_discount) over ({part} {whole}) lv, \
+                first_value(l_discount) over ({part}) fv \
+         from lineitem where l_orderkey < 800"
+    ));
+    // UNBOUNDED FOLLOWING makes an aggregate window WHOLE-partition (every row
+    // gets the partition total), distinct from the cumulative default `run`.
+    p.check(&format!(
+        "select l_orderkey, l_linenumber, \
+                sum(l_quantity) over ({part} {whole}) tot, \
+                max(l_extendedprice) over ({part} {whole}) mx, \
+                sum(l_quantity) over ({part}) run \
+         from lineitem where l_orderkey < 500"
+    ));
+    // RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING = whole partition.
+    p.check(&format!(
+        "select l_orderkey, last_value(l_quantity) over \
+                ({part} range between unbounded preceding and unbounded following) lv \
+         from lineitem where l_orderkey < 300"
+    ));
+    // last_value with the DEFAULT frame (RANGE ..CURRENT ROW): a unique order
+    // key makes peer groups singletons, so it equals the current row's value.
+    p.check(&format!(
+        "select l_orderkey, l_linenumber, last_value(l_discount) over ({part}) lv_def \
+         from lineitem where l_orderkey < 200"
+    ));
+}

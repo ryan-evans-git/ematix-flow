@@ -3343,8 +3343,9 @@ fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -
             let mut out = vec![0.0f64; n];
             let mut valid = vec![true; n];
             for rows in parts.values_mut() {
-                if w.order.is_empty() {
-                    // Whole-partition aggregate.
+                if w.order.is_empty() || w.frame_end_unbounded {
+                    // Whole-partition aggregate (unordered, or an explicit
+                    // UNBOUNDED PRECEDING..UNBOUNDED FOLLOWING frame).
                     let mut st = AggState::default();
                     for &r in rows.iter() {
                         if let Some(v) = w.arg.eval_opt_f64(chunk, r) {
@@ -3464,6 +3465,48 @@ fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -
                     match first {
                         Some(v) => out[r] = v,
                         None => valid[r] = false,
+                    }
+                }
+            }
+            let any_null = valid.iter().any(|&b| !b);
+            Vector::f64(out).with_validity(any_null.then_some(valid))
+        }
+        WindowFunc::LastValue => {
+            let mut out = vec![0.0f64; n];
+            let mut valid = vec![true; n];
+            for rows in parts.values_mut() {
+                rows.sort_by(|&a, &b| order_cmp(a, b));
+                if w.order.is_empty() || w.frame_end_unbounded {
+                    // Whole-partition frame: the last ordered row's value,
+                    // constant across the partition.
+                    let last = rows.last().and_then(|&r| w.arg.eval_opt_f64(chunk, r));
+                    for &r in rows.iter() {
+                        match last {
+                            Some(v) => out[r] = v,
+                            None => valid[r] = false,
+                        }
+                    }
+                } else {
+                    // Default RANGE ..CURRENT ROW: the frame ends at the
+                    // current row's peer group, so last_value is that peer
+                    // group's last member's value (the current row itself when
+                    // the order key is unique).
+                    let mut i = 0;
+                    while i < rows.len() {
+                        let mut j = i + 1;
+                        while j < rows.len()
+                            && order_cmp(rows[i], rows[j]) == std::cmp::Ordering::Equal
+                        {
+                            j += 1;
+                        }
+                        let last = w.arg.eval_opt_f64(chunk, rows[j - 1]);
+                        for &r in &rows[i..j] {
+                            match last {
+                                Some(v) => out[r] = v,
+                                None => valid[r] = false,
+                            }
+                        }
+                        i = j;
                     }
                 }
             }

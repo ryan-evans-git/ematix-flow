@@ -2844,6 +2844,17 @@ impl Binder<'_> {
                 };
                 (WindowFunc::FirstValue, self.bind_output(x, group, aggs)?)
             }
+            "last_value" => {
+                let ast::FunctionArguments::List(args) = &f.args else {
+                    return Err("last_value needs an argument list".into());
+                };
+                let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(x))] =
+                    args.args.as_slice()
+                else {
+                    return Err("last_value takes exactly one argument".into());
+                };
+                (WindowFunc::LastValue, self.bind_output(x, group, aggs)?)
+            }
             "ntile" => {
                 let ast::FunctionArguments::List(args) = &f.args else {
                     return Err("ntile needs an argument list".into());
@@ -2908,16 +2919,25 @@ impl Binder<'_> {
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let rows_frame = match &spec.window_frame {
-            None => false,
+        let (rows_frame, frame_end_unbounded) = match &spec.window_frame {
+            None => (false, false),
             Some(fr) => {
                 use ast::WindowFrameBound as B;
+                // Supported starts: UNBOUNDED PRECEDING. Supported ends:
+                // CURRENT ROW (or implicit) and UNBOUNDED FOLLOWING.
                 let start_ok = matches!(fr.start_bound, B::Preceding(None));
-                let end_ok = matches!(fr.end_bound, None | Some(B::CurrentRow));
+                let (end_unbounded, end_ok) = match &fr.end_bound {
+                    None | Some(B::CurrentRow) => (false, true),
+                    Some(B::Following(None)) => (true, true),
+                    _ => (false, false),
+                };
                 if !start_ok || !end_ok {
                     return Err(format!("unsupported window frame: {fr:?}"));
                 }
-                matches!(fr.units, ast::WindowFrameUnits::Rows)
+                (
+                    matches!(fr.units, ast::WindowFrameUnits::Rows) && !end_unbounded,
+                    end_unbounded,
+                )
             }
         };
         self.windows.push(WindowExpr {
@@ -2926,6 +2946,7 @@ impl Binder<'_> {
             partition,
             order,
             rows_frame,
+            frame_end_unbounded,
             top_k: None,
         });
         Ok(Expr::Column(WINDOW_BASE + self.windows.len() - 1))
@@ -3499,7 +3520,8 @@ fn infer_windowed_slot_type(q: &BoundQuery, nslots: usize, e: &Expr) -> LogicalT
             WindowFunc::Agg(_)
             | WindowFunc::Lag(_)
             | WindowFunc::Lead(_)
-            | WindowFunc::FirstValue => LogicalType::Float64,
+            | WindowFunc::FirstValue
+            | WindowFunc::LastValue => LogicalType::Float64,
         },
         Expr::Binary { op, lhs, rhs } => binary_type(
             *op,
@@ -3568,7 +3590,8 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
                     WindowFunc::Agg(_)
                     | WindowFunc::Lag(_)
                     | WindowFunc::Lead(_)
-                    | WindowFunc::FirstValue => LogicalType::Float64,
+                    | WindowFunc::FirstValue
+                    | WindowFunc::LastValue => LogicalType::Float64,
                 }
             }
         }
