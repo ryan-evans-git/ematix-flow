@@ -714,3 +714,41 @@ fn window_last_value_and_frames() {
          from lineitem where l_orderkey < 200"
     ));
 }
+
+// ---------------------------------------------------------------------------
+// string_agg / group_concat: ordered concatenation with a delimiter. Values
+// are trim()ed so CHAR padding can't diverge inside a joined cell; ordering is
+// pinned (value == key, or a unique key) so both engines emit the same string.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_agg_ordered() {
+    if !have_data() {
+        eprintln!("SKIP string_agg_ordered: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // Grouped, value == order key (ties are value-identical, so order is moot).
+    p.check(
+        "select l_returnflag, string_agg(trim(l_shipmode), ',' order by l_shipmode) s \
+         from lineitem where l_orderkey < 200 group by l_returnflag",
+    );
+    // value != key with a UNIQUE order key (l_orderkey, l_linenumber).
+    p.check(
+        "select l_returnflag, \
+                string_agg(trim(l_linestatus), '|' order by l_orderkey, l_linenumber) s \
+         from lineitem where l_orderkey < 120 group by l_returnflag",
+    );
+    // DESC ordering + multi-char delimiter, scalar (single group).
+    p.check(
+        "select string_agg(trim(l_shipmode), '; ' order by l_shipmode desc) s \
+         from lineitem where l_orderkey < 60",
+    );
+    // group_concat alias.
+    p.check(
+        "select group_concat(trim(l_shipmode), ',' order by l_shipmode) s \
+         from lineitem where l_orderkey < 30",
+    );
+    // Empty group → NULL.
+    p.check("select string_agg(trim(l_shipmode), ',' order by l_shipmode) s from lineitem where l_orderkey < 0");
+}

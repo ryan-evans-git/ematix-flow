@@ -89,6 +89,19 @@ pub struct AggExpr {
     pub func: AggFunc,
     /// The bound argument. For `COUNT(*)` this is unused (any literal).
     pub arg: Expr,
+    /// `string_agg`/`group_concat` only: the delimiter and in-aggregate ORDER
+    /// BY. `None` for every other aggregate.
+    pub str_agg: Option<StrAggSpec>,
+}
+
+/// The delimiter and ordering of a `string_agg` / `group_concat` aggregate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrAggSpec {
+    /// Separator inserted between concatenated values.
+    pub delim: std::sync::Arc<str>,
+    /// `(key, desc)` ordering applied within each group before concatenation;
+    /// empty = arrival order.
+    pub order: Vec<(Expr, bool)>,
 }
 
 /// Supported aggregate functions.
@@ -125,6 +138,12 @@ pub enum AggFunc {
     /// `bool_or(x)` — TRUE iff any non-NULL input is truthy. Foldable as
     /// `max(0/1)`; same BOOLEAN rendering as [`AggFunc::BoolAnd`].
     BoolOr,
+    /// `string_agg(x, delim [ORDER BY …])` / `group_concat` — concatenate the
+    /// non-NULL string values with `delim`, in the optional in-aggregate ORDER
+    /// BY (arrival order otherwise). Buffered (retains each value + its order
+    /// key in [`AggState`]); the delimiter and ordering live in
+    /// [`AggExpr::str_agg`]. Output Utf8; NULL over an empty group.
+    StringAgg,
     /// `COUNT(<col of a LEFT-joined table>)` — counts only row occurrences
     /// where that table matched (the no-NULL engine's outer-join counting;
     /// unmatched preserved rows contribute 0).

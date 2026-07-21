@@ -2624,6 +2624,9 @@ impl Executor<'_> {
                             states[j].buf.push(v);
                         }
                     }),
+                    AggFunc::StringAgg => sel.for_each(|i| {
+                        push_string_agg(&mut states[j], agg, &view, i as usize);
+                    }),
                     _ => {
                         if let Some(col) = &arg_cols[j] {
                             sel.for_each(|i| {
@@ -2673,6 +2676,7 @@ impl Executor<'_> {
                             states[j].buf.push(v);
                         }
                     }
+                    AggFunc::StringAgg => push_string_agg(&mut states[j], agg, &view, i),
                     _ => {
                         let v = match &arg_cols[j] {
                             Some(col) => col_opt_f64(col, i),
@@ -3135,6 +3139,49 @@ fn agg_columns(aggs: &[AggExpr], groups: &[(Vec<GroupKey>, Vec<AggState>)]) -> V
         .collect()
 }
 
+/// Retain one row's `string_agg` value (skipping SQL NULL) together with its
+/// ORDER BY key, for concatenation at finalize.
+fn push_string_agg(st: &mut AggState, agg: &AggExpr, chunk: &DataChunk, row: usize) {
+    let s: std::sync::Arc<str> = match agg.arg.eval_value(chunk, row) {
+        crate::expr::ScalarValue::Null => return,
+        crate::expr::ScalarValue::Utf8(s) => s,
+        other => std::sync::Arc::from(scalar_to_string(&other).as_str()),
+    };
+    let spec = agg.str_agg.as_ref().expect("string_agg spec");
+    let key: Vec<GroupKey> = spec
+        .order
+        .iter()
+        .map(|(e, _)| GroupKey::from(e.eval_value(chunk, row)))
+        .collect();
+    st.sbuf.push((key, s));
+}
+
+/// Render a non-string scalar the way `string_agg` casts it before joining.
+fn scalar_to_string(v: &crate::expr::ScalarValue) -> String {
+    use crate::expr::ScalarValue as S;
+    match v {
+        S::Int32(i) => i.to_string(),
+        S::Int64(i) => i.to_string(),
+        S::Float64(f) => f.to_string(),
+        S::Boolean(b) => b.to_string(),
+        S::Date32(d) => d.to_string(),
+        S::Utf8(s) => s.to_string(),
+        S::Null => String::new(),
+    }
+}
+
+/// Compare two `string_agg` ORDER BY keys, applying each column's DESC flag.
+fn cmp_str_agg_keys(a: &[GroupKey], b: &[GroupKey], order: &[(Expr, bool)]) -> std::cmp::Ordering {
+    for (i, (_, desc)) in order.iter().enumerate() {
+        let o = a[i].cmp(&b[i]);
+        let o = if *desc { o.reverse() } else { o };
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// One typed aggregate-value column (agg position `j`) of the merged
 /// groups.
 fn agg_column(agg: &AggExpr, j: usize, groups: &[(Vec<GroupKey>, Vec<AggState>)]) -> Vector {
@@ -3154,6 +3201,35 @@ fn agg_column(agg: &AggExpr, j: usize, groups: &[(Vec<GroupKey>, Vec<AggState>)]
             let valid: Vec<bool> = states().map(|st| !st.is_null(agg.func)).collect();
             let any_null = valid.iter().any(|&b| !b);
             Vector::i64(vals).with_validity(any_null.then_some(valid))
+        }
+        // string_agg: sort each group's retained (key, value) pairs by the
+        // in-aggregate ORDER BY, then join with the delimiter into a Utf8 cell
+        // (NULL over an empty group).
+        AggFunc::StringAgg => {
+            let spec = agg.str_agg.as_ref().expect("string_agg spec");
+            let mut offsets: Vec<u32> = Vec::with_capacity(groups.len() + 1);
+            let mut data: Vec<u8> = Vec::new();
+            let mut valid: Vec<bool> = Vec::with_capacity(groups.len());
+            offsets.push(0);
+            for st in states() {
+                let sb = &st.sbuf;
+                if sb.is_empty() {
+                    valid.push(false);
+                } else {
+                    let mut idx: Vec<usize> = (0..sb.len()).collect();
+                    idx.sort_by(|&a, &b| cmp_str_agg_keys(&sb[a].0, &sb[b].0, &spec.order));
+                    for (n, &k) in idx.iter().enumerate() {
+                        if n > 0 {
+                            data.extend_from_slice(spec.delim.as_bytes());
+                        }
+                        data.extend_from_slice(sb[k].1.as_bytes());
+                    }
+                    valid.push(true);
+                }
+                offsets.push(data.len() as u32);
+            }
+            let any_null = valid.iter().any(|&b| !b);
+            Vector::utf8(offsets, data).with_validity(any_null.then_some(valid))
         }
         _ => {
             let vals: Vec<f64> = states().map(|st| st.finalize(agg.func)).collect();
@@ -3967,6 +4043,10 @@ struct AggState {
     /// beyond the 24-byte header (same "only some aggregates use it" shape as
     /// `distinct`).
     buf: Vec<f64>,
+    /// Retained `(order key, value)` pairs — only fed by `string_agg` /
+    /// `group_concat`. Empty/unallocated for every other aggregate; sorted by
+    /// the order key at finalize, then joined with the delimiter.
+    sbuf: Vec<(Vec<GroupKey>, std::sync::Arc<str>)>,
 }
 
 impl Default for AggState {
@@ -3979,6 +4059,7 @@ impl Default for AggState {
             max: f64::NEG_INFINITY,
             distinct: std::collections::HashSet::new(),
             buf: Vec::new(),
+            sbuf: Vec::new(),
         }
     }
 }
@@ -4001,6 +4082,7 @@ impl AggState {
         // Buffered aggregates concatenate their retained values; the buffer
         // is sorted only at finalize, so the merge order is irrelevant.
         self.buf.extend_from_slice(&o.buf);
+        self.sbuf.extend(o.sbuf.iter().cloned());
     }
 
     #[inline]
@@ -4027,6 +4109,8 @@ impl AggState {
             AggFunc::StddevSamp | AggFunc::VarSamp => self.count < 2,
             // Buffered percentile / median: NULL only over an empty buffer.
             AggFunc::PercentileCont(_) => self.buf.is_empty(),
+            // string_agg: NULL over an empty (all-NULL) group.
+            AggFunc::StringAgg => self.sbuf.is_empty(),
             // bool_and/bool_or: NULL over an empty/all-NULL group (count is
             // the non-NULL tally).
             AggFunc::BoolAnd | AggFunc::BoolOr => self.count == 0,
@@ -4083,6 +4167,9 @@ impl AggState {
             // Foldable booleans: all-true ⟺ min == 1; any-true ⟺ max == 1.
             AggFunc::BoolAnd => self.min,
             AggFunc::BoolOr => self.max,
+            // string_agg produces Utf8 — materialized directly in agg_column,
+            // never through the f64 finalize.
+            AggFunc::StringAgg => 0.0,
         }
     }
 }

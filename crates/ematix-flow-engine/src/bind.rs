@@ -2544,10 +2544,12 @@ impl Binder<'_> {
                 AggExpr {
                     func: AggFunc::CountDistinct,
                     arg: Expr::Column(s_slot),
+                    str_agg: None,
                 },
                 AggExpr {
                     func: AggFunc::Min,
                     arg: Expr::Column(s_slot),
+                    str_agg: None,
                 },
             ],
             having: None,
@@ -2986,6 +2988,9 @@ impl Binder<'_> {
         if fname == "percentile_cont" {
             return self.bind_percentile_cont(f);
         }
+        if fname == "string_agg" || fname == "group_concat" {
+            return self.bind_string_agg(f);
+        }
         let func = match fname.as_str() {
             "sum" => AggFunc::Sum,
             "count" => AggFunc::Count,
@@ -3032,11 +3037,16 @@ impl Binder<'_> {
                     return Ok(AggExpr {
                         func: AggFunc::CountMatched(t),
                         arg: Expr::Literal(ScalarValue::Int64(1)),
+                        str_agg: None,
                     });
                 }
             }
         }
-        Ok(AggExpr { func, arg })
+        Ok(AggExpr {
+            func,
+            arg,
+            str_agg: None,
+        })
     }
 
     /// Bind `percentile_cont(p) WITHIN GROUP (ORDER BY x)` — the fraction `p`
@@ -3074,6 +3084,47 @@ impl Binder<'_> {
         Ok(AggExpr {
             func: AggFunc::PercentileCont(p.to_bits()),
             arg,
+            str_agg: None,
+        })
+    }
+
+    /// Bind `string_agg(value, delim [ORDER BY key …])` / `group_concat`.
+    fn bind_string_agg(&mut self, f: &ast::Function) -> Result<AggExpr, String> {
+        let ast::FunctionArguments::List(args) = &f.args else {
+            return Err("string_agg needs an argument list".into());
+        };
+        let (val_e, delim) = match args.args.as_slice() {
+            [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(v))] => {
+                (v, std::sync::Arc::<str>::from(","))
+            }
+            [
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(v)),
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(d)),
+            ] => {
+                let delim = match self.clone_free_literal(d)? {
+                    ScalarValue::Utf8(s) => s,
+                    other => {
+                        return Err(format!("string_agg delimiter must be a string: {other:?}"));
+                    }
+                };
+                (v, delim)
+            }
+            _ => return Err("string_agg takes (value[, delimiter])".into()),
+        };
+        let arg = self.bind_scalar(val_e)?;
+        // In-aggregate ORDER BY (deterministic concatenation order).
+        let mut order = Vec::new();
+        for c in &args.clauses {
+            if let ast::FunctionArgumentClause::OrderBy(obs) = c {
+                for oe in obs {
+                    order.push((self.bind_scalar(&oe.expr)?, oe.options.asc == Some(false)));
+                }
+            }
+        }
+        Ok(AggExpr {
+            func: AggFunc::StringAgg,
+            arg,
+            str_agg: Some(crate::logical::StrAggSpec { delim, order }),
         })
     }
 
@@ -3579,6 +3630,7 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
                     | AggFunc::CountMatched(_)
                     | AggFunc::BoolAnd
                     | AggFunc::BoolOr => LogicalType::Int64,
+                    AggFunc::StringAgg => LogicalType::Utf8,
                     _ => LogicalType::Float64,
                 }
             } else {
@@ -4769,6 +4821,8 @@ fn contains_aggregate(e: &ast::Expr) -> bool {
                     | "booland"
                     | "bool_or"
                     | "boolor"
+                    | "string_agg"
+                    | "group_concat"
             ) {
                 return true;
             }
@@ -4888,6 +4942,8 @@ fn contains_nonwindow_agg(e: &ast::Expr) -> bool {
                     | "booland"
                     | "bool_or"
                     | "boolor"
+                    | "string_agg"
+                    | "group_concat"
             ) {
                 return true;
             }
