@@ -1140,7 +1140,7 @@ lands a case here.
   `string_longtail_bundle` (3VL NOT BETWEEN, negative/zero/overlong counts,
   fill-cycling + truncation, char-set trims, all three strpos spellings,
   group-key composition). Parity 26/26, sf1 103/103 0 MISMATCH.
-- **VALUES + FROM-less SELECT — SHIPPED.** The last structural gaps. New
+- **VALUES + FROM-less SELECT — SHIPPED (`dd05892f`).** The last structural gaps. New
   `TableSource::Values(Arc<Vec<Vec<ScalarValue>>>)` — an inline literal row
   set the executor scans via the existing `result_to_chunks` path (a tiny
   pre-materialized derived, in effect). A FROM-less `SELECT <exprs>` binds
