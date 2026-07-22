@@ -1022,7 +1022,7 @@ lands a case here.
   `split_part`, `mode`/`percentile_disc`, `array_agg`, `regexp_matches`. One
   new silent item found: `CAST(x AS VARCHAR)` returns the value untyped
   instead of a string (type mismatch vs DuckDB) — the next silent-bug fix.
-- **CAST(x AS VARCHAR/CHAR/TEXT/STRING) — SHIPPED.** The string-target arm
+- **CAST(x AS VARCHAR/CHAR/TEXT/STRING) — SHIPPED (`0abe4847`).** The string-target arm
   returned the operand UNCHANGED, so a numeric/date operand stayed numeric
   (silent wrong answer vs DuckDB, found by sweep #2). New owned-string variant
   `Expr::CastStr { arg, from_date }` renders at `eval_value`: integers/floats
