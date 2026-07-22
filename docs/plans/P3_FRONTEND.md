@@ -1083,6 +1083,31 @@ lands a case here.
   empty-set edge (SQL `> ALL(∅)` = TRUE) is the one known corner it does not
   reproduce. Gate: `quantified_subquery_any_all` (= ANY/SOME, <> ALL, the
   ordered ops, two rejections). Parity 24/24, sf1 103/103 0 MISMATCH.
+- **Breadth sweep #3 (measured; 78-query probe, removed).** Regression
+  re-probe: 18/19 shipped units OK. Findings, triaged:
+  - 🔴 **`string_agg(DISTINCT …)` silently drops DISTINCT** (emitted
+    `A,A,A,…`) — regression-class silent bug on a shipped unit; the
+    `string_agg_ordered` gate never covered DISTINCT (`sum(DISTINCT)` by
+    contrast rejects loudly).
+  - 🔴 **`CAST(<float> AS INT)` tie-rounding diverges**: DuckDB rounds
+    half-to-even (2.5→2, 3.5→4, −2.5→−2 — verified by direct probe); native
+    `f.round()` rounds half away from zero. The `Expr::CastInt` comment
+    claims DuckDB semantics — wrong on exact .5 ties.
+  - `greatest(date, date)` sweep MISMATCH = harness sort-key artifact
+    (float `1.05e4` sorts before `8.17e3` lexicographically; the single-row
+    aggregate form passes parity). Not an engine bug.
+  - Newly measured honest rejections (loud, correct): `NOT BETWEEN`
+    (BETWEEN itself works), string-func family (`left`/`right`/`lpad`/
+    `repeat`/`reverse`/`strpos`/`initcap`/`trim(BOTH…)`/`ltrim(x,chars)`),
+    `IS TRUE`, tuple `=`/`IN`, `sum(DISTINCT)`/multi-arg `count(DISTINCT
+    a,b)`, month/year interval on a date COLUMN, `EXTRACT(century)`,
+    `JOIN USING`, `NATURAL JOIN`, unary minus in agg-output row space.
+  - Confirmed working (frontier probes): CASE without ELSE, simple CASE,
+    BETWEEN, `substring(x FROM i FOR n)`, LIKE ESCAPE, NOT ILIKE, IN-list
+    with NULL, GROUP BY ordinal, ORDER BY expr / NULLS FIRST, HAVING
+    without GROUP BY, scalar subquery in projection, `date + int`,
+    min/max over dates, `sum() over ()`, `count(*) over (partition)`,
+    derived-table JOIN, OFFSET without LIMIT, nullif/coalesce compositions.
 
 ## Next (P4 tail → P5/P6)
 
