@@ -1124,7 +1124,7 @@ lands a case here.
   engines. Gate: `string_agg_distinct_and_cast_ties` (sorted-distinct,
   grouped, no-order single-value, loud reject; ±ties runtime + literal
   fold + non-tie regression). Parity 25/25, sf1 103/103 0 MISMATCH.
-- **String/predicate long-tail bundle — SHIPPED.** *NOT BETWEEN:* the
+- **String/predicate long-tail bundle — SHIPPED (`f1fcc101`).** *NOT BETWEEN:* the
   BETWEEN desugar now wraps in `Expr::Not` when negated (three-valued, so a
   NULL operand stays NULL). *String-function family:* new `StrFn` variants
   `Left`/`Right` (negative count = drop from the other end, DuckDB form),
