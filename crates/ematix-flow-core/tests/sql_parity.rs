@@ -902,3 +902,30 @@ fn operators_and_scalars_bundle() {
     // current_date (all shipdates precede today, so the count is data-stable).
     p.check("select count(*) c from lineitem where l_shipdate < current_date");
 }
+
+// ---------------------------------------------------------------------------
+// count(DISTINCT <string>) — the distinct-key path was i64-only and panicked
+// on strings (surfaced by the breadth sweep). Now exact via a string set.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn count_distinct_string() {
+    if !have_data() {
+        eprintln!("SKIP count_distinct_string: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    p.check("select count(distinct l_shipmode) c from lineitem where l_orderkey < 3000");
+    p.check(
+        "select l_returnflag, count(distinct l_shipmode) c \
+         from lineitem where l_orderkey < 3000 group by l_returnflag",
+    );
+    // A string EXPRESSION, and mixed string + numeric distinct counts.
+    p.check("select count(distinct trim(l_comment)) c from lineitem where l_orderkey < 1000");
+    p.check(
+        "select count(distinct l_shipmode) a, count(distinct l_linenumber) b \
+         from lineitem where l_orderkey < 1000",
+    );
+    // Empty group → 0 (COUNT is never NULL).
+    p.check("select count(distinct l_shipmode) c from lineitem where l_orderkey < 0");
+}

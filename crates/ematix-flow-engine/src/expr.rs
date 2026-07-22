@@ -186,6 +186,14 @@ enum Val<'a> {
     Null,
 }
 
+/// A `COUNT(DISTINCT …)` key: a numeric key (int / float-bits / bool) on the
+/// fast path, or a string — borrowed from the chunk for a bare column, owned
+/// for a string-valued expression (`trim(x)`, `x || y`, …).
+pub enum DistinctKey<'a> {
+    Num(i64),
+    Str(std::borrow::Cow<'a, str>),
+}
+
 impl Val<'_> {
     #[inline]
     fn as_f64(self) -> f64 {
@@ -506,17 +514,37 @@ impl Expr {
         }
     }
 
-    /// Evaluate to a COUNT(DISTINCT …) set key, or `None` on SQL NULL.
-    /// Integers key as themselves; floats by bit pattern (`-0.0`
-    /// normalized so it groups with `0.0`) — q28's
-    /// `count(DISTINCT ss_list_price)` over a decimal column.
+    /// Evaluate to a COUNT(DISTINCT …) key, or `None` on SQL NULL. Numeric
+    /// keys stay on the borrowed-`Val` fast path (integers as themselves,
+    /// floats by bit pattern with `-0.0` normalized to `0.0` — q28's
+    /// `count(DISTINCT ss_list_price)` over a decimal column); strings borrow
+    /// the chunk's `&str` (the caller interns them into a separate set), so
+    /// `count(DISTINCT <string>)` is exact.
     #[inline]
-    pub fn eval_opt_distinct_key(&self, chunk: &DataChunk, row: usize) -> Option<i64> {
+    pub fn eval_opt_distinct<'a>(
+        &'a self,
+        chunk: &'a DataChunk,
+        row: usize,
+    ) -> Option<DistinctKey<'a>> {
+        // An owned-string expression (trim/lower/upper/replace/concat) can't
+        // take the borrowed `Val` path — evaluate it to an owned string.
+        if is_owned_str_fn(self) {
+            return match self.eval_value(chunk, row) {
+                ScalarValue::Null => None,
+                ScalarValue::Utf8(s) => {
+                    Some(DistinctKey::Str(std::borrow::Cow::Owned(s.to_string())))
+                }
+                other => panic!("COUNT(DISTINCT) string arg produced {other:?}"),
+            };
+        }
         match self.eval(chunk, row) {
             Val::Null => None,
-            Val::Int(i) => Some(i),
-            Val::Float(f) => Some((if f == 0.0 { 0.0f64 } else { f }).to_bits() as i64),
-            other => panic!("COUNT(DISTINCT) key: unsupported value {other:?}"),
+            Val::Int(i) => Some(DistinctKey::Num(i)),
+            Val::Float(f) => Some(DistinctKey::Num(
+                (if f == 0.0 { 0.0f64 } else { f }).to_bits() as i64,
+            )),
+            Val::Bool(b) => Some(DistinctKey::Num(i64::from(b))),
+            Val::Str(s) => Some(DistinctKey::Str(std::borrow::Cow::Borrowed(s))),
         }
     }
 

@@ -30,7 +30,7 @@ use std::sync::Mutex;
 use ematix_parquet_io::ParquetFile;
 
 use crate::chunk::{DataChunk, Selection};
-use crate::expr::{Expr, ScalarValue, eval_num_col, filter_expr, sum_expr_f64};
+use crate::expr::{DistinctKey, Expr, ScalarValue, eval_num_col, filter_expr, sum_expr_f64};
 use crate::logical::{AggExpr, AggFunc, BoundQuery, OrderByKey, Slot, TableInput, TableSource};
 use crate::scan::{ColKind, StockScan};
 use crate::scan_native::{NativeColKind, decode_row_group};
@@ -2745,11 +2745,19 @@ impl Executor<'_> {
                         let flags = view.col(ctx.matched_cols[&t]).as_i64();
                         sel.for_each(|i| states[j].count += flags[i as usize] as u64);
                     }
-                    AggFunc::CountDistinct => sel.for_each(|i| {
-                        if let Some(v) = agg.arg.eval_opt_distinct_key(&view, i as usize) {
-                            states[j].distinct.insert(v);
-                        }
-                    }),
+                    AggFunc::CountDistinct => {
+                        sel.for_each(|i| match agg.arg.eval_opt_distinct(&view, i as usize) {
+                            Some(DistinctKey::Num(v)) => {
+                                states[j].distinct.insert(v);
+                            }
+                            Some(DistinctKey::Str(s)) => {
+                                states[j]
+                                    .distinct_str
+                                    .insert(s.into_owned().into_boxed_str());
+                            }
+                            None => {}
+                        })
+                    }
                     // Buffered aggregates retain each non-NULL value.
                     AggFunc::PercentileCont(_) => sel.for_each(|i| {
                         if let Some(v) = agg.arg.eval_opt_f64(&view, i as usize) {
@@ -2798,11 +2806,15 @@ impl Executor<'_> {
                     AggFunc::CountMatched(t) => {
                         states[j].count += view.col(ctx.matched_cols[&t]).as_i64()[i] as u64;
                     }
-                    AggFunc::CountDistinct => {
-                        if let Some(v) = agg.arg.eval_opt_distinct_key(&view, i) {
+                    AggFunc::CountDistinct => match agg.arg.eval_opt_distinct(&view, i) {
+                        Some(DistinctKey::Num(v)) => {
                             states[j].distinct.insert(v);
                         }
-                    }
+                        Some(DistinctKey::Str(s)) => {
+                            states[j].distinct_str.insert(s.into());
+                        }
+                        None => {}
+                    },
                     AggFunc::PercentileCont(_) => {
                         if let Some(v) = agg.arg.eval_opt_f64(&view, i) {
                             states[j].buf.push(v);
@@ -3333,9 +3345,11 @@ fn agg_column(agg: &AggExpr, j: usize, groups: &[(Vec<GroupKey>, Vec<AggState>)]
         AggFunc::Count | AggFunc::CountMatched(_) => {
             Vector::i64(states().map(|st| st.count as i64).collect())
         }
-        AggFunc::CountDistinct => {
-            Vector::i64(states().map(|st| st.distinct.len() as i64).collect())
-        }
+        AggFunc::CountDistinct => Vector::i64(
+            states()
+                .map(|st| (st.distinct.len() + st.distinct_str.len()) as i64)
+                .collect(),
+        ),
         // bool_and/bool_or land in a 0/1 Int64 column (validity = false over
         // an empty group); the binder's `slot = 1` reference renders it as a
         // NULL-propagating BOOLEAN.
@@ -4184,8 +4198,12 @@ struct AggState {
     count: u64,
     min: f64,
     max: f64,
-    /// Distinct integer values (only fed by `COUNT(DISTINCT …)`).
+    /// Distinct integer/float-bits keys (only fed by numeric `COUNT(DISTINCT
+    /// …)`).
     distinct: std::collections::HashSet<i64>,
+    /// Distinct STRING values (only fed by `COUNT(DISTINCT <string>)`) — kept
+    /// exact rather than hashed to i64; empty/unallocated for numeric distinct.
+    distinct_str: std::collections::HashSet<Box<str>>,
     /// Retained non-NULL argument values (only fed by the buffered
     /// aggregates — `median` / `percentile_cont`). Empty and unallocated for
     /// every foldable aggregate, so the hot perf-gated queries pay nothing
@@ -4207,6 +4225,7 @@ impl Default for AggState {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             distinct: std::collections::HashSet::new(),
+            distinct_str: std::collections::HashSet::new(),
             buf: Vec::new(),
             sbuf: Vec::new(),
         }
@@ -4228,6 +4247,7 @@ impl AggState {
             self.max = o.max;
         }
         self.distinct.extend(o.distinct.iter().copied());
+        self.distinct_str.extend(o.distinct_str.iter().cloned());
         // Buffered aggregates concatenate their retained values; the buffer
         // is sorted only at finalize, so the merge order is irrelevant.
         self.buf.extend_from_slice(&o.buf);
@@ -4310,7 +4330,7 @@ impl AggState {
             AggFunc::VarSamp => self.variance(true),
             AggFunc::StddevPop => self.variance(false).sqrt(),
             AggFunc::VarPop => self.variance(false),
-            AggFunc::CountDistinct => self.distinct.len() as f64,
+            AggFunc::CountDistinct => (self.distinct.len() + self.distinct_str.len()) as f64,
             AggFunc::CountMatched(_) => self.count as f64,
             AggFunc::PercentileCont(bits) => self.percentile(f64::from_bits(bits)),
             // Foldable booleans: all-true ⟺ min == 1; any-true ⟺ max == 1.
