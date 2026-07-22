@@ -734,6 +734,9 @@ pub enum NumFn {
     Trunc,
     /// `power(x, y)` / `pow(x, y)` — `x` raised to `y` (f64).
     Power,
+    /// `strpos(s, sub)` / `instr` / `POSITION(sub IN s)` — 1-based char
+    /// position of the first occurrence, 0 when absent.
+    Strpos,
     /// `greatest(…)` / `least(…)` — the max / min of the (numeric) arguments,
     /// skipping NULL (all-NULL → NULL, matching DuckDB).
     Greatest,
@@ -748,6 +751,28 @@ pub enum StrFn {
     Trim,
     /// `replace(s, from, to)` — replace every occurrence.
     Replace,
+    /// `left(s, n)` — first `n` chars (negative `n` = all but the last |n|).
+    Left,
+    /// `right(s, n)` — last `n` chars (negative `n` = all but the first |n|).
+    Right,
+    /// `lpad(s, n, fill)` — left-pad (cycling `fill`) to `n` chars; a longer
+    /// string truncates to its FIRST `n` chars.
+    Lpad,
+    /// `rpad(s, n, fill)` — right-pad; same truncation rule.
+    Rpad,
+    /// `repeat(s, n)` — `s` concatenated `n` times (`n <= 0` → empty).
+    Repeat,
+    /// `reverse(s)` — chars reversed.
+    Reverse,
+    /// `initcap(s)` — first letter of each word (alphanumeric run)
+    /// uppercased, the rest lowercased.
+    Initcap,
+    /// `ltrim(s[, chars])` — strip leading chars in the set (default space).
+    LtrimChars,
+    /// `rtrim(s[, chars])` — strip trailing chars in the set.
+    RtrimChars,
+    /// `trim(BOTH chars FROM s)` / `btrim(s[, chars])` — strip both ends.
+    BtrimChars,
 }
 
 /// A calendar field pulled out of a Date32 by `EXTRACT` (DuckDB semantics).
@@ -916,6 +941,14 @@ fn eval_num_fn<'a>(func: NumFn, args: &'a [Expr], chunk: &'a DataChunk, row: usi
             Val::Null => Val::Null,
             other => panic!("length needs a string, got {other:?}"),
         },
+        NumFn::Strpos => match (args[0].eval(chunk, row), args[1].eval(chunk, row)) {
+            (Val::Str(h), Val::Str(n)) => Val::Int(match h.find(n) {
+                Some(off) => h[..off].chars().count() as i64 + 1,
+                None => 0,
+            }),
+            (Val::Null, _) | (_, Val::Null) => Val::Null,
+            other => panic!("strpos needs string operands, got {other:?}"),
+        },
         NumFn::Sqrt | NumFn::Ln | NumFn::Exp | NumFn::Sign | NumFn::Trunc => {
             match args[0].eval(chunk, row) {
                 Val::Null => Val::Null,
@@ -986,6 +1019,106 @@ fn eval_str_fn(func: StrFn, args: &[Expr], chunk: &DataChunk, row: usize) -> Sca
             };
             ScalarValue::Utf8(Arc::from(s.replace(&*from, &to).as_str()))
         }
+        StrFn::Left | StrFn::Right => {
+            let (Some(s), Some(n)) = (s0(), int_arg(&args[1], chunk, row)) else {
+                return ScalarValue::Null;
+            };
+            let len = s.chars().count() as i64;
+            // A negative count drops |n| chars from the OTHER end.
+            let keep = if n >= 0 { n.min(len) } else { (len + n).max(0) } as usize;
+            let out: String = if matches!(func, StrFn::Left) {
+                s.chars().take(keep).collect()
+            } else {
+                s.chars().skip((len as usize) - keep).collect()
+            };
+            ScalarValue::Utf8(Arc::from(out.as_str()))
+        }
+        StrFn::Lpad | StrFn::Rpad => {
+            let (Some(s), Some(n), fill) = (
+                s0(),
+                int_arg(&args[1], chunk, row),
+                args[2].eval_value(chunk, row),
+            ) else {
+                return ScalarValue::Null;
+            };
+            let ScalarValue::Utf8(fill) = fill else {
+                return ScalarValue::Null;
+            };
+            let n = n.max(0) as usize;
+            let len = s.chars().count();
+            let out: String = if len >= n {
+                s.chars().take(n).collect()
+            } else if fill.is_empty() {
+                s.to_string()
+            } else {
+                let pad: String = fill.chars().cycle().take(n - len).collect();
+                if matches!(func, StrFn::Lpad) {
+                    pad + &s
+                } else {
+                    format!("{s}{pad}")
+                }
+            };
+            ScalarValue::Utf8(Arc::from(out.as_str()))
+        }
+        StrFn::Repeat => {
+            let (Some(s), Some(n)) = (s0(), int_arg(&args[1], chunk, row)) else {
+                return ScalarValue::Null;
+            };
+            ScalarValue::Utf8(Arc::from(s.repeat(n.max(0) as usize).as_str()))
+        }
+        StrFn::Reverse => match s0() {
+            Some(s) => ScalarValue::Utf8(Arc::from(s.chars().rev().collect::<String>().as_str())),
+            None => ScalarValue::Null,
+        },
+        StrFn::Initcap => match s0() {
+            Some(s) => {
+                let mut out = String::with_capacity(s.len());
+                let mut word_start = true;
+                for c in s.chars() {
+                    if word_start {
+                        out.extend(c.to_uppercase());
+                    } else {
+                        out.extend(c.to_lowercase());
+                    }
+                    word_start = !c.is_alphanumeric();
+                }
+                ScalarValue::Utf8(Arc::from(out.as_str()))
+            }
+            None => ScalarValue::Null,
+        },
+        StrFn::LtrimChars | StrFn::RtrimChars | StrFn::BtrimChars => {
+            let Some(s) = s0() else {
+                return ScalarValue::Null;
+            };
+            let chars: Arc<str> = match args.get(1) {
+                None => Arc::from(" "),
+                Some(a) => match a.eval_value(chunk, row) {
+                    ScalarValue::Utf8(c) => c,
+                    ScalarValue::Null => return ScalarValue::Null,
+                    other => panic!("trim char set must be a string, got {other:?}"),
+                },
+            };
+            let set: Vec<char> = chars.chars().collect();
+            let pat = |c: char| set.contains(&c);
+            let out = match func {
+                StrFn::LtrimChars => s.trim_start_matches(pat),
+                StrFn::RtrimChars => s.trim_end_matches(pat),
+                _ => s.trim_matches(pat),
+            };
+            ScalarValue::Utf8(Arc::from(out))
+        }
+    }
+}
+
+/// Evaluate a string-function integer argument (pad width, char count),
+/// `None` on SQL NULL.
+fn int_arg(e: &Expr, chunk: &DataChunk, row: usize) -> Option<i64> {
+    match e.eval_value(chunk, row) {
+        ScalarValue::Int32(i) => Some(i as i64),
+        ScalarValue::Int64(i) => Some(i),
+        ScalarValue::Float64(f) => Some(f.round_ties_even() as i64),
+        ScalarValue::Null => None,
+        other => panic!("expected an integer argument, got {other:?}"),
     }
 }
 

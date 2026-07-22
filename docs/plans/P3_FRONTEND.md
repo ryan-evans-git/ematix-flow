@@ -1124,6 +1124,22 @@ lands a case here.
   engines. Gate: `string_agg_distinct_and_cast_ties` (sorted-distinct,
   grouped, no-order single-value, loud reject; ±ties runtime + literal
   fold + non-tie regression). Parity 25/25, sf1 103/103 0 MISMATCH.
+- **String/predicate long-tail bundle — SHIPPED.** *NOT BETWEEN:* the
+  BETWEEN desugar now wraps in `Expr::Not` when negated (three-valued, so a
+  NULL operand stays NULL). *String-function family:* new `StrFn` variants
+  `Left`/`Right` (negative count = drop from the other end, DuckDB form),
+  `Lpad`/`Rpad` (cycling fill, truncate-to-n when longer; 2-arg Postgres
+  space-fill accepted), `Repeat`, `Reverse`, `Initcap` (Postgres semantics —
+  DuckDB has no initcap to oracle against), `LtrimChars`/`RtrimChars`/
+  `BtrimChars` (char-set trims; 1-arg = space). The `ast::Expr::Trim` arm
+  now maps `trim(BOTH/LEADING/TRAILING <chars> FROM s)` onto the char-set
+  family. *strpos/instr/`POSITION(sub IN s)`:* new `NumFn::Strpos` (1-based
+  char position, 0 absent, Int64-typed alongside Mod/Length). All ride the
+  existing owned-string machinery (`StrFn { .. }` already matches every
+  wiring site), so binder plumbing was near-zero. Gate:
+  `string_longtail_bundle` (3VL NOT BETWEEN, negative/zero/overlong counts,
+  fill-cycling + truncation, char-set trims, all three strpos spellings,
+  group-key composition). Parity 26/26, sf1 103/103 0 MISMATCH.
 
 ## Next (P4 tail → P5/P6)
 

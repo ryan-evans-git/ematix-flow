@@ -1483,6 +1483,18 @@ impl Binder<'_> {
             "pow",
             "greatest",
             "least",
+            "left",
+            "right",
+            "lpad",
+            "rpad",
+            "repeat",
+            "reverse",
+            "initcap",
+            "ltrim",
+            "rtrim",
+            "btrim",
+            "strpos",
+            "instr",
         ];
         if !KNOWN.contains(&fname.as_str()) {
             return Ok(None);
@@ -1564,6 +1576,59 @@ impl Binder<'_> {
                     digits,
                 }))
             }
+            ("left" | "right", [s, n]) => Ok(Some(Expr::StrFn {
+                func: if fname == "left" {
+                    StrFn::Left
+                } else {
+                    StrFn::Right
+                },
+                args: vec![self.bind_scalar(s)?, self.bind_scalar(n)?],
+            })),
+            // 2-arg lpad/rpad pads with spaces (Postgres form).
+            ("lpad" | "rpad", [s, n]) | ("lpad" | "rpad", [s, n, _]) => {
+                let fill = match args.as_slice() {
+                    [_, _, f] => self.bind_scalar(f)?,
+                    _ => Expr::Literal(ScalarValue::Utf8(std::sync::Arc::from(" "))),
+                };
+                Ok(Some(Expr::StrFn {
+                    func: if fname == "lpad" {
+                        StrFn::Lpad
+                    } else {
+                        StrFn::Rpad
+                    },
+                    args: vec![self.bind_scalar(s)?, self.bind_scalar(n)?, fill],
+                }))
+            }
+            ("repeat", [s, n]) => Ok(Some(Expr::StrFn {
+                func: StrFn::Repeat,
+                args: vec![self.bind_scalar(s)?, self.bind_scalar(n)?],
+            })),
+            ("reverse", [s]) => Ok(Some(Expr::StrFn {
+                func: StrFn::Reverse,
+                args: vec![self.bind_scalar(s)?],
+            })),
+            ("initcap", [s]) => Ok(Some(Expr::StrFn {
+                func: StrFn::Initcap,
+                args: vec![self.bind_scalar(s)?],
+            })),
+            ("ltrim" | "rtrim" | "btrim", [s]) | ("ltrim" | "rtrim" | "btrim", [s, _]) => {
+                let mut fargs = vec![self.bind_scalar(s)?];
+                if let [_, c] = args.as_slice() {
+                    fargs.push(self.bind_scalar(c)?);
+                }
+                Ok(Some(Expr::StrFn {
+                    func: match fname.as_str() {
+                        "ltrim" => StrFn::LtrimChars,
+                        "rtrim" => StrFn::RtrimChars,
+                        _ => StrFn::BtrimChars,
+                    },
+                    args: fargs,
+                }))
+            }
+            ("strpos" | "instr", [s, sub]) => Ok(Some(Expr::NumFn {
+                func: NumFn::Strpos,
+                args: vec![self.bind_scalar(s)?, self.bind_scalar(sub)?],
+            })),
             ("sqrt", [x]) => self.num_fn1(NumFn::Sqrt, x),
             ("ln", [x]) => self.num_fn1(NumFn::Ln, x),
             ("exp", [x]) => self.num_fn1(NumFn::Exp, x),
@@ -3652,12 +3717,33 @@ impl Binder<'_> {
             // TRIM likewise; only plain `TRIM(x)` (both-side whitespace).
             ast::Expr::Trim {
                 expr,
-                trim_where: None,
-                trim_what: None,
+                trim_where,
+                trim_what,
                 trim_characters: None,
-            } => Ok(Bound::Expr(Expr::StrFn {
-                func: StrFn::Trim,
-                args: vec![materialize(self.bind(expr)?)],
+            } => {
+                // Plain `trim(s)` strips whitespace; the SQL-standard
+                // `trim(BOTH/LEADING/TRAILING <chars> FROM s)` maps onto the
+                // char-set trim family.
+                let mut fargs = vec![materialize(self.bind(expr)?)];
+                if let Some(what) = trim_what {
+                    fargs.push(materialize(self.bind(what)?));
+                }
+                use ast::TrimWhereField as W;
+                let func = match (trim_where, trim_what.is_some()) {
+                    (None, false) => StrFn::Trim,
+                    (None | Some(W::Both), _) => StrFn::BtrimChars,
+                    (Some(W::Leading), _) => StrFn::LtrimChars,
+                    (Some(W::Trailing), _) => StrFn::RtrimChars,
+                };
+                Ok(Bound::Expr(Expr::StrFn { func, args: fargs }))
+            }
+            // `POSITION(sub IN s)` — strpos by its SQL-standard spelling.
+            ast::Expr::Position { expr, r#in } => Ok(Bound::Expr(Expr::NumFn {
+                func: NumFn::Strpos,
+                args: vec![
+                    materialize(self.bind(r#in)?),
+                    materialize(self.bind(expr)?),
+                ],
             })),
             ast::Expr::Case {
                 operand,
@@ -3696,26 +3782,30 @@ impl Binder<'_> {
             }
             ast::Expr::Between {
                 expr,
-                negated: false,
+                negated,
                 low,
                 high,
             } => {
-                // Desugar: e BETWEEN lo AND hi  →  e >= lo AND e <= hi.
-                // A 'YYYY-MM-DD' string bound against a date-typed `e`
-                // folds to Date32 (as the comparison arm does — the Spark
-                // texts write `d_date BETWEEN '…' AND …`).
+                // Desugar: e BETWEEN lo AND hi  →  e >= lo AND e <= hi;
+                // NOT BETWEEN wraps that in `Expr::Not` (three-valued, so a
+                // NULL operand stays NULL — matching SQL). A 'YYYY-MM-DD'
+                // string bound against a date-typed `e` folds to Date32 (as
+                // the comparison arm does — the Spark texts write `d_date
+                // BETWEEN '…' AND …`).
                 let bound = materialize(self.bind(expr)?);
                 let mut lo = materialize(self.bind(low)?);
                 let mut hi = materialize(self.bind(high)?);
                 self.coerce_date_literal(&mut lo, &bound);
                 self.coerce_date_literal(&mut hi, &bound);
-                Ok(Bound::Expr(and(
+                let btw = and(
                     binary(BinaryOp::GtEq, bound.clone(), lo),
                     binary(BinaryOp::LtEq, bound, hi),
-                )))
-            }
-            ast::Expr::Between { negated: true, .. } => {
-                Err("NOT BETWEEN is not yet supported".into())
+                );
+                Ok(Bound::Expr(if *negated {
+                    Expr::Not(Box::new(btw))
+                } else {
+                    btw
+                }))
             }
             ast::Expr::InList {
                 expr,
@@ -4048,7 +4138,7 @@ fn infer_slot_type(q: &BoundQuery, e: &Expr) -> LogicalType {
         | Expr::StrFn { .. }
         | Expr::CastStr { .. } => LogicalType::Utf8,
         Expr::NumFn {
-            func: crate::expr::NumFn::Mod | crate::expr::NumFn::Length,
+            func: crate::expr::NumFn::Mod | crate::expr::NumFn::Length | crate::expr::NumFn::Strpos,
             ..
         } => LogicalType::Int64,
         Expr::NumFn { .. } => LogicalType::Float64,
@@ -4106,7 +4196,7 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
         | Expr::StrFn { .. }
         | Expr::CastStr { .. } => LogicalType::Utf8,
         Expr::NumFn {
-            func: crate::expr::NumFn::Mod | crate::expr::NumFn::Length,
+            func: crate::expr::NumFn::Mod | crate::expr::NumFn::Length | crate::expr::NumFn::Strpos,
             ..
         } => LogicalType::Int64,
         Expr::NumFn { .. } => LogicalType::Float64,

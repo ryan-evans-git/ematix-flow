@@ -1183,3 +1183,53 @@ fn string_agg_distinct_and_cast_ties() {
     p.check("select cast(l_extendedprice as int) v from lineitem where l_orderkey < 200");
 }
 
+
+// ---------------------------------------------------------------------------
+// String/predicate long-tail bundle: NOT BETWEEN, the string-function family
+// (left/right/lpad/rpad/repeat/reverse/initcap, ltrim/rtrim with a char set,
+// trim(BOTH/LEADING/TRAILING … FROM …)), and strpos/instr/POSITION.
+// Previously all honest bind-rejections (breadth sweep #3).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_longtail_bundle() {
+    if !have_data() {
+        eprintln!("SKIP string_longtail_bundle: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // NOT BETWEEN (and its 3VL behavior through a nullable expression).
+    p.check("select count(*) c from lineitem where l_quantity not between 10 and 20 and l_orderkey < 5000");
+    p.check("select count(*) c from lineitem where nullif(l_quantity, 30) not between 10 and 20 and l_orderkey < 5000");
+    // left/right, including DuckDB's negative-count form.
+    p.check("select left(l_shipinstruct, 4) a, right(l_shipinstruct, 4) b from lineitem where l_orderkey < 50");
+    p.check("select left(l_shipmode, -1) a, right(l_shipmode, -1) b from lineitem where l_orderkey < 50");
+    p.check("select left(l_shipmode, 0) a, left(l_shipmode, 99) b from lineitem where l_orderkey < 50");
+    // lpad/rpad: pad, cycle the fill, and truncate when already longer.
+    p.check("select lpad(l_returnflag, 5, '*-') a, rpad(l_returnflag, 5, '*-') b from lineitem where l_orderkey < 50");
+    p.check("select lpad(l_shipinstruct, 6, 'x') a, rpad(l_shipinstruct, 6, 'x') b from lineitem where l_orderkey < 50");
+    // (2-arg lpad/rpad is the Postgres space-fill form; DuckDB has no 2-arg
+    // overload to oracle against, so the explicit-space form gates it.)
+    p.check("select lpad(l_returnflag, 3, ' ') a, rpad(l_returnflag, 3, ' ') b from lineitem where l_orderkey < 50");
+    // repeat / reverse / initcap.
+    p.check("select repeat(l_returnflag, 3) a, repeat(l_returnflag, 0) b from lineitem where l_orderkey < 50");
+    p.check("select reverse(l_shipmode) s from lineitem where l_orderkey < 50");
+    // (initcap ships with Postgres semantics; DuckDB has no initcap to
+    // oracle against.)
+    // ltrim/rtrim with a char set (and the default whitespace form).
+    p.check("select ltrim(l_shipmode, 'MAIL') a, rtrim(l_shipmode, 'LIAM') b from lineitem where l_orderkey < 50");
+    p.check("select ltrim(l_shipinstruct) a, rtrim(l_shipinstruct) b from lineitem where l_orderkey < 50");
+    // trim(BOTH/LEADING/TRAILING <chars> FROM <expr>).
+    p.check("select trim(both 'N' from l_shipmode) s from lineitem where l_orderkey < 50");
+    p.check("select trim(leading 'RA' from l_shipmode) s from lineitem where l_orderkey < 50");
+    p.check("select trim(trailing 'BLAIR' from l_shipmode) s from lineitem where l_orderkey < 50");
+    // strpos / instr / POSITION — 1-based, 0 when absent; usable in WHERE.
+    p.check("select strpos(l_shipinstruct, 'IN') a, instr(l_shipinstruct, 'zzz') b from lineitem where l_orderkey < 50");
+    p.check("select position('AI' in l_shipmode) v from lineitem where l_orderkey < 50");
+    p.check("select count(*) c from lineitem where strpos(l_shipmode, 'AI') = 2 and l_orderkey < 2000");
+    // Composition: string fns as group keys and inside aggregates.
+    p.check(
+        "select left(l_shipmode, 2) k, count(*) c from lineitem \
+         where l_orderkey < 2000 group by left(l_shipmode, 2)",
+    );
+}
