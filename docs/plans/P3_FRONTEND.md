@@ -1108,7 +1108,7 @@ lands a case here.
     without GROUP BY, scalar subquery in projection, `date + int`,
     min/max over dates, `sum() over ()`, `count(*) over (partition)`,
     derived-table JOIN, OFFSET without LIMIT, nullif/coalesce compositions.
-- **Sweep-#3 silent-bug fixes — SHIPPED.** *(1) `string_agg(DISTINCT …)`:*
+- **Sweep-#3 silent-bug fixes — SHIPPED (`ebd6695c`).** *(1) `string_agg(DISTINCT …)`:*
   new `StrAggSpec.distinct` flag (binder reads `duplicate_treatment`);
   finalize dedupes after the ordered sort (HashSet keep-first, so with the
   ORDER BY-the-value form it is exactly the sorted distinct). DISTINCT with
