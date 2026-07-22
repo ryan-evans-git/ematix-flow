@@ -979,10 +979,27 @@ lands a case here.
   keeps all); a 1M-iteration guard trips non-termination. Gate: `recursive_cte`
   (series, dedup + outer agg, multi-column accumulation, non-recursive CTE
   alongside). Parity 17/17, sf1 103/103 0 MISMATCH.
-- **Tier-3 residuals:** the SQL surface now covers the join, grouping,
-  aggregate, window, and CTE families end-to-end. Remaining breadth is
-  long-tail (LATERAL, richer window frames / EXCLUDE, `%` operator, FROM-less
-  SELECT, ordered-set aggregate DESC).
+- **Breadth-closeout sweep (measured).** A 56-query probe through the parity
+  harness classified the remaining surface: **16 supported**, **36 honest bind
+  rejections** (loud/safe — `LIMIT OFFSET`, `||`, `%`, `true`/`false`,
+  `CROSS JOIN`, `IS DISTINCT FROM`, `ILIKE`, scalar math fns, `greatest`/`least`,
+  `current_date`, `INTERSECT/EXCEPT ALL`, `VALUES`, FROM-less SELECT, `cume_dist`/
+  `percent_rank`/`nth_value`, `n PRECEDING/FOLLOWING` frames, named `WINDOW`,
+  `DISTINCT ON`, `= ANY(subq)`, `date_part`/`datediff`, `POSITION`, array/regexp/
+  `mode`/`percentile_disc`), and **4 silent-wrong-answer bugs** (below). The
+  probe scaffold was exploratory and not committed.
+- **Silent-correctness fixes — SHIPPED (`c2a7e5e8`).** The three sweep-found
+  cases where the binder accepted syntax but dropped semantics: aggregate
+  `FILTER (WHERE …)` (now `CASE WHEN pred THEN arg ELSE NULL END` — every
+  aggregate skips NULL); `QUALIFY` (new `BoundQuery::qualify`, bound as a
+  post-window predicate and applied as a row filter before projection;
+  `windowed_plain` triggers on a QUALIFY-only window); `lag`/`lead` DEFAULT
+  (new `WindowExpr::lag_default`, returned past the partition edge). Gate:
+  `aggregate_filter_qualify_lag_default`. Parity 18/18, sf1 103/103 0 MISMATCH.
+- **Tier-3 residuals:** the SQL surface covers the join, grouping, aggregate,
+  window, and CTE families end-to-end. Remaining breadth is the measured
+  long-tail above — mostly mechanical binder additions (operators, scalar
+  fns) plus a few features (VALUES, `n PRECEDING` frames, DISTINCT ON, ANY/ALL).
 
 ## Next (P4 tail → P5/P6)
 
