@@ -1007,12 +1007,21 @@ lands a case here.
   `sign`/`trunc`/`power`/`greatest`/`least` (new `NumFn` variants) and
   `current_date` (folds to today's Date32). Gate:
   `operators_and_scalars_bundle`. Parity 19/19, sf1 103/103 0 MISMATCH.
-- **Tier-3 residuals:** the SQL surface covers the join, grouping, aggregate,
-  window, and CTE families end-to-end. Remaining breadth is the narrower
-  long-tail — `VALUES`, FROM-less SELECT, `n PRECEDING/FOLLOWING` frames, named
-  `WINDOW`, `DISTINCT ON`, `= ANY(subq)`, `date_part`/`datediff`, `POSITION`,
-  ordered-set aggregates, array/regexp — plus the `count(distinct <string>)`
-  panic (distinct-key path is i64-only).
+- **count(distinct <string>) — SHIPPED (`b71d34be`).** The distinct-key path
+  was i64-only and panicked on strings. New `Expr::eval_opt_distinct` →
+  `DistinctKey` (numeric keys stay on the borrowed-Val fast path so q28 is
+  unchanged; strings kept exactly in a new `AggState::distinct_str`; owned-
+  string args route through `eval_value`). Gate: `count_distinct_string`.
+  Parity 20/20, sf1 103/103 0 MISMATCH.
+- **Breadth sweep #2 (measured).** After the bundle + silent-bug fixes +
+  count-distinct-string, all 13 re-probed fixes pass. Remaining is a smaller,
+  well-defined long-tail (all honest bind rejections): `VALUES`, FROM-less
+  SELECT, `n PRECEDING/FOLLOWING` frames, named `WINDOW`, `nth_value`/
+  `cume_dist`/`percent_rank`, `DISTINCT ON`, `= ANY/ALL(subq)`, `INTERSECT/
+  EXCEPT ALL`, `date_part`/`datediff`/`EXTRACT(epoch)`, `POSITION`,
+  `split_part`, `mode`/`percentile_disc`, `array_agg`, `regexp_matches`. One
+  new silent item found: `CAST(x AS VARCHAR)` returns the value untyped
+  instead of a string (type mismatch vs DuckDB) — the next silent-bug fix.
 
 ## Next (P4 tail → P5/P6)
 
