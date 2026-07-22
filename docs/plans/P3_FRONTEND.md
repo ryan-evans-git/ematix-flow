@@ -1158,7 +1158,7 @@ lands a case here.
   over VALUES, single-row, ragged-reject). Parity 27/27, sf1 103/103
   0 MISMATCH.
 - **Final breadth bundle: INTERSECT/EXCEPT ALL + JOIN USING + tuple =/IN —
-  SHIPPED.** *Multiset set-ops:* new `SetOp::IntersectAll`/`ExceptAll`; the
+  SHIPPED (`e243e223`).** *Multiset set-ops:* new `SetOp::IntersectAll`/`ExceptAll`; the
   executor merge-walks both sorted sides' equal-row runs (min(nl,nr) /
   nl−nr clamped copies). ★ The set-flavored side-dedup optimization
   (`flavored`) had to EXCLUDE the ALL variants — a side's duplicate counts
