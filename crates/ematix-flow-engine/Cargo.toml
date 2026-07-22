@@ -1,0 +1,35 @@
+[package]
+name = "ematix-flow-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Clean-room, push-based, DataFusion-free analytical engine (see docs/plans/NATIVE_ENGINE.md)."
+
+[dependencies]
+# P0 decode SOURCE only. We use the `parquet` crate's LOW-LEVEL column
+# reader (typed physical values via `ColumnReader`) — NOT its arrow
+# reader, so no `arrow::Array` ever crosses into the engine's data path.
+# The clean-room commitment ("no Arrow substrate") is enforced in code:
+# scan.rs touches only `parquet::column::reader`. Replaced by
+# ematix-parquet's native-vector decode in P1.
+parquet = { workspace = true }
+# The proven adaptive probe structure (dense byte-set/payload vs hash) —
+# a pure kernel with no DataFusion/Arrow dep, so reusing it keeps the
+# engine clean-room. The engine adds its own `probe_narrow` operator over
+# the engine's `DataChunk` (see src/join.rs).
+ematix-flow-push = { path = "../ematix-flow-push" }
+# Native decode (DF-free, Arrow-free) — the ematix-parquet codec + IO
+# crates we own. `src/scan_native.rs` calls their masked-decode
+# primitives directly (the same ones core wraps via its bridge), so the
+# engine's real decode path keeps NO DataFusion dependency. Same 0.17
+# pin core uses, so Cargo.lock resolves to one version.
+ematix-parquet-codec = "0.17"
+ematix-parquet-format = "0.17"
+ematix-parquet-io = "0.17"
+# P3 front-end: tokenize→AST ONLY (the sanctioned bootstrap — a standalone
+# lib, not DataFusion). Everything from the AST inward — binder, logical IR,
+# planner — is owned engine code (src/bind.rs, src/logical.rs).
+sqlparser = { workspace = true }

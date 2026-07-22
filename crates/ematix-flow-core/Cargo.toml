@@ -148,6 +148,10 @@ triangulation = ["dep:polars"]
 iceberg = ["dep:ematix-iceberg", "ematix-iceberg/iceberg", "dep:iceberg"]
 
 [dev-dependencies]
+# The clean-room native engine (docs/plans/NATIVE_ENGINE.md) — used by
+# the P1 GO/NO-GO example to route Q08's push arm through the engine's
+# own DataChunk/operators. No DataFusion dep; dev-only.
+ematix-flow-engine = { path = "../ematix-flow-engine" }
 arrow-array.workspace = true
 testcontainers.workspace = true
 testcontainers-modules.workspace = true

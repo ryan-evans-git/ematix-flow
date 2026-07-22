@@ -831,6 +831,45 @@ impl CachedFileMetadata {
 /// See module docs for semantics. `arrow_schema` is REQUIRED and drives
 /// type promotion (Utf8View / Dictionary). `projection` carries leaf
 /// indices in the parquet column order; the output `RecordBatch`
+/// Morsel-engine P2 spike: a shared, lock-free work queue of row-group
+/// indices that every partition decode stream pulls from, replacing the
+/// static round-robin `rg % N` assignment. Idle decode threads grab the
+/// next RG, so the per-RG cost imbalance P1 measured (filter pruning →
+/// heavy RGs aliasing onto a few partitions) self-balances. Created once
+/// per physical-plan node and shared across its partition streams; the
+/// bench drives a fresh plan per trial, so the single-drain lifetime is
+/// correct (re-executing the same node would find it empty — spike-only,
+/// gated `EMAT_MORSEL_STEAL=1`). See docs/plans/MORSEL_ENGINE.md.
+#[derive(Debug)]
+pub struct SharedRgCursor {
+    rgs: Vec<usize>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl SharedRgCursor {
+    pub fn new(rgs: Vec<usize>) -> Self {
+        Self {
+            rgs,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Claim the next row group, or `None` when the queue is drained.
+    #[inline]
+    pub fn pop(&self) -> Option<usize> {
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.rgs.get(i).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rgs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rgs.is_empty()
+    }
+}
+
 /// schema has the same column order, with one Arrow field per
 /// projected leaf taken from `arrow_schema` (or all fields if no
 /// projection is supplied).
@@ -888,6 +927,12 @@ pub struct EmatArrowBatchReaderBuilder {
     /// `Int32Array` natively. Empty by default (bit-identical to the
     /// pre-NARROW.DEC reader).
     narrow_i64_leaves: Vec<usize>,
+    /// Morsel-engine P2 spike: when set, the reader ignores its static
+    /// `row_groups` and pulls RGs from this shared work queue (dynamic
+    /// work-stealing across partition streams). See [`SharedRgCursor`].
+    /// Mutually exclusive with the L9 sideband path per scan (morsel
+    /// call sites pass `None` for `late_arm` and vice versa).
+    shared_cursor: Option<std::sync::Arc<SharedRgCursor>>,
 }
 
 impl EmatArrowBatchReaderBuilder {
@@ -905,6 +950,7 @@ impl EmatArrowBatchReaderBuilder {
             rg_decode_cache: None,
             late_arm: None,
             narrow_i64_leaves: Vec::new(),
+            shared_cursor: None,
         }
     }
 
@@ -917,6 +963,13 @@ impl EmatArrowBatchReaderBuilder {
     /// cast. Leaves not projected (or not Int64) are ignored.
     pub fn with_narrow_i64_leaves(mut self, leaves: Vec<usize>) -> Self {
         self.narrow_i64_leaves = leaves;
+        self
+    }
+
+    /// Morsel-engine P2 spike: pull row groups from a shared work queue
+    /// instead of this reader's static `row_groups` assignment.
+    pub fn with_shared_rg_cursor(mut self, cursor: std::sync::Arc<SharedRgCursor>) -> Self {
+        self.shared_cursor = Some(cursor);
         self
     }
 
@@ -1116,6 +1169,7 @@ impl EmatArrowBatchReaderBuilder {
             decode_cache: self.decode_cache,
             rg_decode_cache: self.rg_decode_cache,
             late_arm: self.late_arm,
+            shared_cursor: self.shared_cursor,
             cur_rg_idx: 0,
             cur_rg_columns: None,
             cur_rg_filter_bitmap: None,
@@ -1498,6 +1552,10 @@ pub struct EmatArrowBatchReader {
     /// the shared Arc<Vec<DecodedColumn>> with no parquet I/O. On miss,
     /// decodes as usual and inserts. Bypassed when `filter` is set.
     pub(crate) rg_decode_cache: Option<std::sync::Arc<RowGroupDecodeCache>>,
+    /// Morsel-engine P2 spike: shared work queue. When `Some`, `next()`
+    /// pulls the next RG from here (dynamic work-stealing) instead of
+    /// walking the static `row_groups`. See [`SharedRgCursor`].
+    shared_cursor: Option<std::sync::Arc<SharedRgCursor>>,
 
     // ---- iteration state ----
     /// L9.ADAPT LATE-ARM — pending sideband; see the builder field.
@@ -1923,13 +1981,25 @@ impl EmatArrowBatchReader {
         // previous RG's selectivity-gate fallback.
         self.cur_rg_filter_bitmap = None;
 
+        // Morsel-engine P1: time the whole per-RG decode (the single
+        // decode work-unit) regardless of which sub-path fires, so the
+        // trace reconstructs a per-core busy/idle timeline. No-op unless
+        // EMAT_MORSEL_TRACE=1.
+        let _span = crate::morsel_trace::start_span();
+
         // Σ.E5 (#516): late-mat path — when a filter is set, decode the
         // filter column to a bitmap, then masked-decode each projected
         // column. Pages with zero bitmap-popcount are skipped entirely.
-        if let (Some(filter), Some(path)) = (&self.filter, &self.path) {
-            return self.load_row_group_masked(rg, filter.clone(), path.clone());
-        }
-        self.load_row_group_dense(rg)
+        let masked = match (&self.filter, &self.path) {
+            (Some(filter), Some(path)) => Some((filter.clone(), path.clone())),
+            _ => None,
+        };
+        let res = match masked {
+            Some((filter, path)) => self.load_row_group_masked(rg, filter, path),
+            None => self.load_row_group_dense(rg),
+        };
+        crate::morsel_trace::end_span(_span, rg, self.cur_rg_total, self.projection.len());
+        res
     }
 
     /// Σ.E5 Phase 1.8: parallel bitmap+dense path. Spawns one thread
@@ -2377,11 +2447,22 @@ impl Iterator for EmatArrowBatchReader {
             // If the current RG is exhausted (or unset), advance.
             let need_new_rg = self.cur_rg_columns.is_none() || self.cur_rg_row >= self.cur_rg_total;
             if need_new_rg {
-                if self.cur_rg_idx >= self.row_groups.len() {
-                    return None;
-                }
-                let rg = self.row_groups[self.cur_rg_idx];
-                self.cur_rg_idx += 1;
+                // Morsel-engine P2 spike: pull the next RG dynamically
+                // from the shared work queue if one is attached, else
+                // walk the static per-partition assignment.
+                let rg = match &self.shared_cursor {
+                    // `?` returns None from `next()` (end of stream) when the
+                    // shared work queue is drained.
+                    Some(cursor) => cursor.pop()?,
+                    None => {
+                        if self.cur_rg_idx >= self.row_groups.len() {
+                            return None;
+                        }
+                        let rg = self.row_groups[self.cur_rg_idx];
+                        self.cur_rg_idx += 1;
+                        rg
+                    }
+                };
                 if let Err(e) = self.load_row_group(rg) {
                     return Some(Err(e));
                 }
