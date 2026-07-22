@@ -1052,6 +1052,23 @@ lands a case here.
   fields reject loudly. Gate: `date_part_and_datediff` (all fields,
   day/year/month/quarter diffs, epoch, aggregate + predicate contexts).
   Parity 22/22, sf1 103/103 0 MISMATCH.
+- **Bounded ROWS window frames (`n PRECEDING`/`n FOLLOWING`) — SHIPPED.** The
+  one genuine frame-capability gap: the binder previously accepted only an
+  UNBOUNDED PRECEDING start (running / whole-partition / RANGE-peer). New
+  `WindowExpr.rows_bounds: Option<(Option<i64>, Option<i64>)>` — signed row
+  offsets from the current row (`None` = unbounded that side, negative =
+  PRECEDING, 0 = CURRENT ROW, positive = FOLLOWING). The frame binder maps
+  each bound via `frame_bound_offset`; the two pre-existing fast-path shapes
+  (`UNBOUNDED..CURRENT ROW`, `UNBOUNDED..UNBOUNDED FOLLOWING`) keep their
+  boolean flags, everything else with a finite ROWS offset routes to
+  `rows_bounds`. The executor's Agg arm gains a sliding-window branch:
+  aggregate each row over the clamped `[p+start, p+end]` slice of the ordered
+  partition (empty frame → NULL). RANGE-with-offsets and bounded frames over
+  the navigation family (first/last_value, lag/lead, rank) reject loudly — no
+  silent wrong answer. No perf-path change (no TPC query uses these frames).
+  Gate: `window_bounded_rows_frames` (trailing/centered/leading, one-side-
+  unbounded, `rows n preceding` shorthand, no-partition, non-agg rejection).
+  Parity 23/23, sf1 103/103 0 MISMATCH.
 
 ## Next (P4 tail → P5/P6)
 

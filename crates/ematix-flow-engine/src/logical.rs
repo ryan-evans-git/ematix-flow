@@ -222,6 +222,15 @@ pub struct WindowExpr {
     /// `lag`/`lead` DEFAULT (3rd argument) — the value returned past the
     /// partition edge instead of SQL NULL. `None` = NULL past the edge.
     pub lag_default: Option<f64>,
+    /// An explicit bounded `ROWS BETWEEN <start> AND <end>` frame with at
+    /// least one finite row offset (a sliding window). `(start, end)` as
+    /// signed row offsets from the current row: `None` = unbounded on that
+    /// side, `Some(k)` = `k` rows away (negative = PRECEDING, 0 = CURRENT
+    /// ROW, positive = FOLLOWING). When set, the executor aggregates each
+    /// row over the clamped `[current+start, current+end]` window and the
+    /// `rows_frame`/`frame_end_unbounded` flags are unused. Only aggregate
+    /// windows support it (the binder rejects it for the navigation family).
+    pub rows_bounds: Option<(Option<i64>, Option<i64>)>,
     /// An enclosing `WHERE <this window's output> <= K` proved only the
     /// top K rows per partition can survive (rank/row_number only —
     /// set by the binder). The executor prunes each partition to the rows

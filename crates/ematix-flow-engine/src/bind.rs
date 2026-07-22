@@ -3236,27 +3236,37 @@ impl Binder<'_> {
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let (rows_frame, frame_end_unbounded) = match &spec.window_frame {
-            None => (false, false),
+        let (rows_frame, frame_end_unbounded, rows_bounds) = match &spec.window_frame {
+            None => (false, false, None),
             Some(fr) => {
-                use ast::WindowFrameBound as B;
-                // Supported starts: UNBOUNDED PRECEDING. Supported ends:
-                // CURRENT ROW (or implicit) and UNBOUNDED FOLLOWING.
-                let start_ok = matches!(fr.start_bound, B::Preceding(None));
-                let (end_unbounded, end_ok) = match &fr.end_bound {
-                    None | Some(B::CurrentRow) => (false, true),
-                    Some(B::Following(None)) => (true, true),
-                    _ => (false, false),
+                let is_rows = matches!(fr.units, ast::WindowFrameUnits::Rows);
+                let start = frame_bound_offset(&fr.start_bound)?;
+                // An omitted end bound is an implicit CURRENT ROW.
+                let end = match &fr.end_bound {
+                    None => Some(0),
+                    Some(b) => frame_bound_offset(b)?,
                 };
-                if !start_ok || !end_ok {
-                    return Err(format!("unsupported window frame: {fr:?}"));
+                match (start, end) {
+                    // UNBOUNDED PRECEDING .. CURRENT ROW — running (ROWS) or
+                    // the RANGE peer-cumulative default.
+                    (None, Some(0)) => (is_rows, false, None),
+                    // UNBOUNDED PRECEDING .. UNBOUNDED FOLLOWING — whole partition.
+                    (None, None) => (false, true, None),
+                    // Any other ROWS frame is a bounded sliding window.
+                    _ if is_rows => (false, false, Some((start, end))),
+                    // RANGE with finite offsets needs value-based framing.
+                    _ => return Err(format!("unsupported RANGE frame with offsets: {fr:?}")),
                 }
-                (
-                    matches!(fr.units, ast::WindowFrameUnits::Rows) && !end_unbounded,
-                    end_unbounded,
-                )
             }
         };
+        // A bounded sliding frame is only meaningful for an aggregate window;
+        // the navigation family (first/last_value, lag/lead, rank) would give
+        // a silently wrong answer under one, so reject it loudly.
+        if rows_bounds.is_some() && !matches!(func, WindowFunc::Agg(_)) {
+            return Err(
+                "bounded ROWS frames are only supported for aggregate window functions".into(),
+            );
+        }
         self.windows.push(WindowExpr {
             func,
             arg,
@@ -3265,6 +3275,7 @@ impl Binder<'_> {
             rows_frame,
             frame_end_unbounded,
             lag_default,
+            rows_bounds,
             top_k: None,
         });
         Ok(Expr::Column(WINDOW_BASE + self.windows.len() - 1))
@@ -5701,6 +5712,30 @@ fn bind_trunc_unit(s: &str) -> Result<DateTruncUnit, String> {
         "week" | "weeks" => DateTruncUnit::Week,
         "day" | "days" => DateTruncUnit::Day,
         other => return Err(format!("unsupported date_trunc unit '{other}'")),
+    })
+}
+
+/// Map a window-frame bound to a signed row offset from the current row:
+/// `None` = unbounded on that side; `Some(k)` where negative = PRECEDING,
+/// `0` = CURRENT ROW, positive = FOLLOWING. Offsets must be integer literals.
+fn frame_bound_offset(b: &ast::WindowFrameBound) -> Result<Option<i64>, String> {
+    use ast::WindowFrameBound as B;
+    let lit = |e: &ast::Expr| -> Result<i64, String> {
+        match e {
+            ast::Expr::Value(v) => match &v.value {
+                ast::Value::Number(s, _) => s
+                    .parse::<i64>()
+                    .map_err(|_| format!("window frame offset must be an integer: {s}")),
+                other => Err(format!("window frame offset must be a number: {other:?}")),
+            },
+            other => Err(format!("window frame offset must be a literal: {other:?}")),
+        }
+    };
+    Ok(match b {
+        B::Preceding(None) | B::Following(None) => None,
+        B::CurrentRow => Some(0),
+        B::Preceding(Some(e)) => Some(-lit(e)?),
+        B::Following(Some(e)) => Some(lit(e)?),
     })
 }
 

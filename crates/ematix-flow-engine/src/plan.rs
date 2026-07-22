@@ -3578,6 +3578,30 @@ fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -
             let mut out = vec![0.0f64; n];
             let mut valid = vec![true; n];
             for rows in parts.values_mut() {
+                if let Some((start, end)) = w.rows_bounds {
+                    // Bounded sliding ROWS frame: aggregate each row over the
+                    // clamped `[p+start, p+end]` window of the ordered
+                    // partition (offsets in rows; None = unbounded that side).
+                    rows.sort_by(|&a, &b| order_cmp(a, b));
+                    let len = rows.len() as i64;
+                    for p in 0..rows.len() {
+                        let pi = p as i64;
+                        let lo = start.map_or(0, |k| (pi + k).max(0));
+                        let hi = end.map_or(len - 1, |k| (pi + k).min(len - 1));
+                        let mut st = AggState::default();
+                        // `lo..=hi` is empty when `hi < lo` (frame off the
+                        // partition edge) → an empty frame finalizes to NULL.
+                        for idx in lo..=hi {
+                            if let Some(v) = w.arg.eval_opt_f64(chunk, rows[idx as usize]) {
+                                st.update(v);
+                            }
+                        }
+                        let r = rows[p];
+                        out[r] = st.finalize(af);
+                        valid[r] = !st.is_null(af);
+                    }
+                    continue;
+                }
                 if w.order.is_empty() || w.frame_end_unbounded {
                     // Whole-partition aggregate (unordered, or an explicit
                     // UNBOUNDED PRECEDING..UNBOUNDED FOLLOWING frame).

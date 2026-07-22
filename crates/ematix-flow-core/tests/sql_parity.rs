@@ -1019,3 +1019,67 @@ fn date_part_and_datediff() {
     p.check("select distinct extract(epoch from l_shipdate) e from lineitem where l_orderkey < 50");
     p.check("select distinct date_part('epoch', l_shipdate) e from lineitem where l_orderkey < 50");
 }
+
+// ---------------------------------------------------------------------------
+// Bounded ROWS window frames (`n PRECEDING`/`n FOLLOWING`) — a sliding
+// window, the one genuine frame-capability gap (previously the frame binder
+// accepted only UNBOUNDED PRECEDING starts). Aggregate windows only.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn window_bounded_rows_frames() {
+    if !have_data() {
+        eprintln!("SKIP window_bounded_rows_frames: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    let base = "from lineitem where l_orderkey < 400";
+    // Trailing moving sum/avg (n PRECEDING .. CURRENT ROW).
+    p.check(&format!(
+        "select l_orderkey, l_linenumber, \
+         sum(l_quantity) over (partition by l_orderkey order by l_linenumber \
+           rows between 2 preceding and current row) s \
+         {base}"
+    ));
+    // Centered window (n PRECEDING .. m FOLLOWING).
+    p.check(&format!(
+        "select l_orderkey, l_linenumber, \
+         avg(l_extendedprice) over (partition by l_orderkey order by l_linenumber \
+           rows between 1 preceding and 1 following) a, \
+         min(l_quantity) over (partition by l_orderkey order by l_linenumber \
+           rows between 1 preceding and 1 following) mn, \
+         max(l_quantity) over (partition by l_orderkey order by l_linenumber \
+           rows between 1 preceding and 1 following) mx \
+         {base}"
+    ));
+    // Leading window (CURRENT ROW .. m FOLLOWING) and count over a frame.
+    p.check(&format!(
+        "select l_orderkey, l_linenumber, \
+         count(l_quantity) over (partition by l_orderkey order by l_linenumber \
+           rows between current row and 2 following) c \
+         {base}"
+    ));
+    // One unbounded side + a finite offset; and the shorthand `rows n preceding`.
+    p.check(&format!(
+        "select l_orderkey, l_linenumber, \
+         sum(l_quantity) over (partition by l_orderkey order by l_linenumber \
+           rows between unbounded preceding and 1 following) s1, \
+         sum(l_quantity) over (partition by l_orderkey order by l_linenumber \
+           rows 1 preceding) s2 \
+         {base}"
+    ));
+    // No PARTITION BY — the frame slides over the whole ordered set.
+    p.check(&format!(
+        "select l_orderkey, l_linenumber, \
+         sum(l_quantity) over (order by l_orderkey, l_linenumber \
+           rows between 3 preceding and current row) s \
+         {base}"
+    ));
+    // Non-aggregate window under a bounded frame must be rejected (no
+    // silent wrong answer).
+    p.check_rejected(
+        "select first_value(l_quantity) over (partition by l_orderkey \
+         order by l_linenumber rows between 1 preceding and 1 following) f \
+         from lineitem where l_orderkey < 10",
+    );
+}
