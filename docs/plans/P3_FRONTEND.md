@@ -1069,7 +1069,7 @@ lands a case here.
   Gate: `window_bounded_rows_frames` (trailing/centered/leading, one-side-
   unbounded, `rows n preceding` shorthand, no-partition, non-agg rejection).
   Parity 23/23, sf1 103/103 0 MISMATCH.
-- **`<op> ANY/ALL (subquery)` — SHIPPED.** All were honest bind-rejections.
+- **`<op> ANY/ALL (subquery)` — SHIPPED (`fd09218e`).** All were honest bind-rejections.
   An AST-level rewrite (`quantified_to_ast`) folds each form into machinery
   the binder already has — no new IR: `= ANY`/`= SOME` → `IN (subquery)`,
   `<> ALL` → `NOT IN (subquery)` (exact, incl. empty/NULL via the IN path);
