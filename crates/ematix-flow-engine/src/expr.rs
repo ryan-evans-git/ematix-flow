@@ -88,6 +88,15 @@ pub enum Expr {
     /// rounds to the nearest integer (DuckDB `CAST` semantics: `10714.82` →
     /// `10715`). An already-integer operand is unchanged.
     CastInt(Box<Expr>),
+    /// `CAST(<expr> AS VARCHAR/CHAR/TEXT/STRING)` — renders the operand to
+    /// text: integers/floats as their decimal form, a string operand
+    /// unchanged. `from_date` is set by the binder when the operand is
+    /// Date32-typed (the value path represents a date as its raw day-number
+    /// `Val::Int`, which is indistinguishable from an integer at eval time),
+    /// so the string is rendered ISO `YYYY-MM-DD`. Like [`Expr::Upper`] it is
+    /// an OWNED string, so it evaluates via `eval_value` and comparisons
+    /// containing it are handled inline in the `Binary` arm.
+    CastStr { arg: Box<Expr>, from_date: bool },
     /// `round(<expr>, digits)` — round half away from zero at `digits`
     /// decimal places (q2/q78's ratio projections).
     Round {
@@ -242,7 +251,8 @@ impl Expr {
             | Expr::DateTrunc { arg: e, .. }
             | Expr::CastInt(e)
             | Expr::Not(e)
-            | Expr::Upper(e) => e.for_each_col(f),
+            | Expr::Upper(e)
+            | Expr::CastStr { arg: e, .. } => e.for_each_col(f),
             Expr::Round { expr, .. }
             | Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
@@ -358,7 +368,7 @@ impl Expr {
                 Val::Null => Val::Null,
                 other => panic!("round needs a numeric operand, got {other:?}"),
             },
-            Expr::Upper(_) | Expr::StrFn { .. } => {
+            Expr::Upper(_) | Expr::StrFn { .. } | Expr::CastStr { .. } => {
                 panic!("string fn must be evaluated via eval_value or inside a comparison")
             }
             Expr::NumFn { func, args } => eval_num_fn(*func, args, chunk, row),
@@ -476,6 +486,29 @@ impl Expr {
         }
         if let Expr::StrFn { func, args } = self {
             return eval_str_fn(*func, args, chunk, row);
+        }
+        // CAST(x AS VARCHAR) — render the operand to text. A string operand
+        // is unchanged; numerics take their decimal form; a Date32 renders
+        // ISO `YYYY-MM-DD` (not the raw day-number).
+        if let Expr::CastStr { arg, from_date } = self {
+            let render_date = |days: i32| {
+                let (y, m, day) = civil_of_days(days);
+                format!("{y:04}-{m:02}-{day:02}")
+            };
+            let s = match arg.eval_value(chunk, row) {
+                ScalarValue::Null => return ScalarValue::Null,
+                ScalarValue::Utf8(s) => return ScalarValue::Utf8(s),
+                // A Date32 operand flows as an Int on the value path; render
+                // ISO iff the binder tagged it as a date.
+                ScalarValue::Int32(i) if *from_date => render_date(i),
+                ScalarValue::Int64(i) if *from_date => render_date(i as i32),
+                ScalarValue::Int32(i) => i.to_string(),
+                ScalarValue::Int64(i) => i.to_string(),
+                ScalarValue::Float64(f) => f.to_string(),
+                ScalarValue::Boolean(b) => if b { "true" } else { "false" }.to_string(),
+                ScalarValue::Date32(d) => render_date(d),
+            };
+            return ScalarValue::Utf8(Arc::from(s.as_str()));
         }
         // date_trunc yields a Date32 (not a bare day-number) in value space.
         if let Expr::DateTrunc { unit, arg } = self {
@@ -836,7 +869,10 @@ fn extract_field(field: DateField, days: i32) -> i64 {
 /// Does `e` produce an OWNED string that only `eval_value` can build (so a
 /// comparison containing it must route through the inline string path)?
 fn is_owned_str_fn(e: &Expr) -> bool {
-    matches!(e, Expr::Upper(_) | Expr::StrFn { .. } | Expr::Concat(_))
+    matches!(
+        e,
+        Expr::Upper(_) | Expr::StrFn { .. } | Expr::Concat(_) | Expr::CastStr { .. }
+    )
 }
 
 /// Evaluate a numeric-returning scalar builtin on the borrowed `Val` path.

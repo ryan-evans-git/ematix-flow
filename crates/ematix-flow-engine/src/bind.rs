@@ -909,7 +909,8 @@ fn remap_window_cols(e: &mut Expr, win_base: usize, group_base: usize) {
         | Expr::CastInt(i)
         | Expr::Not(i)
         | Expr::Round { expr: i, .. }
-        | Expr::Upper(i) => remap_window_cols(i, win_base, group_base),
+        | Expr::Upper(i)
+        | Expr::CastStr { arg: i, .. } => remap_window_cols(i, win_base, group_base),
         Expr::Like { expr, .. }
         | Expr::InSub { expr, .. }
         | Expr::InSet { expr, .. }
@@ -3524,7 +3525,23 @@ impl Binder<'_> {
                             other => Expr::CastInt(Box::new(other)),
                         }))
                     }
-                    DT::Char(_) | DT::Varchar(_) | DT::Text => Ok(self.bind(expr)?),
+                    // Render the operand to text. Previously this returned
+                    // the operand UNCHANGED — a silent wrong answer for a
+                    // numeric/date operand (DuckDB stringifies). `CastStr`
+                    // stringifies at eval; a string operand is identity.
+                    DT::Char(_)
+                    | DT::CharVarying(_)
+                    | DT::Varchar(_)
+                    | DT::Nvarchar(_)
+                    | DT::Text
+                    | DT::String(_) => {
+                        let inner = materialize(self.bind(expr)?);
+                        let from_date = self.expr_is_date(&inner);
+                        Ok(Bound::Expr(Expr::CastStr {
+                            arg: Box::new(inner),
+                            from_date,
+                        }))
+                    }
                     other => Err(format!("unsupported CAST target: {other}")),
                 }
             }
@@ -3951,9 +3968,11 @@ fn infer_slot_type(q: &BoundQuery, e: &Expr) -> LogicalType {
         }
         Expr::Extract { .. } | Expr::CastInt(_) => LogicalType::Int64,
         Expr::DateTrunc { .. } => LogicalType::Date32,
-        Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) | Expr::StrFn { .. } => {
-            LogicalType::Utf8
-        }
+        Expr::Substr { .. }
+        | Expr::Concat(_)
+        | Expr::Upper(_)
+        | Expr::StrFn { .. }
+        | Expr::CastStr { .. } => LogicalType::Utf8,
         Expr::NumFn {
             func: crate::expr::NumFn::Mod | crate::expr::NumFn::Length,
             ..
@@ -4007,9 +4026,11 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
         ),
         Expr::Extract { .. } | Expr::CastInt(_) => LogicalType::Int64,
         Expr::DateTrunc { .. } => LogicalType::Date32,
-        Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) | Expr::StrFn { .. } => {
-            LogicalType::Utf8
-        }
+        Expr::Substr { .. }
+        | Expr::Concat(_)
+        | Expr::Upper(_)
+        | Expr::StrFn { .. }
+        | Expr::CastStr { .. } => LogicalType::Utf8,
         Expr::NumFn {
             func: crate::expr::NumFn::Mod | crate::expr::NumFn::Length,
             ..
@@ -5378,7 +5399,8 @@ fn references_columns(e: &Expr) -> bool {
         | Expr::CastInt(i)
         | Expr::Not(i)
         | Expr::Round { expr: i, .. }
-        | Expr::Upper(i) => references_columns(i),
+        | Expr::Upper(i)
+        | Expr::CastStr { arg: i, .. } => references_columns(i),
         Expr::Like { expr, .. } => references_columns(expr),
         Expr::ScalarSub(_) => false,
         Expr::InSub { expr, .. }

@@ -434,7 +434,8 @@ fn visit_query_exprs(q: &BoundQuery, f: &mut impl FnMut(&Expr)) {
             | Expr::CastInt(i)
             | Expr::Not(i)
             | Expr::Round { expr: i, .. }
-            | Expr::Upper(i) => walk(i, f),
+            | Expr::Upper(i)
+            | Expr::CastStr { arg: i, .. } => walk(i, f),
             Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
             | Expr::InSet { expr, .. }
@@ -494,7 +495,8 @@ fn rewrite_query_exprs(q: &mut BoundQuery, f: &mut impl FnMut(&mut Expr)) {
             | Expr::CastInt(i)
             | Expr::Not(i)
             | Expr::Round { expr: i, .. }
-            | Expr::Upper(i) => walk(i, f),
+            | Expr::Upper(i)
+            | Expr::CastStr { arg: i, .. } => walk(i, f),
             Expr::Like { expr, .. }
             | Expr::InSub { expr, .. }
             | Expr::InSet { expr, .. }
@@ -4543,7 +4545,8 @@ fn collect_slots(e: &Expr, out: &mut Vec<usize>) {
         | Expr::CastInt(i)
         | Expr::Not(i)
         | Expr::Round { expr: i, .. }
-        | Expr::Upper(i) => collect_slots(i, out),
+        | Expr::Upper(i)
+        | Expr::CastStr { arg: i, .. } => collect_slots(i, out),
         Expr::Like { expr, .. } => collect_slots(expr, out),
         Expr::ScalarSub(_) => {}
         Expr::InSub { expr, .. }

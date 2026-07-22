@@ -929,3 +929,43 @@ fn count_distinct_string() {
     // Empty group → 0 (COUNT is never NULL).
     p.check("select count(distinct l_shipmode) c from lineitem where l_orderkey < 0");
 }
+
+// ---------------------------------------------------------------------------
+// CAST(x AS VARCHAR/CHAR/TEXT) — the target arm returned the operand
+// UNCHANGED, so a numeric/date operand stayed numeric instead of being
+// rendered to text (silent wrong answer vs DuckDB; surfaced by breadth
+// sweep #2). Now stringifies: integers/floats as decimal text, dates as
+// ISO `YYYY-MM-DD`, strings identity.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cast_as_varchar() {
+    if !have_data() {
+        eprintln!("SKIP cast_as_varchar: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // Integer column → text.
+    p.check("select cast(l_linenumber as varchar) k from lineitem where l_orderkey < 200");
+    // char(n) and text spellings.
+    p.check("select cast(l_orderkey as char(20)) k from lineitem where l_orderkey < 50");
+    p.check("select cast(l_linenumber as text) k from lineitem where l_orderkey < 50");
+    // A string operand is identity.
+    p.check("select cast(l_shipmode as varchar) k from lineitem where l_orderkey < 50");
+    // A DATE renders ISO (native previously exposed the raw day-number).
+    p.check("select distinct cast(l_shipdate as varchar) k from lineitem where l_orderkey < 100");
+    // An integer arithmetic expression under the cast.
+    p.check(
+        "select cast(l_orderkey + l_linenumber as varchar) k \
+         from lineitem where l_orderkey < 50",
+    );
+    // Cast result usable as a GROUP BY key and in string concatenation.
+    p.check(
+        "select cast(l_linenumber as varchar) k, count(*) c \
+         from lineitem where l_orderkey < 2000 group by cast(l_linenumber as varchar)",
+    );
+    p.check(
+        "select cast(l_linenumber as varchar) || 'x' k \
+         from lineitem where l_orderkey < 50",
+    );
+}

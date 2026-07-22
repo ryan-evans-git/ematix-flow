@@ -1022,6 +1022,20 @@ lands a case here.
   `split_part`, `mode`/`percentile_disc`, `array_agg`, `regexp_matches`. One
   new silent item found: `CAST(x AS VARCHAR)` returns the value untyped
   instead of a string (type mismatch vs DuckDB) — the next silent-bug fix.
+- **CAST(x AS VARCHAR/CHAR/TEXT/STRING) — SHIPPED.** The string-target arm
+  returned the operand UNCHANGED, so a numeric/date operand stayed numeric
+  (silent wrong answer vs DuckDB, found by sweep #2). New owned-string variant
+  `Expr::CastStr { arg, from_date }` renders at `eval_value`: integers/floats
+  as decimal text, a string operand identity. A Date32 operand flows as its
+  raw day-number `Val::Int` on the value path (indistinguishable from an int
+  at eval time), so the binder tags `from_date` via `expr_is_date` and the
+  eval renders ISO `YYYY-MM-DD` (was exposing the day-number). Also accepts
+  the `char varying`/`nvarchar`/`string` spellings. Wired like `Upper`
+  (owned-string: `is_owned_str_fn`, comparison-inline, group-key, distinct).
+  No corpus query casts to a string type, so the change cannot perturb any
+  parity/perf query. Gate: `cast_as_varchar` (int/char/text/string identity,
+  date→ISO, arithmetic-under-cast, group-key, `|| 'x'` concat). Parity 21/21,
+  sf1 103/103 0 MISMATCH.
 
 ## Next (P4 tail → P5/P6)
 
