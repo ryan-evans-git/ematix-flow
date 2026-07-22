@@ -1069,6 +1069,20 @@ lands a case here.
   Gate: `window_bounded_rows_frames` (trailing/centered/leading, one-side-
   unbounded, `rows n preceding` shorthand, no-partition, non-agg rejection).
   Parity 23/23, sf1 103/103 0 MISMATCH.
+- **`<op> ANY/ALL (subquery)` — SHIPPED.** All were honest bind-rejections.
+  An AST-level rewrite (`quantified_to_ast`) folds each form into machinery
+  the binder already has — no new IR: `= ANY`/`= SOME` → `IN (subquery)`,
+  `<> ALL` → `NOT IN (subquery)` (exact, incl. empty/NULL via the IN path);
+  the ordered comparisons reduce to `left <op> (SELECT min/max(col) FROM
+  subquery)` — a scalar subquery (`ANY`: `>`,`>=`→min / `<`,`<=`→max; `ALL`:
+  the reverse). `wrap_agg_scalar_subquery` clones the subquery and swaps its
+  single projection to `min/max(e)`; it rejects GROUP BY / HAVING / LIMIT /
+  OFFSET subqueries (which would change what min/max ranges over) and the
+  rare `= ALL` / `<> ANY` combos — loudly, never a silent wrong answer. The
+  min/max reduction is exact for the realistic non-empty, non-NULL set; the
+  empty-set edge (SQL `> ALL(∅)` = TRUE) is the one known corner it does not
+  reproduce. Gate: `quantified_subquery_any_all` (= ANY/SOME, <> ALL, the
+  ordered ops, two rejections). Parity 24/24, sf1 103/103 0 MISMATCH.
 
 ## Next (P4 tail → P5/P6)
 

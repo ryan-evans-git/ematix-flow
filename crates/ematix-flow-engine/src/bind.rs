@@ -3909,6 +3909,26 @@ impl Binder<'_> {
                     negated: *negated,
                 }))
             }
+            // `x <op> ANY/ALL (subquery)` rewrites to existing machinery:
+            // `= ANY` ≡ IN, `<> ALL` ≡ NOT IN, and the ordered comparisons
+            // reduce to a min/max scalar subquery.
+            ast::Expr::AnyOp {
+                left,
+                compare_op,
+                right,
+                ..
+            } => {
+                let rewritten = quantified_to_ast(left, compare_op, right, false)?;
+                self.bind(&rewritten)
+            }
+            ast::Expr::AllOp {
+                left,
+                compare_op,
+                right,
+            } => {
+                let rewritten = quantified_to_ast(left, compare_op, right, true)?;
+                self.bind(&rewritten)
+            }
             ast::Expr::Function(f) => {
                 if let Some(parts) = self.bind_concat(f)? {
                     return Ok(Bound::Expr(Expr::Concat(parts)));
@@ -5713,6 +5733,95 @@ fn bind_trunc_unit(s: &str) -> Result<DateTruncUnit, String> {
         "day" | "days" => DateTruncUnit::Day,
         other => return Err(format!("unsupported date_trunc unit '{other}'")),
     })
+}
+
+/// Rewrite `left <op> ANY/ALL (subquery)` into equivalent SQL the binder
+/// already handles: `= ANY` → `IN`, `<> ALL` → `NOT IN`, and each ordered
+/// comparison → `left <op> (SELECT min/max(col) FROM subquery)`.
+///
+/// The min/max mapping (for a non-empty, non-NULL set — the realistic case):
+///   ANY:  `>`,`>=` → min ;  `<`,`<=` → max
+///   ALL:  `>`,`>=` → max ;  `<`,`<=` → min
+fn quantified_to_ast(
+    left: &ast::Expr,
+    op: &ast::BinaryOperator,
+    right: &ast::Expr,
+    is_all: bool,
+) -> Result<ast::Expr, String> {
+    use ast::BinaryOperator as Op;
+    let ast::Expr::Subquery(query) = right else {
+        return Err(format!("ANY/ALL requires a subquery operand, got {right:?}"));
+    };
+    // = ANY ≡ IN ; <> ALL ≡ NOT IN — exact (the IN path handles empty/NULL).
+    match (op, is_all) {
+        (Op::Eq, false) | (Op::NotEq, true) => {
+            return Ok(ast::Expr::InSubquery {
+                expr: Box::new(left.clone()),
+                subquery: query.clone(),
+                negated: is_all,
+            });
+        }
+        _ => {}
+    }
+    let agg = match (op, is_all) {
+        (Op::Gt | Op::GtEq, false) | (Op::Lt | Op::LtEq, true) => "min",
+        (Op::Lt | Op::LtEq, false) | (Op::Gt | Op::GtEq, true) => "max",
+        _ => {
+            let q = if is_all { "ALL" } else { "ANY" };
+            return Err(format!("unsupported {q} comparison operator: {op:?}"));
+        }
+    };
+    Ok(ast::Expr::BinaryOp {
+        left: Box::new(left.clone()),
+        op: op.clone(),
+        right: Box::new(wrap_agg_scalar_subquery(query, agg)?),
+    })
+}
+
+/// Wrap a single-column subquery so its one projected value is reduced by an
+/// aggregate: `(SELECT <agg>(col) FROM <subquery body>)`. The subquery must
+/// have no GROUP BY/HAVING/LIMIT (any of which would change what `min`/`max`
+/// ranges over) — those reject loudly rather than answer wrongly.
+fn wrap_agg_scalar_subquery(query: &ast::Query, agg: &str) -> Result<ast::Expr, String> {
+    let mut q = query.clone();
+    if q.limit_clause.is_some() || q.fetch.is_some() {
+        return Err("ANY/ALL over a LIMIT/OFFSET subquery is unsupported".into());
+    }
+    q.order_by = None; // ordering is irrelevant to an aggregate
+    let ast::SetExpr::Select(sel) = q.body.as_mut() else {
+        return Err("ANY/ALL subquery must be a plain SELECT".into());
+    };
+    let grouped = match &sel.group_by {
+        ast::GroupByExpr::Expressions(v, _) => !v.is_empty(),
+        ast::GroupByExpr::All(_) => true,
+    };
+    if grouped || sel.having.is_some() {
+        return Err("ANY/ALL over a GROUP BY/HAVING subquery is unsupported".into());
+    }
+    if sel.projection.len() != 1 {
+        return Err("an ANY/ALL subquery must select exactly one column".into());
+    }
+    let inner = match &sel.projection[0] {
+        ast::SelectItem::UnnamedExpr(e) => e.clone(),
+        ast::SelectItem::ExprWithAlias { expr, .. } => expr.clone(),
+        other => return Err(format!("unsupported ANY/ALL projection: {other:?}")),
+    };
+    sel.distinct = None; // min/max over DISTINCT == over all
+    sel.projection = vec![ast::SelectItem::UnnamedExpr(ast::Expr::Function(ast::Function {
+        name: ast::ObjectName(vec![ast::ObjectNamePart::Identifier(ast::Ident::new(agg))]),
+        uses_odbc_syntax: false,
+        parameters: ast::FunctionArguments::None,
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(inner))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    }))];
+    Ok(ast::Expr::Subquery(Box::new(q)))
 }
 
 /// Map a window-frame bound to a signed row offset from the current row:

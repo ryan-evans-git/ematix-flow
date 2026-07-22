@@ -1083,3 +1083,53 @@ fn window_bounded_rows_frames() {
          from lineitem where l_orderkey < 10",
     );
 }
+
+// ---------------------------------------------------------------------------
+// `<op> ANY/ALL (subquery)` — rewrites to existing machinery: `= ANY` ≡ IN,
+// `<> ALL` ≡ NOT IN, and the ordered comparisons reduce to a min/max scalar
+// subquery. Previously all were honest bind-rejections.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quantified_subquery_any_all() {
+    if !have_data() {
+        eprintln!("SKIP quantified_subquery_any_all: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::with_tables(&["lineitem", "orders"]);
+    // = ANY / = SOME ≡ IN.
+    p.check(
+        "select count(*) c from orders where o_orderkey = any \
+         (select l_orderkey from lineitem where l_quantity > 48)",
+    );
+    p.check(
+        "select count(*) c from orders where o_orderkey = some \
+         (select l_orderkey from lineitem where l_quantity > 48)",
+    );
+    // <> ALL ≡ NOT IN.
+    p.check(
+        "select count(*) c from orders where o_orderkey <> all \
+         (select l_orderkey from lineitem where l_quantity > 48)",
+    );
+    // Ordered comparisons → min/max scalar subquery. The subquery is the
+    // line quantities of order 1 (a small, non-empty, non-NULL set).
+    let sub = "(select l_quantity from lineitem where l_orderkey = 1)";
+    p.check(&format!(
+        "select count(*) c from lineitem where l_quantity > all {sub} and l_orderkey < 5000"
+    ));
+    p.check(&format!(
+        "select count(*) c from lineitem where l_quantity < all {sub} and l_orderkey < 5000"
+    ));
+    p.check(&format!(
+        "select count(*) c from lineitem where l_quantity > any {sub} and l_orderkey < 5000"
+    ));
+    p.check(&format!(
+        "select count(*) c from lineitem where l_quantity <= any {sub} and l_orderkey < 5000"
+    ));
+    p.check(&format!(
+        "select count(*) c from lineitem where l_quantity >= all {sub} and l_orderkey < 5000"
+    ));
+    // Rare quantifier/operator combos reject loudly (no silent wrong answer).
+    p.check_rejected(&format!("select count(*) from lineitem where l_quantity = all {sub}"));
+    p.check_rejected(&format!("select count(*) from lineitem where l_quantity <> any {sub}"));
+}
