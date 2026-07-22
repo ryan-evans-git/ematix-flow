@@ -1157,6 +1157,30 @@ lands a case here.
   joined to lineitem as an inline dimension, mixed types, NULL, aggregate
   over VALUES, single-row, ragged-reject). Parity 27/27, sf1 103/103
   0 MISMATCH.
+- **Final breadth bundle: INTERSECT/EXCEPT ALL + JOIN USING + tuple =/IN —
+  SHIPPED.** *Multiset set-ops:* new `SetOp::IntersectAll`/`ExceptAll`; the
+  executor merge-walks both sorted sides' equal-row runs (min(nl,nr) /
+  nl−nr clamped copies). ★ The set-flavored side-dedup optimization
+  (`flavored`) had to EXCLUDE the ALL variants — a side's duplicate counts
+  ARE its semantics. *JOIN USING:* `build_using_cond` synthesizes the ON
+  equality chain in NAME space (the joined relation may be a real table OR
+  a view-inlined derived — a view side contributes its DEFINING expression
+  so the equi-edge recognizer sees real columns); an OUTER-joined derived
+  now force-materializes (inlining left the edge with nothing to hang
+  NULL-extension on — also improves the pre-existing `LEFT JOIN (derived)
+  ON` gap). `SELECT *` emits a USING column ONCE (`using_hidden`; under
+  RIGHT the old side's copy hides instead). Fixing that surfaced TWO
+  pre-existing `SELECT *` quirks, both fixed: view-inlined derived
+  INTERNALS leaked raw underlying columns (`inline_owned` now hides them),
+  and mixed table/view expansion ignored FROM order (`wildcard_order`
+  arrival log now drives expansion). *Tuple comparisons:* `(a,b) =/<> (c,d)`
+  and `IN/NOT IN` tuple lists desugar to AND/OR chains of pairwise
+  `IS NOT DISTINCT FROM` — ★ row comparison is TOTAL in DuckDB
+  (probe-verified: `(NULL,'A') = (NULL,'A')` is TRUE), NOT Postgres 3VL,
+  so the result is always boolean and negation is plain NOT. Gate:
+  `setop_all_join_using_tuples` (multiset counts, two-col + mixed-op chain,
+  USING count/qualified/`SELECT *` inner+left, all four tuple ops + the
+  NULL total-order case). Parity 28/28, sf1 103/103 0 MISMATCH.
 
 ## Next (P4 tail → P5/P6)
 

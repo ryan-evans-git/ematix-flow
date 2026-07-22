@@ -260,6 +260,9 @@ fn bind_query(
         extra_edges: Vec::new(),
         pending_conjuncts: Vec::new(),
         force_materialize: forced_mat,
+        using_hidden: Vec::new(),
+        inline_owned: BTreeSet::new(),
+        wildcard_order: Vec::new(),
         left_tables: BTreeSet::new(),
         plain_passthrough: false,
         uses_grouping: false,
@@ -421,32 +424,54 @@ fn bind_query(
         let mut items = Vec::new();
         for item in &select.projection {
             if matches!(item, ast::SelectItem::Wildcard(_)) {
-                for bt in &b.tables {
-                    // Synthetic decorrelation tables (`__corr…`/`__ex…`) are
-                    // internal — `SELECT *` never exposes them.
-                    if bt.display.starts_with("__") {
-                        continue;
-                    }
-                    for c in &bt.def.columns {
-                        // QUALIFIED references: two FROM tables may share a
-                        // column name (q14b's `channel` in both deriveds) —
-                        // each expansion must resolve to its own table.
-                        items.push(ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(
-                            vec![
-                                ast::Ident::new(bt.display.clone()),
-                                ast::Ident::new(c.name.clone()),
-                            ],
-                        )));
-                    }
-                }
-                // Inlined views (including the scalar-aggregate cross-join
-                // views, q28) expand to their defining expressions.
-                for v in &b.views {
-                    for (name, e) in &v.cols {
-                        items.push(ast::SelectItem::ExprWithAlias {
-                            expr: e.clone(),
-                            alias: ast::Ident::new(name.clone()),
-                        });
+                // Expand relations in FROM order (the arrival log covers
+                // tables AND inlined views — mixed materialization must not
+                // reorder `SELECT *` columns).
+                let using_hides = |q: &str, col: &str| {
+                    b.using_hidden.iter().any(|(t, c2)| {
+                        t.eq_ignore_ascii_case(q) && c2.eq_ignore_ascii_case(col)
+                    })
+                };
+                for &(is_view, idx) in &b.wildcard_order {
+                    if is_view {
+                        // Inlined views (including the scalar-aggregate
+                        // cross-join views, q28) expand to their defining
+                        // expressions. A `JOIN … USING` column appears ONCE
+                        // in `SELECT *` (SQL merges the pair) — skip the
+                        // recorded copy.
+                        let v = &b.views[idx];
+                        for (name, e) in &v.cols {
+                            if using_hides(&v.alias, name) {
+                                continue;
+                            }
+                            items.push(ast::SelectItem::ExprWithAlias {
+                                expr: e.clone(),
+                                alias: ast::Ident::new(name.clone()),
+                            });
+                        }
+                    } else {
+                        // Synthetic decorrelation tables (`__corr…`/`__ex…`)
+                        // and view-inlined internals are internal — `SELECT *`
+                        // never exposes them.
+                        let bt = &b.tables[idx];
+                        if bt.display.starts_with("__") || b.inline_owned.contains(&idx) {
+                            continue;
+                        }
+                        for c in &bt.def.columns {
+                            if using_hides(&bt.display, &c.name) {
+                                continue;
+                            }
+                            // QUALIFIED references: two FROM tables may share
+                            // a column name (q14b's `channel` in both
+                            // deriveds) — each expansion resolves to its own
+                            // table.
+                            items.push(ast::SelectItem::UnnamedExpr(
+                                ast::Expr::CompoundIdentifier(vec![
+                                    ast::Ident::new(bt.display.clone()),
+                                    ast::Ident::new(c.name.clone()),
+                                ]),
+                            ));
+                        }
                     }
                 }
             } else {
@@ -1056,10 +1081,18 @@ fn bind_set_query(
     // (q75's `cs_quantity - COALESCE(…)` UNION sides don't re-bind as
     // group keys); everything else keeps row semantics — execute_set's
     // combine-time dedup still enforces the set semantics there.
+    // NB: the ALL variants are multiset ops — a side's duplicate counts ARE
+    // its semantics, so they must NOT bind with set (pre-dedup) semantics.
     let flavored = |t: &Tagged| {
         !matches!(
             t.0,
-            None | Some((ast::SetOperator::Union, ast::SetQuantifier::All))
+            None | Some((
+                ast::SetOperator::Union
+                    | ast::SetOperator::Intersect
+                    | ast::SetOperator::Except
+                    | ast::SetOperator::Minus,
+                ast::SetQuantifier::All
+            ))
         )
     };
     let foldable = |body: &ast::SetExpr| match body {
@@ -1100,6 +1133,8 @@ fn bind_set_query(
                     (O::Union, Q::None | Q::Distinct) => SetOp::Union,
                     (O::Intersect, Q::None | Q::Distinct) => SetOp::Intersect,
                     (O::Except | O::Minus, Q::None | Q::Distinct) => SetOp::Except,
+                    (O::Intersect, Q::All) => SetOp::IntersectAll,
+                    (O::Except | O::Minus, Q::All) => SetOp::ExceptAll,
                     other => return Err(format!("unsupported set operation: {other:?}")),
                 };
                 ops.push((sop, bq));
@@ -1292,6 +1327,15 @@ struct Binder<'a> {
     /// participant would re-open a join cycle whose broken edge falls back
     /// to the fan-out residual path this rewrite exists to avoid.
     force_materialize: BTreeSet<String>,
+    /// `JOIN … USING` duplicate copies `SELECT *` must hide — (table display,
+    /// column name), compared case-insensitively.
+    using_hidden: Vec<(String, String)>,
+    /// Tables merged in by view INLINING — a derived table's internals,
+    /// hidden from `SELECT *` (the view's columns represent them).
+    inline_owned: BTreeSet<usize>,
+    /// FROM-order arrival log of user-visible relations — (is_view, index) —
+    /// so `SELECT *` expands in FROM order across mixed tables/views.
+    wildcard_order: Vec<(bool, usize)>,
     /// Tables joined via LEFT OUTER (their rows may be unmatched).
     left_tables: BTreeSet<usize>,
     /// A window query with no GROUP BY (`rank() OVER … FROM derived`): its
@@ -1433,12 +1477,16 @@ impl Binder<'_> {
                     // clauses route exactly like the top-level FROM loop
                     // (q93's `store_sales LEFT OUTER JOIN store_returns ON …`
                     // inside a derived table).
+                    let inline_from = self.tables.len();
                     for twj in &inner.from {
                         self.add_from_item(&twj.relation)?;
                         for join in &twj.joins {
                             self.add_join(join)?;
                         }
                     }
+                    // The merged tables are the view's INTERNALS — `SELECT *`
+                    // exposes the view's columns, not theirs (DuckDB scoping).
+                    self.inline_owned.extend(inline_from..self.tables.len());
                     if let Some(w) = &inner.selection {
                         let mut cs = Vec::new();
                         split_and(w, &mut cs);
@@ -1470,6 +1518,7 @@ impl Binder<'_> {
                         alias: alias.name.value.clone(),
                         cols,
                     });
+                    self.wildcard_order.push((true, self.views.len() - 1));
                     Ok(())
                 } else if !self.tables.is_empty() && scalar_agg_body(subquery) {
                     // A SCALAR-AGGREGATE derived (no GROUP BY → exactly one
@@ -1785,6 +1834,7 @@ impl Binder<'_> {
             cols.push((name, ast::Expr::Subquery(Box::new(q1))));
         }
         self.views.push(ViewMap { alias, cols });
+        self.wildcard_order.push((true, self.views.len() - 1));
         Ok(())
     }
 
@@ -1883,22 +1933,51 @@ impl Binder<'_> {
         // nullable side); Some(true) = RIGHT (the joined table is preserved,
         // an OLD table becomes nullable). `LEFT`/`LEFT OUTER` (and the RIGHT
         // pair) parse as distinct variants but mean the same thing.
-        let (on, dir) = match &join.join_operator {
-            ast::JoinOperator::Inner(ast::JoinConstraint::On(e))
-            | ast::JoinOperator::Join(ast::JoinConstraint::On(e)) => (e, None),
-            ast::JoinOperator::LeftOuter(ast::JoinConstraint::On(e))
-            | ast::JoinOperator::Left(ast::JoinConstraint::On(e)) => (e, Some(false)),
-            ast::JoinOperator::RightOuter(ast::JoinConstraint::On(e))
-            | ast::JoinOperator::Right(ast::JoinConstraint::On(e)) => (e, Some(true)),
+        // `ON <expr>` carries the condition directly; `USING (cols)`
+        // synthesizes the equivalent equality chain after the relation is
+        // added (both side names are needed to qualify the references).
+        use ast::JoinConstraint as JC;
+        use ast::JoinOperator as JO;
+        let (on_ast, using, dir) = match &join.join_operator {
+            JO::Inner(JC::On(e)) | JO::Join(JC::On(e)) => (Some(e), None, None),
+            JO::LeftOuter(JC::On(e)) | JO::Left(JC::On(e)) => (Some(e), None, Some(false)),
+            JO::RightOuter(JC::On(e)) | JO::Right(JC::On(e)) => (Some(e), None, Some(true)),
+            JO::Inner(JC::Using(c)) | JO::Join(JC::Using(c)) => (None, Some(c), None),
+            JO::LeftOuter(JC::Using(c)) | JO::Left(JC::Using(c)) => (None, Some(c), Some(false)),
+            JO::RightOuter(JC::Using(c)) | JO::Right(JC::Using(c)) => {
+                (None, Some(c), Some(true))
+            }
             other => return Err(format!("unsupported join: {other:?}")),
         };
         let outer = dir.is_some();
+        // An OUTER-joined derived must MATERIALIZE (a real table with a real
+        // join edge) — inlining it as a view leaves the synthesized/ON
+        // equality with no equi-edge to hang NULL-extension on.
+        if outer {
+            if let ast::TableFactor::Derived {
+                alias: Some(a), ..
+            } = &join.relation
+            {
+                self.force_materialize
+                    .insert(a.name.value.to_ascii_lowercase());
+            }
+        }
         let ntables_before = self.tables.len();
+        let nviews_before = self.views.len();
         self.add_from_item(&join.relation)?;
         if self.tables.len() != ntables_before + 1 {
             return Err("a joined relation must be a single table".into());
         }
         let new_t = ntables_before;
+        let using_cond;
+        let on: &ast::Expr = match (on_ast, using) {
+            (Some(e), _) => e,
+            (None, Some(cols)) => {
+                using_cond = self.build_using_cond(cols, new_t, nviews_before, dir)?;
+                &using_cond
+            }
+            (None, None) => unreachable!("join constraint matched above"),
+        };
 
         let mut conjuncts = Vec::new();
         split_and(on, &mut conjuncts);
@@ -1986,6 +2065,116 @@ impl Binder<'_> {
         Ok(())
     }
 
+    /// Synthesize the ON condition for `JOIN … USING (cols)`. The joined
+    /// relation may have landed as a real table OR as an inlined view (a
+    /// plain select-project derived pushes its underlying table plus a
+    /// ViewMap), so resolution works in NAME space: each column must exist
+    /// on the joined side and on exactly one prior table/view; the condition
+    /// is the AND of the alias-qualified equalities. Records the duplicate
+    /// copy `SELECT *` must hide (SQL emits a USING column once): the joined
+    /// side's copy, except under RIGHT — there the joined side is preserved,
+    /// so the OLD side's copy hides instead.
+    fn build_using_cond(
+        &mut self,
+        cols: &[ast::ObjectName],
+        new_t: usize,
+        nviews_before: usize,
+        dir: Option<bool>,
+    ) -> Result<ast::Expr, String> {
+        // The joined side's qualifier + column set.
+        let right_view = self.views.len() > nviews_before;
+        let right_q = if right_view {
+            self.views[nviews_before].alias.clone()
+        } else {
+            self.tables[new_t].display.clone()
+        };
+        let right_has = |b: &Binder, c: &str| -> bool {
+            if right_view {
+                b.views[nviews_before]
+                    .cols
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(c))
+            } else {
+                b.tables[new_t].def.column(c).is_some()
+            }
+        };
+        let mut cond: Option<ast::Expr> = None;
+        for c in cols {
+            let cname = match c.0.as_slice() {
+                [ast::ObjectNamePart::Identifier(id)] => id.value.clone(),
+                other => return Err(format!("unsupported USING column: {other:?}")),
+            };
+            if !right_has(self, &cname) {
+                return Err(format!("USING column '{cname}' not found in '{right_q}'"));
+            }
+            // The joined-side reference: an inlined view contributes its
+            // DEFINING expression (the equi-edge recognizer needs real
+            // columns, not view refs); a table contributes a qualified ref.
+            let view_def = |v: &ViewMap| {
+                v.cols
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(&cname))
+                    .map(|(_, e)| e.clone())
+                    .expect("checked above")
+            };
+            let right_ref = if right_view {
+                view_def(&self.views[nviews_before])
+            } else {
+                ast::Expr::CompoundIdentifier(vec![
+                    ast::Ident::new(right_q.clone()),
+                    ast::Ident::new(cname.clone()),
+                ])
+            };
+            // The left owner: exactly one prior (non-synthetic) table/view.
+            let mut owner: Option<(String, ast::Expr)> = None;
+            let mut claim = |q: String, e: ast::Expr| -> Result<(), String> {
+                if owner.is_some() {
+                    return Err(format!(
+                        "USING column '{cname}' is ambiguous on the left side"
+                    ));
+                }
+                owner = Some((q, e));
+                Ok(())
+            };
+            for bt in self.tables.iter().take(new_t) {
+                if !bt.display.starts_with("__") && bt.def.column(&cname).is_some() {
+                    claim(
+                        bt.display.clone(),
+                        ast::Expr::CompoundIdentifier(vec![
+                            ast::Ident::new(bt.display.clone()),
+                            ast::Ident::new(cname.clone()),
+                        ]),
+                    )?;
+                }
+            }
+            for v in self.views.iter().take(nviews_before) {
+                if v.cols.iter().any(|(n, _)| n.eq_ignore_ascii_case(&cname)) {
+                    let e = view_def(v);
+                    claim(v.alias.clone(), e)?;
+                }
+            }
+            let Some((lq, left_ref)) = owner else {
+                return Err(format!("USING column '{cname}' not found on the left side"));
+            };
+            let eq = ast::Expr::BinaryOp {
+                left: Box::new(left_ref),
+                op: ast::BinaryOperator::Eq,
+                right: Box::new(right_ref),
+            };
+            let hidden_q = if dir == Some(true) { lq } else { right_q.clone() };
+            self.using_hidden.push((hidden_q, cname));
+            cond = Some(match cond {
+                None => eq,
+                Some(acc) => ast::Expr::BinaryOp {
+                    left: Box::new(acc),
+                    op: ast::BinaryOperator::And,
+                    right: Box::new(eq),
+                },
+            });
+        }
+        cond.ok_or_else(|| "USING requires at least one column".into())
+    }
+
     fn push_table(
         &mut self,
         display: String,
@@ -2011,6 +2200,7 @@ impl Binder<'_> {
             source,
             used: Vec::new(),
         });
+        self.wildcard_order.push((false, self.tables.len() - 1));
         Ok(())
     }
 
@@ -2727,6 +2917,9 @@ impl Binder<'_> {
             windows: Vec::new(),
             extra_edges: Vec::new(),
             pending_conjuncts: Vec::new(),
+            using_hidden: Vec::new(),
+            inline_owned: BTreeSet::new(),
+            wildcard_order: Vec::new(),
             force_materialize: BTreeSet::new(),
             left_tables: BTreeSet::new(),
             plain_passthrough: false,
@@ -2951,6 +3144,9 @@ impl Binder<'_> {
             windows: Vec::new(),
             extra_edges: Vec::new(),
             pending_conjuncts: Vec::new(),
+            using_hidden: Vec::new(),
+            inline_owned: BTreeSet::new(),
+            wildcard_order: Vec::new(),
             force_materialize: BTreeSet::new(),
             left_tables: BTreeSet::new(),
             plain_passthrough: false,
@@ -3887,6 +4083,35 @@ impl Binder<'_> {
                 list,
                 negated,
             } => {
+                // Tuple IN: `(a, b) IN ((x, y), …)` — OR over per-element
+                // AND-of-equality chains; NOT IN is the three-valued NOT.
+                if let ast::Expr::Tuple(ls) = expr.as_ref() {
+                    let mut alts: Option<ast::Expr> = None;
+                    for item in list {
+                        let ast::Expr::Tuple(rs) = item else {
+                            return Err(format!("tuple IN needs tuple elements, got {item}"));
+                        };
+                        let eqs = ast::Expr::Nested(Box::new(tuple_eq_ast(ls, rs)?));
+                        alts = Some(match alts {
+                            None => eqs,
+                            Some(acc) => ast::Expr::BinaryOp {
+                                left: Box::new(acc),
+                                op: ast::BinaryOperator::Or,
+                                right: Box::new(eqs),
+                            },
+                        });
+                    }
+                    let ored = alts.ok_or("IN () requires at least one element")?;
+                    let e2 = if *negated {
+                        ast::Expr::UnaryOp {
+                            op: ast::UnaryOperator::Not,
+                            expr: Box::new(ast::Expr::Nested(Box::new(ored))),
+                        }
+                    } else {
+                        ored
+                    };
+                    return self.bind(&e2);
+                }
                 // Desugar: e IN (a, b, c) → e=a OR e=b OR e=c (NOT IN → the
                 // AND of ≠). Lists are small in practice; a set-probe
                 // InList kernel is a labelled follow-on.
@@ -3923,6 +4148,24 @@ impl Binder<'_> {
                 ..
             } => self.bind_like(expr, pattern, *negated, true),
             ast::Expr::BinaryOp { left, op, right } => {
+                // Tuple comparison: `(a, b) = (c, d)` — the AND chain of the
+                // pairwise equalities; `<>` negates it (three-valued NOT).
+                if let (ast::Expr::Tuple(ls), ast::Expr::Tuple(rs)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    let eqs = tuple_eq_ast(ls, rs)?;
+                    let e2 = match op {
+                        ast::BinaryOperator::Eq => eqs,
+                        ast::BinaryOperator::NotEq => ast::Expr::UnaryOp {
+                            op: ast::UnaryOperator::Not,
+                            expr: Box::new(ast::Expr::Nested(Box::new(eqs))),
+                        },
+                        other => {
+                            return Err(format!("unsupported tuple comparison: {other}"));
+                        }
+                    };
+                    return self.bind(&e2);
+                }
                 // Date ± interval folds at bind time (literal dates only —
                 // TPC-H's `date '…' - interval '90' day`).
                 if let ast::Expr::Interval(iv) = right.as_ref() {
@@ -5916,6 +6159,33 @@ fn bind_trunc_unit(s: &str) -> Result<DateTruncUnit, String> {
         "day" | "days" => DateTruncUnit::Day,
         other => return Err(format!("unsupported date_trunc unit '{other}'")),
     })
+}
+
+/// `(a, b) = (c, d)` as an AST AND chain of pairwise `IS NOT DISTINCT FROM`
+/// — row comparison is TOTAL in DuckDB (probe-verified: `(NULL,'A') =
+/// (NULL,'A')` is TRUE, `(NULL,x) <> (2,y)` is TRUE), i.e. NULL compares as
+/// an ordinary value, so the result is always boolean and `<>`/`NOT IN` are
+/// plain negations. The members re-enter the binder's normal coercions.
+fn tuple_eq_ast(ls: &[ast::Expr], rs: &[ast::Expr]) -> Result<ast::Expr, String> {
+    if ls.len() != rs.len() || ls.is_empty() {
+        return Err(format!(
+            "tuple comparison arity mismatch: {} vs {}",
+            ls.len(),
+            rs.len()
+        ));
+    }
+    Ok(ls
+        .iter()
+        .zip(rs)
+        .map(|(l, r)| {
+            ast::Expr::IsNotDistinctFrom(Box::new(l.clone()), Box::new(r.clone()))
+        })
+        .reduce(|acc, eq| ast::Expr::BinaryOp {
+            left: Box::new(acc),
+            op: ast::BinaryOperator::And,
+            right: Box::new(eq),
+        })
+        .expect("nonempty tuple"))
 }
 
 /// Rewrite `left <op> ANY/ALL (subquery)` into equivalent SQL the binder

@@ -1273,3 +1273,66 @@ fn values_and_fromless_select() {
     // Ragged rows reject loudly.
     p.check_rejected("select * from (values (1, 2), (3)) v(a, b)");
 }
+
+// ---------------------------------------------------------------------------
+// Final breadth bundle: INTERSECT/EXCEPT ALL (multiset set-ops), JOIN USING
+// (with the SELECT-* single-copy rule), and tuple =/<>/IN.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setop_all_join_using_tuples() {
+    if !have_data() {
+        eprintln!("SKIP setop_all_join_using_tuples: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::with_tables(&["lineitem", "orders"]);
+    // INTERSECT ALL / EXCEPT ALL — lineitem repeats an orderkey per line, so
+    // multiset counts differ from set counts (the DISTINCT forms would).
+    p.check(
+        "select l_orderkey from lineitem where l_orderkey < 60 \
+         intersect all select o_orderkey from orders where o_orderkey < 60",
+    );
+    p.check(
+        "select l_orderkey from lineitem where l_orderkey < 60 \
+         except all select o_orderkey from orders where o_orderkey < 60",
+    );
+    // Two-column rows and a chain mixing ALL with plain UNION.
+    p.check(
+        "select l_orderkey, l_linenumber from lineitem where l_orderkey < 40 \
+         except all select o_orderkey, 1 from orders where o_orderkey < 40",
+    );
+    p.check(
+        "select l_orderkey from lineitem where l_orderkey < 40 \
+         intersect all select l_orderkey from lineitem where l_orderkey < 40 \
+         union select 39 as x from orders where o_orderkey = 1",
+    );
+    // JOIN USING — count, qualified refs, and the SELECT-* single-copy rule.
+    let a = "(select l_orderkey as k, l_linenumber from lineitem where l_orderkey < 200) a";
+    let b = "(select o_orderkey as k, o_custkey from orders where o_orderkey < 300) b";
+    p.check(&format!("select count(*) c from {a} join {b} using (k)"));
+    p.check(&format!("select a.k, b.o_custkey from {a} join {b} using (k)"));
+    p.check(&format!("select * from {a} join {b} using (k)"));
+    p.check(&format!("select * from {a} left join {b} using (k)"));
+    // Tuple comparisons: =, <>, IN, NOT IN (and NULL three-valuedness).
+    p.check(
+        "select count(*) c from lineitem \
+         where (l_returnflag, l_linestatus) = ('A', 'F') and l_orderkey < 2000",
+    );
+    p.check(
+        "select count(*) c from lineitem \
+         where (l_returnflag, l_linestatus) <> ('A', 'F') and l_orderkey < 2000",
+    );
+    p.check(
+        "select count(*) c from lineitem \
+         where (l_returnflag, l_linestatus) in (('A','F'), ('N','O')) and l_orderkey < 2000",
+    );
+    p.check(
+        "select count(*) c from lineitem \
+         where (l_returnflag, l_linestatus) not in (('A','F'), ('N','O')) and l_orderkey < 2000",
+    );
+    p.check(
+        "select count(*) c from lineitem \
+         where (nullif(l_linenumber, 3), l_returnflag) <> (2, 'A') and l_orderkey < 2000",
+    );
+}
+

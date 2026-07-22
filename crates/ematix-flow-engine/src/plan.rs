@@ -211,6 +211,45 @@ fn execute_set(q: &BoundQuery, memo: &DerivedMemo, columnar: bool) -> Result<Que
                     .filter(|row| right.binary_search_by(|x| row_cmp(x, row)).is_err())
                     .collect()
             }
+            // Multiset forms: sort both sides, then merge-walk runs of equal
+            // rows — INTERSECT ALL keeps min(nl, nr) copies, EXCEPT ALL
+            // keeps nl − nr (clamped at 0).
+            SetOp::IntersectAll | SetOp::ExceptAll => {
+                use std::cmp::Ordering;
+                let intersect = matches!(op, SetOp::IntersectAll);
+                let mut left = r.rows;
+                left.sort_by(row_cmp);
+                let mut right = rs_rows;
+                right.sort_by(row_cmp);
+                let mut out = Vec::new();
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < left.len() {
+                    let mut i2 = i + 1;
+                    while i2 < left.len() && row_cmp(&left[i], &left[i2]) == Ordering::Equal {
+                        i2 += 1;
+                    }
+                    let nl = i2 - i;
+                    while j < right.len() && row_cmp(&right[j], &left[i]) == Ordering::Less {
+                        j += 1;
+                    }
+                    let mut j2 = j;
+                    while j2 < right.len() && row_cmp(&right[j2], &left[i]) == Ordering::Equal {
+                        j2 += 1;
+                    }
+                    let nr = j2 - j;
+                    let keep = if intersect {
+                        nl.min(nr)
+                    } else {
+                        nl.saturating_sub(nr)
+                    };
+                    for _ in 0..keep {
+                        out.push(left[i].clone());
+                    }
+                    i = i2;
+                    j = j2;
+                }
+                out
+            }
         };
     }
     order_rows(&mut r.rows, &order_by);

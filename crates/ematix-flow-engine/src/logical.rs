@@ -260,6 +260,12 @@ pub enum SetOp {
     Intersect,
     /// `EXCEPT` — distinct left rows absent from the right side.
     Except,
+    /// `INTERSECT ALL` — multiset: each row kept `min(count_left,
+    /// count_right)` times.
+    IntersectAll,
+    /// `EXCEPT ALL` — multiset: each row kept `max(0, count_left −
+    /// count_right)` times.
+    ExceptAll,
 }
 
 /// The bound, typed query: the flat select-project-join block.
