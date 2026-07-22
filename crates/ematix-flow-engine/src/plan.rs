@@ -1709,7 +1709,9 @@ impl Executor<'_> {
                     cols.push(compute_window(w, &base, n));
                 }
                 let full = DataChunk::new(cols);
+                // QUALIFY filters the post-window rows before projection.
                 let rows = (0..n)
+                    .filter(|&r| q.qualify.as_ref().is_none_or(|p| p.eval_bool(&full, r)))
                     .map(|r| {
                         q.output
                             .iter()
@@ -3120,6 +3122,7 @@ impl Executor<'_> {
         // per-row-group parallelism.
         if self.columnar
             && q.windows.is_empty()
+            && q.qualify.is_none()
             && q.order_by.is_empty()
             && q.limit.is_none()
             && !q.distinct
@@ -3190,7 +3193,9 @@ impl Executor<'_> {
                 cols.push(compute_window(w, &base, n));
             }
             let full = DataChunk::new(cols);
+            // QUALIFY filters the post-window rows before projection.
             let rows = (0..n)
+                .filter(|&r| q.qualify.as_ref().is_none_or(|p| p.eval_bool(&full, r)))
                 .map(|r| {
                     q.output
                         .iter()
@@ -3200,8 +3205,15 @@ impl Executor<'_> {
                 .collect();
             return Ok((columns, rows, None));
         }
+        // A window-free QUALIFY (rare — references only grouped columns) still
+        // filters the projected rows.
         let rows = keep
             .into_iter()
+            .filter(|&r| {
+                q.qualify
+                    .as_ref()
+                    .is_none_or(|p| p.eval_bool(&row_chunk, r))
+            })
             .map(|r| {
                 q.output
                     .iter()
@@ -3641,12 +3653,18 @@ fn compute_window(w: &crate::logical::WindowExpr, chunk: &DataChunk, n: usize) -
                     } else {
                         p.checked_sub(off)
                     };
-                    match src
-                        .filter(|&s| s < rows.len())
-                        .and_then(|s| w.arg.eval_opt_f64(chunk, rows[s]))
-                    {
-                        Some(v) => out[r] = v,
-                        None => valid[r] = false,
+                    match src.filter(|&s| s < rows.len()) {
+                        // Past the partition edge: the DEFAULT (3rd arg), else NULL.
+                        None => match w.lag_default {
+                            Some(d) => out[r] = d,
+                            None => valid[r] = false,
+                        },
+                        // In range: the source value, or NULL when it is NULL
+                        // (the default does NOT apply to a NULL source).
+                        Some(s) => match w.arg.eval_opt_f64(chunk, rows[s]) {
+                            Some(v) => out[r] = v,
+                            None => valid[r] = false,
+                        },
                     }
                 }
             }

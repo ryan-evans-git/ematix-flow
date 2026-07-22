@@ -219,6 +219,9 @@ pub struct WindowExpr {
     /// partition total on every row (not a running value) and `last_value`
     /// returns the partition's last ordered row.
     pub frame_end_unbounded: bool,
+    /// `lag`/`lead` DEFAULT (3rd argument) — the value returned past the
+    /// partition edge instead of SQL NULL. `None` = NULL past the edge.
+    pub lag_default: Option<f64>,
     /// An enclosing `WHERE <this window's output> <= K` proved only the
     /// top K rows per partition can survive (rank/row_number only —
     /// set by the binder). The executor prunes each partition to the rows
@@ -269,6 +272,10 @@ pub struct BoundQuery {
     pub aggs: Vec<AggExpr>,
     /// Row-space predicate over `[group keys…, agg values…]` (HAVING).
     pub having: Option<Expr>,
+    /// `QUALIFY` — a predicate over the POST-WINDOW row space (may reference
+    /// window outputs), applied as a row filter after windows materialize and
+    /// before the output projection.
+    pub qualify: Option<Expr>,
     pub output: Vec<OutputExpr>,
     /// Trailing outputs appended only to serve ORDER BY expressions —
     /// dropped from the final rows after sorting.

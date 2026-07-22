@@ -396,9 +396,10 @@ fn bind_query(
     }
     let windowed_plain = !set_semantics
         && group.is_empty()
-        && projection
+        && (projection
             .iter()
             .any(|it| item_expr(it).is_some_and(contains_window))
+            || select.qualify.as_ref().is_some_and(contains_window))
         && projection
             .iter()
             .all(|it| item_expr(it).is_none_or(|e| !contains_nonwindow_agg(e)));
@@ -559,6 +560,15 @@ fn bind_query(
         .map(|e| b.bind_output(e, &group, &mut aggs))
         .transpose()?;
 
+    // QUALIFY: a predicate over the POST-WINDOW row space — bind it like an
+    // output so any window functions it references register and get
+    // WINDOW_BASE sentinels (remapped below alongside outputs/HAVING).
+    let mut qualify = select
+        .qualify
+        .as_ref()
+        .map(|e| b.bind_output(e, &group, &mut aggs))
+        .transpose()?;
+
     // ORDER BY: an output column (alias or name), an ordinal, or an
     // arbitrary expression — the latter appends a HIDDEN output column
     // used only for ordering (dropped from the final rows). SELECT aliases
@@ -684,6 +694,9 @@ fn bind_query(
         if let Some(h) = &mut having {
             remap_window_cols(h, win_base, group_base);
         }
+        if let Some(qz) = &mut qualify {
+            remap_window_cols(qz, win_base, group_base);
+        }
         // Window specs may reference GROUPING flags (q36/q70's `PARTITION BY
         // grouping(a) + grouping(b)`); remap those (they carry no window
         // sentinels of their own).
@@ -708,6 +721,7 @@ fn bind_query(
         grouping_sets,
         aggs,
         having,
+        qualify,
         output,
         hidden_outputs,
         has_grouping,
@@ -2476,6 +2490,7 @@ impl Binder<'_> {
             grouping_sets: Vec::new(),
             aggs: Vec::new(),
             having: None,
+            qualify: None,
             output: vec![OutputExpr {
                 expr: Expr::Column(0),
                 name: inner_col,
@@ -2711,6 +2726,7 @@ impl Binder<'_> {
                 },
             ],
             having: None,
+            qualify: None,
             output: vec![
                 OutputExpr {
                     expr: Expr::Column(0),
@@ -2958,6 +2974,7 @@ impl Binder<'_> {
             return Err("named WINDOW references are not yet supported".into());
         };
         let fname = f.name.to_string().to_lowercase();
+        let mut lag_default: Option<f64> = None;
         let (func, arg) = match fname.as_str() {
             "rank" => (WindowFunc::Rank, Expr::Literal(ScalarValue::Int64(0))),
             "dense_rank" => (WindowFunc::DenseRank, Expr::Literal(ScalarValue::Int64(0))),
@@ -2985,8 +3002,19 @@ impl Binder<'_> {
                             }
                         }
                     }
-                    _ => return Err(format!("{fname} takes (value[, offset])")),
+                    _ => return Err(format!("{fname} takes (value[, offset[, default]])")),
                 };
+                // Optional 3rd arg: the DEFAULT returned past the partition edge.
+                if let Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(d))) = a.get(2) {
+                    lag_default = Some(match self.clone_free_literal(d)? {
+                        ScalarValue::Float64(v) => v,
+                        ScalarValue::Int64(v) => v as f64,
+                        ScalarValue::Int32(v) => v as f64,
+                        other => {
+                            return Err(format!("{fname} default must be numeric: {other:?}"));
+                        }
+                    });
+                }
                 let wf = if fname == "lag" {
                     WindowFunc::Lag(off)
                 } else {
@@ -3108,6 +3136,7 @@ impl Binder<'_> {
             order,
             rows_frame,
             frame_end_unbounded,
+            lag_default,
             top_k: None,
         });
         Ok(Expr::Column(WINDOW_BASE + self.windows.len() - 1))
@@ -3186,9 +3215,12 @@ impl Binder<'_> {
             }
             _ => return Err(format!("aggregate '{fname}' takes exactly one argument")),
         };
+        let arg = self.wrap_agg_filter(f, arg)?;
         // A COUNT over a LEFT-joined table's column counts only matched
         // occurrences (the engine has no NULLs; unmatched preserved rows
-        // contribute 0). The column itself is not needed as a payload.
+        // contribute 0). The column itself is not needed as a payload. (A
+        // FILTER wraps `arg` in a CASE, so a filtered count never takes this
+        // matched-only path — it counts the non-NULL CASE values instead.)
         if func == AggFunc::Count {
             if let Expr::Column(slot) = arg {
                 let t = self.slots[slot].table;
@@ -3210,6 +3242,23 @@ impl Binder<'_> {
 
     /// Bind `percentile_cont(p) WITHIN GROUP (ORDER BY x)` — the fraction `p`
     /// is the call argument, the aggregated value is the ORDER BY key.
+    /// Apply an aggregate `FILTER (WHERE pred)` by wrapping the argument in
+    /// `CASE WHEN pred THEN arg ELSE NULL END` — every aggregate skips NULL, so
+    /// filtered-out rows contribute nothing (`count(*) FILTER` counts the
+    /// non-NULL CASE, i.e. the matching rows).
+    fn wrap_agg_filter(&mut self, f: &ast::Function, arg: Expr) -> Result<Expr, String> {
+        match &f.filter {
+            None => Ok(arg),
+            Some(pred) => {
+                let cond = self.bind_scalar(pred)?;
+                Ok(Expr::Case {
+                    whens: vec![(cond, arg)],
+                    else_: Box::new(Expr::Literal(ScalarValue::Null)),
+                })
+            }
+        }
+    }
+
     fn bind_percentile_cont(&mut self, f: &ast::Function) -> Result<AggExpr, String> {
         let ast::FunctionArguments::List(args) = &f.args else {
             return Err("percentile_cont needs a fraction argument".into());
@@ -3240,6 +3289,7 @@ impl Binder<'_> {
             return Err("percentile_cont WITHIN GROUP ... DESC is not yet supported".into());
         }
         let arg = self.bind_scalar(&oe.expr)?;
+        let arg = self.wrap_agg_filter(f, arg)?;
         Ok(AggExpr {
             func: AggFunc::PercentileCont(p.to_bits()),
             arg,
@@ -3271,6 +3321,7 @@ impl Binder<'_> {
             _ => return Err("string_agg takes (value[, delimiter])".into()),
         };
         let arg = self.bind_scalar(val_e)?;
+        let arg = self.wrap_agg_filter(f, arg)?;
         // In-aggregate ORDER BY (deterministic concatenation order).
         let mut order = Vec::new();
         for c in &args.clauses {

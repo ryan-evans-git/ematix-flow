@@ -811,3 +811,48 @@ fn recursive_cte() {
          select (select c from base) bc, sum(n) sn from seq",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Silent-correctness fixes (surfaced by the breadth sweep): features the
+// binder accepted but whose semantics it dropped, silently returning wrong
+// answers — aggregate FILTER, QUALIFY, and lag/lead's DEFAULT argument.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn aggregate_filter_qualify_lag_default() {
+    if !have_data() {
+        eprintln!("SKIP aggregate_filter_qualify_lag_default: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // FILTER (WHERE …) on aggregates — scalar and grouped.
+    p.check(
+        "select count(*) filter (where l_discount > 0.05) a, \
+                sum(l_quantity) filter (where l_returnflag = 'N') b, \
+                avg(l_extendedprice) filter (where l_quantity > 30) c, \
+                count(distinct l_linenumber) filter (where l_discount > 0.04) d \
+         from lineitem where l_orderkey < 2000",
+    );
+    p.check(
+        "select l_returnflag, \
+                count(*) filter (where l_discount > 0.05) a, \
+                sum(l_quantity) filter (where l_linestatus = 'F') b \
+         from lineitem where l_orderkey < 2000 group by l_returnflag",
+    );
+    // QUALIFY over a window (row_number keeps the first line per order).
+    p.check(
+        "select l_orderkey, l_linenumber from lineitem where l_orderkey < 40 \
+         qualify row_number() over (partition by l_orderkey order by l_linenumber) = 1",
+    );
+    p.check(
+        "select l_orderkey, l_linenumber from lineitem where l_orderkey < 40 \
+         qualify rank() over (partition by l_orderkey order by l_quantity desc) <= 2",
+    );
+    // lag / lead with an explicit DEFAULT past the partition edge.
+    p.check(
+        "select l_orderkey, l_linenumber, \
+                lag(l_quantity, 1, -1.0) over (partition by l_returnflag order by l_orderkey, l_linenumber) lg, \
+                lead(l_quantity, 2, -9.0) over (partition by l_returnflag order by l_orderkey, l_linenumber) ld \
+         from lineitem where l_orderkey < 80",
+    );
+}
