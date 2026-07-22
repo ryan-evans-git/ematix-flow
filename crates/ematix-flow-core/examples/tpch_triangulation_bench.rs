@@ -1415,6 +1415,9 @@ async fn build_ematix_ctx(
         // Σ.JS.1 stays installed; the rule self-gates on
         // EMAT_JOIN_SIDE_FIX (default ON), so A/B via the env var.
         sampled_join_side: true,
+        // Σ.SP Phase 1b stays installed; the rule self-gates on
+        // EMAT_GRACE_JOIN + an honest oversize estimate.
+        grace_join: true,
         // RANGE.AGG stays installed; A/B via its own EMAT_RANGE_AGG gate.
         clustered_single_phase_agg: true,
         // Σ.Q.L10: EMAT_PUSH_SEMI=0 to disable for A/B benching.

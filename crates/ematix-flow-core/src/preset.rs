@@ -618,14 +618,20 @@ pub fn with_optimizer_rules_overridden(
         crate::fused_cumulative_window::InjectCumulativeWindowRule,
     ));
     // Morsel-engine P2: shape-gate work-stealing decode ON for scans that
-    // feed a join (Q14/Q17/Q18 −6..−18%); leaves scan→fused-agg (Q06)
-    // alone, where the concurrent-decode contention tax has nothing to
-    // overlap and regresses. Runs LAST so it sees the final join shape and
-    // preserves any L9 sideband via clone_internals. `EMAT_MORSEL_STEAL=1/0`
-    // force-overrides per-scan. See enable_morsel_steal_rule.
-    builder = builder.with_physical_optimizer_rule(Arc::new(
-        crate::enable_morsel_steal_rule::EnableMorselStealRule,
-    ));
+    // feed a join. On the June 2026 base this measured −2.8% net (Q14 −8,
+    // Q17 −7); on the reconciled 2026-07-22 campaign base a swapped-pair
+    // strict A/B (which exposed a ~+3.6% B-slot bias in the harness — run
+    // both orders!) shows the slot-bias-corrected effect is ≈+0.7% net with
+    // Q18 ≈+5% in BOTH frames — the campaign's L9/KEYS.5/Gate-B work
+    // changed the join-feeding scans under it. Banked OPT-IN
+    // (`EMAT_MORSEL_STEAL_GATE=1`; per-scan `EMAT_MORSEL_STEAL=1/0` still
+    // force-overrides). Runs LAST so it sees the final join shape and
+    // preserves any L9 sideband via clone_internals.
+    if crate::flags::opt_in("EMAT_MORSEL_STEAL_GATE") {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            crate::enable_morsel_steal_rule::EnableMorselStealRule,
+        ));
+    }
     let flow_qp_on = o.flow_query_planner
         && (["EMAT_AGG_SEMI", "EMAT_DIM_PUSH", "EMAT_REORDER_QP"]
             .iter()
