@@ -1036,7 +1036,7 @@ lands a case here.
   parity/perf query. Gate: `cast_as_varchar` (int/char/text/string identity,
   date→ISO, arithmetic-under-cast, group-key, `|| 'x'` concat). Parity 21/21,
   sf1 103/103 0 MISMATCH.
-- **date_part / datediff / extract(epoch) — SHIPPED.** The function spellings
+- **date_part / datediff / extract(epoch) — SHIPPED (`8cd5a74d`).** The function spellings
   of the date machinery (honest bind-rejections until now). `date_part('u',
   d)` binds to the same `Expr::Extract` as `EXTRACT(u FROM d)` (new
   `date_field_from_str` maps DuckDB part names). `datediff('u', a, b)` lowers
