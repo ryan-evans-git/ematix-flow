@@ -509,6 +509,15 @@ fn bind_query(
             let (e, t) = b.bind_multi(conj)?;
             match t {
                 Attribution::None => {
+                    // A constant boolean conjunct folds: `true` is a no-op;
+                    // `false` makes the query empty (an always-false root filter).
+                    if let Expr::Literal(ScalarValue::Boolean(bval)) = &e {
+                        if *bval {
+                            continue;
+                        }
+                        post.push(e);
+                        continue;
+                    }
                     return Err(format!(
                         "constant WHERE predicate '{conj}' is not supported"
                     ));
@@ -621,22 +630,31 @@ fn bind_query(
     b.output_aliases.clear();
 
     // LIMIT n.
-    let limit = match &query.limit_clause {
-        None => None,
+    let num_lit = |e: &ast::Expr, what: &str| -> Result<usize, String> {
+        match e {
+            ast::Expr::Value(v) => match &v.value {
+                ast::Value::Number(s, _) => {
+                    s.parse::<usize>().map_err(|_| format!("bad {what} '{s}'"))
+                }
+                other => Err(format!("unsupported {what}: {other}")),
+            },
+            other => Err(format!("unsupported {what} expression: {other}")),
+        }
+    };
+    let (limit, offset) = match &query.limit_clause {
+        None => (None, None),
         Some(ast::LimitClause::LimitOffset {
             limit,
-            offset: None,
+            offset,
             limit_by,
-        }) if limit_by.is_empty() => match limit {
-            None => None,
-            Some(ast::Expr::Value(v)) => match &v.value {
-                ast::Value::Number(s, _) => {
-                    Some(s.parse::<usize>().map_err(|_| format!("bad LIMIT '{s}'"))?)
-                }
-                other => return Err(format!("unsupported LIMIT: {other}")),
-            },
-            Some(other) => return Err(format!("unsupported LIMIT expression: {other}")),
-        },
+        }) if limit_by.is_empty() => {
+            let lim = limit.as_ref().map(|e| num_lit(e, "LIMIT")).transpose()?;
+            let off = offset
+                .as_ref()
+                .map(|o| num_lit(&o.value, "OFFSET"))
+                .transpose()?;
+            (lim, off)
+        }
         Some(other) => return Err(format!("unsupported LIMIT clause: {other:?}")),
     };
 
@@ -729,6 +747,7 @@ fn bind_query(
         distinct,
         order_by,
         limit,
+        offset,
         subqueries: b.subs,
         derived: b.derived,
         set_ops: Vec::new(),
@@ -1425,6 +1444,18 @@ impl Binder<'_> {
     /// `Ok(None)` = neither.
     fn bind_round_or_upper(&mut self, f: &ast::Function) -> Result<Option<Expr>, String> {
         let fname = f.name.to_string().to_lowercase();
+        // Niladic `current_date` / `current_timestamp` / `today` folds to a
+        // Date32 literal of today (days since the Unix epoch).
+        if matches!(
+            fname.as_str(),
+            "current_date" | "today" | "current_timestamp"
+        ) {
+            let days = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| (d.as_secs() / 86_400) as i32)
+                .unwrap_or(0);
+            return Ok(Some(Expr::Literal(ScalarValue::Date32(days))));
+        }
         const KNOWN: &[&str] = &[
             "round",
             "upper",
@@ -1438,6 +1469,15 @@ impl Binder<'_> {
             "mod",
             "date_trunc",
             "datetrunc",
+            "sqrt",
+            "ln",
+            "exp",
+            "sign",
+            "trunc",
+            "power",
+            "pow",
+            "greatest",
+            "least",
         ];
         if !KNOWN.contains(&fname.as_str()) {
             return Ok(None);
@@ -1498,8 +1538,58 @@ impl Binder<'_> {
                     digits,
                 }))
             }
+            ("sqrt", [x]) => self.num_fn1(NumFn::Sqrt, x),
+            ("ln", [x]) => self.num_fn1(NumFn::Ln, x),
+            ("exp", [x]) => self.num_fn1(NumFn::Exp, x),
+            ("sign", [x]) => self.num_fn1(NumFn::Sign, x),
+            ("trunc", [x]) => self.num_fn1(NumFn::Trunc, x),
+            ("power" | "pow", [x, y]) => Ok(Some(Expr::NumFn {
+                func: NumFn::Power,
+                args: vec![self.bind_scalar(x)?, self.bind_scalar(y)?],
+            })),
+            ("greatest" | "least", xs) if !xs.is_empty() => {
+                let func = if fname == "greatest" {
+                    NumFn::Greatest
+                } else {
+                    NumFn::Least
+                };
+                let args = xs
+                    .iter()
+                    .map(|a| self.bind_scalar(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Some(Expr::NumFn { func, args }))
+            }
             _ => Err(format!("'{fname}' takes the wrong number of arguments")),
         }
+    }
+
+    /// Bind a single-argument numeric builtin.
+    fn num_fn1(&mut self, func: NumFn, x: &ast::Expr) -> Result<Option<Expr>, String> {
+        Ok(Some(Expr::NumFn {
+            func,
+            args: vec![self.bind_scalar(x)?],
+        }))
+    }
+
+    /// Bind `[NOT] LIKE` / `[NOT] ILIKE` (`ci` = case-insensitive).
+    fn bind_like(
+        &mut self,
+        expr: &ast::Expr,
+        pattern: &ast::Expr,
+        negated: bool,
+        ci: bool,
+    ) -> Result<Bound, String> {
+        let bound = materialize(self.bind(expr)?);
+        let pat = materialize(self.bind(pattern)?);
+        let Expr::Literal(ScalarValue::Utf8(p)) = pat else {
+            return Err("LIKE pattern must be a string literal".into());
+        };
+        Ok(Bound::Expr(Expr::Like {
+            expr: Box::new(bound),
+            pattern: p.to_string(),
+            negated,
+            ci,
+        }))
     }
 
     /// Register a SCALAR-aggregate query (guaranteed one row) as a view of
@@ -1613,6 +1703,16 @@ impl Binder<'_> {
     }
 
     fn add_join(&mut self, join: &ast::Join) -> Result<(), String> {
+        // CROSS JOIN (or an unconstrained comma-join): add the relation with
+        // NO join edge — the executor attaches an edgeless table as a keyless
+        // cross join (the disconnected-component path), any cross-table WHERE
+        // conjunct becoming a root post-filter.
+        if matches!(join.join_operator, ast::JoinOperator::CrossJoin(_)) {
+            // A regular relation attaches as an edgeless table; a scalar-
+            // aggregate derived attaches as a constant view (adding no table).
+            self.add_from_item(&join.relation)?;
+            return Ok(());
+        }
         // `dir`: None = INNER; Some(false) = LEFT (the joined table is the
         // nullable side); Some(true) = RIGHT (the joined table is preserved,
         // an OLD table becomes nullable). `LEFT`/`LEFT OUTER` (and the RIGHT
@@ -2499,6 +2599,7 @@ impl Binder<'_> {
             distinct: false,
             order_by: Vec::new(),
             limit: None,
+            offset: None,
             subqueries: inner.subs,
             has_grouping: false,
             windows: Vec::new(),
@@ -2749,6 +2850,7 @@ impl Binder<'_> {
             distinct: false,
             order_by: Vec::new(),
             limit: None,
+            offset: None,
             subqueries: inner.subs,
             has_grouping: false,
             windows: Vec::new(),
@@ -3373,6 +3475,7 @@ impl Binder<'_> {
                 ast::Value::SingleQuotedString(s) => Ok(Bound::Expr(Expr::Literal(
                     ScalarValue::Utf8(s.as_str().into()),
                 ))),
+                ast::Value::Boolean(b) => Ok(Bound::Expr(Expr::Literal(ScalarValue::Boolean(*b)))),
                 ast::Value::Null => Ok(Bound::Expr(Expr::Literal(ScalarValue::Null))),
                 other => Err(format!("unsupported literal: {other}")),
             },
@@ -3576,18 +3679,13 @@ impl Binder<'_> {
                 expr,
                 pattern,
                 ..
-            } => {
-                let bound = materialize(self.bind(expr)?);
-                let pat = materialize(self.bind(pattern)?);
-                let Expr::Literal(ScalarValue::Utf8(p)) = pat else {
-                    return Err("LIKE pattern must be a string literal".into());
-                };
-                Ok(Bound::Expr(Expr::Like {
-                    expr: Box::new(bound),
-                    pattern: p.to_string(),
-                    negated: *negated,
-                }))
-            }
+            } => self.bind_like(expr, pattern, *negated, false),
+            ast::Expr::ILike {
+                negated,
+                expr,
+                pattern,
+                ..
+            } => self.bind_like(expr, pattern, *negated, true),
             ast::Expr::BinaryOp { left, op, right } => {
                 // Date ± interval folds at bind time (literal dates only —
                 // TPC-H's `date '…' - interval '90' day`).
@@ -3618,6 +3716,21 @@ impl Binder<'_> {
                         base,
                         Expr::Literal(ScalarValue::Int64(days as i64)),
                     )));
+                }
+                // `%` → mod(), `||` → string concat (owned string — lands in a
+                // projection / group-key slot like the concat() function).
+                if matches!(op, ast::BinaryOperator::Modulo) {
+                    let l = materialize(self.bind(left)?);
+                    let r = materialize(self.bind(right)?);
+                    return Ok(Bound::Expr(Expr::NumFn {
+                        func: NumFn::Mod,
+                        args: vec![l, r],
+                    }));
+                }
+                if matches!(op, ast::BinaryOperator::StringConcat) {
+                    let l = materialize(self.bind(left)?);
+                    let r = materialize(self.bind(right)?);
+                    return Ok(Bound::Expr(Expr::Concat(vec![l, r])));
                 }
                 let op = bind_op(op)?;
                 let l = self.bind(left)?;
@@ -3658,6 +3771,34 @@ impl Binder<'_> {
                 expr: Box::new(materialize(self.bind(inner)?)),
                 negated: true,
             })),
+            // NULL-safe comparison. `a IS NOT DISTINCT FROM b` ⇔ both NULL, or
+            // both non-NULL and equal; `IS DISTINCT FROM` is its negation.
+            // Never NULL.
+            ast::Expr::IsDistinctFrom(a, b) | ast::Expr::IsNotDistinctFrom(a, b) => {
+                let distinct = matches!(e, ast::Expr::IsDistinctFrom(..));
+                let la = materialize(self.bind(a)?);
+                let rb = materialize(self.bind(b)?);
+                let is_null = |x: &Expr| Expr::IsNull {
+                    expr: Box::new(x.clone()),
+                    negated: false,
+                };
+                let not_null = |x: &Expr| Expr::IsNull {
+                    expr: Box::new(x.clone()),
+                    negated: true,
+                };
+                let both_null = binary(BinaryOp::And, is_null(&la), is_null(&rb));
+                let both_set_eq = binary(
+                    BinaryOp::And,
+                    binary(BinaryOp::And, not_null(&la), not_null(&rb)),
+                    binary(BinaryOp::Eq, la.clone(), rb.clone()),
+                );
+                let not_distinct = binary(BinaryOp::Or, both_null, both_set_eq);
+                Ok(Bound::Expr(if distinct {
+                    Expr::Not(Box::new(not_distinct))
+                } else {
+                    not_distinct
+                }))
+            }
             ast::Expr::Substring {
                 expr,
                 substring_from,
@@ -3813,10 +3954,11 @@ fn infer_slot_type(q: &BoundQuery, e: &Expr) -> LogicalType {
         Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) | Expr::StrFn { .. } => {
             LogicalType::Utf8
         }
-        Expr::NumFn { func, .. } => match func {
-            crate::expr::NumFn::Floor | crate::expr::NumFn::Ceil => LogicalType::Float64,
-            crate::expr::NumFn::Mod | crate::expr::NumFn::Length => LogicalType::Int64,
-        },
+        Expr::NumFn {
+            func: crate::expr::NumFn::Mod | crate::expr::NumFn::Length,
+            ..
+        } => LogicalType::Int64,
+        Expr::NumFn { .. } => LogicalType::Float64,
         Expr::Case { whens, .. } => whens
             .first()
             .map(|(_, v)| infer_slot_type(q, v))
@@ -3868,10 +4010,11 @@ fn infer_row_type(q: &BoundQuery, key_tys: &[LogicalType], e: &Expr) -> LogicalT
         Expr::Substr { .. } | Expr::Concat(_) | Expr::Upper(_) | Expr::StrFn { .. } => {
             LogicalType::Utf8
         }
-        Expr::NumFn { func, .. } => match func {
-            crate::expr::NumFn::Floor | crate::expr::NumFn::Ceil => LogicalType::Float64,
-            crate::expr::NumFn::Mod | crate::expr::NumFn::Length => LogicalType::Int64,
-        },
+        Expr::NumFn {
+            func: crate::expr::NumFn::Mod | crate::expr::NumFn::Length,
+            ..
+        } => LogicalType::Int64,
+        Expr::NumFn { .. } => LogicalType::Float64,
         Expr::Case { whens, .. } => whens
             .first()
             .map(|(_, v)| infer_row_type(q, key_tys, v))

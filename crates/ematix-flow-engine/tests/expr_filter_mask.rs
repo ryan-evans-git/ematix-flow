@@ -172,6 +172,7 @@ fn boolean_algebra_and_special_leaves_match_interpreter() {
                 expr: Box::new(col(3)),
                 pattern: "%err%".into(),
                 negated,
+                ci: false,
             },
         );
     }

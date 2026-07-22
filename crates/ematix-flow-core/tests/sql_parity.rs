@@ -856,3 +856,49 @@ fn aggregate_filter_qualify_lag_default() {
          from lineitem where l_orderkey < 80",
     );
 }
+
+// ---------------------------------------------------------------------------
+// High-value operators & scalars bundle (from the breadth sweep): LIMIT OFFSET,
+// the || and % operators, boolean literals, CROSS JOIN, IS [NOT] DISTINCT FROM,
+// ILIKE, scalar math functions, greatest/least, and current_date.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn operators_and_scalars_bundle() {
+    if !have_data() {
+        eprintln!("SKIP operators_and_scalars_bundle: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // LIMIT ... OFFSET.
+    p.check("select l_orderkey, l_linenumber from lineitem order by l_orderkey, l_linenumber limit 5 offset 3");
+    p.check("select l_orderkey from lineitem order by l_orderkey desc, l_linenumber offset 10");
+    // || string concat, % modulo.
+    p.check(
+        "select trim(l_shipmode) || '/' || trim(l_returnflag) s from lineitem where l_orderkey < 4",
+    );
+    p.check("select count(*) c from lineitem where l_orderkey % 3 = 0 and l_orderkey < 500");
+    // Boolean literals (parenthesized IS-comparison to dodge sqlparser's
+    // `IS DISTINCT FROM x AND y` precedence quirk).
+    p.check(
+        "select count(*) c from lineitem where (l_discount > 0.05) = true and l_orderkey < 200",
+    );
+    p.check("select count(*) c from lineitem where true and l_orderkey < 50");
+    // CROSS JOIN (cartesian product with a 1-row derived).
+    p.check("select count(*) c from lineitem l cross join (select max(l_quantity) mq from lineitem) t where l.l_orderkey < 10 and l.l_quantity < t.mq");
+    // IS [NOT] DISTINCT FROM (NULL-safe compare), NULLs injected via nullif.
+    p.check("select count(*) c from lineitem where (nullif(l_linenumber, 1) is distinct from 2) and l_orderkey < 200");
+    p.check("select count(*) c from lineitem where (nullif(l_linenumber, 1) is not distinct from 3) and l_orderkey < 200");
+    // ILIKE.
+    p.check("select count(*) c from lineitem where l_shipmode ilike '%ai%'");
+    // Scalar math functions.
+    p.check(
+        "select sqrt(l_quantity) a, ln(l_quantity) b, exp(l_discount) c, power(l_quantity, 2) d, \
+                sign(l_discount - 0.05) e, trunc(l_extendedprice) f, abs(l_discount - 0.05) g \
+         from lineitem where l_orderkey < 4",
+    );
+    // greatest / least.
+    p.check("select greatest(l_quantity, l_extendedprice, 100) a, least(l_discount, l_tax, 0.02) b from lineitem where l_orderkey < 4");
+    // current_date (all shipdates precede today, so the count is data-stable).
+    p.check("select count(*) c from lineitem where l_shipdate < current_date");
+}

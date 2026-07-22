@@ -296,6 +296,8 @@ pub struct BoundQuery {
     pub distinct: bool,
     pub order_by: Vec<OrderByKey>,
     pub limit: Option<usize>,
+    /// `OFFSET n` — skip the first `n` rows (after ORDER BY, before LIMIT).
+    pub offset: Option<usize>,
     /// Uncorrelated subqueries referenced by [`Expr::ScalarSub`] /
     /// [`Expr::InSub`] — executed first, then substituted as constants /
     /// membership sets.

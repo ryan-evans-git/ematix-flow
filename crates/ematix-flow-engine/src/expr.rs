@@ -124,6 +124,8 @@ pub enum Expr {
         expr: Box<Expr>,
         pattern: String,
         negated: bool,
+        /// Case-insensitive (`ILIKE`) — matches ASCII case-insensitively.
+        ci: bool,
     },
     /// An unresolved scalar subquery — index into
     /// [`BoundQuery::subqueries`](crate::logical::BoundQuery). The executor
@@ -364,8 +366,11 @@ impl Expr {
                 expr,
                 pattern,
                 negated,
+                ci,
             } => match expr.eval(chunk, row) {
-                Val::Str(s) => Val::Bool(like_match(s.as_bytes(), pattern.as_bytes()) != *negated),
+                Val::Str(s) => {
+                    Val::Bool(like_match(s.as_bytes(), pattern.as_bytes(), *ci) != *negated)
+                }
                 Val::Null => Val::Null,
                 other => panic!("LIKE needs a string operand, got {other:?}"),
             },
@@ -618,11 +623,18 @@ fn compare(op: BinaryOp, l: Val<'_>, r: Val<'_>) -> bool {
 /// SQL LIKE match over bytes: `%` matches any run (including empty), `_`
 /// matches exactly one byte. Classic greedy matcher with single-`%`
 /// backtracking — linear for the TPC-H patterns (`PROMO%`, `%special%`).
-fn like_match(s: &[u8], p: &[u8]) -> bool {
+fn like_match(s: &[u8], p: &[u8], ci: bool) -> bool {
+    let eq = |a: u8, b: u8| {
+        if ci {
+            a.eq_ignore_ascii_case(&b)
+        } else {
+            a == b
+        }
+    };
     let (mut si, mut pi) = (0usize, 0usize);
     let (mut star_p, mut star_s) = (usize::MAX, 0usize);
     while si < s.len() {
-        if pi < p.len() && (p[pi] == b'_' || p[pi] == s[si]) {
+        if pi < p.len() && (p[pi] == b'_' || eq(p[pi], s[si])) {
             si += 1;
             pi += 1;
         } else if pi < p.len() && p[pi] == b'%' {
@@ -652,6 +664,18 @@ pub enum NumFn {
     Mod,
     /// `length(s)` — character count (bytes for ASCII).
     Length,
+    /// `sqrt(x)`, `ln(x)`, `exp(x)`, `sign(x)`, `trunc(x)` — single-arg f64.
+    Sqrt,
+    Ln,
+    Exp,
+    Sign,
+    Trunc,
+    /// `power(x, y)` / `pow(x, y)` — `x` raised to `y` (f64).
+    Power,
+    /// `greatest(…)` / `least(…)` — the max / min of the (numeric) arguments,
+    /// skipping NULL (all-NULL → NULL, matching DuckDB).
+    Greatest,
+    Least,
 }
 
 /// String-returning scalar builtins.
@@ -823,6 +847,44 @@ fn eval_num_fn<'a>(func: NumFn, args: &'a [Expr], chunk: &'a DataChunk, row: usi
             Val::Null => Val::Null,
             other => panic!("length needs a string, got {other:?}"),
         },
+        NumFn::Sqrt | NumFn::Ln | NumFn::Exp | NumFn::Sign | NumFn::Trunc => {
+            match args[0].eval(chunk, row) {
+                Val::Null => Val::Null,
+                v => {
+                    let x = v.as_f64();
+                    Val::Float(match func {
+                        NumFn::Sqrt => x.sqrt(),
+                        NumFn::Ln => x.ln(),
+                        NumFn::Exp => x.exp(),
+                        NumFn::Sign => x.signum() * f64::from(x != 0.0),
+                        NumFn::Trunc => x.trunc(),
+                        _ => unreachable!(),
+                    })
+                }
+            }
+        }
+        NumFn::Power => match (args[0].eval(chunk, row), args[1].eval(chunk, row)) {
+            (Val::Null, _) | (_, Val::Null) => Val::Null,
+            (a, b) => Val::Float(a.as_f64().powf(b.as_f64())),
+        },
+        NumFn::Greatest | NumFn::Least => {
+            let want_max = matches!(func, NumFn::Greatest);
+            let mut acc: Option<f64> = None;
+            for a in args {
+                if let v @ (Val::Int(_) | Val::Float(_) | Val::Bool(_)) = a.eval(chunk, row) {
+                    let x = v.as_f64();
+                    acc = Some(match acc {
+                        None => x,
+                        Some(cur) if want_max => cur.max(x),
+                        Some(cur) => cur.min(x),
+                    });
+                }
+            }
+            match acc {
+                Some(x) => Val::Float(x),
+                None => Val::Null,
+            }
+        }
     }
 }
 
@@ -1014,6 +1076,7 @@ fn try_mask(chunk: &DataChunk, e: &Expr, n: usize) -> Option<Vec<bool>> {
             expr,
             pattern,
             negated,
+            ci,
         } => {
             let Expr::Column(c) = expr.as_ref() else {
                 return None;
@@ -1023,9 +1086,9 @@ fn try_mask(chunk: &DataChunk, e: &Expr, n: usize) -> Option<Vec<bool>> {
                 return None;
             }
             let view = v.as_utf8();
-            let (pat, neg) = (pattern.as_bytes(), *negated);
+            let (pat, neg, ci) = (pattern.as_bytes(), *negated, *ci);
             Some(mask_valid(v.validity.as_deref(), n, |i| {
-                like_match(view.get(i).as_bytes(), pat) != neg
+                like_match(view.get(i).as_bytes(), pat, ci) != neg
             }))
         }
         _ => None,
@@ -1399,13 +1462,13 @@ mod tests {
 
     #[test]
     fn like_patterns() {
-        assert!(like_match(b"PROMO BURNISHED", b"PROMO%"));
-        assert!(!like_match(b"STANDARD BRUSHED", b"PROMO%"));
-        assert!(like_match(b"abcXdef", b"abc_def"));
-        assert!(like_match(b"special packages", b"%special%"));
-        assert!(like_match(b"", b"%"));
-        assert!(!like_match(b"ab", b"a_c"));
-        assert!(like_match(b"aXbYc", b"a%b%c"));
+        assert!(like_match(b"PROMO BURNISHED", b"PROMO%", false));
+        assert!(!like_match(b"STANDARD BRUSHED", b"PROMO%", false));
+        assert!(like_match(b"abcXdef", b"abc_def", false));
+        assert!(like_match(b"special packages", b"%special%", false));
+        assert!(like_match(b"", b"%", false));
+        assert!(!like_match(b"ab", b"a_c", false));
+        assert!(like_match(b"aXbYc", b"a%b%c", false));
     }
 
     #[test]

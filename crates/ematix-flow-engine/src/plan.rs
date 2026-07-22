@@ -147,6 +147,7 @@ fn execute_set(q: &BoundQuery, memo: &DerivedMemo, columnar: bool) -> Result<Que
     let set_ops = std::mem::take(&mut base.set_ops);
     let order_by = std::mem::take(&mut base.order_by);
     let limit = base.limit.take();
+    let offset = base.offset.take();
 
     let row_cmp = |a: &Vec<ScalarValue>, b: &Vec<ScalarValue>| {
         a.iter()
@@ -213,6 +214,9 @@ fn execute_set(q: &BoundQuery, memo: &DerivedMemo, columnar: bool) -> Result<Que
         };
     }
     order_rows(&mut r.rows, &order_by);
+    if let Some(o) = offset {
+        r.rows.drain(..o.min(r.rows.len()));
+    }
     if let Some(l) = limit {
         r.rows.truncate(l);
     }
@@ -1814,6 +1818,10 @@ impl Executor<'_> {
             rows.dedup();
         }
         order_rows(&mut rows, &q.order_by);
+        // OFFSET drops the leading rows before LIMIT truncates.
+        if let Some(o) = q.offset {
+            rows.drain(..o.min(rows.len()));
+        }
         if let Some(l) = q.limit {
             rows.truncate(l);
         }
@@ -3125,6 +3133,7 @@ impl Executor<'_> {
             && q.qualify.is_none()
             && q.order_by.is_empty()
             && q.limit.is_none()
+            && q.offset.is_none()
             && !q.distinct
             && q.hidden_outputs == 0
             && q.output.iter().all(|o| match &o.expr {
