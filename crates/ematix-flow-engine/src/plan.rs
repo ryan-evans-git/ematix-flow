@@ -2324,6 +2324,7 @@ impl Executor<'_> {
                 })
                 .unwrap_or(0),
             TableSource::Derived(_) | TableSource::WorkingSet => 0,
+            TableSource::Values(rows) => rows.len() as u64,
         }
     }
 
@@ -2390,6 +2391,17 @@ impl Executor<'_> {
                     .last()
                     .cloned()
                     .ok_or("WorkingSet scanned outside a recursive CTE")?;
+                RootSrc::One(result_to_chunks(&r, ti)?)
+            }
+            TableSource::Values(rows) => {
+                // Inline literal rows (FROM-less dual / VALUES) — a tiny
+                // already-materialized result; row-convert like a derived.
+                let width = rows.first().map_or(0, |r| r.len());
+                let r = QueryResult {
+                    columns: (0..width).map(|i| format!("col{i}")).collect(),
+                    rows: rows.as_ref().clone(),
+                    col_chunks: None,
+                };
                 RootSrc::One(result_to_chunks(&r, ti)?)
             }
             TableSource::Parquet(path) => {

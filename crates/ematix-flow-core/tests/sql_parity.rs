@@ -1233,3 +1233,43 @@ fn string_longtail_bundle() {
          where l_orderkey < 2000 group by left(l_shipmode, 2)",
     );
 }
+
+// ---------------------------------------------------------------------------
+// VALUES + FROM-less SELECT — the last structural gaps. A FROM-less SELECT
+// binds against a synthetic one-row dual (TableSource::Values); a VALUES
+// body rewrites to a UNION ALL chain of FROM-less SELECTs (cols col0…colN,
+// renamed by a derived alias).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn values_and_fromless_select() {
+    if !have_data() {
+        eprintln!("SKIP values_and_fromless_select: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // FROM-less scalar expressions.
+    p.check("select 1 + 2 as x");
+    p.check("select 'a' || 'b' s, 3 * 2.5 v, sqrt(9) r");
+    p.check("select cast('1994-05-01' as date) d");
+    // FROM-less with a scalar subquery over a real table.
+    p.check("select (select max(l_orderkey) from lineitem where l_orderkey < 100) m, 7 k");
+    // Derived VALUES with alias renames, projected and filtered.
+    p.check("select * from (values (1, 'a'), (2, 'b'), (3, 'c')) v(n, s)");
+    p.check("select n * 10 x from (values (1, 'a'), (2, 'b')) v(n, s) where s <> 'a'");
+    // VALUES joined against a real table (an inline dimension).
+    p.check(
+        "select v.label, count(*) c from lineitem \
+         join (values ('A', 'ret'), ('N', 'ok'), ('R', 'ret2')) v(flag, label) \
+         on l_returnflag = v.flag where l_orderkey < 2000 group by v.label",
+    );
+    // Mixed int/float column unifies; NULL in a row.
+    p.check("select * from (values (1, 1.5), (2, 2.0)) v(a, b)");
+    p.check("select * from (values (1, 'x'), (2, NULL)) v(a, b)");
+    // Aggregate over a VALUES table.
+    p.check("select sum(n) s, count(*) c from (values (1), (2), (3)) v(n)");
+    // Single-row VALUES (no UNION chain).
+    p.check("select * from (values (42, 'z')) v(n, s)");
+    // Ragged rows reject loudly.
+    p.check_rejected("select * from (values (1, 2), (3)) v(a, b)");
+}

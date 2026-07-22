@@ -1140,6 +1140,23 @@ lands a case here.
   `string_longtail_bundle` (3VL NOT BETWEEN, negative/zero/overlong counts,
   fill-cycling + truncation, char-set trims, all three strpos spellings,
   group-key composition). Parity 26/26, sf1 103/103 0 MISMATCH.
+- **VALUES + FROM-less SELECT — SHIPPED.** The last structural gaps. New
+  `TableSource::Values(Arc<Vec<Vec<ScalarValue>>>)` — an inline literal row
+  set the executor scans via the existing `result_to_chunks` path (a tiny
+  pre-materialized derived, in effect). A FROM-less `SELECT <exprs>` binds
+  against a synthetic one-row dual (`__dual`, whose `__` prefix already
+  means: hidden from `SELECT *`, deprioritized in unqualified resolution) —
+  so scalar expressions, `sqrt(…)`, casts, and scalar subqueries all
+  evaluate once with zero new executor machinery. A `VALUES (r₁),(r₂)…`
+  body (top-level or derived) rewrites to a UNION ALL chain of FROM-less
+  SELECTs with columns `col0…colN` (DuckDB's convention; derived aliases
+  `v(n, s)` rename via the existing alias-columns path) — the set-op
+  machinery handles type unification (int/float mix, NULLs) for free.
+  Ragged rows reject loudly. Gate: `values_and_fromless_select` (scalar
+  exprs, scalar-sub composition, alias renames + filter/project, VALUES
+  joined to lineitem as an inline dimension, mixed types, NULL, aggregate
+  over VALUES, single-row, ragged-reject). Parity 27/27, sf1 103/103
+  0 MISMATCH.
 
 ## Next (P4 tail → P5/P6)
 

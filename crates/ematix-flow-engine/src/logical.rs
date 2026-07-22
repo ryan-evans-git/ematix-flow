@@ -57,6 +57,10 @@ pub enum TableSource {
     /// working set (see [`BoundQuery::recursive`]). `ScanColumn::leaf` is the
     /// CTE's output-column position.
     WorkingSet,
+    /// An inline literal row set — the FROM-less `SELECT` dual (one dummy
+    /// row) and each `VALUES` side bind against one. `ScanColumn::leaf`
+    /// indexes into a row.
+    Values(std::sync::Arc<Vec<Vec<crate::expr::ScalarValue>>>),
 }
 
 /// One table in the query: its scan plus its own filters (conjuncts that

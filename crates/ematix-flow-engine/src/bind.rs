@@ -174,6 +174,65 @@ fn bind_query(
     if matches!(query.body.as_ref(), ast::SetExpr::SetOperation { .. }) {
         return bind_set_query(query, catalog, ctes);
     }
+    // `VALUES (r₁…), (r₂…)` — a literal row set (top-level or as a derived
+    // table) — rewrites to a UNION ALL chain of FROM-less SELECTs, columns
+    // named col0…colN (DuckDB's convention; a derived alias renames them).
+    if let ast::SetExpr::Values(vals) = query.body.as_ref() {
+        if vals.rows.is_empty() {
+            return Err("VALUES needs at least one row".into());
+        }
+        let width = vals.rows[0].len();
+        if vals.rows.iter().any(|r| r.len() != width) {
+            return Err("VALUES rows have differing widths".into());
+        }
+        let row_select = |row: &[ast::Expr]| {
+            ast::SetExpr::Select(Box::new(ast::Select {
+                select_token: ast::helpers::attached_token::AttachedToken::empty(),
+                optimizer_hint: None,
+                distinct: None,
+                select_modifiers: None,
+                top: None,
+                top_before_distinct: false,
+                projection: row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| ast::SelectItem::ExprWithAlias {
+                        expr: e.clone(),
+                        alias: ast::Ident::new(format!("col{i}")),
+                    })
+                    .collect(),
+                exclude: None,
+                into: None,
+                from: Vec::new(),
+                lateral_views: Vec::new(),
+                prewhere: None,
+                selection: None,
+                connect_by: Vec::new(),
+                group_by: ast::GroupByExpr::Expressions(Vec::new(), Vec::new()),
+                cluster_by: Vec::new(),
+                distribute_by: Vec::new(),
+                sort_by: Vec::new(),
+                having: None,
+                named_window: Vec::new(),
+                qualify: None,
+                window_before_qualify: false,
+                value_table_mode: None,
+                flavor: ast::SelectFlavor::Standard,
+            }))
+        };
+        let mut body = row_select(&vals.rows[0]);
+        for row in &vals.rows[1..] {
+            body = ast::SetExpr::SetOperation {
+                op: ast::SetOperator::Union,
+                set_quantifier: ast::SetQuantifier::All,
+                left: Box::new(body),
+                right: Box::new(row_select(row)),
+            };
+        }
+        let mut q2 = query.clone();
+        *q2.body = body;
+        return bind_query(&q2, catalog, set_semantics, ctes);
+    }
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Err("only plain SELECT is supported here".into());
     };
@@ -188,9 +247,6 @@ fn bind_query(
 
     // FROM: comma-separated plain tables (the TPC-H canonical form), with
     // optional aliases for self-joins (`nation n1, nation n2`).
-    if select.from.is_empty() {
-        return Err("a FROM clause is required".into());
-    }
     let mut b = Binder {
         catalog,
         ctes,
@@ -214,6 +270,25 @@ fn bind_query(
         for join in &twj.joins {
             b.add_join(join)?;
         }
+    }
+    // A FROM-less `SELECT <exprs>` evaluates its (necessarily table-free)
+    // expressions once: bind against a synthetic one-row dual. The `__`
+    // prefix keeps it out of `SELECT *` and unqualified-name resolution.
+    if select.from.is_empty() {
+        b.push_table(
+            "__dual".into(),
+            TableDef {
+                path: PathBuf::new(),
+                columns: vec![crate::catalog::ColumnDef {
+                    name: "__dual".into(),
+                    leaf: 0,
+                    ty: LogicalType::Int64,
+                    dec_scale: None,
+                    nullable: false,
+                }],
+            },
+            TableSource::Values(std::sync::Arc::new(vec![vec![ScalarValue::Int64(0)]])),
+        )?;
     }
 
     // GROUP BY first (slot space) — SELECT items match against these. Keys
