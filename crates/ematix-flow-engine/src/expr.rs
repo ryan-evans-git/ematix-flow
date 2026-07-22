@@ -764,6 +764,9 @@ pub enum DateField {
     Doy,
     /// ISO-8601 week number, 1..=53 (DuckDB `week`).
     Week,
+    /// Seconds since the Unix epoch (DuckDB `epoch`) — a date at UTC
+    /// midnight, so `days * 86400`.
+    Epoch,
 }
 
 /// `date_trunc` granularity.
@@ -862,6 +865,7 @@ fn extract_field(field: DateField, days: i32) -> i64 {
                 week
             }
         }
+        DateField::Epoch => days as i64 * 86_400,
     };
     v
 }

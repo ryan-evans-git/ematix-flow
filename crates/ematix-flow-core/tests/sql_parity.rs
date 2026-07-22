@@ -969,3 +969,53 @@ fn cast_as_varchar() {
          from lineitem where l_orderkey < 50",
     );
 }
+
+// ---------------------------------------------------------------------------
+// date_part / datediff / extract(epoch) — the function spellings of the date
+// machinery. `date_part('u', d)` is EXTRACT(u FROM d); `datediff('u', a, b)`
+// lowers to Extract + arithmetic (b - a in the given unit); epoch = days *
+// 86400. Previously all three were honest bind-rejections (breadth sweep).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn date_part_and_datediff() {
+    if !have_data() {
+        eprintln!("SKIP date_part_and_datediff: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // date_part is EXTRACT by another name — every supported field.
+    p.check(
+        "select date_part('year', l_shipdate) y, date_part('month', l_shipdate) m, \
+         date_part('quarter', l_shipdate) q, date_part('day', l_shipdate) d \
+         from lineitem where l_orderkey < 100",
+    );
+    p.check(
+        "select date_part('dow', l_shipdate) a, date_part('isodow', l_shipdate) b, \
+         date_part('doy', l_shipdate) c, date_part('week', l_shipdate) w \
+         from lineitem where l_orderkey < 100",
+    );
+    // datediff over day/year/month/quarter (receipt >= ship >= commit-ish).
+    p.check(
+        "select datediff('day', l_shipdate, l_receiptdate) d \
+         from lineitem where l_orderkey < 200",
+    );
+    p.check(
+        "select datediff('year', l_commitdate, l_receiptdate) y, \
+         datediff('month', l_commitdate, l_receiptdate) m, \
+         datediff('quarter', l_commitdate, l_receiptdate) q \
+         from lineitem where l_orderkey < 200",
+    );
+    // date_diff spelling + use in an aggregate / predicate.
+    p.check(
+        "select avg(date_diff('day', l_shipdate, l_receiptdate)) avg_days \
+         from lineitem where l_orderkey < 5000",
+    );
+    p.check(
+        "select count(*) c from lineitem \
+         where datediff('day', l_shipdate, l_receiptdate) > 15 and l_orderkey < 5000",
+    );
+    // extract(epoch) and date_part('epoch', …).
+    p.check("select distinct extract(epoch from l_shipdate) e from lineitem where l_orderkey < 50");
+    p.check("select distinct date_part('epoch', l_shipdate) e from lineitem where l_orderkey < 50");
+}

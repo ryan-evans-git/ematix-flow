@@ -1470,6 +1470,10 @@ impl Binder<'_> {
             "mod",
             "date_trunc",
             "datetrunc",
+            "date_part",
+            "datepart",
+            "datediff",
+            "date_diff",
             "sqrt",
             "ln",
             "exp",
@@ -1524,6 +1528,27 @@ impl Binder<'_> {
                     unit,
                     arg: Box::new(self.bind_scalar(d)?),
                 }))
+            }
+            // date_part('unit', d) is EXTRACT(unit FROM d) by another name.
+            ("date_part" | "datepart", [u, d]) => {
+                let field = match self.clone_free_literal(u)? {
+                    ScalarValue::Utf8(s) => date_field_from_str(&s)?,
+                    other => return Err(format!("date_part field must be a string: {other:?}")),
+                };
+                Ok(Some(Expr::Extract {
+                    field,
+                    arg: Box::new(self.bind_scalar(d)?),
+                }))
+            }
+            // datediff('unit', start, end) lowers to Extract + arithmetic.
+            ("datediff" | "date_diff", [u, a, b]) => {
+                let unit = match self.clone_free_literal(u)? {
+                    ScalarValue::Utf8(s) => s,
+                    other => return Err(format!("datediff unit must be a string: {other:?}")),
+                };
+                let start = self.bind_scalar(a)?;
+                let end = self.bind_scalar(b)?;
+                Ok(Some(datediff_expr(&unit, start, end)?))
             }
             ("round", [x]) => Ok(Some(Expr::Round {
                 expr: Box::new(self.bind_scalar(x)?),
@@ -5692,8 +5717,69 @@ fn bind_date_field(field: &ast::DateTimeField) -> Result<DateField, String> {
         F::Dow => DateField::Dow,
         F::Isodow => DateField::IsoDow,
         F::Doy => DateField::Doy,
-        F::Week(_) => DateField::Week,
+        F::Week(_) | F::IsoWeek => DateField::Week,
+        F::Epoch => DateField::Epoch,
         other => return Err(format!("unsupported EXTRACT field: {other}")),
+    })
+}
+
+/// Map a `date_part('<part>', …)` string unit to a [`DateField`] — the
+/// function spelling of `EXTRACT`, DuckDB part names.
+fn date_field_from_str(part: &str) -> Result<DateField, String> {
+    Ok(match part.to_ascii_lowercase().as_str() {
+        "year" | "years" | "yr" | "y" => DateField::Year,
+        "month" | "months" | "mon" => DateField::Month,
+        "day" | "days" | "d" => DateField::Day,
+        "quarter" | "quarters" | "qtr" => DateField::Quarter,
+        "dow" | "dayofweek" | "weekday" => DateField::Dow,
+        "isodow" => DateField::IsoDow,
+        "doy" | "dayofyear" => DateField::Doy,
+        "week" | "weeks" | "isoweek" => DateField::Week,
+        "epoch" => DateField::Epoch,
+        other => return Err(format!("unsupported date_part field: '{other}'")),
+    })
+}
+
+/// Lower `datediff('<unit>', start, end)` to the engine's existing date IR:
+/// the difference `end - start` measured in `unit`, as an integer. `day` is
+/// a raw day subtraction (dates flow as day-numbers); year/month/quarter
+/// count calendar-boundary crossings via `EXTRACT` (matching DuckDB).
+fn datediff_expr(unit: &str, start: Expr, end: Expr) -> Result<Expr, String> {
+    use crate::expr::BinaryOp::{Add, Mul, Sub};
+    let ext = |field: DateField, e: &Expr| Expr::Extract {
+        field,
+        arg: Box::new(e.clone()),
+    };
+    let bin = |op, l: Expr, r: Expr| Expr::Binary {
+        op,
+        lhs: Box::new(l),
+        rhs: Box::new(r),
+    };
+    let int = |n: i64| Expr::Literal(ScalarValue::Int64(n));
+    // `year*scale + field` — the ordinal position used by month/quarter.
+    let ordinal = |field, scale, e: &Expr| {
+        bin(
+            Add,
+            bin(Mul, ext(DateField::Year, e), int(scale)),
+            ext(field, e),
+        )
+    };
+    Ok(match unit.to_ascii_lowercase().as_str() {
+        "day" | "days" | "d" => bin(Sub, end, start),
+        "year" | "years" | "yr" | "y" => {
+            bin(Sub, ext(DateField::Year, &end), ext(DateField::Year, &start))
+        }
+        "month" | "months" | "mon" => bin(
+            Sub,
+            ordinal(DateField::Month, 12, &end),
+            ordinal(DateField::Month, 12, &start),
+        ),
+        "quarter" | "quarters" | "qtr" => bin(
+            Sub,
+            ordinal(DateField::Quarter, 4, &end),
+            ordinal(DateField::Quarter, 4, &start),
+        ),
+        other => return Err(format!("unsupported datediff unit: '{other}'")),
     })
 }
 

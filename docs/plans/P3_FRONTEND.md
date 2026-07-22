@@ -1036,6 +1036,22 @@ lands a case here.
   parity/perf query. Gate: `cast_as_varchar` (int/char/text/string identity,
   date→ISO, arithmetic-under-cast, group-key, `|| 'x'` concat). Parity 21/21,
   sf1 103/103 0 MISMATCH.
+- **date_part / datediff / extract(epoch) — SHIPPED.** The function spellings
+  of the date machinery (honest bind-rejections until now). `date_part('u',
+  d)` binds to the same `Expr::Extract` as `EXTRACT(u FROM d)` (new
+  `date_field_from_str` maps DuckDB part names). `datediff('u', a, b)` lowers
+  entirely to existing IR — `end - start` in unit `u`, as an integer: `day` a
+  raw day subtraction (dates flow as day-numbers, `Date32 - Date32` types
+  Int64 via `is_integer_family`); `year`/`month`/`quarter` count calendar-
+  boundary crossings via `Extract` arithmetic (`year*12 + month`, etc.),
+  matching DuckDB. No new `Expr` variant, no new eval path — built on operands
+  already bound, so it composes in the SELECT list, inside an aggregate
+  (`avg(date_diff(...))`), and in a WHERE predicate for free (`bind_scalar` →
+  general `bind`). `EXTRACT(epoch)` / `date_part('epoch',…)` round out the
+  cluster via new `DateField::Epoch` (`days * 86400`). Unsupported units/
+  fields reject loudly. Gate: `date_part_and_datediff` (all fields,
+  day/year/month/quarter diffs, epoch, aggregate + predicate contexts).
+  Parity 22/22, sf1 103/103 0 MISMATCH.
 
 ## Next (P4 tail → P5/P6)
 
