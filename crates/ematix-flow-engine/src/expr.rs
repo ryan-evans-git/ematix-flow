@@ -85,8 +85,9 @@ pub enum Expr {
     /// because the inner AND/OR/compare are all three-valued.
     Not(Box<Expr>),
     /// `CAST(<expr> AS INT/INTEGER/BIGINT/SMALLINT)` on a fractional value —
-    /// rounds to the nearest integer (DuckDB `CAST` semantics: `10714.82` →
-    /// `10715`). An already-integer operand is unchanged.
+    /// rounds to the nearest integer, ties to EVEN (DuckDB `CAST` semantics:
+    /// `10714.82` → `10715`, `2.5` → `2`, `3.5` → `4`). An already-integer
+    /// operand is unchanged.
     CastInt(Box<Expr>),
     /// `CAST(<expr> AS VARCHAR/CHAR/TEXT/STRING)` — renders the operand to
     /// text: integers/floats as their decimal form, a string operand
@@ -355,7 +356,7 @@ impl Expr {
             },
             Expr::CastInt(e) => match e.eval(chunk, row) {
                 Val::Int(i) => Val::Int(i),
-                Val::Float(f) => Val::Int(f.round() as i64),
+                Val::Float(f) => Val::Int(f.round_ties_even() as i64),
                 Val::Null => Val::Null,
                 other => panic!("CAST AS INT needs a numeric operand, got {other:?}"),
             },

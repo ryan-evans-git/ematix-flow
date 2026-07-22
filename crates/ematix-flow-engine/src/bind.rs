@@ -3459,8 +3459,8 @@ impl Binder<'_> {
             }
             _ => return Err("string_agg takes (value[, delimiter])".into()),
         };
-        let arg = self.bind_scalar(val_e)?;
-        let arg = self.wrap_agg_filter(f, arg)?;
+        let bare = self.bind_scalar(val_e)?;
+        let arg = self.wrap_agg_filter(f, bare.clone())?;
         // In-aggregate ORDER BY (deterministic concatenation order).
         let mut order = Vec::new();
         for c in &args.clauses {
@@ -3470,10 +3470,24 @@ impl Binder<'_> {
                 }
             }
         }
+        // DISTINCT keeps each value once. With an ORDER BY on anything but
+        // the aggregated value itself, which instance's sort position wins is
+        // ambiguous — reject (Postgres does the same) rather than pick one.
+        let distinct = args.duplicate_treatment == Some(ast::DuplicateTreatment::Distinct);
+        if distinct && order.iter().any(|(e, _)| *e != bare) {
+            return Err(
+                "string_agg DISTINCT requires the ORDER BY expression to be the aggregated value"
+                    .into(),
+            );
+        }
         Ok(AggExpr {
             func: AggFunc::StringAgg,
             arg,
-            str_agg: Some(crate::logical::StrAggSpec { delim, order }),
+            str_agg: Some(crate::logical::StrAggSpec {
+                delim,
+                order,
+                distinct,
+            }),
         })
     }
 
@@ -3546,9 +3560,13 @@ impl Binder<'_> {
                     | DT::DoublePrecision => {
                         Ok(Bound::Expr(float_cast_expr(materialize(self.bind(expr)?))))
                     }
-                    // CAST to an integer type rounds a fractional value to
-                    // the nearest integer (DuckDB semantics); an integer
-                    // operand is unchanged. A literal folds now.
+                    // CAST to an integer type rounds to the nearest integer;
+                    // the tie rule follows the SOURCE type, matching DuckDB:
+                    // a DECIMAL literal rounds half AWAY from zero (`2.5`→3,
+                    // probe-verified), while a runtime double expression
+                    // rounds ties to EVEN (`Expr::CastInt`, 2.5→2). A literal
+                    // reaching here came from decimal syntax, so it takes the
+                    // decimal rule and folds now.
                     DT::Int(_) | DT::Integer(_) | DT::BigInt(_) | DT::SmallInt(_) => {
                         let inner = materialize(self.bind(expr)?);
                         Ok(Bound::Expr(match inner {

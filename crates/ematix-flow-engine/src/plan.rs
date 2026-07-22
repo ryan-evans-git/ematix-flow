@@ -3377,11 +3377,20 @@ fn agg_column(agg: &AggExpr, j: usize, groups: &[(Vec<GroupKey>, Vec<AggState>)]
                 } else {
                     let mut idx: Vec<usize> = (0..sb.len()).collect();
                     idx.sort_by(|&a, &b| cmp_str_agg_keys(&sb[a].0, &sb[b].0, &spec.order));
-                    for (n, &k) in idx.iter().enumerate() {
-                        if n > 0 {
+                    // DISTINCT: each value once, first occurrence in
+                    // concatenation order (the binder guarantees any ORDER BY
+                    // is the value itself, so this is the sorted distinct).
+                    let mut seen = std::collections::HashSet::new();
+                    let mut first = true;
+                    for &k in &idx {
+                        if spec.distinct && !seen.insert(sb[k].1.as_ref()) {
+                            continue;
+                        }
+                        if !first {
                             data.extend_from_slice(spec.delim.as_bytes());
                         }
                         data.extend_from_slice(sb[k].1.as_bytes());
+                        first = false;
                     }
                     valid.push(true);
                 }

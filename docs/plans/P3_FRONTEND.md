@@ -1108,6 +1108,22 @@ lands a case here.
     without GROUP BY, scalar subquery in projection, `date + int`,
     min/max over dates, `sum() over ()`, `count(*) over (partition)`,
     derived-table JOIN, OFFSET without LIMIT, nullif/coalesce compositions.
+- **Sweep-#3 silent-bug fixes — SHIPPED.** *(1) `string_agg(DISTINCT …)`:*
+  new `StrAggSpec.distinct` flag (binder reads `duplicate_treatment`);
+  finalize dedupes after the ordered sort (HashSet keep-first, so with the
+  ORDER BY-the-value form it is exactly the sorted distinct). DISTINCT with
+  an ORDER BY that is not the aggregated value is ambiguous — rejected
+  loudly (Postgres does the same), via `Expr: PartialEq` comparison against
+  the unwrapped argument. *(2) CAST→INT tie rounding:* the rule follows the
+  SOURCE type, matching probe-verified DuckDB behavior — a runtime double
+  expression rounds ties to EVEN (`Expr::CastInt` eval → `round_ties_even`;
+  duck: `cast(cast(2.5 as double) as int)` = 2) while a DECIMAL literal
+  rounds half AWAY (bind-time fold keeps `round()`; duck: `cast(2.5 as
+  int)` = 3). The canonical sf1 parquet stores decimals as DOUBLE (duck
+  `typeof` probe), so ties-even is the correct column-data rule for both
+  engines. Gate: `string_agg_distinct_and_cast_ties` (sorted-distinct,
+  grouped, no-order single-value, loud reject; ±ties runtime + literal
+  fold + non-tie regression). Parity 25/25, sf1 103/103 0 MISMATCH.
 
 ## Next (P4 tail → P5/P6)
 

@@ -106,6 +106,11 @@ pub struct StrAggSpec {
     /// `(key, desc)` ordering applied within each group before concatenation;
     /// empty = arrival order.
     pub order: Vec<(Expr, bool)>,
+    /// `string_agg(DISTINCT …)` — each distinct value contributes once (the
+    /// first occurrence in concatenation order). The binder guarantees any
+    /// ORDER BY is the aggregated value itself, so "first occurrence" is
+    /// well-defined.
+    pub distinct: bool,
 }
 
 /// Supported aggregate functions.

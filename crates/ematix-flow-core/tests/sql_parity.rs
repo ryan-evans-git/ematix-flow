@@ -1133,3 +1133,53 @@ fn quantified_subquery_any_all() {
     p.check_rejected(&format!("select count(*) from lineitem where l_quantity = all {sub}"));
     p.check_rejected(&format!("select count(*) from lineitem where l_quantity <> any {sub}"));
 }
+
+// ---------------------------------------------------------------------------
+// Sweep-#3 silent-bug fixes: (1) `string_agg(DISTINCT …)` dropped the
+// DISTINCT on the floor; (2) `CAST(<float> AS INT)` rounded .5 ties away
+// from zero where DuckDB rounds half-to-even.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_agg_distinct_and_cast_ties() {
+    if !have_data() {
+        eprintln!("SKIP string_agg_distinct_and_cast_ties: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // DISTINCT + ORDER BY the aggregated value: sorted distinct values.
+    p.check(
+        "select string_agg(distinct l_returnflag, ',' order by l_returnflag) s \
+         from lineitem where l_orderkey < 500",
+    );
+    p.check(
+        "select l_returnflag, string_agg(distinct l_shipmode, '|' order by l_shipmode) s \
+         from lineitem where l_orderkey < 2000 group by l_returnflag",
+    );
+    // DISTINCT without ORDER BY over a single-valued group (deterministic).
+    p.check(
+        "select string_agg(distinct l_linestatus, ',') s \
+         from lineitem where l_returnflag = 'R' and l_orderkey < 2000",
+    );
+    // DISTINCT with an ORDER BY that is NOT the aggregated value is
+    // ambiguous (which instance's sort position?) — reject loudly.
+    p.check_rejected(
+        "select string_agg(distinct l_shipmode, ',' order by l_orderkey) s \
+         from lineitem where l_orderkey < 100",
+    );
+    // CAST float→int ties round half-to-even, matching DuckDB
+    // (2.5→2, 3.5→4, −2.5→−2). Built from a real column so the native
+    // binder sees a column expression, not a foldable literal.
+    let one = "(select l_extendedprice * 0 + 1 as one from lineitem \
+                where l_orderkey = 1 and l_linenumber = 1) t";
+    p.check(&format!("select cast(one * 2.5 as int) v from {one}"));
+    p.check(&format!("select cast(one * 3.5 as int) v from {one}"));
+    p.check(&format!("select cast(0 - one * 2.5 as int) v from {one}"));
+    p.check(&format!("select cast(one * 73426.5 as int) v from {one}"));
+    // A DECIMAL literal takes the decimal rule instead: half AWAY from zero
+    // (duck cast(2.5 as int) = 3, probe-verified) — the fold matches.
+    p.check(&format!("select cast(2.5 as int) + one v from {one}"));
+    // Non-tie values are unaffected.
+    p.check("select cast(l_extendedprice as int) v from lineitem where l_orderkey < 200");
+}
+
