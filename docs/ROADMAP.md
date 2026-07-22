@@ -3,6 +3,13 @@
 What's been shipped, what's left, and the priority order. Compiled
 from the deferred sections of every phase plan in `docs/`.
 
+> **Current focus (2026-07-18): the v2 program.** The clean-room native
+> engine is merged to `v2`; the active work is the DataFusion-elimination
+> cutover, native distribution, and the DataFrame API. Live plan +
+> sequencing: **[`plans/V2_PROGRAM.md`](plans/V2_PROGRAM.md)** (target:
+> [`V2_TARGET.md`](V2_TARGET.md)). The DF-era `V2_SQL_SURFACE_GAPS.md` and
+> `PHASE_V2_S1/2/3` docs are superseded by that program.
+
 ## Status snapshot (2026-05-10; v0.2.0 cut)
 
 **Shipped:**
