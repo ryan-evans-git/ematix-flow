@@ -53,6 +53,10 @@ pub enum TableSource {
     /// A materialized derived query — index into [`BoundQuery::derived`].
     /// `ScanColumn::leaf` is the derived query's output-column position.
     Derived(usize),
+    /// A `WITH RECURSIVE` self-reference: reads the fixpoint driver's current
+    /// working set (see [`BoundQuery::recursive`]). `ScanColumn::leaf` is the
+    /// CTE's output-column position.
+    WorkingSet,
 }
 
 /// One table in the query: its scan plus its own filters (conjuncts that
@@ -296,4 +300,21 @@ pub struct BoundQuery {
     /// ALL b INTERSECT c` = left-deep). This block's ORDER BY / LIMIT
     /// apply to the COMBINED rows.
     pub set_ops: Vec<(SetOp, BoundQuery)>,
+    /// `WITH RECURSIVE`: when `Some`, THIS query is the anchor (seed) and the
+    /// box holds the recursive step. The executor runs a fixpoint — seed, then
+    /// repeatedly the step (its [`TableSource::WorkingSet`] reading the last
+    /// iteration's new rows) — accumulating until the step yields nothing.
+    pub recursive: Option<Box<RecursiveCte>>,
+}
+
+/// The recursive branch of a `WITH RECURSIVE` CTE (see
+/// [`BoundQuery::recursive`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecursiveCte {
+    /// The recursive query, evaluated once per iteration with its
+    /// [`TableSource::WorkingSet`] bound to the previous iteration's new rows.
+    pub step: BoundQuery,
+    /// `UNION` (dedup new rows against all seen) vs `UNION ALL` (keep every
+    /// row); `true` = distinct.
+    pub distinct: bool,
 }

@@ -752,3 +752,62 @@ fn string_agg_ordered() {
     // Empty group → NULL.
     p.check("select string_agg(trim(l_shipmode), ',' order by l_shipmode) s from lineitem where l_orderkey < 0");
 }
+
+// ---------------------------------------------------------------------------
+// WITH RECURSIVE: seed (anchor) + iterate-to-fixpoint step. The anchor carries
+// a FROM (the engine requires one), seeding from lineitem; the step reads the
+// working set. Covers UNION ALL and UNION (dedup), multi-column accumulation,
+// and outer aggregation over the recursive result.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recursive_cte() {
+    if !have_data() {
+        eprintln!("SKIP recursive_cte: SF1 lineitem absent");
+        return;
+    }
+    let p = Parity::new();
+    // Integer series 1..12, UNION ALL.
+    p.check(
+        "with recursive seq(n) as ( \
+             select l_linenumber from lineitem where l_orderkey = 1 and l_linenumber = 1 \
+             union all \
+             select n + 1 from seq where n < 12 \
+         ) select n from seq order by n",
+    );
+    // Same series via UNION (dedup path) + outer aggregation.
+    p.check(
+        "with recursive seq(n) as ( \
+             select l_linenumber from lineitem where l_orderkey = 1 and l_linenumber = 1 \
+             union \
+             select n + 1 from seq where n < 12 \
+         ) select sum(n) s, count(*) c, max(n) m from seq",
+    );
+    // Two-column accumulation (factorials), UNION ALL.
+    p.check(
+        "with recursive t(n, acc) as ( \
+             select 1, 1 from lineitem where l_orderkey = 1 and l_linenumber = 1 \
+             union all \
+             select n + 1, acc * (n + 1) from t where n < 8 \
+         ) select n, acc from t order by n",
+    );
+    // Outer query joins/filters the recursive result.
+    p.check(
+        "with recursive seq(n) as ( \
+             select l_linenumber from lineitem where l_orderkey = 1 and l_linenumber = 1 \
+             union all \
+             select n + 1 from seq where n < 20 \
+         ) select n from seq where mod(n, 2) = 0 order by n",
+    );
+    // A non-recursive CTE alongside RECURSIVE (only the self-referencing one
+    // iterates).
+    p.check(
+        "with recursive base as (select count(*) c from lineitem where l_orderkey < 50), \
+              seq(n) as ( \
+                  select l_linenumber from lineitem where l_orderkey = 1 and l_linenumber = 1 \
+                  union all \
+                  select n + 1 from seq where n < 6 \
+              ) \
+         select (select c from base) bc, sum(n) sn from seq",
+    );
+}

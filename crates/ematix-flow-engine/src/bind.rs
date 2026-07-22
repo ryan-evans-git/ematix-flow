@@ -58,15 +58,19 @@ pub fn bind_sql(sql: &str, catalog: &Catalog) -> Result<BoundQuery, String> {
 /// value SET, so the dedup is semantics-preserving (and gives the executor
 /// its grouped path).
 /// A CTE registry: name → (bound definition, output columns as
-/// (name, type), defining AST). CTE references materialize as derived
-/// tables; the AST enables the scalar-aggregate cross-join view rewrite
-/// (q77's `FROM cs, cr` with a 1-row cr).
+/// (name, type), defining AST, optional working-set def). CTE references
+/// materialize as derived tables; the AST enables the scalar-aggregate
+/// cross-join view rewrite (q77's `FROM cs, cr` with a 1-row cr). The 4th
+/// element is `Some(def)` only for a `WITH RECURSIVE` self-reference while its
+/// recursive branch binds — such a reference resolves to
+/// [`TableSource::WorkingSet`] (the bound query / AST are then unused dummies).
 type CteMap = HashMap<
     String,
     (
         std::sync::Arc<BoundQuery>,
         Vec<(String, LogicalType)>,
         ast::Query,
+        Option<TableDef>,
     ),
 >;
 
@@ -109,11 +113,28 @@ fn bind_query(
     // the registry this query level sees.
     let mut ctes: CteMap = outer_ctes.clone();
     if let Some(with) = &query.with {
-        if with.recursive {
-            return Err("recursive CTEs are not yet supported".into());
-        }
         for cte in &with.cte_tables {
-            let bq = bind_query(&cte.query, catalog, false, &ctes)?;
+            let cte_name = cte.alias.name.value.clone();
+            // A RECURSIVE `WITH` may still hold non-recursive CTEs; a CTE is
+            // recursive only when its body is a top-level UNION[ALL] whose
+            // recursive term references the CTE name.
+            let bq = if with.recursive {
+                if let Some((anchor, step, union_all)) = split_recursive(&cte.query, &cte_name) {
+                    let declared: Vec<String> = cte
+                        .alias
+                        .columns
+                        .iter()
+                        .map(|c| c.name.value.clone())
+                        .collect();
+                    bind_recursive_cte(
+                        &cte.query, &cte_name, anchor, step, union_all, &declared, catalog, &ctes,
+                    )?
+                } else {
+                    bind_query(&cte.query, catalog, false, &ctes)?
+                }
+            } else {
+                bind_query(&cte.query, catalog, false, &ctes)?
+            };
             let tys = output_types(&bq);
             let names: Vec<String> = if cte.alias.columns.is_empty() {
                 bq.output.iter().map(|o| o.name.clone()).collect()
@@ -125,17 +146,15 @@ fn bind_query(
                     .collect()
             };
             if names.len() != tys.len() {
-                return Err(format!(
-                    "CTE '{}' column list arity mismatch",
-                    cte.alias.name.value
-                ));
+                return Err(format!("CTE '{cte_name}' column list arity mismatch"));
             }
             ctes.insert(
-                cte.alias.name.value.clone(),
+                cte_name,
                 (
                     std::sync::Arc::new(bq),
                     names.into_iter().zip(tys).collect(),
                     cte.query.as_ref().clone(),
+                    None,
                 ),
             );
         }
@@ -699,7 +718,139 @@ fn bind_query(
         subqueries: b.subs,
         derived: b.derived,
         set_ops: Vec::new(),
+        recursive: None,
     })
+}
+
+/// If `query`'s body is a top-level `UNION [ALL]` whose recursive term
+/// references `name`, return `(anchor, recursive, union_all)`.
+fn split_recursive<'a>(
+    query: &'a ast::Query,
+    name: &str,
+) -> Option<(&'a ast::SetExpr, &'a ast::SetExpr, bool)> {
+    let ast::SetExpr::SetOperation {
+        op,
+        set_quantifier,
+        left,
+        right,
+    } = query.body.as_ref()
+    else {
+        return None;
+    };
+    if !matches!(op, ast::SetOperator::Union) {
+        return None;
+    }
+    let union_all = matches!(
+        set_quantifier,
+        ast::SetQuantifier::All | ast::SetQuantifier::AllByName
+    );
+    let (l, r) = (left.as_ref(), right.as_ref());
+    // The recursive term references the CTE; the anchor does not.
+    if setexpr_refs_table(r, name) && !setexpr_refs_table(l, name) {
+        Some((l, r, union_all))
+    } else if setexpr_refs_table(l, name) && !setexpr_refs_table(r, name) {
+        Some((r, l, union_all))
+    } else {
+        None
+    }
+}
+
+/// Does any FROM item of `se` (or a nested set-op / derived) reference a table
+/// named `name`?
+fn setexpr_refs_table(se: &ast::SetExpr, name: &str) -> bool {
+    match se {
+        ast::SetExpr::Select(s) => s.from.iter().any(|twj| {
+            table_factor_refs(&twj.relation, name)
+                || twj
+                    .joins
+                    .iter()
+                    .any(|j| table_factor_refs(&j.relation, name))
+        }),
+        ast::SetExpr::SetOperation { left, right, .. } => {
+            setexpr_refs_table(left, name) || setexpr_refs_table(right, name)
+        }
+        ast::SetExpr::Query(q) => setexpr_refs_table(q.body.as_ref(), name),
+        _ => false,
+    }
+}
+
+fn table_factor_refs(tf: &ast::TableFactor, name: &str) -> bool {
+    match tf {
+        ast::TableFactor::Table { name: n, .. } => n.to_string().eq_ignore_ascii_case(name),
+        ast::TableFactor::Derived { subquery, .. } => {
+            setexpr_refs_table(subquery.body.as_ref(), name)
+        }
+        _ => false,
+    }
+}
+
+/// Bind a recursive CTE into an anchor [`BoundQuery`] carrying its recursive
+/// step (see [`BoundQuery::recursive`]). The anchor binds with the CTE out of
+/// scope; the step binds with the CTE name (`name`) resolving to a
+/// [`TableSource::WorkingSet`] table of the anchor's schema.
+#[allow(clippy::too_many_arguments)]
+fn bind_recursive_cte(
+    query: &ast::Query,
+    name: &str,
+    anchor: &ast::SetExpr,
+    step: &ast::SetExpr,
+    union_all: bool,
+    declared: &[String],
+    catalog: &Catalog,
+    ctes: &CteMap,
+) -> Result<BoundQuery, String> {
+    // Anchor (seed): the CTE is NOT in scope, so it binds like a plain query.
+    let mut seed_q = query.clone();
+    *seed_q.body = anchor.clone();
+    seed_q.with = None;
+    seed_q.order_by = None;
+    let mut seed = bind_query(&seed_q, catalog, false, ctes)?;
+    let tys = output_types(&seed);
+    let names: Vec<String> = if declared.is_empty() {
+        seed.output.iter().map(|o| o.name.clone()).collect()
+    } else {
+        declared.to_vec()
+    };
+    if names.len() != tys.len() {
+        return Err("recursive CTE column list arity mismatch".into());
+    }
+    // Register the self-reference as a WorkingSet table of the anchor schema,
+    // then bind the recursive step against it.
+    let ws_def = TableDef {
+        path: PathBuf::new(),
+        columns: names
+            .iter()
+            .zip(&tys)
+            .enumerate()
+            .map(|(i, (n, ty))| crate::catalog::ColumnDef {
+                name: n.clone(),
+                leaf: i,
+                ty: *ty,
+                dec_scale: None,
+                nullable: false,
+            })
+            .collect(),
+    };
+    let mut inner = ctes.clone();
+    inner.insert(
+        name.to_string(),
+        (
+            std::sync::Arc::new(seed.clone()),
+            names.iter().cloned().zip(tys).collect(),
+            query.clone(),
+            Some(ws_def),
+        ),
+    );
+    let mut step_q = query.clone();
+    *step_q.body = step.clone();
+    step_q.with = None;
+    step_q.order_by = None;
+    let step_bq = bind_query(&step_q, catalog, false, &inner)?;
+    seed.recursive = Some(Box::new(crate::logical::RecursiveCte {
+        step: step_bq,
+        distinct: !union_all,
+    }));
+    Ok(seed)
 }
 
 /// Rewrite the synthetic-column sentinels to their true row-space
@@ -1069,7 +1220,13 @@ impl Binder<'_> {
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| tname.clone());
-                if let Some((cte_bq, cols, cte_ast)) = self.ctes.get(&tname) {
+                if let Some((cte_bq, cols, cte_ast, ws_def)) = self.ctes.get(&tname) {
+                    // A `WITH RECURSIVE` self-reference (only in scope while the
+                    // recursive step binds) → the fixpoint working set.
+                    if let Some(def) = ws_def {
+                        let def = def.clone();
+                        return self.push_table(display, def, TableSource::WorkingSet);
+                    }
                     // A SCALAR-aggregate CTE (1 row) past the first FROM
                     // item: cross-join-as-constants via scalar-subquery
                     // views (q77's `FROM cs, cr`), same as the derived form.
@@ -2004,7 +2161,7 @@ impl Binder<'_> {
                 .as_ref()
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| tname.clone());
-            let def = if let Some((_, cols, _)) = self.ctes.get(&tname) {
+            let def = if let Some((_, cols, _, _)) = self.ctes.get(&tname) {
                 TableDef {
                     path: PathBuf::new(),
                     columns: cols
@@ -2332,6 +2489,7 @@ impl Binder<'_> {
             windows: Vec::new(),
             set_ops: Vec::new(),
             derived: inner.derived,
+            recursive: None,
         };
         self.subs.push(bq);
         Ok(Bound::Expr(Expr::InSub {
@@ -2366,7 +2524,7 @@ impl Binder<'_> {
                 .as_ref()
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| tname.clone());
-            let def = if let Some((_, cs, _)) = self.ctes.get(&tname) {
+            let def = if let Some((_, cs, _, _)) = self.ctes.get(&tname) {
                 TableDef {
                     path: PathBuf::new(),
                     columns: cs
@@ -2580,6 +2738,7 @@ impl Binder<'_> {
             windows: Vec::new(),
             set_ops: Vec::new(),
             derived: inner.derived,
+            recursive: None,
         };
         let idx = self.derived.len();
         self.derived.push(std::sync::Arc::new(bq));
@@ -3801,7 +3960,7 @@ fn rewrite_full_outer(
             .as_ref()
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| tname.clone());
-        let cols: Vec<String> = if let Some((_, cs, _)) = ctes.get(&tname) {
+        let cols: Vec<String> = if let Some((_, cs, _, _)) = ctes.get(&tname) {
             cs.iter().map(|(n, _)| n.clone()).collect()
         } else if let Some(d) = catalog.table(&tname) {
             d.columns.iter().map(|c| c.name.clone()).collect()

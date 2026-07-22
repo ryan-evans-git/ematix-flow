@@ -110,6 +110,9 @@ fn execute_mode(q: &BoundQuery, memo: &DerivedMemo, columnar: bool) -> Result<Qu
                 .map(|n| n.get())
                 .unwrap_or(1)
         });
+    if q.recursive.is_some() {
+        return execute_recursive(q, memo);
+    }
     if !q.set_ops.is_empty() {
         return execute_set(q, memo, columnar);
     }
@@ -214,6 +217,100 @@ fn execute_set(q: &BoundQuery, memo: &DerivedMemo, columnar: bool) -> Result<Que
         r.rows.truncate(l);
     }
     Ok(r)
+}
+
+/// Execute a `WITH RECURSIVE` CTE to fixpoint: run the anchor (seed), then
+/// repeatedly run the recursive step with its [`TableSource::WorkingSet`] bound
+/// to the previous iteration's NEW rows, accumulating until the step adds
+/// nothing. `UNION` dedups new rows against everything seen; `UNION ALL` keeps
+/// every row.
+fn execute_recursive(q: &BoundQuery, memo: &DerivedMemo) -> Result<QueryResult, String> {
+    /// Runaway guard — a non-terminating recursion (e.g. UNION ALL with no
+    /// converging predicate) would otherwise loop forever.
+    const MAX_ITERS: usize = 1_000_000;
+
+    let rec = q.recursive.as_ref().expect("recursive def");
+    let distinct = rec.distinct;
+
+    let row_cmp = |a: &Vec<ScalarValue>, b: &Vec<ScalarValue>| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| cmp_scalar(x, y))
+            .find(|o| *o != std::cmp::Ordering::Equal)
+            .unwrap_or_else(|| a.len().cmp(&b.len()))
+    };
+    let take_rows = |r: QueryResult| -> Vec<Vec<ScalarValue>> {
+        match r.col_chunks {
+            Some(chunks) => rows_from_chunks(&chunks),
+            None => r.rows,
+        }
+    };
+
+    // Seed (anchor): this query minus the recursive marker.
+    let mut seed_q = q.clone();
+    seed_q.recursive = None;
+    let seed = execute_with(&seed_q, memo)?;
+    let columns = seed.columns.clone();
+    let mut working = take_rows(seed);
+
+    // `seen` (distinct only): sorted set of every row emitted so far.
+    let mut seen: Vec<Vec<ScalarValue>> = Vec::new();
+    if distinct {
+        working.sort_by(&row_cmp);
+        working.dedup();
+        seen = working.clone();
+    }
+    let mut result = working.clone();
+
+    let mut iters = 0;
+    while !working.is_empty() {
+        iters += 1;
+        if iters > MAX_ITERS {
+            return Err("recursive CTE exceeded the iteration cap (non-terminating?)".into());
+        }
+        // Publish the working set for the step's WorkingSet scan.
+        memo.work
+            .lock()
+            .expect("work lock")
+            .push(std::sync::Arc::new(QueryResult {
+                columns: columns.clone(),
+                rows: working.clone(),
+                col_chunks: None,
+            }));
+        let step_res = execute_with(&rec.step, memo);
+        memo.work.lock().expect("work lock").pop();
+        let produced = take_rows(step_res?);
+
+        let new_rows: Vec<Vec<ScalarValue>> = if distinct {
+            // Keep only rows not seen before (and unique among themselves).
+            let mut fresh: Vec<Vec<ScalarValue>> = produced
+                .into_iter()
+                .filter(|r| seen.binary_search_by(|x| row_cmp(x, r)).is_err())
+                .collect();
+            fresh.sort_by(&row_cmp);
+            fresh.dedup();
+            for r in &fresh {
+                let pos = seen
+                    .binary_search_by(|x| row_cmp(x, r))
+                    .unwrap_or_else(|e| e);
+                seen.insert(pos, r.clone());
+            }
+            fresh
+        } else {
+            produced
+        };
+        if new_rows.is_empty() {
+            break;
+        }
+        result.extend(new_rows.iter().cloned());
+        working = new_rows;
+    }
+
+    Ok(QueryResult {
+        columns,
+        rows: result,
+        col_chunks: None,
+    })
 }
 
 /// Execute every subquery and substitute its result into the outer query's
@@ -461,7 +558,14 @@ struct Executor<'q> {
 /// the other N−1 references reuse the rows. Non-CTE deriveds are unique
 /// Arcs and simply miss. Dropped with the call, so no cross-query reuse.
 #[derive(Default)]
-struct DerivedMemo(Mutex<HashMap<usize, std::sync::Arc<QueryResult>>>);
+struct DerivedMemo {
+    cache: Mutex<HashMap<usize, std::sync::Arc<QueryResult>>>,
+    /// The recursive-CTE fixpoint driver's working-set stack: the innermost
+    /// active recursive step reads `.last()` for its [`TableSource::WorkingSet`]
+    /// scan. A stack (not a slot) so a step that itself nests a recursive CTE
+    /// keeps the outer working set intact.
+    work: Mutex<Vec<std::sync::Arc<QueryResult>>>,
+}
 
 /// One run's string-key interner (equal strings ⇒ equal ids).
 #[derive(Default)]
@@ -2207,7 +2311,7 @@ impl Executor<'_> {
                         .map(|md| md.row_groups.iter().map(|rg| rg.num_rows as u64).sum())
                 })
                 .unwrap_or(0),
-            TableSource::Derived(_) => 0,
+            TableSource::Derived(_) | TableSource::WorkingSet => 0,
         }
     }
 
@@ -2224,7 +2328,12 @@ impl Executor<'_> {
                 let shared = std::sync::Arc::strong_count(&q.derived[*i]) > 1;
                 let key = std::sync::Arc::as_ptr(&q.derived[*i]) as usize;
                 let cached = if shared {
-                    self.memo.0.lock().expect("memo lock").get(&key).cloned()
+                    self.memo
+                        .cache
+                        .lock()
+                        .expect("memo lock")
+                        .get(&key)
+                        .cloned()
                 } else {
                     None
                 };
@@ -2248,7 +2357,7 @@ impl Executor<'_> {
                         }
                         if shared {
                             self.memo
-                                .0
+                                .cache
                                 .lock()
                                 .expect("memo lock")
                                 .insert(key, r.clone());
@@ -2256,6 +2365,19 @@ impl Executor<'_> {
                         r
                     }
                 };
+                RootSrc::One(result_to_chunks(&r, ti)?)
+            }
+            TableSource::WorkingSet => {
+                // The recursive fixpoint driver pushed the current working set;
+                // scan it as a materialized derived input.
+                let r = self
+                    .memo
+                    .work
+                    .lock()
+                    .expect("work lock")
+                    .last()
+                    .cloned()
+                    .ok_or("WorkingSet scanned outside a recursive CTE")?;
                 RootSrc::One(result_to_chunks(&r, ti)?)
             }
             TableSource::Parquet(path) => {
