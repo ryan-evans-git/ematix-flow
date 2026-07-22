@@ -996,10 +996,23 @@ lands a case here.
   `windowed_plain` triggers on a QUALIFY-only window); `lag`/`lead` DEFAULT
   (new `WindowExpr::lag_default`, returned past the partition edge). Gate:
   `aggregate_filter_qualify_lag_default`. Parity 18/18, sf1 103/103 0 MISMATCH.
+- **Operators & scalars bundle — SHIPPED (`49f9afc1`).** The high-value sweep
+  gaps: `LIMIT … OFFSET` (new `BoundQuery::offset`); `||` → concat and `%` →
+  mod() (Binary-arm interception); boolean literals `true`/`false` (incl. a
+  constant WHERE conjunct — `true` folds, `false` empties); `CROSS JOIN`
+  (edgeless disconnected-component attach); `IS [NOT] DISTINCT FROM` (NULL-safe
+  compare via IsNull/Eq — parenthesize, since sqlparser groups `IS DISTINCT
+  FROM x AND y` as `IS DISTINCT FROM (x AND y)`); `ILIKE` (new `Expr::Like.ci`
+  flag, ASCII case-insensitive `like_match`); scalar math `sqrt`/`ln`/`exp`/
+  `sign`/`trunc`/`power`/`greatest`/`least` (new `NumFn` variants) and
+  `current_date` (folds to today's Date32). Gate:
+  `operators_and_scalars_bundle`. Parity 19/19, sf1 103/103 0 MISMATCH.
 - **Tier-3 residuals:** the SQL surface covers the join, grouping, aggregate,
-  window, and CTE families end-to-end. Remaining breadth is the measured
-  long-tail above — mostly mechanical binder additions (operators, scalar
-  fns) plus a few features (VALUES, `n PRECEDING` frames, DISTINCT ON, ANY/ALL).
+  window, and CTE families end-to-end. Remaining breadth is the narrower
+  long-tail — `VALUES`, FROM-less SELECT, `n PRECEDING/FOLLOWING` frames, named
+  `WINDOW`, `DISTINCT ON`, `= ANY(subq)`, `date_part`/`datediff`, `POSITION`,
+  ordered-set aggregates, array/regexp — plus the `count(distinct <string>)`
+  panic (distinct-key path is i64-only).
 
 ## Next (P4 tail → P5/P6)
 
