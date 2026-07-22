@@ -950,8 +950,39 @@ lands a case here.
   `tier2_aggregate_tail` (median/percentile grouped+scalar, bool_and/bool_or
   grouped+scalar+HAVING, empty-group NULLs). Parity 14/14, sf1 103/103 0
   MISMATCH (foldable hot path untouched), suite green.
-- **Tier-3 residuals still open:** recursive CTEs; `last_value` (needs an
-  UNBOUNDED FOLLOWING window frame) and `string_agg` (ordered Utf8 buffer).
+- **Window-frame breadth + last_value — SHIPPED (`2a23a573`).** The frame
+  binder now accepts `UNBOUNDED FOLLOWING` (ROWS/RANGE) and records
+  `WindowExpr::frame_end_unbounded`; such a frame is whole-partition regardless
+  of ORDER BY, so aggregate windows produce the partition total on every row
+  (the executor routes `order.is_empty() || frame_end_unbounded` to the
+  whole-partition path). `last_value(x)` (new `WindowFunc::LastValue`, mirror of
+  first_value): whole-partition frame → partition's last ordered row; default
+  RANGE ..CURRENT ROW → the current row's peer-group last member. Gate:
+  `window_last_value_and_frames`. Parity 15/15, sf1 103/103 0 MISMATCH.
+- **string_agg / group_concat — SHIPPED (`b50111e9`).** Ordered string
+  concatenation. Binder `bind_string_agg` parses `string_agg(value, delim
+  [ORDER BY key …])` (delimiter from arg 2, ordering from the
+  FunctionArgumentClause::OrderBy) onto a new `AggExpr::str_agg`. Executor:
+  `AggState::sbuf` retains each `(ORDER BY key, value)` pair
+  (empty/unallocated for other aggregates), merge concatenates, and agg_column
+  sorts per-group (DESC honored) + joins into a Utf8 cell (NULL over an empty
+  group). Gate: `string_agg_ordered` (trim()ed values so CHAR padding can't
+  diverge). Parity 16/16, sf1 103/103 0 MISMATCH.
+- **WITH RECURSIVE — SHIPPED (`d408bfb5`).** Iterate-to-fixpoint recursive CTEs.
+  Binder `split_recursive` detects a UNION[ALL] body with a self-referencing
+  term; `bind_recursive_cte` binds the anchor (for the schema), then the step
+  with the self-reference resolving to the new `TableSource::WorkingSet`. The
+  anchor `BoundQuery` carries the step + distinct flag in `BoundQuery::recursive`.
+  Executor `execute_recursive`: run the seed, then repeatedly the step with its
+  WorkingSet (a stack on `DerivedMemo`) bound to the last iteration's new rows,
+  accumulating until it adds nothing (UNION dedups vs everything seen, UNION ALL
+  keeps all); a 1M-iteration guard trips non-termination. Gate: `recursive_cte`
+  (series, dedup + outer agg, multi-column accumulation, non-recursive CTE
+  alongside). Parity 17/17, sf1 103/103 0 MISMATCH.
+- **Tier-3 residuals:** the SQL surface now covers the join, grouping,
+  aggregate, window, and CTE families end-to-end. Remaining breadth is
+  long-tail (LATERAL, richer window frames / EXCLUDE, `%` operator, FROM-less
+  SELECT, ordered-set aggregate DESC).
 
 ## Next (P4 tail → P5/P6)
 
