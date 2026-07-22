@@ -1052,7 +1052,7 @@ lands a case here.
   fields reject loudly. Gate: `date_part_and_datediff` (all fields,
   day/year/month/quarter diffs, epoch, aggregate + predicate contexts).
   Parity 22/22, sf1 103/103 0 MISMATCH.
-- **Bounded ROWS window frames (`n PRECEDING`/`n FOLLOWING`) — SHIPPED.** The
+- **Bounded ROWS window frames (`n PRECEDING`/`n FOLLOWING`) — SHIPPED (`b4e2be61`).** The
   one genuine frame-capability gap: the binder previously accepted only an
   UNBOUNDED PRECEDING start (running / whole-partition / RANGE-peer). New
   `WindowExpr.rows_bounds: Option<(Option<i64>, Option<i64>)>` — signed row
