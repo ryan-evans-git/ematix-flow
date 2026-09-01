@@ -73,10 +73,9 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
   and results surface in the web UI's **Quality** view. Opt-in via
   `pip install "ematix-flow[quality]"`.
 
-Status: beta; the API is stabilizing toward 1.0. Published on PyPI as
-`ematix-flow`. All four surfaces — declarative pipelines, multi-backend,
-streaming, and stream processing — are shipped end-to-end. See
-[CHANGELOG.md](CHANGELOG.md) for the release history.
+Status: live. Published on PyPI as `ematix-flow`. All four surfaces —
+declarative pipelines, multi-backend, streaming, and stream processing — are
+shipped end-to-end. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ---
 
